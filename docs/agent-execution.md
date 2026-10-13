@@ -15,8 +15,8 @@ Three choices shape everything below:
 - **One child process per agent.** An agent is a long-lived process that starts one agent run at a
   time, in its own workspace, as an ordinary child process.
 - **Direct endpoints, one credentials file.** Agents talk to the Git server and to the model endpoint
-  directly. There is no broker between an agent and an endpoint. A single credentials file holds the
-  secrets that runs need; it is read by the tool, never handed to an agent.
+  directly. There is no broker between an agent and an endpoint. A single credentials file holds the secrets that runs need, restricted by file permissions to your user. Note plainly: an agent
+  runs **as you**, so it can read anything you can — including that file. See *Running agents is not a sandbox* in the README.
 - **One Forgejo.** Repositories, permissions and merge requests are the Forgejo's own; the tool does
   not keep a second list of who may do what.
 
