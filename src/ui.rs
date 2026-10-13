@@ -159,6 +159,7 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(field("name", &agent.name));
             lines.push(field("model", &agent.model));
             lines.push(field("endpoint", &agent.endpoint));
+            lines.push(field("max turns", &agent.max_turns.to_string()));
             lines.push(field(
                 "instruction",
                 &agent.instruction.display().to_string(),
@@ -189,12 +190,17 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(run_id) = app.supervisor.state(&agent.name).run_id() {
                 lines.push(field("run", run_id));
             }
+            if let Some(test) = &app.endpoint_test {
+                if test.agent == agent.name {
+                    lines.push(field("endpoint test", &test.describe()));
+                }
+            }
         }
     }
     lines.push(Line::from(""));
     lines.push(field("read from", &app.config_path().display().to_string()));
     lines.push(Line::from(Span::styled(
-        "e edit the instruction   K open the skills directory   t edit the declared steps   s start   x stop   o open the log",
+        "e edit the instruction   K open the skills directory   t edit the declared steps   p test the endpoint   s start   x stop   o open the log",
         Style::new().fg(Color::DarkGray),
     )));
     frame.render_widget(
@@ -260,9 +266,15 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
         "e edit the instruction   K open the skills directory   t edit the declared steps",
         Style::new().fg(Color::DarkGray),
     )));
-    lines.push(placeholder(
-        "the model call is not implemented, so a run follows the declared steps and nothing more",
-    ));
+    if let Some(agent) = app.selected_agent() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "A run sends this instruction, the conversation so far and the declared `shell` tool to {} ({}), runs the tool calls it asks for inside the workspace, and stops when the model finishes or after {} turn(s).",
+                agent.endpoint, agent.model, agent.max_turns
+            ),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(" instruction, steps and skills "))
@@ -309,15 +321,16 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
         ))),
     }
     lines.push(Line::from(
-        "Its contents are never read here: nothing is printed, logged or put on a command line.",
+        "Its contents are never printed: nothing here is shown, logged or put on a command line.",
     ));
     lines.push(Line::from(Span::styled(
         "An agent runs as you, so it can read this file with your rights. The screen shows you where it is.",
         Style::new().fg(Color::DarkGray),
     )));
-    lines.push(placeholder(
-        "no secret is used yet, because no model call and no Forgejo request is made",
-    ));
+    lines.push(Line::from(Span::styled(
+        "The model key for an agent is read from this file at the point of a model call, and is redacted from every transcript, log and error the tool writes.",
+        Style::new().fg(Color::DarkGray),
+    )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(" credentials file "))
@@ -426,7 +439,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(
-            "s start the agent   x stop it   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
+            "s start the agent   x stop it   p test its endpoint   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
         )
         .style(Style::new().fg(Color::DarkGray))
         .wrap(Wrap { trim: true }),

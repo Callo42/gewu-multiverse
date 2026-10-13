@@ -2,7 +2,9 @@
 //!
 //! These tests start the program's own executable in its agent mode, exactly as the
 //! terminal UI does, and then read what the run left behind: the plan, the log and
-//! the append-only JSONL transcript. No model is involved and no network is touched.
+//! the append-only JSONL transcript. The model endpoint is a local stub or, where the
+//! run is stopped before it can think, never reached at all. No real endpoint is
+//! contacted and no money is spent.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,12 +13,16 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gewu_multiverse::paths::{AgentPaths, Layout};
-use gewu_multiverse::run::{RunOutcome, RunPlan};
+use gewu_multiverse::run::{RunModel, RunOutcome, RunPlan};
 use gewu_multiverse::supervisor::{StartDisposition, State, StopDisposition, Supervisor};
+use gewu_multiverse::test_stub::{Stub, StubReply};
 use gewu_multiverse::transcript::{self, Record};
 
 /// The real program, which is also the agent process.
 const BINARY: &str = env!("CARGO_BIN_EXE_gewu-multiverse");
+
+/// A made-up key: not a credential, only something the tests can look for.
+const TEST_KEY: &str = "gw-fixture-key";
 
 fn scratch(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -28,7 +34,7 @@ fn scratch(tag: &str) -> PathBuf {
     root
 }
 
-/// An agent with an instruction and a skill set, ready for a run.
+/// An agent with an instruction, a skill set and a credentials file, ready for a run.
 fn agent(root: &Path, name: &str, instruction: &str) -> AgentPaths {
     let layout = Layout::rooted_at(root);
     let paths = layout.ensure_agent(name).expect("the agent is prepared");
@@ -37,16 +43,38 @@ fn agent(root: &Path, name: &str, instruction: &str) -> AgentPaths {
     fs::create_dir_all(&skill).expect("the skill directory is created");
     fs::write(skill.join("SKILL.md"), "# alpha\n").expect("the skill manifest is written");
     fs::write(skill.join("notes.txt"), "more\n").expect("a skill file is written");
+    // One top-level key, so every agent of this installation has one.
+    gewu_multiverse::mode::write_private(
+        root.join("credentials.toml"),
+        format!("model_key = \"{TEST_KEY}\"\n").as_bytes(),
+    )
+    .expect("the credentials file is written");
     paths
 }
 
 fn supervisor(root: &Path, timeout: Duration, max_concurrent: usize) -> Supervisor {
-    Supervisor::new(
-        Layout::rooted_at(root).state_root(),
-        BINARY,
-        max_concurrent,
-        timeout,
-    )
+    let layout = Layout::rooted_at(root);
+    let mut supervisor = Supervisor::new(layout.state_root(), BINARY, max_concurrent, timeout);
+    supervisor.set_credentials(layout.credentials_file());
+    supervisor
+}
+
+fn model(endpoint: &str) -> RunModel {
+    RunModel {
+        endpoint: endpoint.to_owned(),
+        model: "example-model".to_owned(),
+        max_turns: 4,
+    }
+}
+
+fn completion(content: &str) -> String {
+    serde_json::json!({
+        "model": "example-model",
+        "choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": content}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+    })
+    .to_string()
 }
 
 /// Poll until the agent reaches a terminal state, or fail after a while.
@@ -78,6 +106,7 @@ fn a_real_run_leaves_a_plan_a_log_a_transcript_and_its_effects() {
         "# a comment line\nprintf 'hello from a declared step\\n' > note.txt\n",
     )
     .expect("the steps file is written");
+    let stub = Stub::start(vec![StubReply::json(completion("the note is written"))]);
     let run_id = "run-1";
     let run_dir = paths.run_dir(run_id);
     fs::create_dir_all(&run_dir).expect("the run directory is created");
@@ -87,6 +116,10 @@ fn a_real_run_leaves_a_plan_a_log_a_transcript_and_its_effects() {
         workspace: paths.workspace().to_path_buf(),
         instruction: paths.instruction().to_path_buf(),
         skills_dir: paths.skills_dir().to_path_buf(),
+        endpoint: stub.url(),
+        model: "example-model".to_owned(),
+        credentials: root.join("credentials.toml"),
+        max_turns: 4,
         steps: RunPlan::read_steps(paths.steps_file()).expect("the steps can be read"),
         timeout_secs: 30,
     }
@@ -122,8 +155,11 @@ fn a_real_run_leaves_a_plan_a_log_a_transcript_and_its_effects() {
             "run_started",
             "skills_discovered",
             "instruction_read",
+            "run_limits",
             "tool_call",
             "tool_result",
+            "model_request",
+            "model_reply",
             "child_exit",
             "run_finished"
         ],
@@ -143,10 +179,31 @@ fn a_real_run_leaves_a_plan_a_log_a_transcript_and_its_effects() {
         fs::read_to_string(run_dir.join("skills/alpha/SKILL.md")).expect("installed"),
         "# alpha\n"
     );
+    // The bound is in the transcript, and the reason the loop ended names it.
+    assert!(
+        file.records
+            .iter()
+            .any(|record| matches!(record, Record::RunLimits { max_turns: 4, .. }))
+    );
     assert!(matches!(
         transcript::terminal_record(&run_dir),
-        Some(Record::RunFinished { ref outcome, .. }) if outcome == "succeeded"
+        Some(Record::RunFinished { ref outcome, ref reason, .. })
+            if outcome == "succeeded"
+                && reason.as_deref().unwrap_or("").contains("the model finished")
     ));
+    // Nothing the run wrote holds the key, and the stub saw it only in the header.
+    let transcript_text = fs::read_to_string(run_dir.join("transcript.jsonl")).expect("readable");
+    assert!(
+        !transcript_text.contains(TEST_KEY),
+        "the transcript holds the key"
+    );
+    assert!(!log.contains(TEST_KEY), "the log holds the key");
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].header("authorization").as_deref(),
+        Some(format!("Bearer {TEST_KEY}").as_str())
+    );
 }
 
 #[test]
@@ -154,9 +211,12 @@ fn the_supervisor_starts_a_run_and_records_its_outcome() {
     let root = scratch("supervised-run");
     let paths = agent(&root, "scribe", "do nothing\n");
     fs::write(paths.steps_file(), "true\n").expect("the steps file is written");
+    let stub = Stub::start(vec![StubReply::json(completion("done"))]);
     let mut supervisor = supervisor(&root, Duration::from_secs(30), 10);
     let steps = RunPlan::read_steps(paths.steps_file()).expect("steps");
-    let disposition = supervisor.start(&paths, steps).expect("started");
+    let disposition = supervisor
+        .start(&paths, &model(&stub.url()), steps)
+        .expect("started");
     let run_id = match disposition {
         StartDisposition::Started { run_id, .. } => run_id,
         other => panic!("unexpected {other:?}"),
@@ -180,7 +240,15 @@ fn stopping_an_agent_stops_its_whole_process_tree() {
         .expect("the steps file is written");
     let mut supervisor = supervisor(&root, Duration::from_secs(60), 10);
     let steps = RunPlan::read_steps(paths.steps_file()).expect("steps");
-    let disposition = supervisor.start(&paths, steps).expect("started");
+    // The declared step hangs, so the model is never reached; the endpoint is only a
+    // placeholder here.
+    let disposition = supervisor
+        .start(
+            &paths,
+            &model("http://127.0.0.1:9/v1/chat/completions"),
+            steps,
+        )
+        .expect("started");
     let child_pid = match disposition {
         StartDisposition::Started { pid, .. } => pid,
         other => panic!("unexpected {other:?}"),
@@ -230,7 +298,13 @@ fn an_overrunning_run_is_stopped_by_its_timeout_and_reported() {
     fs::write(paths.steps_file(), "sleep 300\n").expect("the steps file is written");
     let mut supervisor = supervisor(&root, Duration::from_millis(500), 10);
     let steps = RunPlan::read_steps(paths.steps_file()).expect("steps");
-    let disposition = supervisor.start(&paths, steps).expect("started");
+    let disposition = supervisor
+        .start(
+            &paths,
+            &model("http://127.0.0.1:9/v1/chat/completions"),
+            steps,
+        )
+        .expect("started");
     let (run_id, child_pid) = match disposition {
         StartDisposition::Started { run_id, pid } => (run_id, pid),
         other => panic!("unexpected {other:?}"),
@@ -269,12 +343,21 @@ fn a_start_beyond_the_limit_waits_its_turn() {
         fs::write(paths.steps_file(), "sleep 300\n").expect("the steps file is written");
     }
     let mut supervisor = supervisor(&root, Duration::from_secs(60), 1);
+    let placeholder = model("http://127.0.0.1:9/v1/chat/completions");
     let first = supervisor
-        .start(&one, RunPlan::read_steps(one.steps_file()).expect("steps"))
+        .start(
+            &one,
+            &placeholder,
+            RunPlan::read_steps(one.steps_file()).expect("steps"),
+        )
         .expect("started");
     assert!(matches!(first, StartDisposition::Started { .. }));
     let second = supervisor
-        .start(&two, RunPlan::read_steps(two.steps_file()).expect("steps"))
+        .start(
+            &two,
+            &placeholder,
+            RunPlan::read_steps(two.steps_file()).expect("steps"),
+        )
         .expect("queued");
     match second {
         StartDisposition::Queued { position, .. } => assert_eq!(position, 1),
