@@ -36,6 +36,9 @@ const SECRET_KEY_NAMES: &[&str] = &[
 /// The largest number of model requests one agent may keep in flight at once.
 pub const MAX_CONCURRENCY: u16 = 16;
 
+/// The largest number of turns one run may take before it is stopped.
+pub const MAX_TURNS: u32 = 256;
+
 /// The whole configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,10 +131,18 @@ pub struct AgentConfig {
     pub model: String,
     /// The endpoint that serves that model.
     pub endpoint: String,
+    /// How many model turns one run may take before the declared bound stops it.
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u32,
     /// The instruction document, relative to the configuration directory.
     pub instruction: PathBuf,
     /// How many model requests this agent may keep in flight at once.
     pub concurrency: u16,
+}
+
+/// The default bound on model turns in one run.
+fn default_max_turns() -> u32 {
+    24
 }
 
 /// Everything that can go wrong while reading the configuration file.
@@ -366,6 +377,23 @@ impl Config {
                     ),
                 ));
             }
+            if agent.max_turns == 0 {
+                return Err(invalid(
+                    path,
+                    field("max_turns"),
+                    "= 0 is not allowed; a run needs at least one turn to call the model",
+                ));
+            }
+            if agent.max_turns > MAX_TURNS {
+                return Err(invalid(
+                    path,
+                    field("max_turns"),
+                    format!(
+                        "= {} is too large; it must be at most {MAX_TURNS}",
+                        agent.max_turns
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -394,6 +422,8 @@ max_concurrent_agents = 10
 name = "example-agent"
 model = "example-model"
 endpoint = "https://model.example.org/v1"
+# How many model turns one run may take before the declared bound stops it (1 to 256).
+max_turns = 24
 # Relative to this file's directory. The tool also derives an agent's own directory
 # under agents/<name>/, holding its instruction.md, its skills/ and its workspace/.
 instruction = "instructions/example-agent.md"
@@ -613,6 +643,35 @@ token = "abcdef"
     fn a_concurrency_above_the_bound_is_refused() {
         let text = GOOD.replace("concurrency = 2", "concurrency = 17");
         assert!(message(&text).contains("at most 16"));
+    }
+
+    #[test]
+    fn the_default_turn_bound_is_used_when_the_field_is_absent() {
+        let config = Config::from_text(path(), GOOD).expect("the good file is accepted");
+        assert_eq!(config.agents[0].max_turns, 24);
+    }
+
+    #[test]
+    fn a_turn_bound_can_be_set() {
+        let text = GOOD.replace(
+            "endpoint = \"https://model.example.org/v1\"",
+            "endpoint = \"https://model.example.org/v1\"\nmax_turns = 3",
+        );
+        let config = Config::from_text(path(), &text).expect("the bound is accepted");
+        assert_eq!(config.agents[0].max_turns, 3);
+    }
+
+    #[test]
+    fn a_zero_or_oversized_turn_bound_is_refused() {
+        for (value, expected) in [("0", "at least one turn"), ("257", "too large")] {
+            let text = GOOD.replace(
+                "endpoint = \"https://model.example.org/v1\"",
+                &format!("endpoint = \"https://model.example.org/v1\"\nmax_turns = {value}"),
+            );
+            let message = message(&text);
+            assert!(message.contains("max_turns"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
     }
 
     #[test]
