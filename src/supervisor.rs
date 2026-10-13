@@ -17,8 +17,14 @@
 //!   exit is a failure; a run the tool stopped is `stopped`; a run the tool stopped
 //!   for its timeout is `timed_out`. What the process wrote is a log, never a verdict.
 //!
-//! Nothing here runs as root, installs a service or uses a container runtime. The
-//! child is an ordinary process of the same user.
+//! An agent may instead be supervised by the user's own systemd, as a unit this tool
+//! writes ([`crate::systemd`]). The same supervisor holds both: it routes a start,
+//! a stop and a state read to the mode the agent is in, so a caller never has to know
+//! which one is in use. A unit is deliberately *not* stopped when the UI exits: that
+//! is the whole point of the mode.
+//!
+//! Nothing here runs as root, installs a system service or uses a container runtime.
+//! The child is an ordinary process of the same user, and so is a unit.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -34,6 +40,9 @@ use nix::unistd::Pid;
 
 use crate::paths::AgentPaths;
 use crate::run::{LOG_FILE, RunModel, RunOutcome, RunPlan, new_run_id};
+use crate::systemd::{
+    self, Mode, RestartPolicy, Supervision, Systemctl, SystemdSupervisor, UnitSpec,
+};
 use crate::transcript::{self, Record, Transcript};
 
 /// How long a stopped run may take to end politely before it is ended forcefully.
@@ -87,6 +96,13 @@ pub enum State {
         /// How long it lasted, in milliseconds.
         duration_ms: u64,
     },
+    /// The agent runs as a user unit, and systemd could not be asked about it, so
+    /// whether it is running is not known here. This is never shown as running and
+    /// never shown as stopped: the screens say the state is unknown.
+    Unavailable {
+        /// Why, in a sentence.
+        reason: String,
+    },
 }
 
 impl State {
@@ -106,13 +122,14 @@ impl State {
                 RunOutcome::Stopped => "stopped".to_owned(),
                 RunOutcome::TimedOut => "timed out".to_owned(),
             },
+            State::Unavailable { .. } => "state unknown".to_owned(),
         }
     }
 
     /// The run this state is about, if any.
     pub fn run_id(&self) -> Option<&str> {
         match self {
-            State::Idle => None,
+            State::Idle | State::Unavailable { .. } => None,
             State::Waiting { run_id, .. }
             | State::Starting { run_id, .. }
             | State::Running { run_id, .. }
@@ -163,6 +180,20 @@ pub enum StopDisposition {
     Cancelled,
     /// There was nothing to stop.
     Nothing,
+    /// The user's systemd could not be asked to stop the unit.
+    Failed {
+        /// Why, in a sentence.
+        reason: String,
+    },
+}
+
+/// What happened when one agent's supervision mode was switched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeChange {
+    /// The record was written, moving the agent to this mode.
+    Switched(Mode),
+    /// The agent was already in the requested mode, so nothing changed.
+    Already(Mode),
 }
 
 /// Why a start could not be prepared or spawned.
@@ -200,6 +231,14 @@ pub enum StartError {
         /// The agent.
         agent: String,
     },
+    /// The user unit could not be written or started.
+    #[error("`{agent}` cannot be started as a user unit: {message}")]
+    Systemd {
+        /// The agent.
+        agent: String,
+        /// Why, in a sentence from systemd or the filesystem.
+        message: String,
+    },
 }
 
 /// A run that is alive right now.
@@ -233,6 +272,8 @@ struct Queued {
     model: RunModel,
     steps: Vec<String>,
     run_id: String,
+    /// Which mode it will be started in when its turn comes.
+    mode: Mode,
 }
 
 /// The supervisor of every agent of one installation.
@@ -241,6 +282,12 @@ pub struct Supervisor {
     state_root: PathBuf,
     binary: PathBuf,
     credentials: PathBuf,
+    /// The configuration directory, so an agent's supervision record can be found.
+    config_root: PathBuf,
+    /// The mode each agent is in, read from its record when the configuration is read.
+    modes: HashMap<String, Mode>,
+    /// The systemd half: units, their starts and stops, and their state.
+    systemd: SystemdSupervisor,
     max_concurrent: usize,
     timeout: Duration,
     grace: Duration,
@@ -262,10 +309,18 @@ impl Supervisor {
         max_concurrent: usize,
         timeout: Duration,
     ) -> Self {
+        let unit_dir = systemd::user_unit_dir().unwrap_or_default();
         Self {
             state_root: state_root.into(),
             binary: binary.into(),
             credentials: PathBuf::new(),
+            config_root: PathBuf::new(),
+            modes: HashMap::new(),
+            systemd: SystemdSupervisor::new(
+                Systemctl::new(),
+                unit_dir,
+                RestartPolicy::default(),
+            ),
             max_concurrent: max_concurrent.max(1),
             timeout,
             grace: DEFAULT_GRACE,
@@ -286,6 +341,147 @@ impl Supervisor {
     /// Say where the credentials file is. A run reads its model key from there.
     pub fn set_credentials(&mut self, path: impl Into<PathBuf>) {
         self.credentials = path.into();
+    }
+
+    /// Say which configuration directory the agents live under, so their supervision
+    /// records can be read and written.
+    pub fn set_config_root(&mut self, path: impl Into<PathBuf>) {
+        self.config_root = path.into();
+    }
+
+    /// Put the unit files somewhere else. The tests use this; production leaves the
+    /// unit directory where `systemctl --user` looks for it.
+    pub fn set_unit_dir(&mut self, path: impl Into<PathBuf>) {
+        self.systemd.set_unit_dir(path.into());
+    }
+
+    /// Use a chosen `systemctl`, which is what the tests do.
+    pub fn set_systemctl(&mut self, systemctl: Systemctl) {
+        self.systemd.set_systemctl(systemctl);
+    }
+
+    /// Read every agent's supervision record, so the screens know which mode each
+    /// agent is in. Called whenever the configuration is read again.
+    pub fn load_modes(&mut self, agents: &[AgentPaths]) {
+        self.modes.clear();
+        for agent in agents {
+            let record = systemd::read_record(agent);
+            self.modes.insert(agent.name().to_owned(), record.mode);
+            if record.mode == Mode::Systemd {
+                self.systemd.note_run(
+                    agent.name(),
+                    record.run_dir.clone(),
+                    record.restarts_recorded,
+                );
+            }
+        }
+        // An agent whose record no longer says systemd has no unit here any more, so
+        // the run remembered for it is forgotten rather than counted.
+        let supervised: Vec<String> = self
+            .modes
+            .iter()
+            .filter(|(_, mode)| **mode == Mode::Systemd)
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.systemd.keep_only(&supervised);
+        // Read the units back at once, so an agent whose unit is running is shown as
+        // running from the first frame rather than only after the first poll.
+        if !supervised.is_empty() {
+            self.systemd.poll_now();
+        }
+    }
+
+    /// The mode one agent is supervised in. An agent with no record is in the default
+    /// mode, which is a child of this UI.
+    pub fn mode(&self, name: &str) -> Mode {
+        self.modes.get(name).copied().unwrap_or_default()
+    }
+
+    /// Move one agent between the two supervision modes.
+    ///
+    /// This is idempotent: asking for the mode an agent is already in succeeds and
+    /// changes nothing. A switch is refused while the agent is running, in either
+    /// mode, so that no run is ever left without something that knows about it.
+    pub fn switch_mode(
+        &mut self,
+        agent: &AgentPaths,
+        target: Mode,
+    ) -> Result<ModeChange, String> {
+        let name = agent.name().to_owned();
+        // The record lives in the agent's own directory, so that directory is made
+        // here just as it is before a start: switching mode is a change to the agent.
+        agent
+            .ensure()
+            .map_err(|error| format!("`{name}` cannot change mode: {error}"))?;
+        let current = self.mode(&name);
+        if current == target {
+            return Ok(ModeChange::Already(current));
+        }
+        match current {
+            Mode::Tui => {
+                let live = self.live.contains_key(&name)
+                    || self
+                        .states
+                        .get(&name)
+                        .map(|state| state.is_live())
+                        .unwrap_or(false);
+                if live {
+                    return Err(format!(
+                        "refused: `{name}` is running as a child of this UI; stop it first (press x), then switch"
+                    ));
+                }
+            }
+            Mode::Systemd => {
+                self.systemd.poll_now();
+                if self.systemd.is_live(&name) {
+                    let unit = systemd::unit_name(&name);
+                    return Err(format!(
+                        "refused: `{name}` is running as the user unit {unit}; stop it first (press x), then switch"
+                    ));
+                }
+            }
+        }
+        // Leaving systemd mode means the machine keeps no unit for this agent: a unit
+        // left behind could be started by hand and would then contradict the record.
+        if target == Mode::Tui {
+            self.systemd
+                .remove_unit(&name)
+                .map_err(|message| format!("`{name}` could not leave systemd mode: {message}"))?;
+        }
+        let record = match target {
+            Mode::Systemd => Supervision {
+                mode: Mode::Systemd,
+                run_dir: None,
+                restarts_recorded: 0,
+            },
+            Mode::Tui => Supervision::default(),
+        };
+        systemd::write_record(agent, &record).map_err(|error| {
+            format!("the supervision record of `{name}` cannot be written: {error}")
+        })?;
+        self.modes.insert(name.clone(), target);
+        self.states.remove(&name);
+        Ok(ModeChange::Switched(target))
+    }
+
+    /// Whether the user's own systemd answers, and which version it is.
+    pub fn systemd_available(&self) -> Result<String, String> {
+        self.systemd.available()
+    }
+
+    /// The last problem the systemd half met, if any.
+    pub fn systemd_last_error(&self) -> Option<&str> {
+        self.systemd.last_error()
+    }
+
+    /// The directory unit files are written into.
+    pub fn unit_dir(&self) -> &Path {
+        self.systemd.unit_dir()
+    }
+
+    /// How many times systemd reports having restarted one agent's unit.
+    pub fn restart_count(&self, name: &str) -> u32 {
+        self.systemd.restart_count(name)
     }
 
     /// Apply the limits a freshly read configuration carries.
@@ -309,7 +505,7 @@ impl Supervisor {
 
     /// How many agents are running, or starting, right now.
     pub fn running_count(&self) -> usize {
-        self.live.len()
+        self.live.len() + self.systemd.live_count()
     }
 
     /// How many starts are waiting for a free slot.
@@ -318,17 +514,28 @@ impl Supervisor {
     }
 
     /// What the screens should show for one agent.
+    ///
+    /// An agent in systemd mode is read from systemd, never from what this tool last
+    /// did; an agent in the default mode is read from the process this tool holds.
     pub fn state(&self, name: &str) -> State {
+        if self.mode(name) == Mode::Systemd {
+            return self.systemd.state(name).cloned().unwrap_or(State::Idle);
+        }
         self.states.get(name).cloned().unwrap_or(State::Idle)
     }
 
     /// Every agent the supervisor knows about, and its state.
     pub fn states(&self) -> Vec<(String, State)> {
-        let mut all: Vec<(String, State)> = self
-            .states
-            .iter()
-            .map(|(name, state)| (name.clone(), state.clone()))
-            .collect();
+        let mut all: HashMap<String, State> = self.states.clone();
+        for (name, mode) in &self.modes {
+            if *mode == Mode::Systemd {
+                all.insert(
+                    name.clone(),
+                    self.systemd.state(name).cloned().unwrap_or(State::Idle),
+                );
+            }
+        }
+        let mut all: Vec<(String, State)> = all.into_iter().collect();
         all.sort_by(|left, right| left.0.cmp(&right.0));
         all
     }
@@ -341,7 +548,8 @@ impl Supervisor {
     /// Ask for one run of one agent.
     ///
     /// Beyond the concurrency limit the start does not fail: it waits its turn, and
-    /// the poll that follows starts it when a slot is free.
+    /// the poll that follows starts it when a slot is free. Which mode the agent is
+    /// in decides who starts the process, never the caller.
     pub fn start(
         &mut self,
         agent: &AgentPaths,
@@ -349,11 +557,25 @@ impl Supervisor {
         steps: Vec<String>,
     ) -> Result<StartDisposition, StartError> {
         let name = agent.name().to_owned();
-        if let Some(state) = self.states.get(&name) {
-            if state.is_live() {
-                let run_id = state.run_id().unwrap_or("unknown").to_owned();
-                return Ok(StartDisposition::Busy { run_id });
+        let mode = self.mode(&name);
+        let live_run = match mode {
+            Mode::Tui => self
+                .states
+                .get(&name)
+                .filter(|state| state.is_live())
+                .and_then(|state| state.run_id())
+                .map(str::to_owned),
+            Mode::Systemd => {
+                self.systemd.poll_now();
+                if self.systemd.is_live(&name) {
+                    self.systemd.run_of(&name).map(|run| run.run_id)
+                } else {
+                    None
+                }
             }
+        };
+        if let Some(run_id) = live_run {
+            return Ok(StartDisposition::Busy { run_id });
         }
         if self.queue.iter().any(|queued| queued.name == name) {
             let run_id = self
@@ -376,6 +598,7 @@ impl Supervisor {
                 model: model.clone(),
                 steps,
                 run_id: run_id.clone(),
+                mode,
             });
             let position = self.queue.len();
             self.states.insert(
@@ -388,11 +611,18 @@ impl Supervisor {
             self.reindex_queue();
             return Ok(StartDisposition::Queued { run_id, position });
         }
-        let pid = self.spawn(agent, model, steps, run_id.clone())?;
+        let pid = match mode {
+            Mode::Tui => self.spawn(agent, model, steps, run_id.clone())?,
+            Mode::Systemd => self.spawn_systemd(agent, model, steps, run_id.clone())?,
+        };
         Ok(StartDisposition::Started { run_id, pid })
     }
 
     /// Ask one agent to stop. A start still waiting is called off.
+    ///
+    /// In the default mode a stop signals the whole process group; in systemd mode it
+    /// asks the user's own `systemctl --user` to stop the unit, and records that the
+    /// run was stopped.
     pub fn stop(&mut self, name: &str) -> StopDisposition {
         if let Some(queued_at) = self.queue.iter().position(|queued| queued.name == name) {
             let queued = self
@@ -410,6 +640,13 @@ impl Supervisor {
             );
             self.reindex_queue();
             return StopDisposition::Cancelled;
+        }
+        if self.mode(name) == Mode::Systemd {
+            return match self.systemd.stop(name) {
+                Ok(true) => StopDisposition::Signalled,
+                Ok(false) => StopDisposition::Nothing,
+                Err(reason) => StopDisposition::Failed { reason },
+            };
         }
         let Some(live) = self.live.get_mut(name) else {
             return StopDisposition::Nothing;
@@ -434,10 +671,13 @@ impl Supervisor {
         StopDisposition::Signalled
     }
 
-    /// Stop every run and wait, within a budget, until no child is left.
+    /// Stop every run of the default mode and wait, within a budget, until no child is
+    /// left.
     ///
     /// This is what the tool calls before it leaves. It returns how many runs it
-    /// stopped. It proves the children are gone by reaping them.
+    /// stopped. It proves the children are gone by reaping them. An agent in systemd
+    /// mode is deliberately left alone: surviving this UI exiting is the whole reason
+    /// that mode exists, so it is not stopped here.
     pub fn stop_all(&mut self, budget: Duration) -> usize {
         let stopped = self.live.len();
         let names: Vec<String> = self.live.keys().cloned().collect();
@@ -504,8 +744,10 @@ impl Supervisor {
     }
 
     /// Read every live process once: start what can start, finish what has finished,
-    /// and stop what has overrun.
+    /// and stop what has overrun. The user's systemd is read on its own, slower
+    /// cadence, so a unit's state is fresh without a call to systemd per frame.
     pub fn poll(&mut self, now: Instant) {
+        self.systemd.poll(now);
         self.sweep_groups(now);
 
         let names: Vec<String> = self.live.keys().cloned().collect();
@@ -513,30 +755,31 @@ impl Supervisor {
             self.poll_one(&name, now);
         }
 
-        // Fill free slots from the line, in turn.
+        // Fill free slots from the line, in turn, in the mode each start was queued in.
         while self.running_count() < self.max_concurrent {
             let Some(queued) = self.queue.pop_front() else {
                 break;
             };
-            match self.spawn(
-                &queued.paths,
-                &queued.model,
-                queued.steps,
-                queued.run_id.clone(),
-            ) {
-                Ok(_) => {}
-                Err(error) => {
-                    self.last_error = Some(error.to_string());
-                    self.states.insert(
-                        queued.name.clone(),
-                        State::Finished {
-                            run_id: queued.run_id,
-                            outcome: RunOutcome::Failed,
-                            reason: Some(error.to_string()),
-                            duration_ms: 0,
-                        },
-                    );
-                }
+            let run_id = queued.run_id.clone();
+            let started = match queued.mode {
+                Mode::Tui => self
+                    .spawn(&queued.paths, &queued.model, queued.steps, run_id.clone())
+                    .map(|_| ()),
+                Mode::Systemd => self
+                    .spawn_systemd(&queued.paths, &queued.model, queued.steps, run_id.clone())
+                    .map(|_| ()),
+            };
+            if let Err(error) = started {
+                self.last_error = Some(error.to_string());
+                self.states.insert(
+                    queued.name.clone(),
+                    State::Finished {
+                        run_id: queued.run_id,
+                        outcome: RunOutcome::Failed,
+                        reason: Some(error.to_string()),
+                        duration_ms: 0,
+                    },
+                );
             }
         }
         self.reindex_queue();
@@ -691,31 +934,13 @@ impl Supervisor {
         reason: Option<String>,
         duration_ms: u64,
     ) {
-        let existing = transcript::terminal_record(run_dir);
-        if existing.is_none() {
-            if let Ok(mut transcript) = Transcript::open(run_dir) {
-                let _ = transcript.append(&Record::run_finished(
-                    run_id,
-                    outcome,
-                    None,
-                    duration_ms,
-                    reason.clone(),
-                ));
-            }
-        }
-        let (outcome, reason, duration_ms) = match existing {
-            Some(Record::RunFinished {
-                outcome,
-                reason,
-                duration_ms,
-                ..
-            }) => (
-                RunOutcome::parse(&outcome).unwrap_or(RunOutcome::Failed),
-                reason,
-                duration_ms,
-            ),
-            _ => (outcome, reason, duration_ms),
-        };
+        let (outcome, reason, duration_ms) = record_outcome_if_missing(
+            run_dir,
+            run_id,
+            outcome,
+            reason,
+            duration_ms,
+        );
         self.states.insert(
             name.to_owned(),
             State::Finished {
@@ -727,27 +952,32 @@ impl Supervisor {
         );
     }
 
-    /// Start the child process of one run.
-    fn spawn(
-        &mut self,
+    /// Prepare one run's directory, for either mode.
+    ///
+    /// Both modes do exactly this: create the run's directory, write its plan, open
+    /// its log and stamp the line that says a run is starting. The only difference
+    /// between the modes is who starts the process afterwards, which is why the two
+    /// leave the same kind of record.
+    fn prepare_run(
+        &self,
         agent: &AgentPaths,
         model: &RunModel,
         steps: Vec<String>,
-        run_id: String,
-    ) -> Result<u32, StartError> {
+        run_id: &str,
+    ) -> Result<(PathBuf, fs::File), StartError> {
         let name = agent.name().to_owned();
         if self.credentials.as_os_str().is_empty() {
             return Err(StartError::Credentials { agent: name });
         }
         agent.ensure()?;
-        let run_dir = agent.run_dir(&run_id);
+        let run_dir = agent.run_dir(run_id);
         fs::create_dir_all(&run_dir).map_err(|source| StartError::Prepare {
             agent: name.clone(),
-            run_id: run_id.clone(),
+            run_id: run_id.to_owned(),
             source,
         })?;
         let plan = RunPlan {
-            run_id: run_id.clone(),
+            run_id: run_id.to_owned(),
             agent: name.clone(),
             workspace: agent.workspace().to_path_buf(),
             instruction: agent.instruction().to_path_buf(),
@@ -761,7 +991,7 @@ impl Supervisor {
         };
         plan.write(&run_dir).map_err(|source| StartError::Prepare {
             agent: name.clone(),
-            run_id: run_id.clone(),
+            run_id: run_id.to_owned(),
             source,
         })?;
 
@@ -773,7 +1003,7 @@ impl Supervisor {
             .open(&log_path)
             .map_err(|source| StartError::Prepare {
                 agent: name.clone(),
-                run_id: run_id.clone(),
+                run_id: run_id.to_owned(),
                 source,
             })?;
         write_log_line(
@@ -783,6 +1013,19 @@ impl Supervisor {
                 agent.workspace().display()
             ),
         );
+        Ok((run_dir, log))
+    }
+
+    /// Start the child process of one run of the default mode.
+    fn spawn(
+        &mut self,
+        agent: &AgentPaths,
+        model: &RunModel,
+        steps: Vec<String>,
+        run_id: String,
+    ) -> Result<u32, StartError> {
+        let name = agent.name().to_owned();
+        let (run_dir, log) = self.prepare_run(agent, model, steps, &run_id)?;
 
         let mut command = Command::new(&self.binary);
         command
@@ -816,6 +1059,54 @@ impl Supervisor {
             },
         );
         self.states.insert(name, State::Starting { run_id, pid });
+        Ok(pid)
+    }
+
+    /// Start one run as a user unit of the user's own systemd.
+    ///
+    /// The run's directory and plan are prepared exactly as the default mode prepares
+    /// them, and the unit runs exactly the command the UI would run, so the two modes
+    /// leave the same log and transcript. The unit is written for this one run: a
+    /// restart by systemd re-runs the same command against the same run, which is why
+    /// a restart is visible in the run's own record.
+    fn spawn_systemd(
+        &mut self,
+        agent: &AgentPaths,
+        model: &RunModel,
+        steps: Vec<String>,
+        run_id: String,
+    ) -> Result<u32, StartError> {
+        let name = agent.name().to_owned();
+        let (run_dir, _log) = self.prepare_run(agent, model, steps, &run_id)?;
+        let spec = UnitSpec::for_run(
+            &name,
+            &self.binary,
+            &run_dir,
+            agent.workspace(),
+            &run_dir.join(LOG_FILE),
+            RestartPolicy::default(),
+        );
+        let pid = self
+            .systemd
+            .start(&spec, run_id, run_dir.clone())
+            .map_err(|message| StartError::Systemd {
+                agent: name.clone(),
+                message,
+            })?;
+        // Record which run the unit points at, so a later session reads the unit's
+        // state rather than the tool's memory. A failure to write the record after the
+        // unit has started is reported, but it is not a reason to claim the start did
+        // not happen: it did, and systemd has it.
+        let record = Supervision {
+            mode: Mode::Systemd,
+            run_dir: Some(run_dir),
+            restarts_recorded: 0,
+        };
+        if let Err(error) = systemd::write_record(agent, &record) {
+            self.last_error = Some(format!(
+                "the supervision record of `{name}` cannot be written: {error}"
+            ));
+        }
         Ok(pid)
     }
 
@@ -860,6 +1151,48 @@ impl Supervisor {
     /// The directory of a run, for a caller that has only the id.
     pub fn run_dir(&self, name: &str, run_id: &str) -> PathBuf {
         self.state_root.join(name).join(run_id)
+    }
+}
+
+/// Write a run's terminal record, unless the run wrote one itself, and hand back the
+/// outcome the transcript actually holds.
+///
+/// A run that was killed before it could write its own ending — a child stopped by
+/// the UI, a unit stopped with `systemctl --user stop` — gets one written for it, so
+/// every run has exactly one ending decided by something that saw it. A run that
+/// wrote its own ending keeps it: the supervisor's opinion never overwrites the
+/// process's own record.
+pub fn record_outcome_if_missing(
+    run_dir: &Path,
+    run_id: &str,
+    outcome: RunOutcome,
+    reason: Option<String>,
+    duration_ms: u64,
+) -> (RunOutcome, Option<String>, u64) {
+    let existing = transcript::terminal_record(run_dir);
+    if existing.is_none() {
+        if let Ok(mut transcript) = Transcript::open(run_dir) {
+            let _ = transcript.append(&Record::run_finished(
+                run_id,
+                outcome,
+                None,
+                duration_ms,
+                reason.clone(),
+            ));
+        }
+    }
+    match existing {
+        Some(Record::RunFinished {
+            outcome,
+            reason,
+            duration_ms,
+            ..
+        }) => (
+            RunOutcome::parse(&outcome).unwrap_or(RunOutcome::Failed),
+            reason,
+            duration_ms,
+        ),
+        _ => (outcome, reason, duration_ms),
     }
 }
 
@@ -1069,7 +1402,7 @@ mod tests {
                 State::Starting { .. } | State::Running { .. } => true,
                 State::Finished { .. } => true,
                 State::Waiting { .. } => false,
-                State::Idle | State::Stopping { .. } => false,
+                State::Idle | State::Stopping { .. } | State::Unavailable { .. } => false,
             }
         });
         assert_eq!(supervisor.running_count(), 1);
@@ -1245,6 +1578,393 @@ mod tests {
         assert!(
             !group_has_members(3_999_999_999),
             "a group id nothing can be using is empty"
+        );
+    }
+
+    /// A stand-in for `systemctl --user`, with the files that drive it.
+    ///
+    /// These tests are about the commands the tool builds and the states it reads
+    /// back. A script that records its arguments and reports a state the test chooses
+    /// exercises exactly the client the real unit test uses, without a real unit; the
+    /// real thing is exercised by `tests/systemd.rs`.
+    struct FakeSystemd {
+        program: PathBuf,
+        state: PathBuf,
+        restarts: PathBuf,
+        commands: PathBuf,
+    }
+
+    const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
+STATE="__STATE__"
+RESTARTS="__RESTARTS__"
+LOG="__LOG__"
+printf '%s\n' "$*" >> "$LOG"
+[ "$1" = "--user" ] && shift
+verb="$1"
+shift
+unit=""
+for a in "$@"; do
+    case "$a" in
+        -*) ;;
+        *) if [ -z "$unit" ]; then unit="$a"; fi ;;
+    esac
+done
+case "$verb" in
+    daemon-reload|enable|disable) exit 0 ;;
+    start) printf '%s' active > "$STATE"; exit 0 ;;
+    stop) printf '%s' inactive > "$STATE"; exit 0 ;;
+    show)
+        if [ -z "$unit" ]; then printf '%s\n' "255.0-fake"; exit 0; fi
+        state="$(cat "$STATE" 2>/dev/null || printf '%s' inactive)"
+        printf 'LoadState=loaded\nNRestarts=%s\n' "$(cat "$RESTARTS" 2>/dev/null || printf '0')"
+        case "$state" in
+            active) printf 'ActiveState=active\nSubState=running\nMainPID=4242\nResult=success\nActiveEnterTimestampMonotonic=1\n' ;;
+            failed) printf 'ActiveState=failed\nSubState=failed\nMainPID=0\nResult=exit-code\nExecMainStatus=1\n' ;;
+            notfound) printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\n' ;;
+            *) printf 'ActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\n' ;;
+        esac
+        ;;
+    *) exit 0 ;;
+esac
+"#;
+
+    fn fake_systemctl(tag: &str) -> FakeSystemd {
+        let root = scratch_root(tag);
+        let state = root.join("unit-state");
+        let restarts = root.join("unit-restarts");
+        let commands = root.join("systemctl-commands.log");
+        let program = root.join("fake-systemctl.sh");
+        let body = FAKE_SYSTEMCTL
+            .replace("__STATE__", &state.display().to_string())
+            .replace("__RESTARTS__", &restarts.display().to_string())
+            .replace("__LOG__", &commands.display().to_string());
+        fs::write(&program, body).expect("the stand-in is written");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is runnable");
+        FakeSystemd {
+            program,
+            state,
+            restarts,
+            commands,
+        }
+    }
+
+    impl FakeSystemd {
+        fn set(&self, state: &str) {
+            fs::write(&self.state, state).expect("the state is written");
+        }
+
+        fn set_restarts(&self, count: u32) {
+            fs::write(&self.restarts, count.to_string()).expect("the restart count is written");
+        }
+
+        fn commands(&self) -> Vec<String> {
+            fs::read_to_string(&self.commands)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// A supervisor whose `systemctl` is the stand-in, with an agent's directories
+    /// prepared and — when asked — the switch to systemd mode already made.
+    fn systemd_supervisor(
+        tag: &str,
+        fake: &FakeSystemd,
+        mode: Mode,
+    ) -> (crate::paths::Layout, AgentPaths, Supervisor) {
+        let root = scratch_root(tag);
+        let layout = crate::paths::Layout::rooted_at(&root);
+        let agent = layout.ensure_agent("scribe").expect("the agent is prepared");
+        let credentials = layout.root().join("credentials.toml");
+        crate::mode::write_private(&credentials, b"[model_keys]\n\"scribe\" = \"gw-fixture-key\"\n")
+            .expect("the credentials file is written");
+        let mut supervisor = Supervisor::new(
+            layout.state_root(),
+            PathBuf::from("/usr/local/bin/gewu-multiverse"),
+            10,
+            Duration::from_secs(30),
+        );
+        supervisor.set_credentials(credentials);
+        supervisor.set_config_root(layout.root());
+        supervisor.set_unit_dir(layout.root().join("units"));
+        supervisor.set_systemctl(Systemctl::with_binary(&fake.program));
+        supervisor.load_modes(std::slice::from_ref(&agent));
+        if mode == Mode::Systemd {
+            let change = supervisor
+                .switch_mode(&agent, Mode::Systemd)
+                .expect("the switch is made");
+            assert_eq!(change, ModeChange::Switched(Mode::Systemd));
+        }
+        (layout, agent, supervisor)
+    }
+
+    #[test]
+    fn a_systemd_start_writes_the_unit_and_asks_the_users_systemd() {
+        let fake = fake_systemctl("sup-systemd-start-fake");
+        let (layout, agent, mut supervisor) =
+            systemd_supervisor("sup-systemd-start", &fake, Mode::Systemd);
+        assert_eq!(supervisor.mode("scribe"), Mode::Systemd);
+
+        let disposition = supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
+        assert!(matches!(disposition, StartDisposition::Started { .. }));
+
+        let unit_path = layout.root().join("units").join("gewu-agent-scribe.service");
+        assert!(unit_path.is_file(), "the unit is written");
+        let unit = fs::read_to_string(&unit_path).expect("the unit reads");
+        assert!(
+            unit.contains("ExecStart=/usr/local/bin/gewu-multiverse --run-agent"),
+            "{unit}"
+        );
+        assert!(unit.contains("Restart=on-failure"), "{unit}");
+
+        let run_id = supervisor
+            .state("scribe")
+            .run_id()
+            .expect("a run id")
+            .to_owned();
+        let run_dir = supervisor.run_dir("scribe", &run_id);
+        assert!(unit.contains(&run_dir.display().to_string()), "{unit}");
+        assert!(run_dir.join(PLAN_FILE).is_file());
+        let plan = RunPlan::read(&run_dir).expect("the plan reads");
+        assert_eq!(plan.agent, "scribe");
+        assert_eq!(plan.workspace, agent.workspace());
+
+        let commands = fake.commands();
+        eprintln!("systemctl calls: {commands:?}");
+        assert!(
+            commands.iter().any(|line| line == "--user daemon-reload"),
+            "{commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|line| line == "--user start gewu-agent-scribe.service"),
+            "{commands:?}"
+        );
+
+        match supervisor.state("scribe") {
+            State::Running { pid, .. } => assert_eq!(pid, 4242),
+            other => panic!("expected running, got {other:?}"),
+        }
+        assert_eq!(supervisor.running_count(), 1);
+        // The run the unit points at is on record, so a later session can find it.
+        assert_eq!(
+            crate::systemd::read_record(&agent).run_dir.as_deref(),
+            Some(run_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn stopping_a_systemd_agent_stops_the_unit_and_records_a_stopped_run() {
+        let fake = fake_systemctl("sup-systemd-stop-fake");
+        let (_layout, agent, mut supervisor) =
+            systemd_supervisor("sup-systemd-stop", &fake, Mode::Systemd);
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
+        let run_id = supervisor
+            .state("scribe")
+            .run_id()
+            .expect("a run id")
+            .to_owned();
+        let run_dir = supervisor.run_dir("scribe", &run_id);
+
+        assert_eq!(supervisor.stop("scribe"), StopDisposition::Signalled);
+        assert!(
+            fake.commands()
+                .iter()
+                .any(|line| line == "--user stop gewu-agent-scribe.service"),
+            "{:?}",
+            fake.commands()
+        );
+        match supervisor.state("scribe") {
+            State::Finished {
+                outcome: RunOutcome::Stopped,
+                ..
+            } => {}
+            other => panic!("expected a stopped run, got {other:?}"),
+        }
+        match transcript::terminal_record(&run_dir) {
+            Some(Record::RunFinished { outcome, .. }) => assert_eq!(outcome, "stopped"),
+            other => panic!("expected a terminal record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_inactive_unit_with_a_finished_run_is_shown_as_finished_not_running() {
+        let fake = fake_systemctl("sup-systemd-inactive-fake");
+        let (_layout, agent, mut supervisor) =
+            systemd_supervisor("sup-systemd-inactive", &fake, Mode::Systemd);
+        let run_dir = agent.run_dir("run-1-0001");
+        fs::create_dir_all(&run_dir).expect("the run directory is created");
+        let mut written = Transcript::open(&run_dir).expect("a transcript is opened");
+        written
+            .append(&Record::run_started("run-1-0001", "scribe", 1, "/w"))
+            .expect("a record is appended");
+        written
+            .append(&Record::run_finished(
+                "run-1-0001",
+                RunOutcome::Succeeded,
+                Some(0),
+                10,
+                None,
+            ))
+            .expect("a record is appended");
+        crate::systemd::write_record(
+            &agent,
+            &Supervision {
+                mode: Mode::Systemd,
+                run_dir: Some(run_dir),
+                restarts_recorded: 0,
+            },
+        )
+        .expect("the record is written");
+        fake.set("inactive");
+        supervisor.load_modes(std::slice::from_ref(&agent));
+
+        assert!(!supervisor.state("scribe").is_live());
+        match supervisor.state("scribe") {
+            State::Finished {
+                outcome: RunOutcome::Succeeded,
+                duration_ms: 10,
+                ..
+            } => {}
+            other => panic!("expected a finished run, got {other:?}"),
+        }
+        assert_eq!(supervisor.running_count(), 0);
+    }
+
+    #[test]
+    fn a_unit_that_is_not_there_is_shown_as_idle() {
+        let fake = fake_systemctl("sup-systemd-absent-fake");
+        let (_layout, agent, mut supervisor) =
+            systemd_supervisor("sup-systemd-absent", &fake, Mode::Systemd);
+        fake.set("notfound");
+        supervisor.load_modes(std::slice::from_ref(&agent));
+        assert_eq!(supervisor.state("scribe"), State::Idle);
+        assert_eq!(supervisor.state("scribe").word(), "idle");
+    }
+
+    #[test]
+    fn a_mode_switch_is_refused_while_a_child_process_runs() {
+        let binary = fake_agent("sup-switch-live", "sleep 30");
+        let (layout, agent) = layout("sup-switch-live");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        supervisor.set_config_root(layout.root());
+        supervisor.load_modes(std::slice::from_ref(&agent));
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
+        wait_for("running", || {
+            supervisor.poll(Instant::now());
+            matches!(supervisor.state("scribe"), State::Running { .. })
+        });
+        let error = supervisor
+            .switch_mode(&agent, Mode::Systemd)
+            .expect_err("the switch is refused");
+        eprintln!("refusal while a UI child runs: {error}");
+        assert!(error.contains("stop it first"), "{error}");
+        assert!(error.contains("child of this UI"), "{error}");
+        assert_eq!(supervisor.mode("scribe"), Mode::Tui);
+        supervisor.stop_all(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_mode_switch_is_refused_while_the_unit_is_active() {
+        let fake = fake_systemctl("sup-switch-unit-fake");
+        let (_layout, agent, mut supervisor) =
+            systemd_supervisor("sup-switch-unit", &fake, Mode::Systemd);
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
+        let error = supervisor
+            .switch_mode(&agent, Mode::Tui)
+            .expect_err("the switch is refused");
+        eprintln!("refusal while the unit is active: {error}");
+        assert!(error.contains("stop it first"), "{error}");
+        assert!(error.contains("user unit"), "{error}");
+        assert_eq!(supervisor.mode("scribe"), Mode::Systemd);
+    }
+
+    #[test]
+    fn leaving_systemd_mode_removes_the_unit_file_and_is_idempotent() {
+        let fake = fake_systemctl("sup-switch-leave-fake");
+        let (layout, agent, mut supervisor) =
+            systemd_supervisor("sup-switch-leave", &fake, Mode::Systemd);
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
+        let unit_path = layout.root().join("units").join("gewu-agent-scribe.service");
+        assert!(unit_path.is_file());
+        fake.set("inactive");
+        let change = supervisor
+            .switch_mode(&agent, Mode::Tui)
+            .expect("the switch is made");
+        assert_eq!(change, ModeChange::Switched(Mode::Tui));
+        assert!(!unit_path.exists(), "the unit file is removed");
+        assert_eq!(supervisor.mode("scribe"), Mode::Tui);
+        assert_eq!(
+            supervisor
+                .switch_mode(&agent, Mode::Tui)
+                .expect("idempotent"),
+            ModeChange::Already(Mode::Tui)
+        );
+        assert_eq!(crate::systemd::read_record(&agent).mode, Mode::Tui);
+    }
+
+    #[test]
+    fn a_mode_read_again_forgets_a_unit_of_an_agent_that_left_systemd_mode() {
+        let fake = fake_systemctl("sup-forget-fake");
+        let (_layout, agent, mut supervisor) =
+            systemd_supervisor("sup-forget", &fake, Mode::Systemd);
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
+        assert_eq!(supervisor.running_count(), 1);
+        // The record is changed to the default mode outside the tool; reading the
+        // agents again must not keep counting a unit that is no longer the agent's.
+        crate::systemd::write_record(&agent, &Supervision::default()).expect("written");
+        supervisor.load_modes(std::slice::from_ref(&agent));
+        assert_eq!(supervisor.mode("scribe"), Mode::Tui);
+        assert_eq!(supervisor.running_count(), 0);
+        assert_eq!(supervisor.state("scribe"), State::Idle);
+    }
+
+    #[test]
+    fn a_restart_systemd_reports_is_written_into_the_run_log_once() {
+        let fake = fake_systemctl("sup-systemd-restart-fake");
+        let (_layout, agent, mut supervisor) =
+            systemd_supervisor("sup-systemd-restart", &fake, Mode::Systemd);
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
+        let run_id = supervisor
+            .state("scribe")
+            .run_id()
+            .expect("a run id")
+            .to_owned();
+        let run_dir = supervisor.run_dir("scribe", &run_id);
+
+        fake.set_restarts(1);
+        supervisor.systemd.poll_now();
+        let log = fs::read_to_string(run_dir.join(LOG_FILE)).expect("the log reads");
+        assert!(
+            log.contains("systemd restarted this run (restart 1 of at most 3)"),
+            "{log}"
+        );
+        assert_eq!(supervisor.restart_count("scribe"), 1);
+
+        // Reading again does not write it again.
+        supervisor.systemd.poll_now();
+        let log = fs::read_to_string(run_dir.join(LOG_FILE)).expect("the log reads");
+        assert_eq!(
+            log.matches("systemd restarted this run").count(),
+            1,
+            "{log}"
         );
     }
 }

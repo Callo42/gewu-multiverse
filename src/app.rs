@@ -26,7 +26,8 @@ use crate::model;
 use crate::paths::Layout;
 use crate::risk::{self, AckState};
 use crate::run::{RunModel, RunSummary, recent_runs};
-use crate::supervisor::{StartDisposition, StopDisposition, Supervisor};
+use crate::supervisor::{ModeChange, StartDisposition, StopDisposition, Supervisor};
+use crate::systemd::Mode;
 use crate::workspace::{self, GitCredential, GitIdentity};
 
 /// How often the runs screen re-reads the records on disk.
@@ -291,6 +292,7 @@ impl App {
         );
         let mut supervisor = supervisor;
         supervisor.set_credentials(credentials_path.clone());
+        supervisor.set_config_root(layout.root());
         let mut app = Self {
             layout,
             supervisor,
@@ -343,6 +345,7 @@ impl App {
                         self.config_error = Some(error.to_string());
                     }
                 }
+                self.load_agent_modes();
                 match CredentialsFile::prepare(&self.layout.credentials_file()) {
                     Ok(file) => {
                         self.credentials_path = file.path().to_path_buf();
@@ -606,8 +609,85 @@ impl App {
             ),
             StopDisposition::Cancelled => format!("`{name}` was called off while it waited"),
             StopDisposition::Nothing => format!("`{name}` is not running"),
+            StopDisposition::Failed { reason } => {
+                format!("`{name}` could not be stopped: {reason}")
+            }
         };
         self.refresh_recent();
+    }
+
+    /// Move the selected agent between the two supervision modes.
+    ///
+    /// Idempotent: asking for the mode the agent is already in says so and changes
+    /// nothing. A switch is refused while the agent is running, in either mode, so a
+    /// run is never left without the thing that knows about it.
+    pub fn request_mode_switch(&mut self) {
+        let Some(name) = self.selected_name() else {
+            self.status = "there is no agent whose supervision mode could change".to_owned();
+            return;
+        };
+        let paths = match self.layout.agent(&name) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.status = format!("`{name}` cannot change mode: {error}");
+                return;
+            }
+        };
+        let target = self.supervisor.mode(&name).other();
+        match self.supervisor.switch_mode(&paths, target) {
+            Ok(ModeChange::Already(mode)) => {
+                self.status = format!(
+                    "`{name}` is already supervised by {} ({})",
+                    mode.label(),
+                    mode.as_str()
+                );
+            }
+            Ok(ModeChange::Switched(mode)) => {
+                let note = match mode {
+                    Mode::Systemd => {
+                        // Say plainly whether a start can follow, so a machine without a
+                        // user session does not look ready when it is not.
+                        match self.supervisor.systemd_available() {
+                            Ok(version) => format!(
+                                "a unit is written and started the next time it is started \
+                                 (s), and it keeps running when this UI exits (systemd {version})"
+                            ),
+                            Err(reason) => format!(
+                                "a unit will be written at the next start (s), but {reason}: \
+                                 starting will be refused until a user session is available"
+                            ),
+                        }
+                    }
+                    Mode::Tui => {
+                        "its unit file was removed from your systemd directory".to_owned()
+                    }
+                };
+                self.status = format!(
+                    "`{name}` is now supervised by {} ({}): {note}",
+                    mode.label(),
+                    mode.as_str(),
+                );
+            }
+            Err(message) => self.status = message,
+        }
+        self.refresh_recent();
+    }
+
+    /// Read every agent's supervision record, so the screens know which mode each
+    /// agent is in and which run a systemd-supervised agent's unit points at.
+    fn load_agent_modes(&mut self) {
+        let names: Vec<String> = self
+            .agents()
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
+        let mut agents = Vec::new();
+        for name in names {
+            if let Ok(paths) = self.layout.agent(&name) {
+                agents.push(paths);
+            }
+        }
+        self.supervisor.load_modes(&agents);
     }
 
     /// Test the selected agent's endpoint with one minimal call.
@@ -1330,6 +1410,7 @@ impl App {
             KeyCode::Esc => self.screen = Screen::Agents,
             KeyCode::Char('s') => self.request_agent_start(),
             KeyCode::Char('x') => self.request_agent_stop(),
+            KeyCode::Char('m') => self.request_mode_switch(),
             KeyCode::Char('p') => self.request_endpoint_test(),
             KeyCode::Char('c') => self.request_role_check(),
             KeyCode::Char('i') => self.request_identity(),
@@ -1413,6 +1494,22 @@ mod tests {
         std::fs::write(root.join("config.toml"), config)
             .expect("the test writes the configuration");
         App::with_runner(Layout::rooted_at(root), quiet_runner("app-runner"))
+    }
+
+    /// A runner that stays alive, so a test can watch an agent be started and stop it.
+    fn sleeping_runner(tag: &str) -> PathBuf {
+        let path = scratch_root(tag).join("sleeping-runner.sh");
+        std::fs::write(&path, "#!/bin/sh\nsleep 30\n").expect("the runner is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the runner is runnable");
+        path
+    }
+
+    fn app_with_sleeping_runner(tag: &str, config: &str) -> App {
+        let root = scratch_root(tag);
+        std::fs::write(root.join("config.toml"), config)
+            .expect("the test writes the configuration");
+        App::with_runner(Layout::rooted_at(root), sleeping_runner(tag))
     }
 
     const GOOD: &str = r#"
@@ -1632,6 +1729,45 @@ concurrency = 3
         let app = app_with(GOOD);
         assert_eq!(app.supervisor.max_concurrent(), 10);
         assert_eq!(app.supervisor.timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn moving_an_agent_between_supervision_modes_is_reported_and_recorded() {
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::Char('m')));
+        eprintln!("after m (tui -> systemd): {}", app.status);
+        assert!(app.status.contains("systemd"), "{}", app.status);
+        assert_eq!(app.supervisor.mode("one"), Mode::Systemd);
+        let paths = app.layout.agent("one").expect("the paths are derived");
+        assert_eq!(crate::systemd::read_record(&paths).mode, Mode::Systemd);
+
+        // The same key moves it back, and the unit file is gone afterwards.
+        app.on_key(key(KeyCode::Char('m')));
+        eprintln!("after m (systemd -> tui): {}", app.status);
+        assert!(app.status.contains("tui"), "{}", app.status);
+        assert_eq!(app.supervisor.mode("one"), Mode::Tui);
+        assert_eq!(crate::systemd::read_record(&paths).mode, Mode::Tui);
+    }
+
+    #[test]
+    fn a_supervision_mode_change_is_refused_while_the_agent_runs() {
+        let mut app = app_with_sleeping_runner("app-switch-live", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction is written");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        app.on_key(key(KeyCode::Char('m')));
+        assert!(app.status.contains("refused"), "{}", app.status);
+        assert!(app.status.contains("stop it first"), "{}", app.status);
+        assert_eq!(app.supervisor.mode("one"), Mode::Tui);
+        app.shutdown();
     }
 
     #[test]
