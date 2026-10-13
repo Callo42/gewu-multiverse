@@ -8,6 +8,9 @@
 //! One branch of the program does not draw anything: `--run-agent <run dir>` is one
 //! agent run, and it is how the tool starts an agent — as a child process of itself.
 //! It reads its plan, does the work, writes its log and transcript, and exits.
+//! Another, `--git-askpass <prompt>`, is how the user's own `git` asks this program
+//! for an agent's token: the answer goes straight to git over a pipe, so the token is
+//! never an argument, a URL, a log line or a screen.
 
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
@@ -23,6 +26,7 @@ use gewu_multiverse::cli::{Cli, HELP, Invocation, parse_args};
 use gewu_multiverse::editor;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::ui;
+use gewu_multiverse::workspace;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -30,7 +34,21 @@ use ratatui::backend::CrosstermBackend;
 const TICK: Duration = Duration::from_millis(250);
 
 fn main() -> ExitCode {
-    let invocation = match parse_args(std::env::args().skip(1)) {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+
+    // `git` runs `GIT_ASKPASS` as `<program> <prompt>`: the prompt is the program's
+    // one argument, with no option of ours in between. When the tool set the askpass
+    // environment for a git command, that one argument is the prompt, and this is the
+    // branch that answers it. The answer is written to standard output, which is the
+    // pipe git reads; nothing goes to standard error.
+    if std::env::var_os(gewu_multiverse::workspace::ASKPASS_CREDENTIALS).is_some()
+        && arguments.len() == 1
+        && !arguments[0].starts_with('-')
+    {
+        return ExitCode::from(workspace::askpass_main(&arguments[0]).clamp(0, 255) as u8);
+    }
+
+    let invocation = match parse_args(arguments) {
         Ok(invocation) => invocation,
         Err(message) => {
             eprintln!("gewu-multiverse: {message}\n\n{HELP}");
@@ -52,6 +70,11 @@ fn main() -> ExitCode {
             // is the process the supervisor starts; it needs no terminal and no UI.
             let end = agent_run::execute(&run_dir);
             ExitCode::from(end.exit_code.clamp(0, 255) as u8)
+        }
+        Invocation::GitAskpass { prompt } => {
+            // Git is waiting on the other end of the pipe. Write only the answer, and
+            // write no error: a failure here must not put a secret into a log.
+            ExitCode::from(workspace::askpass_main(&prompt).clamp(0, 255) as u8)
         }
         Invocation::Run(cli) => match run(cli) {
             Ok(()) => ExitCode::SUCCESS,

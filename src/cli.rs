@@ -24,6 +24,11 @@ pub enum Invocation {
         /// The run directory holding the plan to execute.
         run_dir: PathBuf,
     },
+    /// Answer git's credential question and exit. Started by `git`, never by a person.
+    GitAskpass {
+        /// The prompt git asked with. It is not a secret and is not printed.
+        prompt: String,
+    },
     /// Print the help text and stop.
     Help,
     /// Print the version and stop.
@@ -78,6 +83,13 @@ where
         match argument.as_str() {
             "-h" | "--help" => return Ok(Invocation::Help),
             "-V" | "--version" => return Ok(Invocation::Version),
+            // `git` starts this program for a credential, passing the prompt as one
+            // argument. This mode is answered immediately: it must never print help or
+            // an error, because both would be noise on git's side of the pipe.
+            "--git-askpass" => {
+                let prompt = args.collect::<Vec<String>>().join(" ");
+                return Ok(Invocation::GitAskpass { prompt });
+            }
             "--config-dir" => {
                 if root.is_some() {
                     return Err("--config-dir was given twice".to_owned());
@@ -195,6 +207,22 @@ mod tests {
     fn a_directory_given_twice_is_refused() {
         assert!(parse(&["--config-dir", "/a", "--config-dir", "/b"]).is_err());
         assert!(parse(&["--state-dir", "/a", "--state-dir", "/b"]).is_err());
+    }
+
+    #[test]
+    fn the_askpass_mode_takes_the_prompt_and_answers_immediately() {
+        assert_eq!(
+            parse(&["--git-askpass", "Password for 'https://example.org':"]),
+            Ok(Invocation::GitAskpass {
+                prompt: "Password for 'https://example.org':".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(&["--git-askpass"]),
+            Ok(Invocation::GitAskpass {
+                prompt: String::new()
+            })
+        );
     }
 
     #[test]

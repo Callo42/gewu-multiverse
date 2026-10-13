@@ -21,7 +21,7 @@ records are plain logs and JSONL transcripts.
 
 ## Status
 
-**An agent runs and thinks; the Forgejo is the next round.** In place now:
+**An agent runs, thinks, and works on one Forgejo.** In place now:
 
 - the terminal UI, with a screen per thing you configure: the agent list and each
   agent's state, one agent's settings, its instruction and skills, the Forgejo
@@ -29,9 +29,9 @@ records are plain logs and JSONL transcripts.
 - one configuration file, validated on load, with a clear message instead of a crash
   when it is wrong — including the run timeout, the limit on agents running at once,
   and each agent's bound on model turns;
-- one credentials file, created with mode **0600**, which holds the model keys. A key
-  is read only at the moment of a model call, and every transcript, log and error the
-  tool writes has it redacted;
+- one credentials file, created with mode **0600**, which holds the model keys and the
+  Forgejo tokens. A secret is read only at the moment it is needed, and every
+  transcript, log and error the tool writes has it redacted;
 - the first-run risk acknowledgment, required once per installation before any agent
   may be started;
 - **agents that actually run**: one child process per agent, in its own workspace, with
@@ -45,14 +45,91 @@ records are plain logs and JSONL transcripts.
   results back, and repeats until the model answers without a tool call or the declared
   turn bound is reached. Every exchange is in the transcript as it happened, with the
   key redacted;
-- **"test this endpoint"** on an agent's screen (`p`): one minimal call, and the answer
-  shown plainly — either what the model replied, or the class of failure;
+- **one Forgejo, checked as the configured role** (`c`): the URL and the token are
+  validated, and the repositories the token can see are listed with their namespace,
+  whether each is private or public, and what the caller may do with it. An
+  administrator's token shows an administrative view — the private repositories it does
+  not own among them — and an ordinary token shows only what it may read; a bad URL, a
+  bad token, or a token without the rights the configuration expects each fail with
+  their own class;
+- **one identity per agent, derived from configuration**: with an administrator token
+  the tool creates and manages one Forgejo account per agent, named from the agent's
+  own name, and stores its token in the credentials file; without one, you supply each
+  agent's token and the tool records that this is the path in use;
+- **repository work under the agent's identity** (`g`, `P`, `U`): the tool clones or
+  opens a repository the role check listed into the agent's workspace and configures
+  git there, so a commit made in that workspace is authored by the agent and not by
+  you. It opens and updates pull requests as the agent through the Forgejo API. The
+  agent uses the user's own `git`; no `glab` is needed;
 - editing an agent's instruction, its skills and its declared steps from the UI, through
   your own `$EDITOR`, and reading a run's log through your own `$PAGER`.
 
-Not there yet, and named as such on the screens that would show it: **the Forgejo
-work** (no request is made, no role is checked, and a workspace is a plain directory
-rather than a clone). See [How an agent runs](docs/agent-execution.md) for the details.
+Still to come, and named as such rather than pretended: a **`systemd` mode** (running
+agents as services) and the first-run/quickstart polish around it. See
+[Connecting a Forgejo](docs/forgejo.md) and [How an agent runs](docs/agent-execution.md)
+for the details.
+
+## Connecting a Forgejo
+
+A Forgejo connection is one URL, one token, and — when you want the tool to make the
+agents' accounts for you — one administrator's token. All of it lives in the two files
+you already have; no source is edited and no secret is ever passed on a command line.
+
+```toml
+# config.toml — no secret here
+[forgejo]
+url = "https://forgejo.example.org"
+# The role the token is expected to have. "admin" refuses an ordinary token;
+# "member" accepts any account.
+role = "member"
+```
+
+```toml
+# credentials.toml — secrets only, mode 0600
+# The token the role check uses: the repositories it lists are the ones this token
+# can see.
+forgejo_token = "…"
+# Optional. With it, the tool creates and manages one Forgejo account and token per
+# agent. Without it, supply each agent's token below.
+forgejo_admin_token = "…"
+
+[forgejo_agent_tokens]
+# One token per agent name, used when no administrator token is configured:
+# "scribe" = "…"
+```
+
+**The role check** (`c`) answers three questions: is the URL usable, is the token
+accepted, and does the token have the rights `role` says it should. It then lists the
+repositories the token can see — each with its `namespace/name`, whether it is
+private or public, and whether the caller may read, write or administer it. The
+difference between the two roles is visible in that list: an administrator's token
+sees every repository, including private ones it does not own; an ordinary token sees
+only the public ones and the private ones it has been given. A token that is not an
+administrator's, under `role = "admin"`, is refused with `not_admin`.
+
+**One identity per agent.** With `forgejo_admin_token` present, the tool creates the
+account `gewu-<agent>` on the Forgejo, writes a mark on it so it is never mistaken for
+a person, sets it a freshly generated password (used once, never stored), makes a token
+for it, and writes that token under `[forgejo_agent_tokens]`. The credentials file
+records the mode in use — `managed` for that path, `supplied` for the other — and the
+login and email a commit will use. Without an administrator token, the tool reads the
+token you put under `[forgejo_agent_tokens]`, asks the Forgejo whose it is, and records
+that instead. Either way the result is the same: an agent whose commits are its own.
+
+**Working on a repository.** After a role check, choose a repository on the Forgejo
+screen and press `g`: it is cloned into the agent's workspace under the repository's
+name, and the agent's git identity — the login and email recorded above — is written
+into the clone's local configuration. The agent works with the user's own `git`, so a
+commit made there is authored by the agent. `P` pushes the current branch and opens a
+pull request as the agent; `U` updates the newest open one. A title and body can be
+put in `<config dir>/agents/<agent>/pull-request.txt`, first line the title.
+
+**Every request carries a token.** There are no anonymous calls. A token is read from
+the credentials file and travels only in a request's `Authorization` header. Git is
+handed the token through `GIT_ASKPASS`: git runs this same program with the prompt as
+its argument, and the program answers from the credentials file over a pipe. The token
+is never a URL, a command-line argument, a log line or a screen.
+
 
 ## An agent's model configuration
 
@@ -100,9 +177,12 @@ acknowledgment once, and asks you to confirm it. Edit the configuration file, th
 re-read it. `gewu-multiverse --config-dir <dir>` keeps the files somewhere else instead.
 
 Keys: `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch screens, `up`/`down` choose
-an agent (or a run on the runs screen), `enter` opens the chosen agent, `esc` goes back
+an agent (or a run on the runs screen, or a repository on the Forgejo screen), `enter`
+opens the chosen agent, `esc` goes back
 to the list, `s` starts the chosen agent, `x` stops it, `p` tests its model endpoint,
-`e` edits its instruction, `K`
+`c` checks the Forgejo role, `i` settles the chosen agent's Forgejo identity, `g`
+clones the chosen repository into its workspace, `P` opens a pull request as the agent,
+`U` updates the newest open one, `e` edits its instruction, `K`
 opens its skills directory, `t` edits its declared run steps, `o` opens its newest log,
 and `r` re-reads the files. Each agent's own files live under
 `<config dir>/agents/<name>/`; its runs are recorded under
