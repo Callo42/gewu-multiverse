@@ -72,7 +72,8 @@ records are plain logs and JSONL transcripts.
 - editing an agent's instruction, its skills and its declared steps from the UI, through
   your own `$EDITOR`, and reading a run's log through your own `$PAGER`.
 
-Still to come, and named as such rather than pretended: the first-run/quickstart polish.
+The first-run/quickstart walkthrough is written down below, from install to a run's log and
+transcript: see [Quickstart: from nothing to a running agent](#quickstart-from-nothing-to-a-running-agent).
 See [Connecting a Forgejo](docs/forgejo.md), [How an agent runs](docs/agent-execution.md)
 and [Two ways an agent can be supervised](docs/systemd-mode.md) for the details.
 
@@ -223,6 +224,91 @@ opens its skills directory, `t` edits its declared run steps, `o` opens its newe
 and `r` re-reads the files. Each agent's own files live under
 `<config dir>/agents/<name>/`; its runs are recorded under
 `~/.local/state/gewu-multiverse/<name>/`. `--state-dir <dir>` moves the run records.
+
+## Quickstart: from nothing to a running agent
+
+This is the whole path, in the order it works. It uses a Forgejo you already run and any
+endpoint that speaks the OpenAI-compatible chat-completions shape you can name; both may
+be local. No secret is ever a command-line argument: the tokens and the model key go in
+`credentials.toml`, whose mode is 0600.
+
+1. **Install** (once), with Rust 1.85 or newer:
+
+   ```sh
+   cargo install --git https://github.com/Callo42/gewu-multiverse
+   ```
+
+2. **Start it once**: `gewu-multiverse`. It writes a commented `config.toml` and a
+   `credentials.toml` (mode 0600) under `~/.config/gewu-multiverse`, and shows the risk
+   acknowledgment over the Agents screen. Press `y` to record it; it is asked once per
+   configuration directory. Quit with `q`.
+
+3. **Edit `~/.config/gewu-multiverse/config.toml`** so it names your Forgejo and one
+   agent, for example:
+
+   ```toml
+   [forgejo]
+   url = "http://127.0.0.1:3000"
+   role = "member"
+
+   [limits]
+   run_timeout_secs = 300
+   max_concurrent_agents = 2
+
+   [[agents]]
+   name = "scribe"
+   model = "the-model-id"
+   endpoint = "http://127.0.0.1:8000/v1/chat/completions"
+   max_turns = 8
+   instruction = "agents/scribe/instruction.md"
+   concurrency = 1
+   ```
+
+   `instruction` is the path shown on the agent's screen. The run itself reads the
+   derived `agents/<name>/instruction.md`, which is the file `e` writes and the file the
+   tool checks before a start; point the field at that path to keep the two in step. See
+   [How an agent runs](docs/agent-execution.md).
+
+4. **Edit `~/.config/gewu-multiverse/credentials.toml`** (mode 0600) and put the Forgejo
+   token or tokens and the model key there. The file holds secrets only:
+
+   ```toml
+   forgejo_token = "…"          # the token the role check uses
+   # forgejo_admin_token = "…"  # optional: create one account per agent (docs/forgejo.md)
+
+   [model_keys]
+   "scribe" = "…"               # the bearer key for this agent's endpoint
+   ```
+
+5. **Start again** and press `r` to re-read the files. The agent is now listed. Press
+   `e` to write its `agents/scribe/instruction.md` through your own `$EDITOR`.
+
+6. **Check the Forgejo** with `c`, settle the agent's identity with `i`, and clone a
+   repository with `g` (choose it with `up`/`down` on the Forgejo screen). With an
+   administrator token the tool creates the account `gewu-<agent>` for you; without one,
+   put the agent's own token under `[forgejo_agent_tokens]` first.
+
+7. **Run it**: choose the agent and press `s`, or press `p` first to test the model
+   endpoint on its own. The Agents screen moves the agent from `running` to `exited`.
+
+8. **Read the result**: press `o` to open the newest `run.log` in your own `$PAGER`.
+   The append-only transcript is beside it, at
+   `~/.local/state/gewu-multiverse/<name>/<run-id>/transcript.jsonl`; the Runs screen
+   (`6`) lists recent runs with their outcome.
+
+One already-prepared run can be executed without the UI, which is also how the UI starts
+an agent — as a child process of itself:
+
+```sh
+gewu-multiverse --run-agent ~/.local/state/gewu-multiverse/<name>/<run-id>
+```
+
+Two boundaries to know before the first run. First, the credentials file is created and
+held at mode **0600**; the Credentials screen shows its path and its contents are never
+printed. Second, an agent runs **as you** and a `sudo` attempt fails, but that is a
+layout, not a sandbox: see [Running agents is not a sandbox](#running-agents-is-not-a-sandbox)
+below and [Two ways an agent can be supervised](docs/systemd-mode.md) for how to make a
+run outlive the window.
 
 ## Running agents is not a sandbox
 
