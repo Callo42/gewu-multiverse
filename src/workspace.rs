@@ -1,0 +1,364 @@
+//! Git work in an agent's workspace, under the agent's own identity.
+//!
+//! The tool needs no `glab` and no other Git host client. It runs `git` — the user's
+//! own `git`, in the agent's workspace — and configures the two things a commit needs:
+//!
+//! - **who authored it**: the repository's local `user.name` is the agent's Forgejo
+//!   login and `user.email` is the email recorded for that account, so a commit made
+//!   in the workspace is authored by the agent rather than by the person running the
+//!   tool;
+//! - **how it authenticates**: git is started with `GIT_ASKPASS` pointing back at
+//!   this same program, which hands git the agent's token **from the credentials
+//!   file** over a pipe. The token is never a URL, never a command-line argument and
+//!   never a line in a log. The login travels in the clone URL; the secret does not.
+//!
+//! [`askpass_main`] is that pipe. It reads the credentials path and the agent's name
+//! from the environment (paths and a name, never a secret) and writes the token to
+//! standard output, which is exactly where git reads it from. On any problem it
+//! writes nothing and fails, so a wrong setup is an authentication failure rather
+//! than a leaked secret.
+
+use std::fmt;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::credentials;
+
+/// The environment variable naming the credentials file, for the askpass mode.
+pub const ASKPASS_CREDENTIALS: &str = "GEWU_GIT_CREDENTIALS";
+/// The environment variable naming the agent, for the askpass mode.
+pub const ASKPASS_AGENT: &str = "GEWU_GIT_AGENT";
+/// The environment variable naming the login, for the askpass mode (not a secret).
+pub const ASKPASS_LOGIN: &str = "GEWU_GIT_LOGIN";
+
+/// The parts git needs to authenticate as one agent.
+///
+/// A `GitCredential` holds no secret: it names the file the secret is read from, the
+/// agent to read it for, and the login to use.
+#[derive(Clone)]
+pub struct GitCredential<'a> {
+    /// This program, which git calls back for the token.
+    pub askpass: &'a Path,
+    /// The credentials file the token is read from.
+    pub credentials: &'a Path,
+    /// The agent whose token is used.
+    pub agent: &'a str,
+    /// The Forgejo login, which git may be asked for.
+    pub login: &'a str,
+}
+
+/// The identity a commit in one workspace is authored by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitIdentity {
+    /// The Forgejo account's login.
+    pub login: String,
+    /// The email recorded for that account.
+    pub email: String,
+}
+
+impl GitIdentity {
+    /// The identity, as one line.
+    pub fn line(&self) -> String {
+        format!("{} <{}>", self.login, self.email)
+    }
+}
+
+/// Why a git operation did not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceError {
+    /// There is no `git` to run.
+    #[error(
+        "`git` could not be run: install git, or put it on PATH, because the tool works with the user's own git"
+    )]
+    GitMissing {
+        /// The reason from the operating system.
+        source: std::io::Error,
+    },
+    /// Git ran and refused.
+    #[error("`{command}` failed: {message}")]
+    Git {
+        /// The command, without any secret in it.
+        command: String,
+        /// What git said, bounded.
+        message: String,
+    },
+    /// The directory is not a git repository.
+    #[error("{path} is not a git repository, so nothing can be opened there")]
+    NotARepository {
+        /// The directory that was asked for.
+        path: PathBuf,
+    },
+    /// The destination is in the way.
+    #[error("{path} is not empty and is not a git repository, so a clone would not be safe there")]
+    DestinationInTheWay {
+        /// The destination that was refused.
+        path: PathBuf,
+    },
+    /// The credentials file could not be read.
+    #[error(transparent)]
+    Credentials(#[from] credentials::CredentialsError),
+    /// The workspace could not be prepared.
+    #[error("the workspace {path} cannot be prepared: {source}")]
+    Workspace {
+        /// The directory that failed.
+        path: PathBuf,
+        /// The reason from the filesystem.
+        source: std::io::Error,
+    },
+}
+
+impl WorkspaceError {
+    /// The class of failure, as one word a screen can hold.
+    pub fn class(&self) -> &'static str {
+        match self {
+            WorkspaceError::GitMissing { .. } => "git_missing",
+            WorkspaceError::Git { .. } => "git",
+            WorkspaceError::NotARepository { .. } => "not_a_repository",
+            WorkspaceError::DestinationInTheWay { .. } => "destination_in_the_way",
+            WorkspaceError::Credentials(_) => "credentials",
+            WorkspaceError::Workspace { .. } => "workspace",
+        }
+    }
+}
+
+/// The clone URL for a repository, with the agent's login in it.
+///
+/// Only the login goes in the URL. The password is what git asks for, and git is
+/// answered by [`askpass_main`] from the credentials file over a pipe.
+pub fn clone_url(base: &str, full_name: &str, login: &str) -> String {
+    let base = base.trim_end_matches('/');
+    match base.split_once("://") {
+        Some((scheme, rest)) => format!("{scheme}://{login}@{rest}/{full_name}.git"),
+        None => format!("{base}/{full_name}.git"),
+    }
+}
+
+/// The directory one repository is cloned into inside an agent's workspace.
+pub fn clone_destination(workspace: &Path, full_name: &str) -> PathBuf {
+    let name = full_name.rsplit('/').next().unwrap_or(full_name);
+    workspace.join(name)
+}
+
+/// Clone a repository into the workspace, or open the clone that is already there.
+///
+/// This is the "clone or open" of the design: if the destination already holds a git
+/// repository it is opened and its identity is (re)applied; otherwise it is cloned.
+/// Either way the agent's git identity is configured before the call returns.
+pub fn prepare(
+    base: &str,
+    full_name: &str,
+    workspace: &Path,
+    destination: &Path,
+    identity: &GitIdentity,
+    credential: Option<&GitCredential<'_>>,
+) -> Result<PathBuf, WorkspaceError> {
+    if destination.join(".git").is_dir() {
+        set_identity(destination, identity)?;
+        return Ok(destination.to_path_buf());
+    }
+    if destination.exists() {
+        let empty = std::fs::read_dir(destination)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !empty {
+            return Err(WorkspaceError::DestinationInTheWay {
+                path: destination.to_path_buf(),
+            });
+        }
+    }
+    std::fs::create_dir_all(workspace).map_err(|source| WorkspaceError::Workspace {
+        path: workspace.to_path_buf(),
+        source,
+    })?;
+
+    let login = credential.map(|credential| credential.login).unwrap_or("");
+    let url = if login.is_empty() {
+        format!("{}/{full_name}.git", base.trim_end_matches('/'))
+    } else {
+        clone_url(base, full_name, login)
+    };
+    let destination_text = destination.display().to_string();
+    run_git(&["clone", &url, &destination_text], workspace, credential)?;
+    set_identity(destination, identity)?;
+    Ok(destination.to_path_buf())
+}
+
+/// Set the repository's local git identity, so a commit is authored by the agent.
+pub fn set_identity(repository: &Path, identity: &GitIdentity) -> Result<(), WorkspaceError> {
+    if !repository.join(".git").exists() {
+        return Err(WorkspaceError::NotARepository {
+            path: repository.to_path_buf(),
+        });
+    }
+    run_git(&["config", "user.name", &identity.login], repository, None)?;
+    run_git(&["config", "user.email", &identity.email], repository, None)?;
+    Ok(())
+}
+
+/// The branch a workspace's repository is on.
+pub fn current_branch(repository: &Path) -> Result<String, WorkspaceError> {
+    let text = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], repository, None)?;
+    Ok(text.trim().to_owned())
+}
+
+/// Push the current branch to `origin`, as the agent.
+pub fn push(repository: &Path, credential: &GitCredential<'_>) -> Result<(), WorkspaceError> {
+    run_git(
+        &["push", "--set-upstream", "origin", "HEAD"],
+        repository,
+        Some(credential),
+    )?;
+    Ok(())
+}
+
+/// The environment git is given so it authenticates as the agent.
+///
+/// The values are a path, a name and a login. The token is not among them; the
+/// program git calls reads it from the credentials file when git asks.
+pub fn git_env(credential: &GitCredential<'_>) -> Vec<(String, String)> {
+    vec![
+        (
+            "GIT_ASKPASS".to_owned(),
+            credential.askpass.display().to_string(),
+        ),
+        ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        (
+            ASKPASS_CREDENTIALS.to_owned(),
+            credential.credentials.display().to_string(),
+        ),
+        (ASKPASS_AGENT.to_owned(), credential.agent.to_owned()),
+        (ASKPASS_LOGIN.to_owned(), credential.login.to_owned()),
+    ]
+}
+
+/// Run one git command, without a secret anywhere in it.
+fn run_git(
+    args: &[&str],
+    cwd: &Path,
+    credential: Option<&GitCredential<'_>>,
+) -> Result<String, WorkspaceError> {
+    let mut command = Command::new("git");
+    // No credential helper: the token travels through the askpass pipe and is never
+    // written into a git credential store.
+    command.arg("-c").arg("credential.helper=");
+    command.args(args);
+    command.current_dir(cwd);
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(credential) = credential {
+        for (key, value) in git_env(credential) {
+            command.env(key, value);
+        }
+    }
+    let output = command
+        .output()
+        .map_err(|source| WorkspaceError::GitMissing { source })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(WorkspaceError::Git {
+            command: format!("git {}", args.join(" ")),
+            message: crate::model::excerpt(stderr.trim(), 500),
+        });
+    }
+    Ok(stdout)
+}
+
+/// The askpass entry point: hand git the login or the token it asked for.
+///
+/// Git calls this program with the prompt as the one argument. A prompt asking for a
+/// user name is answered with the login; anything else — a password or a passphrase —
+/// with the agent's token, read from the credentials file named in the environment.
+/// Nothing is written to standard error, so a failure cannot put a secret in a log.
+///
+/// The return value is the process exit code: zero when an answer was written, one
+/// otherwise.
+pub fn askpass_main(prompt: &str) -> i32 {
+    let credentials_path = match std::env::var(ASKPASS_CREDENTIALS) {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => return 1,
+    };
+    let agent = match std::env::var(ASKPASS_AGENT) {
+        Ok(agent) => agent,
+        Err(_) => return 1,
+    };
+    let answer = if prompt.to_ascii_lowercase().contains("username") {
+        std::env::var(ASKPASS_LOGIN).ok().or_else(|| {
+            credentials::recorded_login(&credentials_path, &agent)
+                .ok()
+                .flatten()
+        })
+    } else {
+        credentials::forgejo_agent_token(&credentials_path, &agent)
+            .ok()
+            .map(|token| token.expose().to_owned())
+    };
+    let Some(answer) = answer else {
+        return 1;
+    };
+    let mut out = std::io::stdout();
+    if out.write_all(answer.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
+        return 1;
+    }
+    if out.flush().is_err() {
+        return 1;
+    }
+    0
+}
+
+impl fmt::Debug for GitCredential<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitCredential")
+            .field("askpass", &self.askpass)
+            .field("credentials", &self.credentials)
+            .field("agent", &self.agent)
+            .field("login", &self.login)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clone_url_carries_the_login_and_never_a_token() {
+        let url = clone_url("https://forgejo.example.org", "root/demo", "gewu-scribe");
+        assert_eq!(url, "https://gewu-scribe@forgejo.example.org/root/demo.git");
+        assert!(!url.contains("token"));
+    }
+
+    #[test]
+    fn a_clone_destination_is_the_repository_name_inside_the_workspace() {
+        assert_eq!(
+            clone_destination(Path::new("/w"), "root/demo"),
+            Path::new("/w/demo")
+        );
+    }
+
+    #[test]
+    fn the_git_environment_names_a_path_a_name_and_a_login_only() {
+        let env = git_env(&GitCredential {
+            askpass: Path::new("/usr/bin/gewu-multiverse"),
+            credentials: Path::new("/home/me/.config/gewu-multiverse/credentials.toml"),
+            agent: "scribe",
+            login: "gewu-scribe",
+        });
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["GIT_TERMINAL_PROMPT"], "0");
+        assert_eq!(map["GEWU_GIT_AGENT"], "scribe");
+        assert_eq!(map["GEWU_GIT_LOGIN"], "gewu-scribe");
+        assert_eq!(map["GIT_ASKPASS"], "/usr/bin/gewu-multiverse");
+        for value in map.values() {
+            assert!(!value.contains("token"), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_askpass_mode_writes_nothing_without_its_environment() {
+        // No environment is set in the test process, so nothing is written and the
+        // exit code says so.
+        let code = askpass_main("Password for 'https://example.org':");
+        assert_eq!(code, 1);
+    }
+}

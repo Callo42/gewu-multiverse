@@ -6,8 +6,10 @@
 //! skill set and a declared list of shell steps, and leaves a log and an append-only
 //! JSONL transcript. A run then calls the model at its own configured endpoint,
 //! executes the tool calls the model asks for inside the agent's workspace, and stops
-//! when the model finishes or a declared bound is reached. No request is made to the
-//! Forgejo yet.
+//! when the model finishes or a declared bound is reached. The tool also talks to one
+//! Forgejo: it checks what the configured token can see, gives each agent its own
+//! Forgejo identity, and lets an agent work on a repository so its commits are
+//! authored by the agent rather than by the user.
 //!
 //! The modules are:
 //!
@@ -16,12 +18,15 @@
 //! - [`paths`] — the two roots and every path derived from an agent's name;
 //! - [`config`] — the configuration file and its validation;
 //! - [`mode`] — the file modes the private files are held to;
-//! - [`credentials`] — the credentials file, and the one secret it hands out;
+//! - [`credentials`] — the credentials file, and the secrets it hands out;
 //! - [`risk`] — the first-run risk acknowledgment and its record;
 //! - [`time`] — the clock, and how an instant is written down;
 //! - [`transcript`] — the append-only record of a run;
 //! - [`run`] — a run's identity, its plan and its outcome;
 //! - [`model`] — the direct model client, and its error taxonomy;
+//! - [`forgejo`] — the Forgejo client, the role check and its error taxonomy;
+//! - [`identity`] — one Forgejo identity per agent, derived from configuration;
+//! - [`workspace`] — git work in an agent's workspace, under that identity;
 //! - [`agent_run`] — the agent process itself, one run at a time;
 //! - [`supervisor`] — starting, watching and stopping agent processes;
 //! - [`editor`] — handing a file to the user's own editor or pager;
@@ -39,6 +44,8 @@ pub mod cli;
 pub mod config;
 pub mod credentials;
 pub mod editor;
+pub mod forgejo;
+pub mod identity;
 pub mod mode;
 pub mod model;
 pub mod naming;
@@ -49,6 +56,7 @@ pub mod supervisor;
 pub mod time;
 pub mod transcript;
 pub mod ui;
+pub mod workspace;
 
 /// A tiny local HTTP server for the tests and demonstrations only; the application
 /// never starts it and never listens on a socket.

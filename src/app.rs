@@ -20,11 +20,14 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::config::{AgentConfig, Config};
 use crate::credentials::{self, CredentialsFile};
+use crate::forgejo::{self, ForgejoClient, RoleCheck};
+use crate::identity::{self, AgentIdentity};
 use crate::model;
 use crate::paths::Layout;
 use crate::risk::{self, AckState};
 use crate::run::{RunModel, RunSummary, recent_runs};
 use crate::supervisor::{StartDisposition, StopDisposition, Supervisor};
+use crate::workspace::{self, GitCredential, GitIdentity};
 
 /// How often the runs screen re-reads the records on disk.
 const RECENT_RUNS_REFRESH: Duration = Duration::from_secs(1);
@@ -160,11 +163,57 @@ impl EndpointTest {
     }
 }
 
+/// Why a Forgejo action did not produce a result, with the class a person can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgejoFailure {
+    /// One word: `bad_url`, `missing_token`, `bad_token`, `not_admin`, `forbidden`,
+    /// `not_found`, `server_error`, `malformed_reply`, `timeout`, `transport`, or one
+    /// of the identity and workspace classes.
+    pub class: String,
+    /// The message, which never holds a token.
+    pub message: String,
+}
+
+/// The result of settling one agent's Forgejo identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityReport {
+    /// The agent the identity is about.
+    pub agent: String,
+    /// The identity, or why it could not be settled.
+    pub result: Result<AgentIdentity, ForgejoFailure>,
+}
+
+impl IdentityReport {
+    /// One line for a screen.
+    pub fn describe(&self) -> String {
+        match &self.result {
+            Ok(identity) => format!(
+                "{}{}",
+                identity.line(),
+                if identity.created {
+                    " (created now)"
+                } else {
+                    ""
+                }
+            ),
+            Err(failure) => format!("failed ({}): {}", failure.class, failure.message),
+        }
+    }
+}
+
 /// Say how an endpoint test ended.
 fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String {
     match result {
         Ok(summary) => format!("the endpoint answered: {summary}"),
         Err(failure) => format!("failed ({}): {}", failure.class, failure.message),
+    }
+}
+
+/// A Forgejo failure, as a screen holds it.
+fn failure_of(error: forgejo::ForgejoError) -> ForgejoFailure {
+    ForgejoFailure {
+        class: error.class().to_owned(),
+        message: error.to_string(),
     }
 }
 
@@ -202,6 +251,14 @@ pub struct App {
     pub recent: Vec<RunSummary>,
     /// The result of the last "test this endpoint" action, if any.
     pub endpoint_test: Option<EndpointTest>,
+    /// The result of the last role check, if any.
+    pub role_check: Option<Result<RoleCheck, ForgejoFailure>>,
+    /// Which repository the Forgejo screen has selected.
+    pub repo_selected: usize,
+    /// The result of the last identity action, if any.
+    pub identity_report: Option<IdentityReport>,
+    /// A line about the last repository or pull-request action.
+    pub forgejo_note: Option<String>,
     /// When the recent runs were last read.
     last_scan: Option<Instant>,
     /// The one line under the screens.
@@ -251,6 +308,10 @@ impl App {
             run_selected: 0,
             recent: Vec::new(),
             endpoint_test: None,
+            role_check: None,
+            repo_selected: 0,
+            identity_report: None,
+            forgejo_note: None,
             last_scan: None,
             status: String::new(),
             pending: None,
@@ -352,6 +413,19 @@ impl App {
     /// The configuration file this installation uses.
     pub fn config_path(&self) -> PathBuf {
         self.layout.config_file()
+    }
+
+    /// Whether the credentials file holds a role token and an administrator token.
+    ///
+    /// The presence of an administrator token is what chooses the identity path, so
+    /// the Forgejo screen shows both plainly rather than inferring anything.
+    pub fn forgejo_tokens_present(&self) -> (bool, bool) {
+        let role = credentials::forgejo_token(&self.credentials_path).is_ok();
+        let admin = credentials::forgejo_admin_token(&self.credentials_path)
+            .ok()
+            .flatten()
+            .is_some();
+        (role, admin)
     }
 
     /// The configuration directory.
@@ -583,6 +657,386 @@ impl App {
         });
     }
 
+    /// The Forgejo the configuration names, when the configuration was read.
+    fn forgejo_settings(&self) -> Option<crate::config::Forgejo> {
+        self.config.as_ref().map(|config| config.forgejo.clone())
+    }
+
+    /// The repository the Forgejo screen has selected, when a check has been run.
+    pub fn selected_repository(&self) -> Option<&forgejo::Repository> {
+        match &self.role_check {
+            Some(Ok(check)) => check.repositories.get(self.repo_selected),
+            _ => None,
+        }
+    }
+
+    /// Validate the URL and the token, and list what the token can see.
+    ///
+    /// This is the role check. The token comes from the credentials file, and the
+    /// result says plainly whether the view is an administrator's or an ordinary
+    /// member's, or names the class of failure: a bad URL, a bad token, or a token
+    /// that does not carry the rights the configuration expects.
+    pub fn request_role_check(&mut self) {
+        let Some(settings) = self.forgejo_settings() else {
+            self.status =
+                "the configuration could not be read, so no Forgejo can be checked".to_owned();
+            return;
+        };
+        let result = match identity::role_token(&self.credentials_path, settings.role) {
+            Ok(token) => {
+                let config = forgejo::ForgejoConfig {
+                    url: settings.url.clone(),
+                    token,
+                    timeout: forgejo::DEFAULT_TIMEOUT,
+                };
+                forgejo::role_check(&config, settings.role).map_err(failure_of)
+            }
+            Err(error) => Err(ForgejoFailure {
+                class: error.class().to_owned(),
+                message: error.to_string(),
+            }),
+        };
+        self.status = match &result {
+            Ok(check) => format!("role check: {}", check.summary()),
+            Err(failure) => format!("role check failed ({}): {}", failure.class, failure.message),
+        };
+        self.role_check = Some(result);
+        self.repo_selected = 0;
+    }
+
+    /// Settle the selected agent's Forgejo identity.
+    ///
+    /// With an administrator token in the credentials file the account and its token
+    /// are created and managed here, derived from the agent's name. Without one, the
+    /// token the user supplied under `[forgejo_agent_tokens]` is checked and its
+    /// account recorded. Either way the credentials file ends up naming the login a
+    /// commit will be authored by.
+    pub fn request_identity(&mut self) {
+        let Some(name) = self.selected_name() else {
+            self.status =
+                "the configuration lists no agent whose identity could be settled".to_owned();
+            return;
+        };
+        let Some(settings) = self.forgejo_settings() else {
+            self.status =
+                "the configuration could not be read, so no identity can be settled".to_owned();
+            return;
+        };
+        let result =
+            identity::resolve(&settings.url, &name, &self.credentials_path).map_err(|error| {
+                ForgejoFailure {
+                    class: error.class().to_owned(),
+                    message: error.to_string(),
+                }
+            });
+        self.status = match &result {
+            Ok(identity) => format!(
+                "identity for `{name}`: {}{}",
+                identity.line(),
+                if identity.created {
+                    " (created now)"
+                } else {
+                    ""
+                }
+            ),
+            Err(failure) => format!(
+                "identity for `{name}` failed ({}): {}",
+                failure.class, failure.message
+            ),
+        };
+        self.identity_report = Some(IdentityReport {
+            agent: name,
+            result,
+        });
+    }
+
+    /// The git identity recorded for an agent, or why there is none yet.
+    fn recorded_git_identity(&self, agent: &str) -> Result<GitIdentity, ForgejoFailure> {
+        let login = credentials::recorded_login(&self.credentials_path, agent)
+            .ok()
+            .flatten();
+        let email = credentials::recorded_email(&self.credentials_path, agent)
+            .ok()
+            .flatten();
+        match (login, email) {
+            (Some(login), Some(email)) => Ok(GitIdentity { login, email }),
+            _ => Err(ForgejoFailure {
+                class: "no_identity".to_owned(),
+                message: format!(
+                    "no Forgejo identity is recorded for `{agent}`; press i to settle one, or supply its token under [forgejo_agent_tokens]"
+                ),
+            }),
+        }
+    }
+
+    /// Clone the repository on show into the selected agent's workspace.
+    ///
+    /// The repository is the one the role check listed and the screen has selected;
+    /// the clone goes into the agent's workspace under the repository's name, and the
+    /// agent's git identity is configured there, so commits made in it are authored by
+    /// the agent.
+    pub fn request_clone(&mut self) {
+        let Some(repository) = self.selected_repository().cloned() else {
+            self.status =
+                "no repository is on show: press c to run the role check first".to_owned();
+            return;
+        };
+        let Some(name) = self.selected_name() else {
+            self.status = "the configuration lists no agent to clone for".to_owned();
+            return;
+        };
+        let identity = match self.recorded_git_identity(&name) {
+            Ok(identity) => identity,
+            Err(failure) => {
+                self.status = failure.message;
+                return;
+            }
+        };
+        let Some(base) = self.forgejo_settings().map(|settings| settings.url) else {
+            self.status = "the configuration could not be read".to_owned();
+            return;
+        };
+        let paths = match self.layout.ensure_agent(&name) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.status = format!("`{name}` cannot be prepared: {error}");
+                return;
+            }
+        };
+        let destination = workspace::clone_destination(paths.workspace(), &repository.full_name);
+        let askpass = std::env::current_exe().unwrap_or_default();
+        let credential = GitCredential {
+            askpass: &askpass,
+            credentials: &self.credentials_path,
+            agent: &name,
+            login: &identity.login,
+        };
+        match workspace::prepare(
+            &base,
+            &repository.full_name,
+            paths.workspace(),
+            &destination,
+            &identity,
+            Some(&credential),
+        ) {
+            Ok(path) => {
+                let note = format!(
+                    "{} is ready in {} as {}",
+                    repository.full_name,
+                    path.display(),
+                    identity.line()
+                );
+                self.status = note.clone();
+                self.forgejo_note = Some(note);
+            }
+            Err(error) => {
+                self.status = format!(
+                    "cloning {} failed ({}): {}",
+                    repository.full_name,
+                    error.class(),
+                    error
+                );
+            }
+        }
+    }
+
+    /// Push the workspace's current branch and open a pull request as the agent.
+    pub fn request_pull_request(&mut self) {
+        let Some(repository) = self.selected_repository().cloned() else {
+            self.status =
+                "no repository is on show: press c to run the role check first".to_owned();
+            return;
+        };
+        let Some(name) = self.selected_name() else {
+            self.status = "the configuration lists no agent to open a pull request for".to_owned();
+            return;
+        };
+        let Some(settings) = self.forgejo_settings() else {
+            self.status = "the configuration could not be read".to_owned();
+            return;
+        };
+        let paths = match self.layout.agent(&name) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.status = format!("`{name}` cannot be prepared: {error}");
+                return;
+            }
+        };
+        let destination = workspace::clone_destination(paths.workspace(), &repository.full_name);
+        if !destination.join(".git").is_dir() {
+            self.status = format!(
+                "{} has not been cloned into `{name}`'s workspace yet; press g first",
+                repository.full_name
+            );
+            return;
+        }
+        let identity = match self.recorded_git_identity(&name) {
+            Ok(identity) => identity,
+            Err(failure) => {
+                self.status = failure.message;
+                return;
+            }
+        };
+        let askpass = std::env::current_exe().unwrap_or_default();
+        let credential = GitCredential {
+            askpass: &askpass,
+            credentials: &self.credentials_path,
+            agent: &name,
+            login: &identity.login,
+        };
+        let branch = match workspace::current_branch(&destination) {
+            Ok(branch) => branch,
+            Err(error) => {
+                self.status = format!(
+                    "the workspace branch cannot be read ({}): {error}",
+                    error.class()
+                );
+                return;
+            }
+        };
+        if let Err(error) = workspace::push(&destination, &credential) {
+            self.status = format!("pushing `{branch}` failed ({}): {error}", error.class());
+            return;
+        }
+        let token = match credentials::forgejo_agent_token(&self.credentials_path, &name) {
+            Ok(token) => token,
+            Err(error) => {
+                self.status = format!("no Forgejo token for `{name}`: {error}");
+                return;
+            }
+        };
+        let client = match ForgejoClient::new(&settings.url, token, forgejo::DEFAULT_TIMEOUT) {
+            Ok(client) => client,
+            Err(error) => {
+                self.status = format!(
+                    "the Forgejo client could not be built ({}): {error}",
+                    error.class()
+                );
+                return;
+            }
+        };
+        let base = repository
+            .default_branch
+            .clone()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| "main".to_owned());
+        let (title, body) = self.pull_request_text(&name, &branch);
+        match client.open_pull_request(
+            &repository.namespace,
+            &repository.name,
+            &title,
+            &body,
+            &branch,
+            &base,
+        ) {
+            Ok(pull) => {
+                let note = format!("opened {} as {}", pull.line(), identity.login);
+                self.status = note.clone();
+                self.forgejo_note = Some(note);
+            }
+            Err(error) => {
+                self.status = format!("opening a pull request failed ({}): {error}", error.class());
+            }
+        }
+    }
+
+    /// Update the newest open pull request of the repository on show, as the agent.
+    pub fn request_update_pull_request(&mut self) {
+        let Some(repository) = self.selected_repository().cloned() else {
+            self.status =
+                "no repository is on show: press c to run the role check first".to_owned();
+            return;
+        };
+        let Some(name) = self.selected_name() else {
+            self.status = "the configuration lists no agent".to_owned();
+            return;
+        };
+        let Some(settings) = self.forgejo_settings() else {
+            self.status = "the configuration could not be read".to_owned();
+            return;
+        };
+        let token = match credentials::forgejo_agent_token(&self.credentials_path, &name) {
+            Ok(token) => token,
+            Err(error) => {
+                self.status = format!("no Forgejo token for `{name}`: {error}");
+                return;
+            }
+        };
+        let client = match ForgejoClient::new(&settings.url, token, forgejo::DEFAULT_TIMEOUT) {
+            Ok(client) => client,
+            Err(error) => {
+                self.status = format!(
+                    "the Forgejo client could not be built ({}): {error}",
+                    error.class()
+                );
+                return;
+            }
+        };
+        let open = match client.pull_requests(&repository.namespace, &repository.name) {
+            Ok(pulls) => pulls,
+            Err(error) => {
+                self.status = format!(
+                    "the open pull requests could not be listed ({}): {error}",
+                    error.class()
+                );
+                return;
+            }
+        };
+        let Some(pull) = open.first() else {
+            self.status = format!(
+                "{} has no open pull request to update",
+                repository.full_name
+            );
+            return;
+        };
+        let (title, body) = self.pull_request_text(&name, &pull.head);
+        match client.update_pull_request(
+            &repository.namespace,
+            &repository.name,
+            pull.number,
+            Some(&title),
+            Some(&body),
+            None,
+        ) {
+            Ok(updated) => {
+                let note = format!("updated {} as `{name}`", updated.line());
+                self.status = note.clone();
+                self.forgejo_note = Some(note);
+            }
+            Err(error) => {
+                self.status = format!(
+                    "updating pull request #{} failed ({}): {error}",
+                    pull.number,
+                    error.class()
+                );
+            }
+        }
+    }
+
+    /// The title and body of a pull request, from the agent's own file when it has one.
+    fn pull_request_text(&self, agent: &str, branch: &str) -> (String, String) {
+        let title = format!("Work by the agent `{agent}`");
+        let body = format!(
+            "Opened by `{agent}` from branch `{branch}`. The commit is authored by the agent's own Forgejo identity."
+        );
+        let Ok(paths) = self.layout.agent(agent) else {
+            return (title, body);
+        };
+        let path = paths.config_dir().join("pull-request.txt");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return (title, body);
+        };
+        let mut lines = text.lines();
+        let first = lines.next().unwrap_or("").trim().to_owned();
+        let rest = lines.collect::<Vec<_>>().join("\n");
+        let rest = rest.trim().to_owned();
+        if first.is_empty() {
+            (title, if rest.is_empty() { body } else { rest })
+        } else {
+            (first, rest)
+        }
+    }
+
     /// Ask to edit one of the selected agent's files. The terminal loop carries it out.
     pub fn request_edit(&mut self, target: EditTarget) {
         let Some(name) = self.selected_name() else {
@@ -790,11 +1244,25 @@ impl App {
 
     /// Move the selection on the screen on show.
     pub fn move_selection(&mut self, steps: isize) {
-        if self.screen == Screen::Runs {
-            self.move_run_selection(steps);
-        } else {
-            self.move_agent_selection(steps);
+        match self.screen {
+            Screen::Runs => self.move_run_selection(steps),
+            Screen::Forgejo => self.move_repo_selection(steps),
+            _ => self.move_agent_selection(steps),
         }
+    }
+
+    /// Move the repository selection on the Forgejo screen, stopping at the ends.
+    pub fn move_repo_selection(&mut self, steps: isize) {
+        let count = match &self.role_check {
+            Some(Ok(check)) => check.repositories.len(),
+            _ => 0,
+        };
+        if count == 0 {
+            self.repo_selected = 0;
+            return;
+        }
+        let last = count as isize - 1;
+        self.repo_selected = (self.repo_selected as isize + steps).clamp(0, last) as usize;
     }
 
     /// Move the agent selection, stopping at the ends.
@@ -863,6 +1331,20 @@ impl App {
             KeyCode::Char('s') => self.request_agent_start(),
             KeyCode::Char('x') => self.request_agent_stop(),
             KeyCode::Char('p') => self.request_endpoint_test(),
+            KeyCode::Char('c') => self.request_role_check(),
+            KeyCode::Char('i') => self.request_identity(),
+            KeyCode::Char('g') => {
+                self.show(Screen::Forgejo);
+                self.request_clone();
+            }
+            KeyCode::Char('P') => {
+                self.show(Screen::Forgejo);
+                self.request_pull_request();
+            }
+            KeyCode::Char('U') => {
+                self.show(Screen::Forgejo);
+                self.request_update_pull_request();
+            }
             KeyCode::Char('e') => self.request_edit(EditTarget::Instruction),
             KeyCode::Char('t') => self.request_edit(EditTarget::Steps),
             KeyCode::Char('o') => self.request_view_log(),

@@ -195,6 +195,15 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                     lines.push(field("endpoint test", &test.describe()));
                 }
             }
+            match crate::credentials::recorded_login(&app.credentials_path, &agent.name) {
+                Ok(Some(login)) => lines.push(field("forgejo identity", &login)),
+                _ => lines.push(field("forgejo identity", "not settled — press i")),
+            }
+            if let Some(report) = &app.identity_report {
+                if report.agent == agent.name {
+                    lines.push(field("forgejo account", &report.describe()));
+                }
+            }
         }
     }
     lines.push(Line::from(""));
@@ -283,7 +292,7 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// The Forgejo connection and the role check.
+/// The Forgejo connection, the role check and the repository list.
 fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     match &app.config {
@@ -293,13 +302,88 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(field("role", config.forgejo.role.as_str()));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(placeholder(
-        "the role check is not implemented: no request has been sent and no repository has been looked at",
+    let (member, admin) = app.forgejo_tokens_present();
+    lines.push(field(
+        "role token",
+        if member {
+            "in the credentials file"
+        } else {
+            "absent"
+        },
     ));
+    lines.push(field(
+        "admin token",
+        if admin {
+            "configured (identities are managed)"
+        } else {
+            "absent (identities are supplied)"
+        },
+    ));
+    if let Some(agent) = app.selected_agent() {
+        match crate::credentials::recorded_login(&app.credentials_path, &agent.name) {
+            Ok(Some(login)) => lines.push(field("agent identity", &login)),
+            _ => lines.push(field("agent identity", "not settled — press i")),
+        }
+    }
+    lines.push(Line::from(""));
+
+    match &app.role_check {
+        None => lines.push(placeholder(
+            "no role check has been run yet — press c to list what the configured token can see",
+        )),
+        Some(Err(failure)) => lines.push(Line::from(Span::styled(
+            format!("role check failed ({}): {}", failure.class, failure.message),
+            Style::new().fg(Color::Red),
+        ))),
+        Some(Ok(check)) => {
+            lines.push(Line::from(format!(
+                "{} — {} ({} of these private)",
+                if check.administrative() {
+                    "administrative view"
+                } else {
+                    "ordinary view"
+                },
+                check.summary(),
+                check.private_visible
+            )));
+            lines.push(Line::from(""));
+            if check.repositories.is_empty() {
+                lines.push(Line::from(
+                    "the token can see no repository on this instance",
+                ));
+            }
+            for (at, repository) in check.repositories.iter().enumerate() {
+                let style = if at == app.repo_selected {
+                    Style::new().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::new()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", repository.line()),
+                    style,
+                )));
+            }
+        }
+    }
+    if let Some(report) = &app.identity_report {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "identity for `{}`: {}",
+            report.agent,
+            report.describe()
+        )));
+    }
+    if let Some(note) = &app.forgejo_note {
+        lines.push(Line::from(note.clone()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "c check the role   i settle the agent's identity   up/down choose a repository   g clone it into the agent's workspace   P open a pull request as the agent   U update the newest one",
+        Style::new().fg(Color::DarkGray),
+    )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" Forgejo connection "))
+            .block(Block::bordered().title(" Forgejo connection and role check "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -439,7 +523,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(
-            "s start the agent   x stop it   p test its endpoint   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
+            "s start the agent   x stop it   p test its endpoint   c check the Forgejo role   i settle its Forgejo identity   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
         )
         .style(Style::new().fg(Color::DarkGray))
         .wrap(Wrap { trim: true }),
