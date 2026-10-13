@@ -58,11 +58,35 @@ pub struct RunPlan {
     pub instruction: PathBuf,
     /// The directory holding the skills the run installs.
     pub skills_dir: PathBuf,
-    /// The declared shell steps the run executes, in sequence. A step that fails
-    /// ends the run.
+    /// The endpoint the agent's configuration names, called directly by the run.
+    pub endpoint: String,
+    /// The model id the agent's configuration names.
+    pub model: String,
+    /// The credentials file the model key is read from. It holds no key itself.
+    pub credentials: PathBuf,
+    /// The declared bound on model turns. Reaching it ends the run, visibly.
+    pub max_turns: u32,
+    /// The declared shell steps the run executes first, in sequence. A step that
+    /// fails ends the run.
     pub steps: Vec<String>,
     /// How long the run may last before it is stopped. A bound, not a promise.
     pub timeout_secs: u64,
+}
+
+/// The model an agent runs against, as the configuration describes it.
+///
+/// This is what the screens and the supervisor carry from an agent's configuration to
+/// the plan of a run: where to call, which model, and how many turns are allowed. The
+/// key is deliberately not here — it is read from the credentials file by the run
+/// itself, at the moment of the call.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunModel {
+    /// The endpoint to call directly.
+    pub endpoint: String,
+    /// The model id to ask for.
+    pub model: String,
+    /// The bound on model turns in one run.
+    pub max_turns: u32,
 }
 
 impl RunPlan {
@@ -294,6 +318,10 @@ mod tests {
             workspace: PathBuf::from("/tmp/ws"),
             instruction: PathBuf::from("/tmp/i.md"),
             skills_dir: PathBuf::from("/tmp/skills"),
+            endpoint: "https://model.example.org/v1".to_owned(),
+            model: "example-model".to_owned(),
+            credentials: PathBuf::from("/tmp/credentials.toml"),
+            max_turns: 4,
             steps: vec!["echo one".to_owned(), "echo two".to_owned()],
             timeout_secs: 30,
         }
@@ -332,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_plan_with_an_unknown_field_is_refused() {
-        let text = r#"{"run_id":"r","agent":"a","workspace":"/w","instruction":"/i","skills_dir":"/s","steps":[],"timeout_secs":1,"extra":true}"#;
+        let text = r#"{"run_id":"r","agent":"a","workspace":"/w","instruction":"/i","skills_dir":"/s","endpoint":"http://e","model":"m","credentials":"/c","max_turns":1,"steps":[],"timeout_secs":1,"extra":true}"#;
         assert!(serde_json::from_str::<RunPlan>(text).is_err());
     }
 

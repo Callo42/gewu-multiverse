@@ -185,7 +185,8 @@ fn the_credentials_screen_shows_the_path_and_the_mode_from_disk() {
     assert!(path.is_file());
     assert!(screen.contains(&path.display().to_string()), "{screen}");
     assert!(screen.contains("0600"), "{screen}");
-    assert!(screen.contains("never read here"), "{screen}");
+    assert!(screen.contains("never printed"), "{screen}");
+    assert!(screen.contains("redacted"), "{screen}");
 }
 
 #[test]
@@ -201,16 +202,27 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
         assert!(!text.is_empty());
     }
 
-    // The screens that still have nothing behind them say so.
-    for screen in [Screen::Forgejo, Screen::Credentials, Screen::Instructions] {
-        app.show(screen);
-        let text = render(&app);
-        assert!(
-            text.contains("Placeholder"),
-            "{} must say what is not there yet:\n{text}",
-            screen.title()
-        );
-    }
+    // The one screen that still has nothing behind it says so.
+    app.show(Screen::Forgejo);
+    let forgejo = render(&app);
+    assert!(
+        forgejo.contains("Placeholder"),
+        "Forgejo must say what is not there yet:\n{forgejo}"
+    );
+
+    // The instruction screen names the model loop rather than calling it missing.
+    app.show(Screen::Instructions);
+    let instructions = render(&app);
+    assert!(
+        instructions.contains("declared `shell` tool"),
+        "{instructions}"
+    );
+    assert!(instructions.contains("turn(s)"), "{instructions}");
+
+    // The credentials screen says the key is redacted from everything written.
+    app.show(Screen::Credentials);
+    let credentials = render(&app);
+    assert!(credentials.contains("redacted"), "{credentials}");
 
     // The agent list separates the two agents and shows a state for each.
     app.show(Screen::Agents);
@@ -227,6 +239,8 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
     let agent = render(&app);
     assert!(agent.contains("agents/scribe"), "{agent}");
     assert!(agent.contains("e edit the instruction"), "{agent}");
+    assert!(agent.contains("p test the"), "{agent}");
+    assert!(agent.contains("max turns"), "{agent}");
 
     // The runs screen has nothing to list yet, and says so rather than claiming a run.
     app.show(Screen::Runs);
@@ -324,4 +338,75 @@ fn the_instruction_screen_shows_the_files_on_disk_and_the_editing_keys() {
     assert!(screen.contains("13 bytes"), "{screen}");
     assert!(screen.contains("alpha"), "{screen}");
     assert!(screen.contains("declared steps"), "{screen}");
+}
+
+#[test]
+fn the_endpoint_test_shows_a_success_and_a_clear_failure_with_its_class() {
+    use gewu_multiverse::test_stub::{Stub, StubReply};
+
+    let completion = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
+
+    // A success, against a local stub.
+    let good = Stub::start(vec![StubReply::json(completion)]);
+    let root = scratch("endpoint-ok");
+    fs::write(
+        root.join("config.toml"),
+        CONFIG.replace("https://model.example.org/v1", &good.url()),
+    )
+    .expect("the configuration is written");
+    let mut app = App::with_runner(Layout::rooted_at(root.clone()), quiet_runner("endpoint-ok"));
+    app.show_acknowledgment = false;
+    gewu_multiverse::mode::write_private(
+        root.join("credentials.toml"),
+        b"[model_keys]\n\"scribe\" = \"gw-fixture-key\"\n",
+    )
+    .expect("the credentials file is written");
+    app.selected = 0;
+    app.on_key(KeyEvent::from(KeyCode::Char('p')));
+    let test = app.endpoint_test.clone().expect("an endpoint test result");
+    assert!(test.result.is_ok(), "{}", app.status);
+    assert!(
+        app.status.contains("endpoint test for `scribe`: ok"),
+        "{}",
+        app.status
+    );
+    assert!(!app.status.contains("gw-fixture-key"), "{}", app.status);
+    assert_eq!(good.requests().len(), 1, "one minimal call was made");
+
+    // A clear failure: the stub refuses the key.
+    let bad = Stub::start(vec![StubReply::status(401, r#"{"error":"no"}"#)]);
+    let root = scratch("endpoint-bad");
+    fs::write(
+        root.join("config.toml"),
+        CONFIG.replace("https://model.example.org/v1", &bad.url()),
+    )
+    .expect("the configuration is written");
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("endpoint-bad"),
+    );
+    app.show_acknowledgment = false;
+    gewu_multiverse::mode::write_private(
+        root.join("credentials.toml"),
+        b"[model_keys]\n\"scribe\" = \"gw-fixture-key\"\n",
+    )
+    .expect("the credentials file is written");
+    app.selected = 0;
+    app.on_key(KeyEvent::from(KeyCode::Char('p')));
+    let test = app.endpoint_test.clone().expect("an endpoint test result");
+    match &test.result {
+        Err(failure) => {
+            assert_eq!(failure.class, "bad_key");
+            assert!(failure.message.contains("401"), "{}", failure.message);
+        }
+        Ok(summary) => panic!("expected a failure, got {summary}"),
+    }
+    assert!(app.status.contains("bad_key"), "{}", app.status);
+    assert!(!app.status.contains("gw-fixture-key"), "{}", app.status);
+
+    // The agent screen shows the failure plainly.
+    app.show(Screen::AgentConfig);
+    let screen = render(&app);
+    assert!(screen.contains("endpoint test"), "{screen}");
+    assert!(screen.contains("bad_key"), "{screen}");
 }

@@ -33,7 +33,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
 use crate::paths::AgentPaths;
-use crate::run::{LOG_FILE, RunOutcome, RunPlan, new_run_id};
+use crate::run::{LOG_FILE, RunModel, RunOutcome, RunPlan, new_run_id};
 use crate::transcript::{self, Record, Transcript};
 
 /// How long a stopped run may take to end politely before it is ended forcefully.
@@ -194,6 +194,12 @@ pub enum StartError {
     /// The program does not know which executable to start.
     #[error("the tool's own executable cannot be found, so no agent process can be started")]
     NoBinary,
+    /// The credentials file's path is not known, so a run cannot read its model key.
+    #[error("the credentials file path is not known, so `{agent}` cannot read its model key")]
+    Credentials {
+        /// The agent.
+        agent: String,
+    },
 }
 
 /// A run that is alive right now.
@@ -224,6 +230,7 @@ enum StopKind {
 struct Queued {
     name: String,
     paths: AgentPaths,
+    model: RunModel,
     steps: Vec<String>,
     run_id: String,
 }
@@ -233,6 +240,7 @@ struct Queued {
 pub struct Supervisor {
     state_root: PathBuf,
     binary: PathBuf,
+    credentials: PathBuf,
     max_concurrent: usize,
     timeout: Duration,
     grace: Duration,
@@ -257,6 +265,7 @@ impl Supervisor {
         Self {
             state_root: state_root.into(),
             binary: binary.into(),
+            credentials: PathBuf::new(),
             max_concurrent: max_concurrent.max(1),
             timeout,
             grace: DEFAULT_GRACE,
@@ -272,6 +281,11 @@ impl Supervisor {
     /// How long a stopped run may take to end politely.
     pub fn set_grace(&mut self, grace: Duration) {
         self.grace = grace;
+    }
+
+    /// Say where the credentials file is. A run reads its model key from there.
+    pub fn set_credentials(&mut self, path: impl Into<PathBuf>) {
+        self.credentials = path.into();
     }
 
     /// Apply the limits a freshly read configuration carries.
@@ -331,6 +345,7 @@ impl Supervisor {
     pub fn start(
         &mut self,
         agent: &AgentPaths,
+        model: &RunModel,
         steps: Vec<String>,
     ) -> Result<StartDisposition, StartError> {
         let name = agent.name().to_owned();
@@ -358,6 +373,7 @@ impl Supervisor {
             self.queue.push_back(Queued {
                 name: name.clone(),
                 paths: agent.clone(),
+                model: model.clone(),
                 steps,
                 run_id: run_id.clone(),
             });
@@ -372,7 +388,7 @@ impl Supervisor {
             self.reindex_queue();
             return Ok(StartDisposition::Queued { run_id, position });
         }
-        let pid = self.spawn(agent, steps, run_id.clone())?;
+        let pid = self.spawn(agent, model, steps, run_id.clone())?;
         Ok(StartDisposition::Started { run_id, pid })
     }
 
@@ -502,7 +518,12 @@ impl Supervisor {
             let Some(queued) = self.queue.pop_front() else {
                 break;
             };
-            match self.spawn(&queued.paths, queued.steps, queued.run_id.clone()) {
+            match self.spawn(
+                &queued.paths,
+                &queued.model,
+                queued.steps,
+                queued.run_id.clone(),
+            ) {
                 Ok(_) => {}
                 Err(error) => {
                     self.last_error = Some(error.to_string());
@@ -710,10 +731,14 @@ impl Supervisor {
     fn spawn(
         &mut self,
         agent: &AgentPaths,
+        model: &RunModel,
         steps: Vec<String>,
         run_id: String,
     ) -> Result<u32, StartError> {
         let name = agent.name().to_owned();
+        if self.credentials.as_os_str().is_empty() {
+            return Err(StartError::Credentials { agent: name });
+        }
         agent.ensure()?;
         let run_dir = agent.run_dir(&run_id);
         fs::create_dir_all(&run_dir).map_err(|source| StartError::Prepare {
@@ -727,6 +752,10 @@ impl Supervisor {
             workspace: agent.workspace().to_path_buf(),
             instruction: agent.instruction().to_path_buf(),
             skills_dir: agent.skills_dir().to_path_buf(),
+            endpoint: model.endpoint.clone(),
+            model: model.model.clone(),
+            credentials: self.credentials.clone(),
+            max_turns: model.max_turns,
             steps,
             timeout_secs: self.timeout.as_secs(),
         };
@@ -927,6 +956,25 @@ mod tests {
         (layout, agent)
     }
 
+    /// A supervisor with a credentials file already in place, so a start can prepare
+    /// a plan. The fake agent ignores the plan; these tests are about the supervisor.
+    fn supervisor(
+        layout: &crate::paths::Layout,
+        binary: PathBuf,
+        max_concurrent: usize,
+        timeout: Duration,
+    ) -> Supervisor {
+        let credentials = layout.root().join("credentials.toml");
+        crate::mode::write_private(
+            &credentials,
+            b"[model_keys]\n\"scribe\" = \"gw-fixture-key\"\n",
+        )
+        .expect("the credentials file is written");
+        let mut supervisor = Supervisor::new(layout.state_root(), binary, max_concurrent, timeout);
+        supervisor.set_credentials(credentials);
+        supervisor
+    }
+
     fn wait_for(what: &str, mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -942,9 +990,10 @@ mod tests {
     fn a_started_run_is_visible_and_then_finishes_cleanly() {
         let binary = fake_agent("sup-ok", "exit 0");
         let (layout, agent) = layout("sup-ok");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 10, Duration::from_secs(30));
-        let disposition = supervisor.start(&agent, Vec::new()).expect("started");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        let disposition = supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
         assert!(matches!(disposition, StartDisposition::Started { .. }));
         assert_eq!(supervisor.running_count(), 1);
         wait_for("the run to finish", || {
@@ -964,9 +1013,10 @@ mod tests {
     fn a_non_zero_exit_is_a_failure_with_a_reason() {
         let binary = fake_agent("sup-fail", "exit 3");
         let (layout, agent) = layout("sup-fail");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 10, Duration::from_secs(30));
-        supervisor.start(&agent, Vec::new()).expect("started");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
         wait_for("the failure to be recorded", || {
             supervisor.poll(Instant::now());
             matches!(
@@ -991,12 +1041,15 @@ mod tests {
         let (layout, _) = layout("sup-limit");
         let one = layout.ensure_agent("one").expect("one");
         let two = layout.ensure_agent("two").expect("two");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 1, Duration::from_secs(30));
+        let mut supervisor = supervisor(&layout, binary, 1, Duration::from_secs(30));
 
-        let first = supervisor.start(&one, Vec::new()).expect("started");
+        let first = supervisor
+            .start(&one, &RunModel::default(), Vec::new())
+            .expect("started");
         assert!(matches!(first, StartDisposition::Started { .. }));
-        let second = supervisor.start(&two, Vec::new()).expect("queued");
+        let second = supervisor
+            .start(&two, &RunModel::default(), Vec::new())
+            .expect("queued");
         match second {
             StartDisposition::Queued { position, .. } => assert_eq!(position, 1),
             other => panic!("expected a wait, got {other:?}"),
@@ -1029,10 +1082,13 @@ mod tests {
         let (layout, _) = layout("sup-cancel");
         let one = layout.ensure_agent("one").expect("one");
         let two = layout.ensure_agent("two").expect("two");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 1, Duration::from_secs(30));
-        supervisor.start(&one, Vec::new()).expect("started");
-        supervisor.start(&two, Vec::new()).expect("queued");
+        let mut supervisor = supervisor(&layout, binary, 1, Duration::from_secs(30));
+        supervisor
+            .start(&one, &RunModel::default(), Vec::new())
+            .expect("started");
+        supervisor
+            .start(&two, &RunModel::default(), Vec::new())
+            .expect("queued");
         assert_eq!(supervisor.stop("two"), StopDisposition::Cancelled);
         assert_eq!(supervisor.waiting_count(), 0);
         assert!(matches!(
@@ -1049,9 +1105,10 @@ mod tests {
     fn a_run_that_overruns_its_timeout_is_stopped_and_reported() {
         let binary = fake_agent("sup-timeout", "sleep 30");
         let (layout, agent) = layout("sup-timeout");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 10, Duration::from_millis(200));
-        supervisor.start(&agent, Vec::new()).expect("started");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_millis(200));
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
         wait_for("the timeout", || {
             supervisor.poll(Instant::now());
             matches!(
@@ -1075,9 +1132,10 @@ mod tests {
     fn stopping_a_run_is_reported_as_stopped_and_the_process_is_gone() {
         let binary = fake_agent("sup-stop", "sleep 30");
         let (layout, agent) = layout("sup-stop");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 10, Duration::from_secs(30));
-        let disposition = supervisor.start(&agent, Vec::new()).expect("started");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        let disposition = supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
         let pid = match disposition {
             StartDisposition::Started { pid, .. } => pid,
             other => panic!("unexpected {other:?}"),
@@ -1107,11 +1165,14 @@ mod tests {
     fn a_busy_agent_is_not_started_twice() {
         let binary = fake_agent("sup-busy", "sleep 30");
         let (layout, agent) = layout("sup-busy");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 10, Duration::from_secs(30));
-        supervisor.start(&agent, Vec::new()).expect("started");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
         assert!(matches!(
-            supervisor.start(&agent, Vec::new()).expect("refused"),
+            supervisor
+                .start(&agent, &RunModel::default(), Vec::new())
+                .expect("refused"),
             StartDisposition::Busy { .. }
         ));
         supervisor.stop_all(Duration::from_secs(5));
@@ -1121,9 +1182,10 @@ mod tests {
     fn the_terminal_record_of_a_stopped_run_is_written_once() {
         let binary = fake_agent("sup-record", "sleep 30");
         let (layout, agent) = layout("sup-record");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 10, Duration::from_secs(30));
-        let disposition = supervisor.start(&agent, Vec::new()).expect("started");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        let disposition = supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("started");
         let run_id = match disposition {
             StartDisposition::Started { run_id, .. } => run_id,
             other => panic!("unexpected {other:?}"),
@@ -1159,8 +1221,7 @@ mod tests {
     fn stop_all_changes_nothing_when_nothing_runs() {
         let binary = fake_agent("sup-empty", "exit 0");
         let (layout, _) = layout("sup-empty");
-        let mut supervisor =
-            Supervisor::new(layout.state_root(), binary, 10, Duration::from_secs(30));
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
         assert_eq!(supervisor.stop_all(Duration::from_millis(100)), 0);
     }
 
