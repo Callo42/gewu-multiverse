@@ -1,0 +1,28 @@
+[package]
+name = "gewu-multiverse"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A local, single-Universe Matrixverse: one Forgejo, the agents you define, and a terminal UI."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Callo42/gewu-multiverse"
+keywords = ["tui", "forgejo", "agents"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# ratatui — the terminal UI itself: layout, widgets and the frame loop of the screens.
+ratatui = "0.29"
+# crossterm — the terminal backend and key-event reader that ratatui draws into.
+crossterm = "0.28"
+# serde — turns the configuration file into typed values, refusing unknown fields.
+serde = { version = "1", features = ["derive"] }
+# toml — the configuration file format, chosen because it takes comments and is hand-editable.
+toml = "1"
+# directories — finds the user's own configuration directory on each platform.
+directories = "6"
+# thiserror — derives the error types, so a bad file is a clear message and never a panic.
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
