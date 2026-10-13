@@ -13,6 +13,7 @@
 
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crossterm::event::{KeyCode, KeyEvent};
 use gewu_multiverse::app::{App, Screen};
 use gewu_multiverse::paths::Layout;
+use gewu_multiverse::run::{RunOutcome, new_run_id};
+use gewu_multiverse::transcript::{Record, Transcript};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -31,6 +34,10 @@ const CONFIG: &str = r#"
 [forgejo]
 url = "https://forgejo.example.org"
 role = "member"
+
+[limits]
+run_timeout_secs = 30
+max_concurrent_agents = 2
 
 [[agents]]
 name = "scribe"
@@ -58,10 +65,22 @@ fn scratch(tag: &str) -> PathBuf {
     root
 }
 
+/// A runner that does nothing and exits cleanly, so a screen test can start an agent
+/// without starting the program itself.
+fn quiet_runner(tag: &str) -> PathBuf {
+    let path = scratch(tag).join("quiet-runner.sh");
+    fs::write(&path, "#!/bin/sh\nexit 0\n").expect("the runner is written");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("runnable");
+    path
+}
+
 /// An app over a configuration written by the test.
 fn app(root: &Path) -> App {
     fs::write(root.join("config.toml"), CONFIG).expect("the test writes the configuration");
-    App::new(Layout::rooted_at(root.to_path_buf()))
+    App::with_runner(
+        Layout::rooted_at(root.to_path_buf()),
+        quiet_runner("runner"),
+    )
 }
 
 /// Draw one frame and read the cells back as text.
@@ -116,7 +135,10 @@ fn the_acknowledgment_is_recorded_once_and_then_stays_out_of_the_way() {
     assert!(!first.show_acknowledgment);
 
     // A second start of the same installation does not ask again.
-    let second = App::new(Layout::rooted_at(root.clone()));
+    let second = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("recorded-once-two"),
+    );
     assert!(!second.show_acknowledgment);
     assert!(!render(&second).contains("Before the first agent runs"));
 
@@ -139,10 +161,16 @@ fn nothing_starts_an_agent_before_the_acknowledgment() {
     assert!(app.status.contains("refused"), "{}", app.status);
     assert!(app.show_acknowledgment);
 
-    // After confirming, the start key says plainly that nothing runs yet.
+    // After confirming, the start is still refused, because the agent has no
+    // instruction document yet — and the screen says which key writes one.
     app.on_key(KeyEvent::from(KeyCode::Char('y')));
     app.on_key(KeyEvent::from(KeyCode::Char('s')));
-    assert!(app.status.contains("not implemented"), "{}", app.status);
+    assert!(
+        app.status.contains("no instruction document"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.supervisor.running_count(), 0);
 }
 
 #[test]
@@ -171,32 +199,81 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
         let text = render(&app);
         show(screen.title(), &app);
         assert!(!text.is_empty());
-        if screen != Screen::Agents {
-            assert!(
-                text.contains("Placeholder"),
-                "{} must say what is not there yet:\n{text}",
-                screen.title()
-            );
-        }
     }
 
-    // The agent list separates the two agents and says no run has happened.
+    // The screens that still have nothing behind them say so.
+    for screen in [Screen::Forgejo, Screen::Credentials, Screen::Instructions] {
+        app.show(screen);
+        let text = render(&app);
+        assert!(
+            text.contains("Placeholder"),
+            "{} must say what is not there yet:\n{text}",
+            screen.title()
+        );
+    }
+
+    // The agent list separates the two agents and shows a state for each.
     app.show(Screen::Agents);
     let agents = render(&app);
     assert!(
         agents.contains("scribe") && agents.contains("checker"),
         "{agents}"
     );
-    assert!(agents.contains("never run"), "{agents}");
+    assert!(agents.contains("idle"), "{agents}");
+    assert!(agents.contains("layout, not a sandbox"), "{agents}");
 
-    // The runs screen has one line per agent, and none of them claims a run.
+    // The agent screen shows where its files are and how to edit them.
+    app.show(Screen::AgentConfig);
+    let agent = render(&app);
+    assert!(agent.contains("agents/scribe"), "{agent}");
+    assert!(agent.contains("e edit the instruction"), "{agent}");
+
+    // The runs screen has nothing to list yet, and says so rather than claiming a run.
     app.show(Screen::Runs);
     let runs = render(&app);
-    assert!(
-        runs.contains("scribe — runs recorded: 0") && runs.contains("checker — runs recorded: 0"),
-        "{runs}"
-    );
-    assert!(runs.contains("No agent has ever run"), "{runs}");
+    assert!(runs.contains("No run has been recorded yet"), "{runs}");
+}
+
+#[test]
+fn the_runs_screen_lists_a_recorded_run_with_its_outcome() {
+    let root = scratch("runs-recorded");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+
+    // Write one run's records by hand, exactly as a real run leaves them.
+    let run_id = new_run_id(1);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 4321, "/w"))
+        .expect("a record is appended");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            1234,
+            None,
+        ))
+        .expect("a record is appended");
+    fs::write(run_dir.join("run.log"), "gewu-multiverse: a run\n").expect("a log is written");
+
+    app.refresh_recent();
+    app.show(Screen::Runs);
+    let screen = render(&app);
+    show("Runs (one record)", &app);
+    assert!(screen.contains("scribe"), "{screen}");
+    assert!(screen.contains(&run_id), "{screen}");
+    assert!(screen.contains("succeeded"), "{screen}");
+    // The notes name the log on show; the exact path is asserted through the action
+    // below, because a long temporary path wraps across rows in this narrow backend.
+    assert!(screen.contains("o opens the log on show"), "{screen}");
+
+    // `o` opens the log of the run on show.
+    app.on_key(KeyEvent::from(KeyCode::Char('o')));
+    let action = app.take_action().expect("a view was asked for");
+    assert_eq!(action.path, run_dir.join("run.log"));
 }
 
 #[test]
@@ -219,9 +296,32 @@ fn a_broken_configuration_is_a_message_on_screen_rather_than_a_panic() {
         "[forgejo]\nurl = \"forgejo.example.org\"\nrole = \"member\"\n",
     )
     .expect("the test writes the configuration");
-    let mut app = App::new(Layout::rooted_at(root));
+    let mut app = App::with_runner(Layout::rooted_at(root), quiet_runner("broken-runner"));
     app.show_acknowledgment = false;
     let screen = render(&app);
     assert!(screen.contains("forgejo.url"), "{screen}");
     assert!(screen.contains("http://"), "{screen}");
+}
+
+#[test]
+fn the_instruction_screen_shows_the_files_on_disk_and_the_editing_keys() {
+    let root = scratch("instruction");
+    let mut app = app(&root);
+    app.on_key(KeyEvent::from(KeyCode::Char('y')));
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(paths.instruction(), "write a note\n").expect("the instruction is written");
+    fs::write(paths.steps_file(), "# nothing yet\n").expect("the steps file is written");
+    fs::create_dir_all(paths.skills_dir().join("alpha")).expect("a skill directory");
+    fs::write(
+        paths.skills_dir().join("alpha").join("SKILL.md"),
+        "# alpha\n",
+    )
+    .expect("a skill manifest");
+
+    app.show(Screen::Instructions);
+    let screen = render(&app);
+    show("Instruction", &app);
+    assert!(screen.contains("13 bytes"), "{screen}");
+    assert!(screen.contains("alpha"), "{screen}");
+    assert!(screen.contains("declared steps"), "{screen}");
 }

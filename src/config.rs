@@ -17,6 +17,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
+/// The agent-name rule lives in [`crate::naming`], because directories derive from it.
+pub use crate::naming::{MAX_AGENT_NAME_LEN, agent_name_problem, is_safe_agent_name};
+
 /// Key names that may never appear in the configuration file. A file that carries
 /// one is refused, and the message points at the credentials file instead.
 const SECRET_KEY_NAMES: &[&str] = &[
@@ -33,19 +36,56 @@ const SECRET_KEY_NAMES: &[&str] = &[
 /// The largest number of model requests one agent may keep in flight at once.
 pub const MAX_CONCURRENCY: u16 = 16;
 
-/// The longest an agent name may be.
-pub const MAX_AGENT_NAME_LEN: usize = 32;
-
 /// The whole configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The one Forgejo this Universe talks to.
     pub forgejo: Forgejo,
-    /// The agents, in the order the file lists them. An empty list is allowed.
+    /// The run limits every agent is admitted with.
+    #[serde(default)]
+    pub limits: Limits,
+    /// The agents, in the sequence the file lists them. An empty list is allowed.
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
 }
+
+/// The bounds every run of this installation is held to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    /// How long one run may last before it is stopped, in seconds.
+    #[serde(default = "default_run_timeout_secs")]
+    pub run_timeout_secs: u64,
+    /// How many agents may run at once. A start beyond this waits its turn.
+    #[serde(default = "default_max_concurrent_agents")]
+    pub max_concurrent_agents: u16,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            run_timeout_secs: default_run_timeout_secs(),
+            max_concurrent_agents: default_max_concurrent_agents(),
+        }
+    }
+}
+
+/// The default per-run timeout: fifteen minutes.
+fn default_run_timeout_secs() -> u64 {
+    900
+}
+
+/// The default limit on agents running at once.
+fn default_max_concurrent_agents() -> u16 {
+    10
+}
+
+/// The longest a run timeout may be: one day.
+pub const MAX_RUN_TIMEOUT_SECS: u64 = 86_400;
+
+/// The largest the limit on agents running at once may be.
+pub const MAX_CONCURRENT_AGENTS: u16 = 64;
 
 /// The Forgejo connection: where it is, and which role to act as.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -232,6 +272,41 @@ impl Config {
             return Err(invalid(path, "forgejo.url", format!("= {url:?} {problem}")));
         }
 
+        if self.limits.run_timeout_secs == 0 {
+            return Err(invalid(
+                path,
+                "limits.run_timeout_secs",
+                "= 0 is not allowed; a run needs a timeout of at least 1 second",
+            ));
+        }
+        if self.limits.run_timeout_secs > MAX_RUN_TIMEOUT_SECS {
+            return Err(invalid(
+                path,
+                "limits.run_timeout_secs",
+                format!(
+                    "= {} is too large; it must be at most {MAX_RUN_TIMEOUT_SECS}",
+                    self.limits.run_timeout_secs
+                ),
+            ));
+        }
+        if self.limits.max_concurrent_agents == 0 {
+            return Err(invalid(
+                path,
+                "limits.max_concurrent_agents",
+                "= 0 is not allowed; at least one agent must be able to run",
+            ));
+        }
+        if self.limits.max_concurrent_agents > MAX_CONCURRENT_AGENTS {
+            return Err(invalid(
+                path,
+                "limits.max_concurrent_agents",
+                format!(
+                    "= {} is too large; it must be at most {MAX_CONCURRENT_AGENTS}",
+                    self.limits.max_concurrent_agents
+                ),
+            ));
+        }
+
         let mut names: Vec<&str> = Vec::with_capacity(self.agents.len());
         for (index, agent) in self.agents.iter().enumerate() {
             let field = |name: &str| format!("agents[{index}].{name}");
@@ -308,12 +383,19 @@ url = "https://forgejo.example.org"
 # The role to act as: "admin" (administrative views) or "member" (ordinary).
 role = "member"
 
+[limits]
+# How long one run may last before it is stopped, in seconds (1 to 86400).
+run_timeout_secs = 900
+# How many agents may run at once (1 to 64). A start beyond this waits its turn.
+max_concurrent_agents = 10
+
 # One entry per agent. Remove the block if you want no agents.
 [[agents]]
 name = "example-agent"
 model = "example-model"
 endpoint = "https://model.example.org/v1"
-# Relative to this file's directory.
+# Relative to this file's directory. The tool also derives an agent's own directory
+# under agents/<name>/, holding its instruction.md, its skills/ and its workspace/.
 instruction = "instructions/example-agent.md"
 # How many model requests this agent may keep in flight at once (1 to 16).
 concurrency = 2
@@ -333,31 +415,6 @@ fn url_problem(url: &str) -> Option<&'static str> {
     }
     if url.chars().any(char::is_whitespace) {
         return Some("holds whitespace");
-    }
-    None
-}
-
-/// What is wrong with an agent name, if anything.
-pub fn agent_name_problem(name: &str) -> Option<String> {
-    if name.is_empty() {
-        return Some("is empty; it needs a name".to_owned());
-    }
-    if name.chars().count() > MAX_AGENT_NAME_LEN {
-        return Some(format!("is longer than {MAX_AGENT_NAME_LEN} characters"));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Some(
-            "is not allowed; a name uses lowercase letters, digits and hyphens only".to_owned(),
-        );
-    }
-    if name.starts_with('-') || name.ends_with('-') {
-        return Some("starts or ends with a hyphen, which is not allowed".to_owned());
-    }
-    if name.contains("--") {
-        return Some("holds a doubled hyphen, which is not allowed".to_owned());
     }
     None
 }
@@ -602,6 +659,66 @@ token = "abcdef"
         let root = crate::test_support::scratch_root("config-missing");
         let error = Config::load(&root.join("nothing.toml")).expect_err("the file is absent");
         assert!(matches!(error, ConfigError::Missing { .. }));
+    }
+
+    #[test]
+    fn limits_have_the_expected_defaults_when_the_table_is_absent() {
+        let config = Config::from_text(path(), GOOD).expect("the good file is accepted");
+        assert_eq!(config.limits.run_timeout_secs, 900);
+        assert_eq!(config.limits.max_concurrent_agents, 10);
+        assert_eq!(Limits::default(), config.limits);
+    }
+
+    #[test]
+    fn limits_can_be_set() {
+        let text = format!("{GOOD}\n[limits]\nrun_timeout_secs = 3\nmax_concurrent_agents = 2\n");
+        let config = Config::from_text(path(), &text).expect("the limits are accepted");
+        assert_eq!(config.limits.run_timeout_secs, 3);
+        assert_eq!(config.limits.max_concurrent_agents, 2);
+    }
+
+    #[test]
+    fn the_sample_carries_the_default_limits() {
+        let config = Config::from_text(path(), SAMPLE).expect("the sample is accepted");
+        assert_eq!(config.limits.max_concurrent_agents, 10);
+        assert_eq!(config.limits.run_timeout_secs, 900);
+    }
+
+    #[test]
+    fn a_zero_or_oversized_limit_is_refused() {
+        for (field, text, expected) in [
+            (
+                "limits.run_timeout_secs",
+                format!("{GOOD}\n[limits]\nrun_timeout_secs = 0\n"),
+                "at least 1 second",
+            ),
+            (
+                "limits.run_timeout_secs",
+                format!("{GOOD}\n[limits]\nrun_timeout_secs = 86401\n"),
+                "too large",
+            ),
+            (
+                "limits.max_concurrent_agents",
+                format!("{GOOD}\n[limits]\nmax_concurrent_agents = 0\n"),
+                "at least one agent",
+            ),
+            (
+                "limits.max_concurrent_agents",
+                format!("{GOOD}\n[limits]\nmax_concurrent_agents = 65\n"),
+                "too large",
+            ),
+        ] {
+            let message = message(&text);
+            assert!(message.contains(field), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_under_limits_is_refused() {
+        let text = format!("{GOOD}\n[limits]\ntimeout = 3\n");
+        let message = message(&text);
+        assert!(message.contains("unknown field"), "{message}");
     }
 
     fn agent_block(name: &str) -> String {
