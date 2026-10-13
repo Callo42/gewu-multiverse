@@ -18,6 +18,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use crate::app::{App, Screen};
 use crate::risk;
 use crate::run::RunOutcome;
+use crate::systemd::Mode;
 
 /// The space between the field name and its value on the detail screens.
 const LABEL_WIDTH: usize = 16;
@@ -75,7 +76,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
 
-    let header = Row::new(["agent", "model", "requests", "state"]).style(
+    let header = Row::new(["agent", "model", "requests", "supervision", "state"]).style(
         Style::new()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -94,16 +95,18 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(agent.name.clone()),
                 Cell::from(agent.model.clone()),
                 Cell::from(agent.concurrency.to_string()),
+                Cell::from(app.supervisor.mode(&agent.name).as_str()),
                 Cell::from(app.supervisor.state(&agent.name).word()),
             ])
             .style(style)
         })
         .collect();
     let widths = [
-        Constraint::Length(18),
-        Constraint::Length(18),
-        Constraint::Length(10),
-        Constraint::Min(20),
+        Constraint::Length(14),
+        Constraint::Length(16),
+        Constraint::Length(9),
+        Constraint::Length(12),
+        Constraint::Min(18),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -137,8 +140,27 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Red),
         )));
     }
+    if let Some(error) = app.supervisor.systemd_last_error() {
+        lines.push(Line::from(Span::styled(
+            format!("the last look at the units did not go well: {error}"),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    if app
+        .agents()
+        .iter()
+        .any(|agent| app.supervisor.mode(&agent.name) == Mode::Systemd)
+    {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "A `systemd` agent runs as a user unit: it keeps running when this UI exits. Your systemd directory is {}. It needs a user session, and `loginctl enable-linger` to outlive a logout. It is a convenience, not a security boundary.",
+                app.supervisor.unit_dir().display()
+            ),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     lines.push(Line::from(Span::styled(
-        "Each agent is an ordinary child process of this tool, run as you. Its workspace is a directory: a layout, not a sandbox.",
+        "An agent in `tui` mode is an ordinary child process of this tool, run as you. Either way its workspace is a directory: a layout, not a sandbox.",
         Style::new().fg(Color::DarkGray),
     )));
     if !app.ack_confirmed() {
@@ -170,6 +192,18 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                 "run state",
                 &app.supervisor.state(&agent.name).word(),
             ));
+            let mode = app.supervisor.mode(&agent.name);
+            lines.push(field("supervision", &format!("{} ({})", mode.label(), mode.as_str())));
+            if mode == Mode::Systemd {
+                lines.push(field(
+                    "unit",
+                    &crate::systemd::unit_name(&agent.name),
+                ));
+                lines.push(field(
+                    "restarts",
+                    &app.supervisor.restart_count(&agent.name).to_string(),
+                ));
+            }
             if let Some(paths) = app.selected_paths() {
                 lines.push(field(
                     "agent files",
@@ -209,7 +243,7 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(field("read from", &app.config_path().display().to_string()));
     lines.push(Line::from(Span::styled(
-        "e edit the instruction   K open the skills directory   t edit the declared steps   p test the endpoint   s start   x stop   o open the log",
+        "e edit the instruction   K open the skills directory   t edit the declared steps   p test the endpoint   s start   x stop   m switch supervision mode   o open the log",
         Style::new().fg(Color::DarkGray),
     )));
     frame.render_widget(
@@ -523,7 +557,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(
-            "s start the agent   x stop it   p test its endpoint   c check the Forgejo role   i settle its Forgejo identity   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
+            "s start the agent   x stop it   m switch supervision mode (tui / systemd)   p test its endpoint   c check the Forgejo role   i settle its Forgejo identity   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
         )
         .style(Style::new().fg(Color::DarkGray))
         .wrap(Wrap { trim: true }),

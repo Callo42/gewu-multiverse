@@ -177,6 +177,11 @@ too — politely first (`SIGTERM`), and forcibly (`SIGKILL`) after a short grace
 then reaps the child and sweeps the group again, so a run leaves nothing of itself
 running. Leaving the UI stops every run the same way, within a budget.
 
+An agent in the opt-in `systemd` mode is stopped by asking the user's own
+`systemctl --user` to stop its unit instead, and the run is recorded as `stopped` just
+the same. Such an agent is deliberately **not** stopped when the UI exits: that is the
+reason the mode exists. See [Two ways an agent can be supervised](systemd-mode.md).
+
 ## Editing an instruction, skills and steps
 
 The UI does not grow its own editor. It hands a path to the program you already chose:
@@ -218,8 +223,6 @@ output, a model reply, an error message — before it reaches the transcript or 
 
 ## What is not here yet
 
-- **A service mode.** The tool is a program you start, not a daemon, and there is no
-  `systemd` mode yet.
 - **Streaming a reply.** The model exchange is one request and one reply. A streamed
   exchange would fill the same reply before the turn ends; it is not here yet.
 - **The clone inside the workspace is not made for you on start.** You clone a

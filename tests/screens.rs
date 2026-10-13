@@ -497,3 +497,36 @@ fn the_endpoint_test_shows_a_success_and_a_clear_failure_with_its_class() {
     assert!(screen.contains("endpoint test"), "{screen}");
     assert!(screen.contains("bad_key"), "{screen}");
 }
+
+#[test]
+fn an_agent_in_systemd_mode_is_shown_as_supervised_by_a_user_unit() {
+    let root = scratch("systemd-mode");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let agent = app.ensure_agent("scribe").expect("the agent is prepared");
+    gewu_multiverse::systemd::write_record(
+        &agent,
+        &gewu_multiverse::systemd::Supervision {
+            mode: gewu_multiverse::systemd::Mode::Systemd,
+            ..Default::default()
+        },
+    )
+    .expect("the record is written");
+    app.reload();
+
+    // The agent list names the mode beside the state.
+    let screen = render(&app);
+    show("agents, one agent in systemd mode", &app);
+    assert!(screen.contains("supervision"), "{screen}");
+    assert!(screen.contains("systemd"), "{screen}");
+    assert!(screen.contains("user unit"), "{screen}");
+    assert!(screen.contains("keeps running when this UI exits"), "{screen}");
+
+    // The agent's own screen names the unit it will be started as.
+    app.show(Screen::AgentConfig);
+    let screen = render(&app);
+    show("agent configuration, systemd mode", &app);
+    assert!(screen.contains("user unit"), "{screen}");
+    assert!(screen.contains("gewu-agent-scribe.service"), "{screen}");
+    assert!(screen.contains("restarts"), "{screen}");
+}
