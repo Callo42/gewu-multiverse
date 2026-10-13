@@ -21,8 +21,43 @@ records are plain logs and JSONL transcripts.
 
 ## Status
 
-**Early.** The design is settled and the code is being written; nothing is installable yet. This README will grow the
-install command and a quickstart when the first binary exists.
+**Skeleton, and honest about it.** The crate builds, installs and opens the terminal UI. In place
+now:
+
+- the terminal UI, with a screen per thing you configure: the agent list, one agent's settings, its
+  instruction and skills, the Forgejo connection and the role check, the credentials file, and runs;
+- one configuration file, validated on load, with a clear message instead of a crash when it is
+  wrong;
+- one credentials file, created with mode **0600**, whose contents are never read, printed, logged or
+  put on a command line;
+- the first-run risk acknowledgment, required once per installation before any agent may be started.
+
+Not there yet, and named as such on the screens that would show them: running an agent (so nothing
+starts, stops or watches one), any network request, run records and transcripts, instruction and
+skill handling, editing from the UI, and the Forgejo repository check.
+
+## Install
+
+```sh
+cargo install --git https://github.com/Callo42/gewu-multiverse
+```
+
+That needs a Rust toolchain (edition 2024, so Rust 1.85 or newer) and a Unix-like system.
+
+## First run
+
+```sh
+gewu-multiverse
+```
+
+On the first start it writes a commented `config.toml` and a `credentials.toml` with mode 0600 under
+your own configuration directory (`~/.config/gewu-multiverse` on Linux), shows the risk
+acknowledgment once, and asks you to confirm it. Edit the configuration file, then press `r` to
+re-read it. `gewu-multiverse --config-dir <dir>` keeps the files somewhere else instead.
+
+Keys: `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch screens, `up`/`down` choose an agent,
+`enter` opens it, `esc` goes back to the list, `s` asks to start the chosen agent, `r` re-reads the
+files.
 
 ## Running agents is not a sandbox
 
