@@ -584,7 +584,11 @@ impl Supervisor {
                 let run_id = live.run_id.clone();
                 let pid = live.pid;
                 let duration_ms = live.started.elapsed().as_millis() as u64;
+                signal_group(pid, Signal::SIGTERM);
                 let _ = live.child.wait();
+                if group_has_members(pid) {
+                    self.sweeps.push((pid, Instant::now() + self.grace));
+                }
                 let dir = live.dir.clone();
                 self.live.remove(name);
                 self.record_outcome(
@@ -595,7 +599,6 @@ impl Supervisor {
                     Some(format!("the agent process cannot be read: {error}")),
                     duration_ms,
                 );
-                self.sweeps.push((pid, Instant::now() + self.grace));
             }
         }
     }
@@ -605,11 +608,16 @@ impl Supervisor {
         let Some(mut live) = self.live.remove(name) else {
             return;
         };
-        let _ = live.child.wait();
-        let duration_ms = live.started.elapsed().as_millis() as u64;
+        // Signal the group while the child is still an unreaped member, so the group
+        // id cannot have been given to anyone else yet, then reap the child.
         let pid = live.pid;
         signal_group(pid, Signal::SIGTERM);
-        self.sweeps.push((pid, Instant::now() + self.grace));
+        let _ = live.child.wait();
+        let duration_ms = live.started.elapsed().as_millis() as u64;
+        // Only a group that still has members needs to be swept again, forcefully.
+        if group_has_members(pid) {
+            self.sweeps.push((pid, Instant::now() + self.grace));
+        }
 
         // The process decides. A stop the tool asked for is `stopped`; a stop for the
         // timeout is `timed_out`; otherwise the exit code decides.
@@ -786,6 +794,12 @@ impl Supervisor {
     fn sweep_groups(&mut self, now: Instant) {
         let mut remaining = Vec::new();
         for (pid, deadline) in self.sweeps.drain(..) {
+            // A group that is already empty is left alone: a process group id that has
+            // been given back must never be signalled, because it may name someone else
+            // by now.
+            if !group_has_members(pid) {
+                continue;
+            }
             if now >= deadline {
                 signal_group(pid, Signal::SIGKILL);
             } else {
@@ -847,6 +861,41 @@ fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
 /// error: the thing this function exists for has already happened.
 fn signal_group(pid: u32, signal: Signal) {
     let _ = killpg(Pid::from_raw(pid as i32), signal);
+}
+
+/// Whether any process on this machine is still in the process group `pgid`.
+///
+/// This is read from Linux's own `/proc`, so it is the operating system's answer, not
+/// a guess. Where `/proc` cannot be read, the answer is `true` — the careful direction,
+/// because it keeps a run's cleanup going rather than declaring it done.
+fn group_has_members(pgid: u32) -> bool {
+    let entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return true,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // The shape is `pid (name) state ppid pgrp ...`, and the name may hold
+        // spaces or brackets, so the fields are read after the last `)`.
+        let Some((_, after_name)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = after_name.split_whitespace();
+        let _state = fields.next();
+        let _parent = fields.next();
+        let pgrp = fields.next().and_then(|value| value.parse::<u32>().ok());
+        if pgrp == Some(pgid) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1113,5 +1162,28 @@ mod tests {
         let mut supervisor =
             Supervisor::new(layout.state_root(), binary, 10, Duration::from_secs(30));
         assert_eq!(supervisor.stop_all(Duration::from_millis(100)), 0);
+    }
+
+    /// The process group of this very process, read from `/proc/self/stat`.
+    fn own_process_group() -> u32 {
+        let stat = fs::read_to_string("/proc/self/stat").expect("this process is on Linux");
+        let (_, after_name) = stat.rsplit_once(')').expect("stat holds a name");
+        let mut fields = after_name.split_whitespace();
+        let _state = fields.next();
+        let _parent = fields.next();
+        fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("the group is a number")
+    }
+
+    #[test]
+    fn a_process_group_with_members_is_told_apart_from_an_empty_one() {
+        let own = own_process_group();
+        assert!(group_has_members(own), "this process is in group {own}");
+        assert!(
+            !group_has_members(3_999_999_999),
+            "a group id nothing can be using is empty"
+        );
     }
 }
