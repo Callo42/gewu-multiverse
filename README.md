@@ -24,6 +24,13 @@ records are plain logs and JSONL transcripts.
 **Early.** The design is settled and the code is being written; nothing is installable yet. This README will grow the
 install command and a quickstart when the first binary exists.
 
+## Running agents is not a sandbox
+
+Agents run **as you**, in their own workspace directory, with no privilege escalation — a `sudo` attempt fails. That is a
+layout, not a security boundary: an agent can read anything your user can read, **including the credentials file**, and it acts
+with your rights on this machine. The tool shows you where the credentials file lives, and asks you to acknowledge this once on
+first start.
+
 ## Licence
 
 Licensed under either of
