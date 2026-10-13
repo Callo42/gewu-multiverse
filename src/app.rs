@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::config::{AgentConfig, Config};
-use crate::credentials::CredentialsFile;
+use crate::credentials::{self, CredentialsFile};
+use crate::model;
 use crate::paths::Layout;
 use crate::risk::{self, AckState};
-use crate::run::{RunSummary, recent_runs};
+use crate::run::{RunModel, RunSummary, recent_runs};
 use crate::supervisor::{StartDisposition, StopDisposition, Supervisor};
 
 /// How often the runs screen re-reads the records on disk.
@@ -129,6 +130,44 @@ pub enum ActionKind {
     View,
 }
 
+/// The result of the "test this endpoint" action for one agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointTest {
+    /// The agent whose endpoint was tested.
+    pub agent: String,
+    /// The endpoint that was called.
+    pub endpoint: String,
+    /// The model that was asked for.
+    pub model: String,
+    /// On success, a one-line summary of the reply; on failure, its class and message.
+    pub result: Result<String, EndpointFailure>,
+}
+
+/// Why the endpoint test failed, with the class a person can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointFailure {
+    /// One word: `bad_url`, `missing_key`, `bad_key`, `model_not_found`, `rate_limited`,
+    /// `server_error`, `malformed_reply`, `timeout` or `transport`.
+    pub class: String,
+    /// The message, which never holds the key.
+    pub message: String,
+}
+
+impl EndpointTest {
+    /// One line for the status bar and the agent screen.
+    pub fn describe(&self) -> String {
+        describe_endpoint_result(&self.result)
+    }
+}
+
+/// Say how an endpoint test ended.
+fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String {
+    match result {
+        Ok(summary) => format!("the endpoint answered: {summary}"),
+        Err(failure) => format!("failed ({}): {}", failure.class, failure.message),
+    }
+}
+
 /// Everything the screens draw.
 #[derive(Debug)]
 pub struct App {
@@ -161,6 +200,8 @@ pub struct App {
     pub run_selected: usize,
     /// The recent runs, read from the records on disk.
     pub recent: Vec<RunSummary>,
+    /// The result of the last "test this endpoint" action, if any.
+    pub endpoint_test: Option<EndpointTest>,
     /// When the recent runs were last read.
     last_scan: Option<Instant>,
     /// The one line under the screens.
@@ -191,6 +232,8 @@ impl App {
             crate::config::Limits::default().max_concurrent_agents as usize,
             Duration::from_secs(crate::config::Limits::default().run_timeout_secs),
         );
+        let mut supervisor = supervisor;
+        supervisor.set_credentials(credentials_path.clone());
         let mut app = Self {
             layout,
             supervisor,
@@ -207,6 +250,7 @@ impl App {
             selected: 0,
             run_selected: 0,
             recent: Vec::new(),
+            endpoint_test: None,
             last_scan: None,
             status: String::new(),
             pending: None,
@@ -424,10 +468,11 @@ impl App {
                     .to_owned();
             return;
         }
-        let Some(name) = self.selected_name() else {
+        let Some(agent) = self.selected_agent().cloned() else {
             self.status = "refused: the configuration lists no agent to start".to_owned();
             return;
         };
+        let name = agent.name.clone();
         let paths = match self.layout.ensure_agent(&name) {
             Ok(paths) => paths,
             Err(error) => {
@@ -449,7 +494,12 @@ impl App {
                 return;
             }
         };
-        match self.supervisor.start(&paths, steps) {
+        let model = RunModel {
+            endpoint: agent.endpoint.clone(),
+            model: agent.model.clone(),
+            max_turns: agent.max_turns,
+        };
+        match self.supervisor.start(&paths, &model, steps) {
             Ok(StartDisposition::Started { run_id, pid }) => {
                 self.status = format!("started `{name}`: run {run_id}, process {pid}");
                 self.refresh_recent();
@@ -484,6 +534,53 @@ impl App {
             StopDisposition::Nothing => format!("`{name}` is not running"),
         };
         self.refresh_recent();
+    }
+
+    /// Test the selected agent's endpoint with one minimal call.
+    ///
+    /// This is the acceptance the design names: a person can point an agent at an
+    /// endpoint and ask the tool to prove it works. The call is made here, on the
+    /// spot, and its result is one line: either what the model answered, or the class
+    /// of failure and its message. The key is read from the credentials file for this
+    /// one call and is never shown.
+    pub fn request_endpoint_test(&mut self) {
+        let Some(agent) = self.selected_agent().cloned() else {
+            self.status = "the configuration lists no agent to test".to_owned();
+            return;
+        };
+        let credentials = self.layout.credentials_file();
+        let result = match credentials::model_key(&credentials, &agent.name) {
+            Err(error) => Err(EndpointFailure {
+                class: "missing_key".to_owned(),
+                message: error.to_string(),
+            }),
+            Ok(key) => {
+                let config = model::ModelConfig {
+                    endpoint: agent.endpoint.clone(),
+                    model: agent.model.clone(),
+                    api_key: key,
+                    timeout: model::PROBE_TIMEOUT,
+                };
+                match model::probe(&config) {
+                    Ok(reply) => Ok(reply.summary()),
+                    Err(error) => Err(EndpointFailure {
+                        class: error.class().to_owned(),
+                        message: error.to_string(),
+                    }),
+                }
+            }
+        };
+        let short = match &result {
+            Ok(_) => "ok".to_owned(),
+            Err(failure) => format!("failed ({})", failure.class),
+        };
+        self.status = format!("endpoint test for `{}`: {short}", agent.name);
+        self.endpoint_test = Some(EndpointTest {
+            agent: agent.name,
+            endpoint: agent.endpoint,
+            model: agent.model,
+            result,
+        });
     }
 
     /// Ask to edit one of the selected agent's files. The terminal loop carries it out.
@@ -765,6 +862,7 @@ impl App {
             KeyCode::Esc => self.screen = Screen::Agents,
             KeyCode::Char('s') => self.request_agent_start(),
             KeyCode::Char('x') => self.request_agent_stop(),
+            KeyCode::Char('p') => self.request_endpoint_test(),
             KeyCode::Char('e') => self.request_edit(EditTarget::Instruction),
             KeyCode::Char('t') => self.request_edit(EditTarget::Steps),
             KeyCode::Char('o') => self.request_view_log(),

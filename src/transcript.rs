@@ -40,6 +40,31 @@ pub struct SkillRef {
     pub digest: String,
 }
 
+/// One tool call the model asked for, as recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelToolCall {
+    /// The model's own id for the call.
+    pub id: String,
+    /// The declared tool's name.
+    pub name: String,
+    /// The arguments, as the model wrote them.
+    pub arguments: String,
+}
+
+/// The tokens a model reply used, as the endpoint reported them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUsage {
+    /// Tokens in the request.
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    /// Tokens in the reply.
+    #[serde(default)]
+    pub completion_tokens: u64,
+    /// Tokens in both.
+    #[serde(default)]
+    pub total_tokens: u64,
+}
+
 /// One line of a transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -75,24 +100,30 @@ pub enum Record {
         /// The skills, in name sequence.
         skills: Vec<SkillRef>,
     },
-    /// A declared tool is about to run.
+    /// A declared or model-asked tool is about to run.
     ToolCall {
         /// When.
         ts: String,
-        /// Which declared step this is, starting at one.
+        /// Which model turn asked for it, or `null` for a declared step.
+        #[serde(default)]
+        turn: Option<u32>,
+        /// Which tool call this is, starting at one.
         index: u32,
-        /// The tool's name. This round declares exactly one: `shell`.
+        /// The tool's name: `shell`.
         tool: String,
         /// The command handed to the shell.
         command: String,
         /// The directory the shell runs in.
         cwd: String,
     },
-    /// A declared tool has finished.
+    /// A tool has finished.
     ToolResult {
         /// When.
         ts: String,
-        /// Which declared step this is.
+        /// Which model turn asked for it, or `null` for a declared step.
+        #[serde(default)]
+        turn: Option<u32>,
+        /// Which tool call this is.
         index: u32,
         /// The tool's name.
         tool: String,
@@ -100,8 +131,11 @@ pub enum Record {
         exit_code: Option<i32>,
         /// The signal that ended the shell, when a signal did.
         signal: Option<i32>,
-        /// How long the step took, in milliseconds.
+        /// How long the tool took, in milliseconds.
         duration_ms: u64,
+        /// A bounded, redacted excerpt of what the tool printed.
+        #[serde(default)]
+        output: Option<String>,
     },
     /// The agent process itself is about to exit.
     ChildExit {
@@ -111,6 +145,76 @@ pub enum Record {
         exit_code: Option<i32>,
         /// The signal that ended it, when a signal did.
         signal: Option<i32>,
+    },
+    /// The bounds the run will be held to, recorded before the first model call.
+    RunLimits {
+        /// When.
+        ts: String,
+        /// The run's identity.
+        run_id: String,
+        /// The declared bound on model turns.
+        max_turns: u32,
+        /// The declared bound on the run's lifetime, in seconds.
+        timeout_secs: u64,
+        /// The endpoint the run will call directly.
+        endpoint: String,
+        /// The model id the run will ask for.
+        model: String,
+    },
+    /// A model request is about to be sent.
+    ModelRequest {
+        /// When.
+        ts: String,
+        /// The run's identity.
+        run_id: String,
+        /// Which turn this is, starting at one.
+        turn: u32,
+        /// The endpoint called.
+        endpoint: String,
+        /// The model asked for.
+        model: String,
+        /// The `Authorization` header as recorded: always `Bearer <redacted>`.
+        authorization: String,
+        /// The request body exactly as sent, with the key redacted.
+        body: String,
+    },
+    /// A model reply arrived.
+    ModelReply {
+        /// When.
+        ts: String,
+        /// The run's identity.
+        run_id: String,
+        /// Which turn this is.
+        turn: u32,
+        /// The HTTP status the endpoint answered with.
+        status: u16,
+        /// The text of the reply, when there was any.
+        content: Option<String>,
+        /// The tool calls the model asked for.
+        #[serde(default)]
+        tool_calls: Vec<ModelToolCall>,
+        /// Why the model stopped, when the endpoint said.
+        #[serde(default)]
+        finish_reason: Option<String>,
+        /// The tokens the endpoint reported.
+        #[serde(default)]
+        usage: Option<ModelUsage>,
+        /// The reply body exactly as it arrived, with the key redacted.
+        body: String,
+    },
+    /// A model exchange failed. The class says what kind of failure it was.
+    ModelCallFailed {
+        /// When.
+        ts: String,
+        /// The run's identity.
+        run_id: String,
+        /// Which turn this was; zero when the run never got as far as a call.
+        turn: u32,
+        /// The error class: `bad_url`, `missing_key`, `bad_key`, `model_not_found`,
+        /// `rate_limited`, `server_error`, `malformed_reply`, `timeout`, `transport`.
+        class: String,
+        /// The message, which never holds the key.
+        message: String,
     },
     /// The run is over. Written by the process that supervised the run, once, last.
     RunFinished {
@@ -159,31 +263,38 @@ impl Record {
         }
     }
 
-    /// The record of a declared tool about to run.
-    pub fn tool_call(index: u32, command: &str, cwd: &str) -> Self {
+    /// The record of a tool about to run. `turn` is `None` for a declared step and
+    /// `Some(turn)` when the model asked for it.
+    pub fn tool_call(turn: Option<u32>, index: u32, tool: &str, command: &str, cwd: &str) -> Self {
         Record::ToolCall {
             ts: stamp(),
+            turn,
             index,
-            tool: SHELL_TOOL.to_owned(),
+            tool: tool.to_owned(),
             command: command.to_owned(),
             cwd: cwd.to_owned(),
         }
     }
 
-    /// The record of a declared tool that has finished.
+    /// The record of a tool that has finished.
     pub fn tool_result(
+        turn: Option<u32>,
         index: u32,
+        tool: &str,
         exit_code: Option<i32>,
         signal: Option<i32>,
         duration_ms: u64,
+        output: Option<String>,
     ) -> Self {
         Record::ToolResult {
             ts: stamp(),
+            turn,
             index,
-            tool: SHELL_TOOL.to_owned(),
+            tool: tool.to_owned(),
             exit_code,
             signal,
             duration_ms,
+            output,
         }
     }
 
@@ -193,6 +304,80 @@ impl Record {
             ts: stamp(),
             exit_code,
             signal,
+        }
+    }
+
+    /// The bounds the run is held to, recorded before the first model call.
+    pub fn run_limits(
+        run_id: &str,
+        max_turns: u32,
+        timeout_secs: u64,
+        endpoint: &str,
+        model: &str,
+    ) -> Self {
+        Record::RunLimits {
+            ts: stamp(),
+            run_id: run_id.to_owned(),
+            max_turns,
+            timeout_secs,
+            endpoint: endpoint.to_owned(),
+            model: model.to_owned(),
+        }
+    }
+
+    /// The record of a model request about to be sent.
+    pub fn model_request(
+        run_id: &str,
+        turn: u32,
+        endpoint: &str,
+        model: &str,
+        authorization: &str,
+        body: &str,
+    ) -> Self {
+        Record::ModelRequest {
+            ts: stamp(),
+            run_id: run_id.to_owned(),
+            turn,
+            endpoint: endpoint.to_owned(),
+            model: model.to_owned(),
+            authorization: authorization.to_owned(),
+            body: body.to_owned(),
+        }
+    }
+
+    /// The record of a model reply that arrived.
+    #[allow(clippy::too_many_arguments)]
+    pub fn model_reply(
+        run_id: &str,
+        turn: u32,
+        status: u16,
+        content: Option<String>,
+        tool_calls: Vec<ModelToolCall>,
+        finish_reason: Option<String>,
+        usage: Option<ModelUsage>,
+        body: &str,
+    ) -> Self {
+        Record::ModelReply {
+            ts: stamp(),
+            run_id: run_id.to_owned(),
+            turn,
+            status,
+            content,
+            tool_calls,
+            finish_reason,
+            usage,
+            body: body.to_owned(),
+        }
+    }
+
+    /// The record of a model exchange that failed, with its class.
+    pub fn model_call_failed(run_id: &str, turn: u32, class: &str, message: &str) -> Self {
+        Record::ModelCallFailed {
+            ts: stamp(),
+            run_id: run_id.to_owned(),
+            turn,
+            class: class.to_owned(),
+            message: message.to_owned(),
         }
     }
 
@@ -223,6 +408,10 @@ impl Record {
             Record::ToolCall { .. } => "tool_call",
             Record::ToolResult { .. } => "tool_result",
             Record::ChildExit { .. } => "child_exit",
+            Record::RunLimits { .. } => "run_limits",
+            Record::ModelRequest { .. } => "model_request",
+            Record::ModelReply { .. } => "model_reply",
+            Record::ModelCallFailed { .. } => "model_call_failed",
             Record::RunFinished { .. } => "run_finished",
         }
     }
@@ -236,6 +425,10 @@ impl Record {
             | Record::ToolCall { ts, .. }
             | Record::ToolResult { ts, .. }
             | Record::ChildExit { ts, .. }
+            | Record::RunLimits { ts, .. }
+            | Record::ModelRequest { ts, .. }
+            | Record::ModelReply { ts, .. }
+            | Record::ModelCallFailed { ts, .. }
             | Record::RunFinished { ts, .. } => ts,
         }
     }
@@ -408,8 +601,44 @@ mod tests {
                 bytes: 12,
                 digest: digest(b"# alpha"),
             }]),
-            Record::tool_call(1, "echo one", "/tmp/ws"),
-            Record::tool_result(1, Some(0), None, 4),
+            Record::tool_call(None, 1, SHELL_TOOL, "echo one", "/tmp/ws"),
+            Record::tool_result(
+                None,
+                1,
+                SHELL_TOOL,
+                Some(0),
+                None,
+                4,
+                Some("one\n".to_owned()),
+            ),
+            Record::run_limits("run-1", 4, 30, "http://127.0.0.1:1/v1", "m"),
+            Record::model_request(
+                "run-1",
+                1,
+                "http://127.0.0.1:1/v1",
+                "m",
+                "Bearer <redacted>",
+                "{\"model\":\"m\"}",
+            ),
+            Record::model_reply(
+                "run-1",
+                1,
+                200,
+                Some("done".to_owned()),
+                vec![ModelToolCall {
+                    id: "call_1".to_owned(),
+                    name: SHELL_TOOL.to_owned(),
+                    arguments: "{\"command\":\"ls\"}".to_owned(),
+                }],
+                Some("stop".to_owned()),
+                Some(ModelUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 2,
+                    total_tokens: 7,
+                }),
+                "{\"choices\":[]}",
+            ),
+            Record::model_call_failed("run-1", 2, "bad_key", "the endpoint refused the key"),
             Record::child_exit(Some(0), None),
             Record::run_finished("run-1", RunOutcome::Succeeded, Some(0), 42, None),
         ];
