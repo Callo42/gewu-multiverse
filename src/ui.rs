@@ -5,7 +5,9 @@
 //! the terminal shows.
 //!
 //! Every screen that has nothing behind it says so, in a line that starts with
-//! `Placeholder`. No screen offers an action the program cannot carry out.
+//! `Placeholder`. No screen offers an action the program cannot carry out: the state
+//! it shows comes from the supervisor, the files it names are read back from disk,
+//! and what is still missing — the model call and the Forgejo work — is named.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -15,6 +17,7 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
 use crate::app::{App, Screen};
 use crate::risk;
+use crate::run::RunOutcome;
 
 /// The space between the field name and its value on the detail screens.
 const LABEL_WIDTH: usize = 16;
@@ -24,7 +27,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
-        Constraint::Length(3),
+        Constraint::Length(4),
     ])
     .split(frame.area());
 
@@ -70,9 +73,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The list of agents and their state.
 fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
-    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
 
-    let header = Row::new(["agent", "model", "concurrency", "state"]).style(
+    let header = Row::new(["agent", "model", "requests", "state"]).style(
         Style::new()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -91,16 +94,16 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(agent.name.clone()),
                 Cell::from(agent.model.clone()),
                 Cell::from(agent.concurrency.to_string()),
-                Cell::from("defined; never run"),
+                Cell::from(app.supervisor.state(&agent.name).word()),
             ])
             .style(style)
         })
         .collect();
     let widths = [
-        Constraint::Length(22),
-        Constraint::Length(22),
-        Constraint::Length(12),
-        Constraint::Min(16),
+        Constraint::Length(18),
+        Constraint::Length(18),
+        Constraint::Length(10),
+        Constraint::Min(20),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -122,9 +125,22 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Red),
         )));
     }
-    lines.push(placeholder(
-        "no supervisor exists yet, so nothing here starts, stops or watches an agent",
-    ));
+    lines.push(Line::from(format!(
+        "Running: {} of {} allowed by the configuration; {} start(s) waiting for a slot.",
+        app.supervisor.running_count(),
+        app.supervisor.max_concurrent(),
+        app.supervisor.waiting_count(),
+    )));
+    if let Some(error) = app.supervisor.last_error() {
+        lines.push(Line::from(Span::styled(
+            format!("the last start did not go well: {error}"),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Each agent is an ordinary child process of this tool, run as you. Its workspace is a directory: a layout, not a sandbox.",
+        Style::new().fg(Color::DarkGray),
+    )));
     if !app.ack_confirmed() {
         lines.push(Line::from(Span::styled(
             "The risk of running an agent is not acknowledged: starting one is refused.",
@@ -134,7 +150,7 @@ fn agent_notes(app: &App) -> Text<'static> {
     Text::from(lines)
 }
 
-/// One agent's configuration, read from the configuration file.
+/// One agent's configuration, read from the configuration file and the supervisor.
 fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     match app.selected_agent() {
@@ -147,14 +163,40 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                 "instruction",
                 &agent.instruction.display().to_string(),
             ));
-            lines.push(field("concurrency", &agent.concurrency.to_string()));
+            lines.push(field("requests", &agent.concurrency.to_string()));
+            lines.push(Line::from(""));
+            lines.push(field(
+                "run state",
+                &app.supervisor.state(&agent.name).word(),
+            ));
+            if let Some(paths) = app.selected_paths() {
+                lines.push(field(
+                    "agent files",
+                    &paths.config_dir().display().to_string(),
+                ));
+                lines.push(field("workspace", &paths.workspace().display().to_string()));
+            }
+            if let Some(problem) = app.selected_paths_problem() {
+                lines.push(Line::from(Span::styled(
+                    problem,
+                    Style::new().fg(Color::Red),
+                )));
+            }
+            match app.latest_run_log(&agent.name) {
+                Some(log) => lines.push(field("newest log", &log.display().to_string())),
+                None => lines.push(field("newest log", "no run yet")),
+            }
+            if let Some(run_id) = app.supervisor.state(&agent.name).run_id() {
+                lines.push(field("run", run_id));
+            }
         }
     }
     lines.push(Line::from(""));
     lines.push(field("read from", &app.config_path().display().to_string()));
-    lines.push(placeholder(
-        "editing an agent from here is not implemented; change the configuration file and press r",
-    ));
+    lines.push(Line::from(Span::styled(
+        "e edit the instruction   K open the skills directory   t edit the declared steps   s start   x stop   o open the log",
+        Style::new().fg(Color::DarkGray),
+    )));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(" agent configuration "))
@@ -163,31 +205,67 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// An agent's instruction and skills.
+/// An agent's instruction, its declared steps and its skills, as they are on disk.
 fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     match app.selected_agent() {
         None => lines.push(Line::from(no_agent_text(app))),
         Some(agent) => {
             lines.push(field("agent", &agent.name));
-            lines.push(field(
-                "instruction",
-                &agent.instruction.display().to_string(),
-            ));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "The file above is not read or shown yet, and no skill set is installed.",
-                Style::new().fg(Color::Yellow),
-            )));
+            match app.instruction_summary() {
+                Some((path, exists, bytes)) => {
+                    lines.push(field("instruction", &path.display().to_string()));
+                    lines.push(field(
+                        "  on disk",
+                        &if exists {
+                            format!("{bytes} bytes")
+                        } else {
+                            "not there yet — press e to write it".to_owned()
+                        },
+                    ));
+                }
+                None => lines.push(field("instruction", "the name cannot be used")),
+            }
+            match app.steps_summary() {
+                Some((path, exists, count)) => {
+                    lines.push(field("steps", &path.display().to_string()));
+                    lines.push(field(
+                        "  declared",
+                        &if exists {
+                            format!("{count} shell step(s), run in the workspace")
+                        } else {
+                            "none — press t to declare some".to_owned()
+                        },
+                    ));
+                }
+                None => lines.push(field("steps", "the name cannot be used")),
+            }
+            let skills = app.skills_summary();
+            lines.push(field("skills", &format!("{} on disk", skills.len())));
+            for (name, bytes) in skills.iter().take(8) {
+                lines.push(Line::from(format!(
+                    "                  {name} (SKILL.md, {bytes} bytes)"
+                )));
+            }
+            if skills.len() > 8 {
+                lines.push(Line::from(format!(
+                    "                  … and {} more",
+                    skills.len() - 8
+                )));
+            }
         }
     }
     lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "e edit the instruction   K open the skills directory   t edit the declared steps",
+        Style::new().fg(Color::DarkGray),
+    )));
     lines.push(placeholder(
-        "instruction handling and skill sets are not implemented; nothing is delivered to an agent",
+        "the model call is not implemented, so a run follows the declared steps and nothing more",
     ));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" instruction and skills "))
+            .block(Block::bordered().title(" instruction, steps and skills "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -233,8 +311,12 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(
         "Its contents are never read here: nothing is printed, logged or put on a command line.",
     ));
+    lines.push(Line::from(Span::styled(
+        "An agent runs as you, so it can read this file with your rights. The screen shows you where it is.",
+        Style::new().fg(Color::DarkGray),
+    )));
     lines.push(placeholder(
-        "no secret is used yet, because no agent runs and no request is made",
+        "no secret is used yet, because no model call and no Forgejo request is made",
     ));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -244,37 +326,83 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Each agent's recent runs.
+/// The recent runs, read from the records on disk.
 fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
+    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
+
+    let header = Row::new(["agent", "run", "started", "outcome"]).style(
+        Style::new()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows: Vec<Row> = app
+        .recent
+        .iter()
+        .enumerate()
+        .map(|(at, run)| {
+            let style = if at == app.run_selected {
+                Style::new().fg(Color::Black).bg(Color::Cyan)
+            } else if run.outcome == Some(RunOutcome::Failed) {
+                Style::new().fg(Color::Red)
+            } else {
+                Style::new()
+            };
+            Row::new(vec![
+                Cell::from(run.agent.clone()),
+                Cell::from(run.run_id.clone()),
+                Cell::from(run.started_text()),
+                Cell::from(run.describe()),
+            ])
+            .style(style)
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(24),
+        Constraint::Length(24),
+        Constraint::Min(18),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered().title(" recent runs "));
+    frame.render_widget(table, parts[0]);
+
     let mut lines: Vec<Line> = Vec::new();
-    if app.agents().is_empty() {
-        lines.push(Line::from(no_agent_text(app)));
-    }
-    for agent in app.agents() {
+    lines.push(Line::from(format!(
+        "Run records are read from {}.",
+        app.state_root().display()
+    )));
+    if app.recent.is_empty() {
+        lines.push(Line::from(
+            "No run has been recorded yet, so there is nothing to list.",
+        ));
+    } else if let Some(run) = app.selected_run() {
         lines.push(Line::from(format!(
-            "  {} — runs recorded: 0, and no transcript to show",
-            agent.name
+            "o opens the log on show: {}",
+            run.log.display()
+        )));
+        lines.push(Line::from(Span::styled(
+            "The outcome is decided by the process, not by what it wrote.",
+            Style::new().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(
-        "No agent has ever run, so there is nothing else to list here.",
-    ));
-    lines.push(placeholder(
-        "run records, transcripts and logs are not implemented",
-    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" recent runs, one line per agent "))
-            .wrap(Wrap { trim: false }),
-        area,
+            .block(Block::bordered().title(" run records "))
+            .wrap(Wrap { trim: true }),
+        parts[1],
     );
 }
 
 /// The status line and the key hints.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    // Two rows for the status, so a whole message fits, and one for the keys.
-    let parts = Layout::vertical([Constraint::Length(2), Constraint::Length(1)]).split(area);
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
     let status_style = if app.config_error.is_some() || app.credentials_error.is_some() {
         Style::new().fg(Color::Red)
     } else if !app.ack_confirmed() {
@@ -290,11 +418,19 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(
-            "q quit   tab or left/right screen   1-6 screen   up/down agent   enter open   esc agents   s start   r re-read",
+            "q quit   tab or left/right screen   1-6 screen   up/down select   enter open   esc agents   r re-read",
         )
         .style(Style::new().fg(Color::DarkGray))
         .wrap(Wrap { trim: true }),
         parts[1],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "s start the agent   x stop it   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
+        )
+        .style(Style::new().fg(Color::DarkGray))
+        .wrap(Wrap { trim: true }),
+        parts[2],
     );
 }
 
@@ -302,7 +438,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let screen = frame.area();
     let width = 78.min(screen.width);
-    let height = (risk::LINES.len() as u16 + 8).min(screen.height);
+    let height = (risk::LINES.len() as u16 + 9).min(screen.height);
     let popup = centered(screen, width, height);
 
     let mut lines: Vec<Line> = Vec::new();

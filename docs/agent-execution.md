@@ -1,176 +1,161 @@
-# Agent execution in gewu-multiverse
+# How an agent runs in `gewu-multiverse`
 
-This document describes how an agent runs in `gewu-multiverse`: what the tool is, what each part of
-an agent is, and how a run behaves. It is written for this repository's own documentation and uses
-only this repository's vocabulary.
-
-## What the tool is
-
-`gewu-multiverse` is a local, single-Universe Matrixverse written in Rust. One Forgejo hosts the Git
-repositories. A configurable number of agents work in it. The TUI is the only entrypoint: there is no
-web page, no service API for users, and no account or tenant model.
-
-Three choices shape everything below:
-
-- **One child process per agent.** An agent is a long-lived process that starts one agent run at a
-  time, in its own workspace, as an ordinary child process.
-- **Direct endpoints, one credentials file.** Agents talk to the Git server and to the model endpoint
-  directly. There is no broker between an agent and an endpoint. A single credentials file holds the secrets that runs need, restricted by file permissions to your user. Note plainly: an agent
-  runs **as you**, so it can read anything you can — including that file. See *Running agents is not a sandbox* in the README.
-- **One Forgejo.** Repositories, permissions and merge requests are the Forgejo's own; the tool does
-  not keep a second list of who may do what.
+This document describes what happens when you start an agent. It describes the tool
+as it is now: an agent runs as an ordinary local child process, with an instruction, a
+skill set and a declared list of shell steps, and leaves a log and an append-only
+transcript. **No model is called yet**, and no request is made to the Forgejo yet; both
+are named where they would appear.
 
 ## What an agent is
 
-An agent is made of six parts. Each is editable or replaceable on its own.
+An agent has a **name**. Everything else about it is derived from that name, so adding
+an agent is a configuration change and never a code change. A name is lowercase
+letters, digits and single hyphens, at most 32 characters, and it must be a name that
+can safely become one directory. A name that cannot is refused with a sentence, before
+any path is built from it.
 
-### Identity
+Two roots hold everything.
 
-An agent has a name. Everything else about it — its workspace directory, its record directory, its
-configuration file, the names of its local sockets and log files — is derived from that name, so
-adding an agent is a configuration change and never a code change. Names are bounded and validated:
-lowercase letters, digits and hyphens, no leading or trailing hyphen, no doubled hyphen, within a
-length that keeps every derived path and socket name inside the filesystem's own limits. Two agents
-can never derive the same workspace: a derived path that would sit inside another agent's workspace
-is refused.
+- The **configuration root** (`~/.config/gewu-multiverse`, or `$XDG_CONFIG_HOME/gewu-multiverse`)
+  holds `config.toml`, `credentials.toml`, the first-run acknowledgment, and one
+  directory per agent:
 
-### Configuration
+  ```
+  agents/<name>/
+      instruction.md   what the agent is told to do; you write it with `e`
+      steps.txt        the shell steps one run executes, one per line; `t`
+      skills/          one directory per skill, each with a SKILL.md; `K`
+      workspace/       where a run's declared steps work
+  ```
 
-One roster file lists the agents that exist and whether each is set to run or paused. One file per
-agent carries that agent's own settings: its workspace repository, its instruction, its skill set,
-its model, its branch, and the run limits it is admitted with. Both files are validated strictly
-when read: unknown fields are refused, a roster count that disagrees with its list is refused, a
-duplicate name is refused, and an agent whose settings disagree with the roster is refused. Editing
-these files is the way to add, remove, pause or reconfigure an agent.
+- The **state root** (`~/.local/state/gewu-multiverse`, or `$XDG_STATE_HOME/gewu-multiverse`)
+  holds one directory per agent, and one directory per run:
 
-### Workspace
+  ```
+  <name>/<run id>/
+      plan.json         what the run was started with, written before it starts
+      run.log           the agent process's own output and the declared steps' output
+      transcript.jsonl  the append-only record of what happened
+      skills/           the skill set this run installed, byte for byte
+  ```
 
-An agent's workspace is one clone of one Git repository. A run begins with a fresh clone, so a run
-never inherits a previous run's uncommitted state. The clone is made from the local Forgejo, and the
-agent's commits carry the agent's own name.
+A run id is a timestamp and a sequence number (`run-<milliseconds>-<sequence>`), so
+sorting run ids sorts runs by age. Run records are read from disk, so a run started in
+an earlier session is listed just like one started now.
 
-### Instruction
+## What a run does
 
-An instruction is a plain-text document on disk. It has two layers:
-
-- a **fixed header** written by the tool, carrying the identity facts the agent must be told (its
-  name, the Universe it works in, the repository it owns) with the tool substituting those facts;
-- an **editable body**, which the user writes, stored as a versioned document with a content digest
-  and a timestamp.
-
-The body may be set for all agents or overridden for one agent. Every write keeps the previous
-versions, so history is never destroyed. A body takes effect at the **next** run: a run that has
-already started keeps the instruction it started with. Bodies are bounded plain text — no binary
-content, no credential-shaped text — and a body that names a skill which is not installed is refused
-rather than delivered.
-
-### Skills
-
-A skill is a directory containing a `SKILL.md` manifest and optionally more plain-text files. A
-skill set is either the tool's built-in set or a set the user configures. At the start of a run the
-tool writes the effective set into the agent's home directory, refusing unsafe names, empty skills
-and paths that would leave the skill's own directory. Skill bodies are never pasted into the
-instruction: the agent discovers and loads them itself.
-
-### Endpoints and credentials
-
-Two endpoints are configured: the Forgejo and the model. A run's model request must name the model
-that the agent is configured with; a request naming a different model is refused. Request targets are
-built from the configured endpoint, never from anything the agent supplies, and a redirect is never
-followed while a credential is attached. The single credentials file is read once per run, checked to
-be non-empty, in-bounds and free of whitespace and control characters, and never appears in the
-instruction, the agent's environment, a log line or a transcript.
-
-## How a run behaves
+A run is one execution of one agent. The tool prepares it, starts one child process,
+and decides how it ended.
 
 ### Preparing
 
-A run begins by taking a fresh run identity and a fresh per-run secret. The tool then writes the
-agent's generated configuration, installs the effective skills, checks that the credential really
-identifies the agent it is supposed to (by asking the Git server who the credential is, and refusing
-the run if the answer is not the expected agent), and clones the workspace. Each of these steps can
-refuse the run; none of them silently continues.
+The tool creates the run directory, writes `plan.json` into it, and creates `run.log`.
+The plan holds the agent's name, its workspace, its instruction, its skills directory,
+the declared steps and the per-run timeout. Nothing secret is in it, and nothing secret
+is passed on a command line.
 
-### Executing
+### Starting
 
-The run then starts **one** agent process with the instruction on its standard input, a fixed
-argument list, a fixed environment, and the workspace as its working directory. The process runs
-until it exits, until the run is stopped, or until the run's deadline is reached.
+One child process per agent is started, with the agent's workspace as its working
+directory, as the leader of a **new process group**. That group is what makes stopping
+work: one signal reaches the agent and every tool it started.
+
+The child then, in sequence:
+
+1. records that the run started, with its own process id;
+2. installs the agent's skills into the run directory, byte for byte — a skill is one
+   directory with a `SKILL.md`; an unsafe skill name, a skill without a manifest, or a
+   link inside a skill refuses the whole run, so nothing is half-installed;
+3. reads `instruction.md` and records its size and a digest of its bytes;
+4. executes the declared steps, one shell command at a time, in the workspace, through
+   `/bin/sh -c`, recording each call and its result in the transcript;
+5. records its own exit and the run's outcome.
+
+The **declared tool set** is exactly one tool: `shell`, run inside the workspace. Until
+model calls exist, the steps come from the agent's own `steps.txt`. Delete that file and
+a run declares no steps. A step that fails ends the run, and later steps do not run.
 
 ### Finishing
 
-The outcome of a run is decided by the process, never by what the process wrote. A clean exit
-succeeds. A stop requested by the tool is recorded as stopped. A run that reaches its deadline is
-recorded as failed for that reason. Stopping a run signals the whole process group — so tools the
-agent started are stopped too — first politely, then forcibly after a short grace.
+The outcome is decided by the process, never by what it wrote:
 
-### Lifetime
+| How it ended | Outcome |
+|---|---|
+| the process exited 0 and every step succeeded | `succeeded` |
+| the process exited non-zero, or a step failed | `failed` |
+| the tool stopped it on request | `stopped` |
+| the tool stopped it for its timeout | `timed_out` |
 
-Each run has one absolute deadline, fixed when the run starts. The deadline reserves a shutdown
-grace before it, so the process is stopped early enough to end cleanly. Nothing extends a deadline:
-not a retry, not a new turn, not a pause and resume. The next attempt is a new run with a new
-deadline.
+The agent process writes the terminal record when it ends on its own. When the tool
+stops a run, the process cannot write anything, so the tool writes the terminal record
+instead — exactly one terminal record per run, either way.
 
-### Records
+### The log and the transcript
 
-Each run writes two things: a JSONL transcript of the run (its identity, timestamps, model calls and
-tool effects, with explicit truncation flags where a payload was too large) and a log file carrying
-the agent process's own output. Append is crash-safe: a partial final line is recognised as partial
-and the next line is never written onto it.
+`run.log` holds the agent process's own lines and the output of every declared step.
 
-### Supervision
+`transcript.jsonl` is append-only, one JSON object per line, each with an `event` tag:
+`run_started`, `instruction_read`, `skills_discovered`, `tool_call`, `tool_result`,
+`child_exit`, `run_finished`. Nothing already written is ever rewritten. A file whose
+last line has no newline after it is the remains of a crash: that incomplete line is
+dropped before the next record is appended, so a new record is never written onto it.
 
-One long-lived supervising process owns each agent. It holds an exclusive reservation for that agent,
-so two supervisors can never own one agent at once. After an unclean end it waits a full run-length
-window before resuming, so it can never overlap a predecessor that is still finishing. Then it runs a
-session loop: read the pause setting, clean up any residue, prepare a run, execute it, classify the
-outcome, and either take the success cooldown or the failure backoff.
+## Timeouts and how many agents run at once
 
-The supervisor publishes a state for each agent — starting, running, waiting, cooling down, backing
-off, paused, stopped — together with the current run, the number of consecutive failures, the reason
-for the last failure, and whether cleanup is pending.
+Both are configuration:
 
-### Pausing and waking
+```toml
+[limits]
+run_timeout_secs = 900        # 1 to 86400; default 900
+max_concurrent_agents = 10    # 1 to 64; default 10
+```
 
-Pausing is a setting, not a signal. It is read at the start of a run and never interrupts one in
-progress: the running run finishes, its record is written, and the agent then stops cleanly. A pause
-setting that cannot be read is not permission to keep going; the supervisor waits and tries again.
+A run that reaches its timeout is signalled and recorded as `timed_out`, with the
+reason on screen and in the transcript.
 
-A wake request asks the supervisor to start the next run as soon as the current one is done. It
-coalesces: many wake requests while a run is active produce one next run, and never interrupt the
-active run. This is also what the optional systemd unit's reload action does.
+At most `max_concurrent_agents` agents run at once. A start beyond that limit **waits
+its turn**; it does not fail. The agent list shows how many are running and how many are
+waiting, and the waiting start becomes a running one as soon as a slot is free. Calling
+off a start that is still waiting leaves a `stopped` run behind.
 
-### Concurrency
+## Stopping
 
-At most ten agents run at once by default. Each agent may also have a small bound on how many model
-requests it keeps in flight, so one agent cannot use the whole model endpoint by itself.
+Stopping a run signals its whole process group — so tools the agent started are stopped
+too — politely first (`SIGTERM`), and forcibly (`SIGKILL`) after a short grace. The tool
+then reaps the child and sweeps the group again, so a run leaves nothing of itself
+running. Leaving the UI stops every run the same way, within a budget.
 
-### Failure
+## Editing an instruction, skills and steps
 
-Failures fall into two classes, and the difference matters.
+The UI does not grow its own editor. It hands a path to the program you already chose:
+`$EDITOR` (or `$VISUAL`, or `vi`) for editing, `$PAGER` for reading a log. The path is
+always passed as an argument, never pasted into command text. The terminal is put back
+exactly as it was when the program exits.
 
-- **Retryable**: network and capacity problems. The supervisor waits a bounded, jittered backoff and
-  tries again. Consecutive failures lengthen the wait up to a configured maximum. A success resets
-  the count and takes a short cooldown instead.
-- **Not retryable**: an identity that does not check out, a configuration that fails validation, a
-  record whose digest disagrees with its content, a transaction whose result cannot be proved. The
-  run stops and the reason is surfaced. Retrying these would only repeat the same wrong thing.
+Keys on the instruction screen:
 
-### Stopping and cleanup
+- `e` — edit `instruction.md` (created from a short template if it is absent);
+- `K` — hand the `skills/` directory to your editor (create one directory per skill,
+  each with a `SKILL.md`);
+- `t` — edit `steps.txt`.
 
-When an agent is stopped — by request, by a pause, or by the tool shutting down — cleanup gets its
-own time budget, independent of the stop request, so a shutdown can never erase the obligation to
-clean up. The tool proves the child process is gone before it declares the agent stopped: an
-observed-but-uncertain state is never treated as "already gone". A cleanup failure is recorded as a
-cleanup failure, distinct from whatever ended the run in the first place.
+## The workspace is a layout, not a sandbox
 
-## Where runs are controlled
+This matters enough to say twice.
 
-The TUI is the only entrypoint. It lists agents and their states, starts and stops the tool, pauses
-and resumes agents, wakes an agent, edits an agent's configuration and its instruction, and manages
-its skill set. The same controls are available as documented commands, so the tool can be run without
-the TUI where that is useful.
+An agent runs **as you**: the same user, the same machine, your rights. Its workspace is
+a directory and its steps are started with that directory as their working directory —
+that is the whole intent, and it is **not confinement**. A step can read anything you
+can read, including the credentials file, and it can write anywhere you can write. The
+tool deliberately asks the operating system for no isolation: no container runtime, no
+service, no privilege change. The honest statement is that the workspace is a layout you
+can reason about, not a boundary that holds.
 
-An optional systemd mode runs the tool as services: one supervising process per agent, restarted on
-failure, with the same pause, wake and cleanup behaviour. The mode changes only who starts the
-supervisor; the run behaviour above is identical either way.
+## What is not here yet
+
+- **The model call.** A run follows its declared steps; it does not decide them. The
+  model that would choose steps is the next round, and the instruction screen says so.
+- **The Forgejo work.** No request is made, no role is checked and no repository is
+  looked at. Each run's workspace is a plain directory, not a clone from the Forgejo.
+- **Secrets.** No run reads the credentials file, because nothing yet needs one.
