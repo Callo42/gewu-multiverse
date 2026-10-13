@@ -21,20 +21,29 @@ records are plain logs and JSONL transcripts.
 
 ## Status
 
-**Skeleton, and honest about it.** The crate builds, installs and opens the terminal UI. In place
-now:
+**An agent runs; the model and the Forgejo are the next rounds.** In place now:
 
-- the terminal UI, with a screen per thing you configure: the agent list, one agent's settings, its
-  instruction and skills, the Forgejo connection and the role check, the credentials file, and runs;
-- one configuration file, validated on load, with a clear message instead of a crash when it is
-  wrong;
-- one credentials file, created with mode **0600**, whose contents are never read, printed, logged or
-  put on a command line;
-- the first-run risk acknowledgment, required once per installation before any agent may be started.
+- the terminal UI, with a screen per thing you configure: the agent list and each
+  agent's state, one agent's settings, its instruction and skills, the Forgejo
+  connection and the role check, the credentials file, and the recent runs;
+- one configuration file, validated on load, with a clear message instead of a crash
+  when it is wrong — including the run timeout and the limit on agents running at once;
+- one credentials file, created with mode **0600**, whose contents are never read,
+  printed, logged or put on a command line;
+- the first-run risk acknowledgment, required once per installation before any agent
+  may be started;
+- **agents that actually run**: one child process per agent, in its own workspace, with
+  an instruction, a skill set and a declared list of shell steps; started, stopped and
+  watched from the UI, within a configurable concurrency limit and under a configurable
+  timeout; each run leaving a log and an append-only JSONL transcript under
+  `~/.local/state/gewu-multiverse/<agent>/<run-id>/`;
+- editing an agent's instruction, its skills and its declared steps from the UI, through
+  your own `$EDITOR`, and reading a run's log through your own `$PAGER`.
 
-Not there yet, and named as such on the screens that would show them: running an agent (so nothing
-starts, stops or watches one), any network request, run records and transcripts, instruction and
-skill handling, editing from the UI, and the Forgejo repository check.
+Not there yet, and named as such on the screens that would show them: **the model
+call** (a run follows its declared steps; it does not decide them) and **the Forgejo
+work** (no request is made, no role is checked, and a workspace is a plain directory
+rather than a clone). See [How an agent runs](docs/agent-execution.md) for the details.
 
 ## Install
 
@@ -55,16 +64,21 @@ your own configuration directory (`~/.config/gewu-multiverse` on Linux), shows t
 acknowledgment once, and asks you to confirm it. Edit the configuration file, then press `r` to
 re-read it. `gewu-multiverse --config-dir <dir>` keeps the files somewhere else instead.
 
-Keys: `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch screens, `up`/`down` choose an agent,
-`enter` opens it, `esc` goes back to the list, `s` asks to start the chosen agent, `r` re-reads the
-files.
+Keys: `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch screens, `up`/`down` choose
+an agent (or a run on the runs screen), `enter` opens the chosen agent, `esc` goes back
+to the list, `s` starts the chosen agent, `x` stops it, `e` edits its instruction, `K`
+opens its skills directory, `t` edits its declared run steps, `o` opens its newest log,
+and `r` re-reads the files. Each agent's own files live under
+`<config dir>/agents/<name>/`; its runs are recorded under
+`~/.local/state/gewu-multiverse/<name>/`. `--state-dir <dir>` moves the run records.
 
 ## Running agents is not a sandbox
 
 Agents run **as you**, in their own workspace directory, with no privilege escalation — a `sudo` attempt fails. That is a
 layout, not a security boundary: an agent can read anything your user can read, **including the credentials file**, and it acts
 with your rights on this machine. The tool shows you where the credentials file lives, and asks you to acknowledge this once on
-first start.
+first start. A run's declared steps are started with the workspace as their working directory, and nothing more: the tool asks
+the operating system for no isolation at all.
 
 ## Licence
 

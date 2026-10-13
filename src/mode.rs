@@ -6,7 +6,8 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// The only mode the credentials file may have: its user alone may read and write it.
@@ -30,6 +31,23 @@ pub fn render(mode: u32) -> String {
     format!("{:04o}", mode)
 }
 
+/// Write a whole file with mode 0600, replacing whatever was there.
+///
+/// The mode is set at creation and checked afterwards, so a file that already
+/// existed with a wider mode does not keep it.
+pub fn write_private(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
+    let path = path.as_ref();
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(SECRET_FILE_MODE)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    set_mode(path, SECRET_FILE_MODE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +56,17 @@ mod tests {
     fn a_mode_is_rendered_with_leading_zeroes() {
         assert_eq!(render(0o600), "0600");
         assert_eq!(render(0o700), "0700");
+    }
+
+    #[test]
+    fn a_private_write_always_leaves_mode_0600() {
+        let root = crate::test_support::scratch_root("mode-private");
+        let path = root.join("a-file");
+        write_private(&path, b"first").expect("written");
+        assert_eq!(mode_of(&path).expect("mode readable"), 0o600);
+        set_mode(&path, 0o644).expect("widened for the test");
+        write_private(&path, b"second").expect("written again");
+        assert_eq!(mode_of(&path).expect("mode readable"), 0o600);
+        assert_eq!(fs::read_to_string(&path).expect("readable"), "second");
     }
 }
