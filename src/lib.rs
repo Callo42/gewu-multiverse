@@ -1,17 +1,26 @@
 //! `gewu-multiverse` — a local, single-Universe Matrixverse.
 //!
-//! This crate is the skeleton of the terminal application: it opens the UI, reads one
-//! configuration file, prepares one credentials file, and records the first-run risk
-//! acknowledgment. No agent runs yet and no network request is made yet.
+//! This crate is the terminal application: it opens the UI, reads one configuration
+//! file, prepares one credentials file, records the first-run risk acknowledgment,
+//! and runs agents as ordinary local child processes. A run reads an instruction, a
+//! skill set and a declared list of shell steps, and leaves a log and an append-only
+//! JSONL transcript. No model is called and no request is made to the Forgejo yet.
 //!
 //! The modules are:
 //!
-//! - [`cli`] — the three arguments the program accepts;
-//! - [`paths`] — the one directory the three files live in;
+//! - [`cli`] — the arguments the program accepts;
+//! - [`naming`] — what an agent name may be, because directories derive from it;
+//! - [`paths`] — the two roots and every path derived from an agent's name;
 //! - [`config`] — the configuration file and its validation;
-//! - [`mode`] — the file modes the two files are held to;
+//! - [`mode`] — the file modes the private files are held to;
 //! - [`credentials`] — the credentials file (created, never read);
 //! - [`risk`] — the first-run risk acknowledgment and its record;
+//! - [`time`] — the clock, and how an instant is written down;
+//! - [`transcript`] — the append-only record of a run;
+//! - [`run`] — a run's identity, its plan and its outcome;
+//! - [`agent_run`] — the agent process itself, one run at a time;
+//! - [`supervisor`] — starting, watching and stopping agent processes;
+//! - [`editor`] — handing a file to the user's own editor or pager;
 //! - [`ui`] — drawing the screens;
 //! - [`app`] — the state behind the screens and the key bindings.
 
@@ -20,13 +29,20 @@ compile_error!(
     "gewu-multiverse targets Unix-like systems: it needs a terminal and 0600 file modes."
 );
 
+pub mod agent_run;
 pub mod app;
 pub mod cli;
 pub mod config;
 pub mod credentials;
+pub mod editor;
 pub mod mode;
+pub mod naming;
 pub mod paths;
 pub mod risk;
+pub mod run;
+pub mod supervisor;
+pub mod time;
+pub mod transcript;
 pub mod ui;
 
 #[cfg(test)]

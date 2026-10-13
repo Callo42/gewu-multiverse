@@ -4,6 +4,10 @@
 //! The terminal is restored on every way out, including a panic: [`Screen`] puts it
 //! back when it is dropped. Running without a terminal is refused with a sentence,
 //! not a panic.
+//!
+//! One branch of the program does not draw anything: `--run-agent <run dir>` is one
+//! agent run, and it is how the tool starts an agent — as a child process of itself.
+//! It reads its plan, does the work, writes its log and transcript, and exits.
 
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
@@ -13,8 +17,10 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use gewu_multiverse::app::App;
+use gewu_multiverse::agent_run;
+use gewu_multiverse::app::{ActionKind, App, PendingAction};
 use gewu_multiverse::cli::{Cli, HELP, Invocation, parse_args};
+use gewu_multiverse::editor;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::ui;
 use ratatui::Terminal;
@@ -40,6 +46,12 @@ fn main() -> ExitCode {
         Invocation::Version => {
             println!("gewu-multiverse {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
+        }
+        Invocation::RunAgent { run_dir } => {
+            // One run of one agent, with the plan already written into run_dir. This
+            // is the process the supervisor starts; it needs no terminal and no UI.
+            let end = agent_run::execute(&run_dir);
+            ExitCode::from(end.exit_code.clamp(0, 255) as u8)
         }
         Invocation::Run(cli) => match run(cli) {
             Ok(()) => ExitCode::SUCCESS,
@@ -74,21 +86,40 @@ fn run(cli: Cli) -> Result<(), StartupError> {
     }
 
     let layout = match cli.root {
-        Some(root) => Layout::rooted_at(root),
-        None => Layout::in_user_config_dir()?,
+        Some(root) => {
+            let layout = Layout::rooted_at(root);
+            match cli.state_root {
+                Some(state) => layout.with_state_root(state),
+                None => layout,
+            }
+        }
+        None => {
+            let layout = Layout::in_user_config_dir()?;
+            match cli.state_root {
+                Some(state) => layout.with_state_root(state),
+                None => layout,
+            }
+        }
     };
 
     let mut app = App::new(layout);
     let mut screen = Screen::enter()?;
     let drawn = event_loop(&mut screen, &mut app);
+    // Stop every run before the terminal comes back, and prove the children are gone.
+    let stopped = app.shutdown();
     let left = screen.leave();
     drawn.and(left)?;
+    if stopped > 0 {
+        println!("gewu-multiverse: stopped {stopped} running agent(s) before leaving");
+    }
     Ok(())
 }
 
 /// Draw, then wait for a key, until the user asks to leave.
 fn event_loop(screen: &mut Screen, app: &mut App) -> io::Result<()> {
     loop {
+        // Read every live process and refresh the run records before drawing.
+        app.tick();
         screen.terminal.draw(|frame| ui::draw(frame, app))?;
         if app.should_quit {
             return Ok(());
@@ -101,10 +132,30 @@ fn event_loop(screen: &mut Screen, app: &mut App) -> io::Result<()> {
                 }
             }
         }
+        // Editing a file or reading a log means leaving the UI for a moment and
+        // coming back; only this loop can do that.
+        if let Some(action) = app.take_action() {
+            let result = hand_to_the_user(screen, &action)?;
+            app.note_action(&action, result);
+        }
     }
 }
 
-/// The terminal while the UI is on it.
+/// Step out of the UI, hand a path to the user's editor or pager, and step back in.
+fn hand_to_the_user(
+    screen: &mut Screen,
+    action: &PendingAction,
+) -> io::Result<io::Result<std::process::ExitStatus>> {
+    screen.suspend()?;
+    let result = match action.kind {
+        ActionKind::Edit => editor::edit(&action.path),
+        ActionKind::View => editor::view(&action.path),
+    };
+    screen.resume()?;
+    Ok(result)
+}
+
+/// The terminal while the UI is on it, or while it is stepped out of the way.
 struct Screen {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     active: bool,
@@ -126,7 +177,28 @@ impl Screen {
         })
     }
 
-    /// Put the terminal back. Safe to call more than once.
+    /// Step out of the UI: hand the terminal back to the user's own program.
+    fn suspend(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        disable_raw_mode()?;
+        crossterm::execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+        Ok(())
+    }
+
+    /// Come back into the UI after a program has finished with the terminal.
+    fn resume(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        enable_raw_mode()?;
+        crossterm::execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        self.terminal.clear()
+    }
+
+    /// Put the terminal back for good. Safe to call more than once.
     fn leave(&mut self) -> io::Result<()> {
         if !self.active {
             return Ok(());
