@@ -9,7 +9,9 @@ You install it, open the terminal UI, and it lets you:
   administrative views, an ordinary one cannot);
 - define **how many agents** you want, each with its **own model endpoint, key and instructions**;
 - use the agent identities and tokens so that an agent's commits are attributed to that agent, never to you;
-- start, stop and watch agents, with a log and a transcript for every run;
+- start, stop and watch agents, with a log and a transcript for every run — as children
+  of the UI by default, or as **user units** that outlive the window, when you ask for
+  that per agent;
 - check the repositories you can reach — under the role you configured.
 
 ## What this deliberately is not
@@ -39,6 +41,12 @@ records are plain logs and JSONL transcripts.
   watched from the UI, within a configurable concurrency limit and under a configurable
   timeout; each run leaving a log and an append-only JSONL transcript under
   `~/.local/state/gewu-multiverse/<agent>/<run-id>/`;
+- **two ways to supervise an agent** (`m`): the default is a child of the terminal UI,
+  which stops when the UI exits; the opt-in `systemd` mode runs an agent as a **user
+  unit** of your own systemd, so it keeps running when the window closes, and is
+  visible to `systemctl --user status`. The unit is written by the tool, holds no
+  secret, runs exactly the command the UI would run, and restarts a failed run within a
+  declared bound. See [Two ways an agent can be supervised](docs/systemd-mode.md);
 - **a direct model call**: a run posts one non-streaming chat request to the endpoint
   its agent's configuration names, with the model id and the key from the credentials
   file. It runs the tool calls the model asks for inside the workspace, feeds the
@@ -64,10 +72,37 @@ records are plain logs and JSONL transcripts.
 - editing an agent's instruction, its skills and its declared steps from the UI, through
   your own `$EDITOR`, and reading a run's log through your own `$PAGER`.
 
-Still to come, and named as such rather than pretended: a **`systemd` mode** (running
-agents as services) and the first-run/quickstart polish around it. See
-[Connecting a Forgejo](docs/forgejo.md) and [How an agent runs](docs/agent-execution.md)
-for the details.
+Still to come, and named as such rather than pretended: the first-run/quickstart polish.
+See [Connecting a Forgejo](docs/forgejo.md), [How an agent runs](docs/agent-execution.md)
+and [Two ways an agent can be supervised](docs/systemd-mode.md) for the details.
+
+## Two ways an agent can be supervised
+
+An agent runs as a **child of the terminal UI** unless you say otherwise. That is the
+default, and it is what you want most of the time: the run belongs to the session you
+started it in, and leaving the UI stops it and proves the process is gone.
+
+When work should outlive the window it was started from, move an agent to the opt-in
+**`systemd` mode** with `m`. The tool then writes one **user unit** under your own
+systemd directory — `~/.config/systemd/user/gewu-agent-<name>.service`, never a system
+unit, never root — and asks your own `systemctl --user` to start it. The unit runs
+exactly the command the UI would run, with the agent's workspace as its working
+directory, keeps no secret (the run reads the credentials file itself), and writes the
+same log and transcript. Leaving the UI does not stop it; `x` stops it in either mode,
+and `systemctl --user status gewu-agent-<name>.service` shows it like any other unit.
+A failed run is restarted within a declared bound (`Restart=on-failure`, at most three
+starts in sixty seconds), and every restart systemd reports is written into the run's
+own log.
+
+The two modes are two ways to supervise the same run, not two kinds of agent: the mode
+is recorded per agent and can be switched at any time, **except while the agent is
+running**, when the switch is refused with a sentence saying to stop it first.
+
+This mode needs a **user session** (a systemd instance running as you), and
+`loginctl enable-linger "$USER"` if an agent should keep running after you log out. It
+is a convenience, **not a security boundary**: a unit runs as you, with your rights,
+exactly like the default. [Two ways an agent can be supervised](docs/systemd-mode.md)
+says all of this at length, including what the machine must have.
 
 ## Connecting a Forgejo
 
@@ -179,7 +214,8 @@ re-read it. `gewu-multiverse --config-dir <dir>` keeps the files somewhere else 
 Keys: `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch screens, `up`/`down` choose
 an agent (or a run on the runs screen, or a repository on the Forgejo screen), `enter`
 opens the chosen agent, `esc` goes back
-to the list, `s` starts the chosen agent, `x` stops it, `p` tests its model endpoint,
+to the list, `s` starts the chosen agent, `x` stops it, `m` moves it between the two
+supervision modes (`tui` and `systemd`), `p` tests its model endpoint,
 `c` checks the Forgejo role, `i` settles the chosen agent's Forgejo identity, `g`
 clones the chosen repository into its workspace, `P` opens a pull request as the agent,
 `U` updates the newest open one, `e` edits its instruction, `K`
