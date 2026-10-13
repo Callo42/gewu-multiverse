@@ -4,8 +4,9 @@ This document describes what happens when you start an agent. It describes the t
 as it is now: an agent runs as an ordinary local child process, with an instruction, a
 skill set and a declared list of shell steps, calls the model at its own configured
 endpoint, runs the tool calls the model asks for inside its workspace, and leaves a log
-and an append-only transcript. **No request is made to the Forgejo yet**; that is named
-where it would appear.
+and an append-only transcript. The Forgejo side is described in
+[Connecting a Forgejo](forgejo.md): the role check, one identity per agent, and the
+clone an agent works in.
 
 ## What an agent is
 
@@ -217,8 +218,10 @@ output, a model reply, an error message — before it reaches the transcript or 
 
 ## What is not here yet
 
-- **The Forgejo work.** No request is made, no role is checked and no repository is
-  looked at. Each run's workspace is a plain directory, not a clone from the Forgejo.
+- **A service mode.** The tool is a program you start, not a daemon, and there is no
+  `systemd` mode yet.
 - **Streaming a reply.** The model exchange is one request and one reply. A streamed
   exchange would fill the same reply before the turn ends; it is not here yet.
-- **A service mode.** The tool is a program you start, not a daemon.
+- **The clone inside the workspace is not made for you on start.** You clone a
+  repository from the Forgejo screen (`g`); a run does not clone one by itself. See
+  [Connecting a Forgejo](forgejo.md).

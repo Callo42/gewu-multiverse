@@ -202,11 +202,11 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
         assert!(!text.is_empty());
     }
 
-    // The one screen that still has nothing behind it says so.
+    // The Forgejo screen names the URL and role and says no check has been run yet.
     app.show(Screen::Forgejo);
     let forgejo = render(&app);
     assert!(
-        forgejo.contains("Placeholder"),
+        forgejo.contains("no role check has been run yet"),
         "Forgejo must say what is not there yet:\n{forgejo}"
     );
 
@@ -299,7 +299,94 @@ fn the_forgejo_screen_shows_the_configured_url_and_role_and_claims_no_check() {
     let screen = render(&app);
     assert!(screen.contains("https://forgejo.example.org"), "{screen}");
     assert!(screen.contains("member"), "{screen}");
-    assert!(screen.contains("no request has been sent"), "{screen}");
+    assert!(
+        screen.contains("no role check has been run yet"),
+        "{screen}"
+    );
+    assert!(screen.contains("admin token"), "{screen}");
+    assert!(
+        screen.contains("absent (identities are supplied)"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_forgejo_screen_shows_a_role_check_and_an_identity_plainly() {
+    use gewu_multiverse::app::{ForgejoFailure, IdentityReport};
+    use gewu_multiverse::config::Role;
+    use gewu_multiverse::forgejo::{Permissions, Repository, RoleCheck, Viewer};
+    use gewu_multiverse::identity::{AgentIdentity, IdentityMode};
+
+    let root = scratch("forgejo-check");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.role_check = Some(Ok(RoleCheck {
+        url: "https://forgejo.example.org".to_owned(),
+        role: Role::Admin,
+        viewer: Viewer {
+            login: "root".to_owned(),
+            email: None,
+            description: None,
+            is_admin: true,
+        },
+        repositories: vec![
+            Repository {
+                full_name: "root/demo".to_owned(),
+                namespace: "root".to_owned(),
+                name: "demo".to_owned(),
+                private: false,
+                default_branch: Some("main".to_owned()),
+                html_url: None,
+                permissions: Permissions {
+                    admin: true,
+                    push: true,
+                    pull: true,
+                },
+            },
+            Repository {
+                full_name: "root/private".to_owned(),
+                namespace: "root".to_owned(),
+                name: "private".to_owned(),
+                private: true,
+                default_branch: Some("main".to_owned()),
+                html_url: None,
+                permissions: Permissions {
+                    admin: true,
+                    push: true,
+                    pull: true,
+                },
+            },
+        ],
+        private_visible: 1,
+    }));
+    app.repo_selected = 1;
+    app.identity_report = Some(IdentityReport {
+        agent: "scribe".to_owned(),
+        result: Ok(AgentIdentity {
+            agent: "scribe".to_owned(),
+            login: "gewu-scribe".to_owned(),
+            email: "gewu-scribe@agents.invalid".to_owned(),
+            mode: IdentityMode::Managed,
+            created: true,
+        }),
+    });
+    app.show(Screen::Forgejo);
+    let screen = render(&app);
+    show("Forgejo (checked)", &app);
+    assert!(screen.contains("administrative view"), "{screen}");
+    assert!(screen.contains("root/private"), "{screen}");
+    assert!(screen.contains("private"), "{screen}");
+    assert!(screen.contains("root sees 2 repository(ies)"), "{screen}");
+    assert!(screen.contains("gewu-scribe"), "{screen}");
+    assert!(screen.contains("(created"), "{screen}");
+
+    // A refused check names its class rather than hiding it.
+    app.role_check = Some(Err(ForgejoFailure {
+        class: "not_admin".to_owned(),
+        message: "the token belongs to `author`".to_owned(),
+    }));
+    let screen = render(&app);
+    assert!(screen.contains("not_admin"), "{screen}");
 }
 
 #[test]

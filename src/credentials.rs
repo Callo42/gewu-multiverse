@@ -36,12 +36,22 @@ pub const TEMPLATE: &str = r#"# gewu-multiverse credentials
 # alone. It is never printed, never written to a log, and never passed on a command
 # line. The configuration file holds no secret at all.
 #
-# Put the token you use to reach your Forgejo here.
-
+# The token the tool uses for the role check: the repositories it lists are the
+# repositories this token can see. Put a member's token here for an ordinary view,
+# or an administrator's token when the configuration says role = "admin".
 forgejo_token = ""
+#
+# An administrator's token, if you have one. With it, the tool creates and manages
+# one Forgejo account and token per agent, derived from the agent's name. Without
+# it, supply each agent's token under [forgejo_agent_tokens] below.
+forgejo_admin_token = ""
 
 [model_keys]
 # One key per agent name. For an agent called example-agent:
+# "example-agent" = ""
+
+[forgejo_agent_tokens]
+# One token per agent name, used when no administrator token is configured above:
 # "example-agent" = ""
 "#;
 
@@ -135,6 +145,23 @@ pub enum CredentialsError {
         path: PathBuf,
         /// The agent whose key is absent.
         agent: String,
+    },
+    /// The file holds no Forgejo token under the key that was asked for.
+    #[error("the credentials file {path} records no Forgejo value under `{key}`; add one there")]
+    MissingToken {
+        /// The file that was read.
+        path: PathBuf,
+        /// The key that was empty or absent.
+        key: String,
+    },
+    /// The file could not be rewritten after an identity was recorded.
+    #[error("the credentials file {path} cannot be rewritten: {source}")]
+    Rewrite {
+        /// The file that failed.
+        path: PathBuf,
+        /// The reason from the filesystem.
+        #[source]
+        source: io::Error,
     },
 }
 
@@ -298,6 +325,146 @@ impl fmt::Display for Secret {
 /// `model_key` at the top level is accepted as a key for every agent. An absent or
 /// empty key is a sentence naming the file and the agent, never a guess.
 pub fn model_key(path: &Path, agent: &str) -> Result<Secret, CredentialsError> {
+    let value = read_value(path)?;
+    let key = value
+        .get("model_keys")
+        .and_then(|keys| keys.get(agent))
+        .and_then(toml::Value::as_str)
+        .or_else(|| value.get("model_key").and_then(toml::Value::as_str))
+        .unwrap_or("");
+    if key.trim().is_empty() {
+        return Err(CredentialsError::MissingKey {
+            path: path.to_path_buf(),
+            agent: agent.to_owned(),
+        });
+    }
+    Ok(Secret::new(key.to_owned()))
+}
+
+/// Read the token the role check uses, from `forgejo_token`.
+pub fn forgejo_token(path: &Path) -> Result<Secret, CredentialsError> {
+    let value = read_value(path)?;
+    secret_at(path, &value, "forgejo_token")
+}
+
+/// Read the administrator's token, from `forgejo_admin_token`, when there is one.
+///
+/// This is the switch between the two identity paths: an administrator token means
+/// the tool creates and manages one identity per agent; no token means the user
+/// supplies each agent's own token.
+pub fn forgejo_admin_token(path: &Path) -> Result<Option<Secret>, CredentialsError> {
+    let value = read_value(path)?;
+    match value
+        .get("forgejo_admin_token")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+    {
+        Some(text) if !text.is_empty() => Ok(Some(Secret::new(text.to_owned()))),
+        _ => Ok(None),
+    }
+}
+
+/// Read the Forgejo token that was supplied for one agent.
+pub fn forgejo_agent_token(path: &Path, agent: &str) -> Result<Secret, CredentialsError> {
+    forgejo_agent_token_optional(path, agent)?.ok_or_else(|| CredentialsError::MissingToken {
+        path: path.to_path_buf(),
+        key: format!("forgejo_agent_tokens.{agent}"),
+    })
+}
+
+/// Read the Forgejo token supplied for one agent, when one is there.
+pub fn forgejo_agent_token_optional(
+    path: &Path,
+    agent: &str,
+) -> Result<Option<Secret>, CredentialsError> {
+    let value = read_value(path)?;
+    Ok(value
+        .get("forgejo_agent_tokens")
+        .and_then(|tokens| tokens.get(agent))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| Secret::new(text.to_owned())))
+}
+
+/// The Forgejo login recorded for an agent, when one was recorded.
+pub fn recorded_login(path: &Path, agent: &str) -> Result<Option<String>, CredentialsError> {
+    let value = read_value(path)?;
+    Ok(text_at(&value, "forgejo_logins", agent))
+}
+
+/// The email recorded for an agent's identity, when one was recorded.
+pub fn recorded_email(path: &Path, agent: &str) -> Result<Option<String>, CredentialsError> {
+    let value = read_value(path)?;
+    Ok(text_at(&value, "forgejo_emails", agent))
+}
+
+/// Which identity path the credentials file records, when it records one.
+pub fn recorded_identity_mode(path: &Path) -> Result<Option<String>, CredentialsError> {
+    let value = read_value(path)?;
+    Ok(text_at(&value, "forgejo_identity_mode", ""))
+}
+
+/// Record an agent's identity in the credentials file.
+///
+/// The token is only written when one is given; recording a login and an email for
+/// an already-supplied token leaves that token alone. The whole file is rewritten so
+/// the change is atomic from a reader's point of view, and it is held to mode 0600.
+pub fn record_agent_identity(
+    path: &Path,
+    agent: &str,
+    token: Option<&Secret>,
+    login: &str,
+    email: &str,
+    mode: &str,
+) -> Result<(), CredentialsError> {
+    let mut value = read_value(path)?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| CredentialsError::MissingToken {
+            path: path.to_path_buf(),
+            key: "the credentials file".to_owned(),
+        })?;
+    if let Some(token) = token {
+        let tokens = table
+            .entry("forgejo_agent_tokens".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let Some(tokens) = tokens.as_table_mut() {
+            tokens.insert(
+                agent.to_owned(),
+                toml::Value::String(token.expose().to_owned()),
+            );
+        }
+    }
+    let logins = table
+        .entry("forgejo_logins".to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let Some(logins) = logins.as_table_mut() {
+        logins.insert(agent.to_owned(), toml::Value::String(login.to_owned()));
+    }
+    let emails = table
+        .entry("forgejo_emails".to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let Some(emails) = emails.as_table_mut() {
+        emails.insert(agent.to_owned(), toml::Value::String(email.to_owned()));
+    }
+    table.insert(
+        "forgejo_identity_mode".to_owned(),
+        toml::Value::String(mode.to_owned()),
+    );
+    let text = toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Read the credentials file, refusing one that is not a private plain file.
+fn read_value(path: &Path) -> Result<toml::Value, CredentialsError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -333,23 +500,36 @@ pub fn model_key(path: &Path, agent: &str) -> Result<Secret, CredentialsError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let value: toml::Value = toml::from_str(&text).map_err(|error| CredentialsError::Syntax {
+    toml::from_str(&text).map_err(|error| CredentialsError::Syntax {
         path: path.to_path_buf(),
         message: error.to_string(),
-    })?;
-    let key = value
-        .get("model_keys")
-        .and_then(|keys| keys.get(agent))
-        .and_then(toml::Value::as_str)
-        .or_else(|| value.get("model_key").and_then(toml::Value::as_str))
-        .unwrap_or("");
-    if key.trim().is_empty() {
-        return Err(CredentialsError::MissingKey {
+    })
+}
+
+/// One top-level secret, or a sentence naming the key that is empty or absent.
+fn secret_at(path: &Path, value: &toml::Value, key: &str) -> Result<Secret, CredentialsError> {
+    match value.get(key).and_then(toml::Value::as_str).map(str::trim) {
+        Some(text) if !text.is_empty() => Ok(Secret::new(text.to_owned())),
+        _ => Err(CredentialsError::MissingToken {
             path: path.to_path_buf(),
-            agent: agent.to_owned(),
-        });
+            key: key.to_owned(),
+        }),
     }
-    Ok(Secret::new(key.to_owned()))
+}
+
+/// A string under a table, or a top-level string when `key` is empty.
+fn text_at(value: &toml::Value, table: &str, key: &str) -> Option<String> {
+    if key.is_empty() {
+        return value
+            .get(table)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+    }
+    value
+        .get(table)
+        .and_then(|table| table.get(key))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -524,5 +704,152 @@ mod tests {
             model_key(&path, "scribe"),
             Err(CredentialsError::Syntax { .. })
         ));
+    }
+
+    #[test]
+    fn the_forgejo_tokens_are_read_from_their_own_keys() {
+        let path = credentials_with(
+            "credentials-forgejo",
+            "forgejo_token = \"role-token\"\nforgejo_admin_token = \"admin-token\"\n\n[forgejo_agent_tokens]\n\"scribe\" = \"agent-token\"\n",
+        );
+        assert_eq!(
+            forgejo_token(&path).expect("a role token").expose(),
+            "role-token"
+        );
+        assert_eq!(
+            forgejo_admin_token(&path)
+                .expect("the file reads")
+                .expect("an admin token")
+                .expose(),
+            "admin-token"
+        );
+        assert_eq!(
+            forgejo_agent_token(&path, "scribe")
+                .expect("an agent token")
+                .expose(),
+            "agent-token"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_forgejo_token_is_a_sentence_not_a_guess() {
+        let path = credentials_with(
+            "credentials-forgejo-empty",
+            "forgejo_token = \"\"\nforgejo_admin_token = \"\"\n",
+        );
+        assert!(matches!(
+            forgejo_token(&path),
+            Err(CredentialsError::MissingToken { .. })
+        ));
+        assert!(
+            forgejo_admin_token(&path)
+                .expect("the file reads")
+                .is_none()
+        );
+        assert!(matches!(
+            forgejo_agent_token(&path, "scribe"),
+            Err(CredentialsError::MissingToken { .. })
+        ));
+        assert!(
+            forgejo_agent_token_optional(&path, "scribe")
+                .expect("the file reads")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recording_an_identity_writes_the_token_the_login_and_the_mode_privately() {
+        let path = credentials_with(
+            "credentials-record",
+            "forgejo_token = \"role-token\"\nforgejo_admin_token = \"admin-token\"\n\n[model_keys]\n\"scribe\" = \"sk-scribe\"\n",
+        );
+        record_agent_identity(
+            &path,
+            "scribe",
+            Some(&Secret::new("agent-token")),
+            "gewu-scribe",
+            "gewu-scribe@agents.invalid",
+            "managed",
+        )
+        .expect("the identity is recorded");
+
+        // The token is there, and so is everything else the file held.
+        assert_eq!(
+            forgejo_agent_token(&path, "scribe")
+                .expect("the token")
+                .expose(),
+            "agent-token"
+        );
+        assert_eq!(
+            forgejo_token(&path).expect("the role token").expose(),
+            "role-token"
+        );
+        assert!(
+            forgejo_admin_token(&path)
+                .expect("the file reads")
+                .is_some()
+        );
+        assert_eq!(
+            model_key(&path, "scribe").expect("the model key").expose(),
+            "sk-scribe"
+        );
+        assert_eq!(
+            recorded_login(&path, "scribe")
+                .expect("the file reads")
+                .as_deref(),
+            Some("gewu-scribe")
+        );
+        assert_eq!(
+            recorded_email(&path, "scribe")
+                .expect("the file reads")
+                .as_deref(),
+            Some("gewu-scribe@agents.invalid")
+        );
+        assert_eq!(
+            recorded_identity_mode(&path)
+                .expect("the file reads")
+                .as_deref(),
+            Some("managed")
+        );
+        // The rewrite keeps the file private.
+        assert_eq!(
+            mode_of(&path).expect("the mode is readable"),
+            SECRET_FILE_MODE
+        );
+    }
+
+    #[test]
+    fn recording_an_identity_without_a_token_leaves_the_supplied_token_alone() {
+        let path = credentials_with(
+            "credentials-record-supplied",
+            "[forgejo_agent_tokens]\n\"scribe\" = \"supplied-token\"\n",
+        );
+        record_agent_identity(
+            &path,
+            "scribe",
+            None,
+            "author",
+            "author@example.org",
+            "supplied",
+        )
+        .expect("the identity is recorded");
+        assert_eq!(
+            forgejo_agent_token(&path, "scribe")
+                .expect("the token")
+                .expose(),
+            "supplied-token"
+        );
+        assert_eq!(
+            recorded_login(&path, "scribe")
+                .expect("the file reads")
+                .as_deref(),
+            Some("author")
+        );
+        assert_eq!(
+            recorded_identity_mode(&path)
+                .expect("the file reads")
+                .as_deref(),
+            Some("supplied")
+        );
     }
 }

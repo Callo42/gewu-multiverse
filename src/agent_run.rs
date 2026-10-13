@@ -653,7 +653,8 @@ struct ToolOutcome {
 /// the whole intent: a tool is meant to work in the workspace. It is not confinement,
 /// and the documentation says so.
 fn run_shell(command: &str, plan: &RunPlan, log: &mut RunLog) -> Result<ToolOutcome, String> {
-    let mut child = Command::new("/bin/sh")
+    let mut child_command = Command::new("/bin/sh");
+    child_command
         .arg("-c")
         .arg(command)
         .current_dir(&plan.workspace)
@@ -662,7 +663,19 @@ fn run_shell(command: &str, plan: &RunPlan, log: &mut RunLog) -> Result<ToolOutc
         .stderr(Stdio::piped())
         .env("GEWU_AGENT", &plan.agent)
         .env("GEWU_RUN_ID", &plan.run_id)
-        .env("GEWU_WORKSPACE", &plan.workspace)
+        .env("GEWU_WORKSPACE", &plan.workspace);
+    // `git` in the workspace authenticates as the agent, and asks this same program
+    // for the token through `GIT_ASKPASS`. The token is read from the credentials
+    // file by the askpass process and handed over a pipe, so it is never an argument
+    // to a command, a URL or a line in the log.
+    if let Ok(askpass) = std::env::current_exe() {
+        child_command
+            .env("GIT_ASKPASS", askpass)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env(crate::workspace::ASKPASS_CREDENTIALS, &plan.credentials)
+            .env(crate::workspace::ASKPASS_AGENT, &plan.agent);
+    }
+    let mut child = child_command
         .spawn()
         .map_err(|error| format!("the command `{command}` cannot be started: {error}"))?;
 
