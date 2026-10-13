@@ -424,9 +424,9 @@ model = "example-model"
 endpoint = "https://model.example.org/v1"
 # How many model turns one run may take before the declared bound stops it (1 to 256).
 max_turns = 24
-# Relative to this file's directory. The tool also derives an agent's own directory
-# under agents/<name>/, holding its instruction.md, its skills/ and its workspace/.
-instruction = "instructions/example-agent.md"
+# The instruction path shown on the agent's screen. The run reads the derived
+# agents/<name>/instruction.md, which `e` writes; this field does not move it.
+instruction = "agents/example-agent/instruction.md"
 # How many model requests this agent may keep in flight at once (1 to 16).
 concurrency = 2
 "#;
