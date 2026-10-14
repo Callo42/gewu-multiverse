@@ -2769,3 +2769,28 @@ fn a_leftover_secret_names_the_age_of_the_credentials_file() {
         "the leftover has no age: {screen}"
     );
 }
+
+#[test]
+fn the_editor_confirmation_names_the_file_and_agrees_with_its_subject() {
+    // F5: the overlay said `press Y … or N to leave without saving`, but nano with an
+    // unmodified buffer leaves at `^X` at once, so the person's `N` reached the
+    // product and opened the add-agent form. The advice must be true in both cases.
+    // F6: `the declared steps of `scribe` opens in` did not agree with its subject.
+    let root = scratch("editor-confirm");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.editor_configured = false;
+    app.show(Screen::Instructions);
+    app.on_key(KeyEvent::from(KeyCode::Char('t')));
+    assert!(app.editor_confirm.is_some(), "the confirmation is up");
+    let screen = render(&app);
+    assert!(
+        screen.contains("the declared steps of `scribe` open in"),
+        "{screen}"
+    );
+    assert!(screen.contains("if it asks"), "{screen}");
+    assert!(
+        !screen.contains("N to leave without saving"),
+        "the advice still promises a prompt that may never come: {screen}"
+    );
+}

@@ -118,6 +118,12 @@ impl EditTarget {
             EditTarget::Steps => "declared steps",
         }
     }
+
+    /// Whether the label is a plural noun, so a sentence built around it takes a
+    /// plural verb (`the declared steps … open`, `the instruction … opens`) (F6).
+    pub fn is_plural(self) -> bool {
+        matches!(self, EditTarget::Steps)
+    }
 }
 
 /// The in-TUI form that gets a first user to a named agent without a text editor.
@@ -363,11 +369,17 @@ pub fn filesize_text(bytes: u64) -> String {
 }
 
 /// How long ago a test ran, in words, so a success cannot masquerade as current.
+///
+/// Every age string in the product comes from here, so the ladder is one ladder
+/// (W-6): an instant is `just now`, then seconds, then minutes, hours and days. The
+/// seconds rung is what keeps the first step after `just now` from being a full
+/// minute, which read as a jump when a report was watched.
 fn tested_age(tested_at_ms: u64) -> String {
     let now = crate::time::now_unix_ms();
     let seconds = now.saturating_sub(tested_at_ms) / 1000;
     match seconds {
-        0..=59 => "just now".to_owned(),
+        0..=9 => "just now".to_owned(),
+        10..=59 => format!("{seconds} seconds ago"),
         60..=3599 => {
             let minutes = seconds / 60;
             if minutes == 1 {
@@ -450,6 +462,30 @@ impl IdentityReport {
             }
             Err(failure) => format!("failed ({}): {}", failure.class, failure.message),
         }
+    }
+}
+
+/// The one line the identity key writes to the status.
+///
+/// It is a receipt, not a second copy of the report: the report itself is drawn on
+/// the Forgejo panel, once (W-3). Repeating it here printed the same sentence twice
+/// on one 80×24 screen, the panel's copy clipped at the border. A **failure** keeps
+/// its whole message: it names the key that fixes it (`v` on the Forgejo screen) and
+/// the panel's copy can be below the fold.
+fn identity_receipt(
+    name: &str,
+    result: &Result<crate::identity::AgentIdentity, ForgejoFailure>,
+) -> String {
+    match result {
+        Ok(identity) => format!(
+            "identity for `{name}` settled as `{}` ({}) — the Forgejo panel carries the report",
+            identity.login,
+            identity.mode.as_str()
+        ),
+        Err(failure) => format!(
+            "identity for `{name}` failed ({}): {}",
+            failure.class, failure.message
+        ),
     }
 }
 
@@ -595,6 +631,12 @@ pub struct App {
     pub repo_selected: usize,
     /// The result of the last identity action, if any.
     pub identity_report: Option<IdentityReport>,
+    /// What the selected agent's workspace holds, cached for the agent screen.
+    ///
+    /// A summary runs `git` several times, and the screen is redrawn many times a
+    /// second, so it is recomputed at most once a second while the Agent screen is
+    /// on show (W-2): the agent name it was read for, the sentence, and when.
+    workspace_note: Option<(String, String, Instant)>,
     /// The last start that was refused or failed, with the reason.
     pub start_failure: Option<(String, String)>,
     /// An agent whose stop was signalled and whose ending has not been read yet.
@@ -676,6 +718,7 @@ impl App {
             role_check: None,
             repo_selected: 0,
             identity_report: None,
+            workspace_note: None,
             start_failure: None,
             pending_stop: None,
             started_ms: crate::time::now_unix_ms(),
@@ -694,6 +737,8 @@ impl App {
 
     /// Re-read the files, and apply the limits they carry. Run at start and on `r`.
     pub fn reload(&mut self) {
+        // A screen change or an edit can change which workspace is on show; the
+        // cache is keyed by agent name and a time, so the next tick re-reads it.
         match self.layout.ensure_root() {
             Ok(()) => {
                 self.root_error = None;
@@ -1640,6 +1685,32 @@ impl App {
         }
     }
 
+    /// A run record's reason, read against the configuration as it is now.
+    ///
+    /// A record's reason is history: the paths in it were the ones in force when that
+    /// run ran. When the configuration directory has since moved — a copied `HOME`, a
+    /// renamed installation — the reason names a file that is not the one on this
+    /// screen, and a reader takes it for today's (W-1). When the reason embeds a path
+    /// that is not the live instruction, the drawn sentence says the path is the
+    /// run's own and names the file the configuration points at now. Nothing is
+    /// claimed about whether the run's complaint still holds.
+    pub fn reason_with_history(&self, agent: &str, reason: &str) -> String {
+        let text = crate::model::in_product_words(reason);
+        let live = self
+            .agent_paths(agent)
+            .ok()
+            .map(|paths| paths.instruction().display().to_string());
+        match live {
+            Some(live) => match foreign_path(&text, &live) {
+                Some(path) => format!(
+                    "{text} (the path `{path}` is from when that run ran; the instruction now is {live})"
+                ),
+                None => text,
+            },
+            None => text,
+        }
+    }
+
     /// Why one agent's most recent *start* did not go well, when it never became a run.
     pub fn last_start_failure(&self, name: &str) -> Option<String> {
         self.start_failure
@@ -2028,20 +2099,7 @@ impl App {
                     message: crate::model::in_product_words(&error.to_string()),
                 }
             });
-        self.status = match &result {
-            Ok(identity) => format!(
-                "identity for `{name}`: {}",
-                IdentityReport {
-                    agent: name.clone(),
-                    result: Ok(identity.clone()),
-                }
-                .describe()
-            ),
-            Err(failure) => format!(
-                "identity for `{name}` failed ({}): {}",
-                failure.class, failure.message
-            ),
-        };
+        self.status = identity_receipt(&name, &result);
         self.identity_report = Some(IdentityReport {
             agent: name,
             result,
@@ -2097,6 +2155,94 @@ impl App {
             agent: agent.to_owned(),
             result: Ok(identity),
         })
+    }
+
+    /// What the selected agent's workspace holds, when it has been read.
+    pub fn workspace_note(&self) -> Option<&str> {
+        let name = self.selected_name()?;
+        match &self.workspace_note {
+            Some((cached, note, _)) if cached == &name => Some(note.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Read the selected agent's workspace once a second while its screen is on show.
+    fn refresh_workspace_note(&mut self) {
+        if self.screen != Screen::AgentConfig {
+            return;
+        }
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        let stale = match &self.workspace_note {
+            Some((cached, _, at)) => cached != &name || at.elapsed() >= Duration::from_secs(1),
+            None => true,
+        };
+        if stale {
+            let note = self.workspace_note_for(&name);
+            self.workspace_note = Some((name, note, Instant::now()));
+        }
+    }
+
+    /// One sentence about the repository in an agent's workspace (W-2).
+    ///
+    /// What is knowable is read from the repository itself; what the product cannot
+    /// read is said plainly instead of guessed.
+    fn workspace_note_for(&self, name: &str) -> String {
+        let paths = match self.agent_paths(name) {
+            Ok(paths) => paths,
+            Err(_) => return "the workspace path cannot be decided".to_owned(),
+        };
+        let workspace = paths.workspace();
+        if !workspace.exists() {
+            return "the workspace directory is not there yet; a run or a clone creates it"
+                .to_owned();
+        }
+        let state = match workspace::inspect(workspace) {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                return "not a git repository — the product reads it as a directory, not as history"
+                    .to_owned();
+            }
+            Err(workspace::WorkspaceError::GitMissing { .. }) => {
+                return "git is not installed, so the product cannot read what is in this directory"
+                    .to_owned();
+            }
+            Err(error) => return format!("the repository could not be read ({})", error.detail()),
+        };
+        let agent_identity = format!(
+            "{} <{}>",
+            credentials::recorded_login(&self.credentials_path, name)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            credentials::recorded_email(&self.credentials_path, name)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
+        let whose = match &state.local_identity {
+            Some(identity) if *identity == agent_identity => {
+                format!("the local git identity is the agent's ({identity})")
+            }
+            Some(identity) => {
+                format!("the local git identity is {identity}, not the agent's")
+            }
+            None => "no local git identity is set".to_owned(),
+        };
+        let changed = match state.changed {
+            0 => "clean".to_owned(),
+            1 => "1 changed path".to_owned(),
+            count => format!("{count} changed paths"),
+        };
+        if state.commit.is_empty() {
+            return format!("an empty repository on {} (no commit yet), {changed} — {whose}", state.branch);
+        }
+        let age = tested_age(state.committed_at.saturating_mul(1000));
+        format!(
+            "on {}, {} ({age}), {changed} — {whose}",
+            state.branch, state.commit
+        )
     }
 
     /// The git identity recorded for an agent, or why there is none yet.
@@ -2644,6 +2790,14 @@ impl App {
                 // written. A person who quit the editor without saving must be told so.
                 let changed = action.before != stamp(&action.path);
                 let program = crate::editor::editor();
+                // W-4: the sentence names the thing (`the declared steps`) and now the
+                // file too, so the status line alone is enough to find what was
+                // created or opened.
+                let file = action
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("the file");
                 self.reload();
                 if !status.success() {
                     // The editor may have failed before saving; if the hand-off itself
@@ -2655,21 +2809,20 @@ impl App {
                         ""
                     };
                     self.status = format!(
-                        "{program} left with code {:?} for {}; it may not have been saved{created}",
+                        "{program} left with code {:?} for {} ({file}); it may not have been saved{created}",
                         status.code(),
                         action.label
                     );
                 } else {
                     // `declared steps` is plural; `instruction` and `new skill` are not.
-                    let verb = if action.label.contains("steps") || action.label.contains("skills")
-                    {
+                    let verb = if action.target.map(EditTarget::is_plural).unwrap_or(false) {
                         "were"
                     } else {
                         "was"
                     };
                     if changed {
                         self.status = format!(
-                            "{} {verb} edited in {program}; the files were read again",
+                            "{} {verb} edited in {program} ({file}); the files were read again",
                             action.label
                         );
                     } else if action.created {
@@ -2678,8 +2831,10 @@ impl App {
                         // found: report the creation instead.
                         self.status = created_status(action, &program);
                     } else {
-                        self.status =
-                            format!("{} {verb} not changed ({program})", action.label);
+                        self.status = format!(
+                            "{} {verb} not changed ({file}, opened in {program})",
+                            action.label
+                        );
                     }
                 }
             }
@@ -2804,6 +2959,7 @@ impl App {
     pub fn tick(&mut self) {
         self.supervisor.poll(Instant::now());
         self.note_stop_proven();
+        self.refresh_workspace_note();
         let stale = match self.last_scan {
             Some(at) => at.elapsed() >= RECENT_RUNS_REFRESH,
             None => true,
@@ -3040,7 +3196,22 @@ impl App {
     /// not silently double a secret. This is what P-1 and P-2 asked for; without
     /// bracketed paste the program could not tell a paste from typing.
     pub fn on_paste(&mut self, text: &str) {
-        if self.show_acknowledgment || self.show_help {
+        // An overlay that owns the keys owns a paste too; it must not drop it in
+        // silence. Say what owns the screen and how to get to a field, so the paste
+        // is not lost without a word (F4). `on_key` says the same for a key.
+        if self.show_acknowledgment {
+            self.status = if self.ack_review {
+                "this is the acknowledged terms, read-only — any key closes it, then paste where a field is open"
+                    .to_owned()
+            } else {
+                "answer this screen first: y to acknowledge, or n for not now".to_owned()
+            };
+            return;
+        }
+        if self.show_help {
+            self.status =
+                "the key list is open — press esc to close it, then paste where a field is open"
+                    .to_owned();
             return;
         }
         let (first, more) = match text.find(['\n', '\r']) {
@@ -3060,6 +3231,31 @@ impl App {
         if let Some(prompt) = self.secret_prompt.as_mut() {
             prompt.value = first.to_owned();
             self.status = note.to_owned();
+            return;
+        }
+        // The remaining overlays own the keys, so the generic `press n … or k/f/v/A`
+        // advice would be false under them. Each names what answers it instead.
+        if self.editor_confirm.is_some() {
+            self.status =
+                "the editor confirmation is open — enter opens it, esc cancels"
+                    .to_owned();
+            return;
+        }
+        if self.confirm_remove.is_some() {
+            self.status =
+                "answer the removal confirmation first: y or enter removes, n, esc or q keeps"
+                    .to_owned();
+            return;
+        }
+        if self.confirm_forget.is_some() {
+            self.status =
+                "answer the delete confirmation first: y or enter deletes, n, esc or q keeps"
+                    .to_owned();
+            return;
+        }
+        if self.confirm_quit.is_some() {
+            self.status =
+                "the leave question is open — q again quits, any other key stays".to_owned();
             return;
         }
         // A paste is never dropped in silence; say where it can land.
@@ -3455,6 +3651,17 @@ fn editable_template(target: EditTarget, agent: &str) -> String {
     }
 }
 
+/// The first absolute path a stored sentence names that is not the live file.
+///
+/// Only the shape a path is written in matters here: a token that begins with `/`,
+/// with the sentence's own trailing punctuation removed. Anything else is prose.
+fn foreign_path(text: &str, live: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| token.trim_end_matches(['.', ',', ';', ':', ')']))
+        .find(|token| token.starts_with('/') && *token != live)
+        .map(str::to_owned)
+}
+
 /// Write a hand-off's template, creating the directories a skill needs.
 fn write_template(path: &std::path::Path, template: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -3471,17 +3678,22 @@ fn write_template(path: &std::path::Path, template: &[u8]) -> std::io::Result<()
 /// whatever is under `skills/` (H-1, H-2). The sentence names the creation and what
 /// the screen beside it will now show.
 fn created_status(action: &PendingAction, program: &str) -> String {
+    let file = action
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("the file");
     match action.target {
         Some(EditTarget::Skills) => format!(
-            "{} was created as a template and left unchanged ({program}); a run installs every skill under `skills/`, so write it or remove the directory",
+            "{} was created as a template ({file}) and left unchanged ({program}); a run installs every skill under `skills/`, so write it or remove the directory",
             action.label
         ),
         Some(EditTarget::Steps) => format!(
-            "{} did not exist; the template was created and left unchanged ({program}) — it declares 0 shell steps, so the screen now shows the file",
+            "{} did not exist; the template ({file}) was created and left unchanged ({program}) — it declares 0 shell steps, so the screen now shows the file",
             action.label
         ),
         _ => format!(
-            "{} did not exist; the template was created and left unchanged ({program})",
+            "{} did not exist; the template ({file}) was created and left unchanged ({program})",
             action.label
         ),
     }
@@ -3936,10 +4148,11 @@ concurrency = 1
         // H-1: `K` created a counted skill and said `was not changed`; H-2: `t`
         // created a steps file and said `was not changed`. One guard per hand-off key:
         // the status must name the creation the screen beside it can see.
+        // W-4: the sentence names the file it made, not only the thing.
         let cases = [
-            (KeyCode::Char('K'), "created as a template"),
-            (KeyCode::Char('t'), "the template was created"),
-            (KeyCode::Char('e'), "the template was created"),
+            (KeyCode::Char('K'), "created as a template (SKILL.md)"),
+            (KeyCode::Char('t'), "the template (steps.txt) was created"),
+            (KeyCode::Char('e'), "the template (instruction.md) was created"),
         ];
         for (keycode, expected) in cases {
             let mut app = app_with(GOOD);
@@ -4722,6 +4935,140 @@ concurrency = 3
             }
             other => panic!("expected a finished state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_paste_with_no_field_open_is_never_read_as_keys_and_says_where_it_can_land() {
+        // F4: a token pasted at a screen with no field open opened the add-agent form,
+        // because the paste was read as keystrokes. A bracketed paste is one event and
+        // is never replayed as keys; with no field open it is dropped with a sentence
+        // that names where it can land.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.show(Screen::Forgejo);
+        // The token begins with `g` (a clone binding) and contains `t` (the editor
+        // binding) and `a` (the form binding); none of them may fire.
+        app.on_paste("ga-fixture-token-abcd");
+        assert!(app.add_agent.is_none(), "the paste opened the add-agent form");
+        assert!(app.secret_prompt.is_none(), "the paste opened a secret prompt");
+        assert!(app.editor_confirm.is_none(), "the paste asked to open an editor");
+        assert_eq!(
+            app.status,
+            "there is no one-line field here to take a paste; press n for the form, or k/f/v/A for a secret"
+        );
+        // A field that is open takes the paste, one line only.
+        app.show(Screen::Credentials);
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_paste("secret");
+        assert_eq!(app.secret_prompt.as_ref().expect("a prompt").value, "secret");
+    }
+
+    #[test]
+    fn a_paste_under_an_overlay_is_not_dropped_in_silence() {
+        // F4's sibling path: the acknowledgment and the key list own the keys, and they
+        // own a paste too — but a paste is still never dropped without a word.
+        let mut app = app_with(GOOD);
+        assert!(app.show_acknowledgment, "the first run shows the modal");
+        app.on_paste("token");
+        assert!(
+            app.status.contains("answer this screen first"),
+            "{}",
+            app.status
+        );
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(app.show_help, "the key list is open");
+        app.on_paste("token");
+        assert!(app.status.contains("key list is open"), "{}", app.status);
+    }
+
+    #[test]
+    fn every_overlay_answers_a_paste_with_what_owns_the_screen() {
+        // F4's sweep: the generic `press n … or k/f/v/A` advice is false under a
+        // confirmation that owns the keys, so each overlay names its own answer.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.confirm_remove = Some("one".to_owned());
+        app.on_paste("token");
+        assert!(app.status.contains("removal confirmation"), "{}", app.status);
+        app.confirm_remove = None;
+        app.confirm_forget = Some(vec!["ghost".to_owned()]);
+        app.on_paste("token");
+        assert!(app.status.contains("delete confirmation"), "{}", app.status);
+        app.confirm_forget = None;
+        app.confirm_quit = Some(1);
+        app.on_paste("token");
+        assert!(app.status.contains("leave question"), "{}", app.status);
+        app.confirm_quit = None;
+        app.editor_configured = false;
+        app.show(Screen::Instructions);
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.editor_confirm.is_some(), "the editor confirmation is up");
+        app.on_paste("token");
+        assert!(app.status.contains("editor confirmation"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_identity_status_does_not_repeat_the_report_the_panel_carries() {
+        // W-3: the report is drawn once, on the Forgejo panel. The status is a receipt;
+        // a failure keeps its actionable message.
+        use crate::identity::{AgentIdentity, IdentityMode};
+        let settled = Ok(AgentIdentity {
+            agent: "one".to_owned(),
+            login: "gewu-one".to_owned(),
+            email: "gewu-one@agents.invalid".to_owned(),
+            mode: IdentityMode::Managed,
+            created: true,
+            created_at: Some(1_700_000_000),
+        });
+        let receipt = identity_receipt("one", &settled);
+        assert!(!receipt.contains("gewu-one@agents.invalid"), "{receipt}");
+        assert!(!receipt.contains("(created"), "{receipt}");
+        let refused = Err(ForgejoFailure {
+            class: "no_agent_token".to_owned(),
+            message: "press v on the Forgejo screen to supply it".to_owned(),
+        });
+        let receipt = identity_receipt("one", &refused);
+        assert!(
+            receipt.contains("press v on the Forgejo screen"),
+            "{receipt}"
+        );
+    }
+
+    #[test]
+    fn a_moved_configurations_record_names_the_dead_path_and_the_live_file() {
+        // W-1: a copied configuration leaves a record whose reason names the old path;
+        // the drawn sentence says the path is the run's own and names the file now.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.selected = 0;
+        let live = app
+            .selected_paths()
+            .expect("paths")
+            .instruction()
+            .display()
+            .to_string();
+        let stored = "the instruction document /old/place/agents/one/instruction.md is still the placeholder; write what the agent should do".to_string();
+        let drawn = app.reason_with_history("one", &stored);
+        assert!(drawn.contains("/old/place/agents/one/instruction.md"), "{drawn}");
+        assert!(drawn.contains("from when that run ran"), "{drawn}");
+        assert!(drawn.contains(&live), "{drawn}");
+        // A reason that names the file in use gains no clause.
+        let current = format!("the instruction document {live} is still the placeholder");
+        assert_eq!(app.reason_with_history("one", &current), current);
+    }
+
+    #[test]
+    fn the_age_ladder_has_a_rung_for_every_unit_it_names() {
+        // W-6: the first step after `just now` was a full minute. The ladder is one
+        // ladder for every age string, and seconds sit between the two.
+        let now = crate::time::now_unix_ms();
+        let ago = |seconds: u64| tested_age(now.saturating_sub(seconds.saturating_mul(1000)));
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(30), "30 seconds ago");
+        assert_eq!(ago(5 * 60), "5 minutes ago");
+        assert_eq!(ago(3 * 3600), "3 hours ago");
+        assert_eq!(ago(2 * 86_400), "2 days ago");
     }
 
     #[test]
