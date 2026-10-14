@@ -850,6 +850,13 @@ impl SystemdSupervisor {
     /// Returns whether there was something alive to stop. A unit that was not active
     /// is left alone: there is nothing to signal, and saying otherwise would be a lie.
     pub fn stop(&mut self, agent: &str) -> Result<bool, String> {
+        self.stop_with_reason(agent, "the user unit was stopped on request")
+    }
+
+    /// Stop one agent's unit and record the run with a caller-chosen reason, so a
+    /// stop the user never asked for — a configuration re-read that no longer lists
+    /// the agent — is not recorded as "on request" (T-6).
+    pub fn stop_with_reason(&mut self, agent: &str, reason_text: &str) -> Result<bool, String> {
         let unit = unit_name(agent);
         let status = self.systemctl.show(&unit)?;
         if !status.is_live() {
@@ -864,7 +871,7 @@ impl SystemdSupervisor {
                 &run_dir,
                 &run_id,
                 RunOutcome::Stopped,
-                Some("the user unit was stopped on request".to_owned()),
+                Some(reason_text.to_owned()),
                 0,
             );
             if let Some(record) = self.runs.get_mut(agent) {
@@ -893,9 +900,18 @@ impl SystemdSupervisor {
     }
 
     /// Remove one agent's unit file, after making sure it is not running.
+    ///
+    /// An agent with no unit file on disk has nothing to stop and nothing systemd
+    /// needs to be asked about, so leaving `systemd` mode for such an agent succeeds
+    /// even when the user manager cannot be reached. That is the way back out of a
+    /// `systemd` record written by an earlier session on a machine that has since
+    /// lost its user session (T-1): the record, not the manager, was the door.
     pub fn remove_unit(&mut self, agent: &str) -> Result<(), String> {
-        self.stop_quietly(agent)?;
         let path = self.unit_dir.join(unit_name(agent));
+        let on_disk = path.is_file();
+        if on_disk {
+            self.stop_quietly(agent)?;
+        }
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -904,9 +920,12 @@ impl SystemdSupervisor {
             }
         }
         self.runs.remove(agent);
-        // A unit the tool no longer manages must not stay reported as failed.
-        let _ = self.systemctl.reset_failed(&unit_name(agent));
-        self.systemctl.daemon_reload()
+        if on_disk {
+            // A unit the tool no longer manages must not stay reported as failed.
+            let _ = self.systemctl.reset_failed(&unit_name(agent));
+            self.systemctl.daemon_reload()?;
+        }
+        Ok(())
     }
 
     /// Read every unit back, at most once per poll interval.

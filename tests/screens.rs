@@ -19,7 +19,7 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use gewu_multiverse::app::{App, Screen};
+use gewu_multiverse::app::{App, Screen, SecretTarget};
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::run::{RunOutcome, new_run_id};
 use gewu_multiverse::transcript::{Record, Transcript};
@@ -235,7 +235,7 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
         instructions.contains("declared `shell` tool"),
         "{instructions}"
     );
-    assert!(instructions.contains("turn(s)"), "{instructions}");
+    assert!(instructions.contains("turns"), "{instructions}");
 
     // The credentials screen says the key is redacted from everything written.
     app.show(Screen::Credentials);
@@ -1141,24 +1141,37 @@ fn the_repository_list_never_hides_a_row_the_selection_can_reach() {
     let root = scratch("repo-window");
     let mut app = app(&root);
     app.show_acknowledgment = false;
-    app.role_check = Some(Ok(three_repository_check()));
+    // Seven repositories, so the list is longer than the panel at the minimum and
+    // the window (not the whole list) is what is exercised.
+    let mut check = three_repository_check();
+    for index in 0..4 {
+        check
+            .repositories
+            .push(repository(&format!("uxmember/extra-{index}"), false));
+    }
+    app.role_check = Some(Ok(check));
     app.show(Screen::Forgejo);
 
-    let wide = render(&app);
-    assert!(wide.contains("uxmember/demo-public"), "{wide}");
+    let narrow = render_at(80, 24, &app);
+    assert!(
+        narrow.contains("of 7"),
+        "the title does not say how many repositories there are: {narrow}"
+    );
+    // T-12: the checked list gets the panel, so more than one row is drawn even at
+    // 80x24 and the explanation never takes the whole panel.
+    assert!(
+        narrow.matches("uxmember/").count() + narrow.matches("uxadmin/").count() >= 2,
+        "only one repository row is drawn: {narrow}"
+    );
 
     for _ in 0..2 {
         app.move_repo_selection(1);
     }
     assert_eq!(app.repo_selected, 2);
-    let narrow = render_at(80, 24, &app);
+    let selected = render_at(80, 24, &app);
     assert!(
-        narrow.contains("> uxmember/demo-public"),
-        "the selected repository is not drawn or not marked: {narrow}"
-    );
-    assert!(
-        narrow.contains("of 3"),
-        "the title does not say how many repositories there are: {narrow}"
+        selected.contains("> uxmember/demo-public"),
+        "the selected repository is not drawn or not marked: {selected}"
     );
 }
 
@@ -1290,4 +1303,166 @@ fn a_paste_note_is_not_hidden_by_the_form() {
     let screen = render_at(80, 24, &app);
     assert!(screen.contains("first line"), "{screen}");
     assert!(screen.contains("13 characters, hidden"), "{screen}");
+}
+
+#[test]
+fn a_long_status_gets_the_rows_to_be_read_whole_at_eighty_columns() {
+    // T-2 / C-6 / N-6: a failed clone's cause is git's own `fatal:` line, which
+    // follows the progress chatter. At the advertised minimum the footer must hold
+    // both, not just the first.
+    let root = scratch("status-grow");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.status = concat!(
+        "clone root/alpha acted as gewu-scribe (managed) (the list came from the role token): ",
+        "failed (git): Cloning into '/tmp/alpha'...\n",
+        "fatal: unable to access 'http://127.0.0.1:39511/root/alpha.git/': ",
+        "Failed to connect to 127.0.0.1 port 39511 after 0 ms: Couldn't connect to server"
+    )
+    .to_owned();
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("clone root/alpha acted as"), "{screen}");
+    assert!(screen.contains("fatal: unable to access"), "{screen}");
+    // Growing the footer never hides the screen behind it: the agent row is still
+    // drawn at the minimum.
+    assert!(screen.contains("scribe"), "{screen}");
+}
+
+#[test]
+fn a_broken_configuration_names_the_key_that_reads_it_again() {
+    // T-7: the recovery key belongs with the error, not only in the legend a short
+    // window clips; and the diagnostic is not clipped by a fixed three-row status.
+    let root = scratch("config-key");
+    fs::write(root.join("config.toml"), "[[agents]\nname = \"scribe\"\n").expect("broken file");
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("config-key"),
+    );
+    app.show_acknowledgment = false;
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("no agent list"), "{screen}");
+    assert!(screen.contains("press r to read it"), "{screen}");
+}
+
+#[test]
+fn a_trailing_newline_is_not_reported_as_a_dropped_guidance_line() {
+    // T-3 / D-1: no guidance line was written, so none was dropped.
+    let root = scratch("instruction-newline");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(paths.instruction(), "Do one thing\n").expect("the instruction is written");
+    app.show(Screen::Instructions);
+    let screen = render(&app);
+    assert!(screen.contains("trailing newline is not sent"), "{screen}");
+    assert!(!screen.contains("the guidance line is dropped"), "{screen}");
+}
+
+#[test]
+fn the_credentials_screen_shows_the_mode_the_file_actually_has() {
+    // D-2: the screen printed the mode cached at startup while the live read refused
+    // the widened file; the two facts contradicted each other.
+    let root = scratch("credentials-mode");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    fs::set_permissions(
+        &app.credentials_path,
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("the credentials file is widened");
+    app.show(Screen::Credentials);
+    let screen = render(&app);
+    assert!(screen.contains("0644"), "the real mode is not shown: {screen}");
+    assert!(screen.contains("not ready"), "{screen}");
+}
+
+#[test]
+fn a_one_character_secret_is_counted_in_the_singular() {
+    // D-9: `1 characters` is the product's own voice with a pluralisation gutter.
+    let root = scratch("one-char");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Credentials);
+    app.request_secret(SecretTarget::ModelKey);
+    app.on_key(KeyEvent::from(KeyCode::Char('x')));
+    let screen = render(&app);
+    assert!(screen.contains("1 character, hidden"), "{screen}");
+    assert!(!screen.contains("1 characters"), "{screen}");
+}
+
+#[test]
+fn the_model_key_prompt_names_the_agent_it_writes_for() {
+    // T-4: the subject is chosen on the Agents screen and the write is not undoable.
+    let root = scratch("key-subject");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Agents);
+    app.move_agent_selection(1);
+    app.show(Screen::Credentials);
+    app.request_secret(SecretTarget::ModelKey);
+    let screen = render(&app);
+    assert!(screen.contains("set the model key for `checker`"), "{screen}");
+    assert!(
+        screen.contains("The model key for `checker` is written"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_forgejo_screen_never_says_placeholder() {
+    // D-5: `Placeholder` is a word from inside the product, not a word for the user.
+    let root = scratch("no-placeholder");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Forgejo);
+    let screen = render(&app);
+    assert!(!screen.contains("Placeholder"), "{screen}");
+    assert!(screen.contains("no role check has been run yet"), "{screen}");
+}
+
+#[test]
+fn the_identity_line_names_the_account_i_would_create() {
+    // D-4: `i` acts on a remote system; name the account before the keypress.
+    let root = scratch("identity-preview");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Forgejo);
+    let screen = render(&app);
+    assert!(screen.contains("not settled"), "{screen}");
+    assert!(screen.contains("`gewu-scribe`"), "{screen}");
+}
+
+#[test]
+fn the_agent_screen_keeps_a_long_paths_file_name_and_says_when_fields_are_below() {
+    // D-7: at 80x24 the panel clipped `newest log` mid-filename and silently dropped
+    // fields; the file name must survive and the panel must say more is below.
+    let root = scratch("agent-overflow");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.ensure_agent("scribe").expect("the agent is prepared");
+    let run_id = new_run_id(1);
+    let run_dir = app.state_root().join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 1, "/w"))
+        .expect("a record");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            10,
+            None,
+        ))
+        .expect("a record");
+    fs::write(run_dir.join(gewu_multiverse::run::LOG_FILE), "log\n").expect("a log");
+    app.refresh_recent();
+    app.show(Screen::AgentConfig);
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("more fields below"), "{screen}");
+    // At a taller window the field and its file name are drawn whole, so the path is
+    // not inherently clipped — the short window is what the title now declares.
+    let tall = render_at(80, 40, &app);
+    assert!(tall.contains("run.log"), "{tall}");
 }

@@ -792,16 +792,38 @@ fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
 /// how the two sizes differ.
 fn strip_placeholder(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let mut dropped = false;
-    let mut kept: Vec<&str> = Vec::new();
-    for line in text.lines() {
-        if !dropped && line.trim() == INSTRUCTION_PLACEHOLDER {
-            dropped = true;
-            continue;
-        }
-        kept.push(line);
+    let lines: Vec<&str> = text.lines().collect();
+    let drop_at = first_content_line(&lines).filter(|&at| lines[at].trim() == INSTRUCTION_PLACEHOLDER);
+    match drop_at {
+        None => lines.join("\n"),
+        Some(at) => lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != at)
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
-    kept.join("\n")
+}
+
+/// The index of the first line that is not blank, if the text has one.
+fn first_content_line(lines: &[&str]) -> Option<usize> {
+    lines.iter().position(|line| !line.trim().is_empty())
+}
+
+/// Whether a run drops the product's own guidance line from this document.
+///
+/// True only when the document's first non-blank line is the placeholder. The
+/// Instruction screen uses this to name the reason the two sizes differ: a document
+/// with no guidance line but a trailing newline differs by that byte alone, not by a
+/// dropped line (T-3, D-1).
+#[must_use]
+pub fn guidance_dropped(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    first_content_line(&lines)
+        .map(|at| lines[at].trim() == INSTRUCTION_PLACEHOLDER)
+        .unwrap_or(false)
 }
 
 /// The instruction's size on disk and the size a run sends.
@@ -1613,6 +1635,27 @@ mod tests {
         assert_eq!(on_disk, doc.len());
         assert_eq!(sent, read.len());
         assert!(on_disk > sent, "the two sizes differ");
+    }
+
+    #[test]
+    fn a_trailing_newline_is_not_a_dropped_guidance_line() {
+        // T-3 / D-1: the screen must name the real difference. A document with no
+        // guidance line differs from what a run sends by its trailing newline alone.
+        let doc = b"Do one thing\n";
+        let (on_disk, sent) = instruction_payload(doc);
+        assert_eq!(on_disk, doc.len());
+        assert_eq!(sent, doc.len() - 1);
+        assert!(!guidance_dropped(doc));
+
+        // The placeholder, when it is the first content line, is the only thing
+        // dropped; a copy later in the user's own document is not.
+        let only = format!("{INSTRUCTION_PLACEHOLDER}\n");
+        assert!(guidance_dropped(only.as_bytes()));
+        let later = format!("my line\n{INSTRUCTION_PLACEHOLDER}\n");
+        assert!(!guidance_dropped(later.as_bytes()));
+        assert_eq!(instruction_payload(later.as_bytes()).0, later.len());
+        let read = strip_placeholder(later.as_bytes());
+        assert!(read.contains(INSTRUCTION_PLACEHOLDER), "{read}");
     }
 
     #[test]
