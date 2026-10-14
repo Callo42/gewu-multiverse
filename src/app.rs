@@ -198,6 +198,10 @@ impl SecretTarget {
 pub struct SecretPrompt {
     /// Which secret is being collected.
     pub target: SecretTarget,
+    /// The agent the secret belongs to, when the secret is per-agent. Named in the
+    /// prompt, because the subject is chosen on another screen and a write is not
+    /// undoable (T-4).
+    pub agent: Option<String>,
     /// What has been typed so far. Drawn as `*`, never as itself.
     pub value: String,
     /// Why the last attempt to record it did not work.
@@ -209,8 +213,17 @@ impl SecretPrompt {
     pub fn new(target: SecretTarget) -> Self {
         Self {
             target,
+            agent: None,
             value: String::new(),
             error: None,
+        }
+    }
+
+    /// The subject of the write, in the product's words, with its article.
+    pub fn subject(&self) -> String {
+        match &self.agent {
+            Some(agent) => format!("{} for `{agent}`", self.target.describe()),
+            None => self.target.describe().to_owned(),
         }
     }
 }
@@ -1125,11 +1138,17 @@ impl App {
             self.status = "the configuration lists no agent for that secret".to_owned();
             return;
         }
-        self.secret_prompt = Some(SecretPrompt::new(target));
+        let mut prompt = SecretPrompt::new(target);
+        if target.needs_agent() {
+            prompt.agent = self.selected_name();
+        }
+        // The prompt names its subject before the write: the agent was selected on a
+        // different screen, and a secret write is not undoable (T-4).
         self.status = format!(
             "type the {} and press enter; it is written to the credentials file and never shown",
-            target.describe()
+            prompt.subject()
         );
+        self.secret_prompt = Some(prompt);
     }
 
     /// One key while the secret prompt is open.
@@ -1166,7 +1185,7 @@ impl App {
             }
             return;
         }
-        let agent = self.selected_name();
+        let agent = prompt.agent.clone().or_else(|| self.selected_name());
         let subject = agent.clone().unwrap_or_else(|| "the connection".to_owned());
         let (table, key) = match prompt.target {
             SecretTarget::ModelKey => (Some("model_keys"), subject.clone()),

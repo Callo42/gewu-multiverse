@@ -19,7 +19,7 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use gewu_multiverse::app::{App, Screen};
+use gewu_multiverse::app::{App, Screen, SecretTarget};
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::run::{RunOutcome, new_run_id};
 use gewu_multiverse::transcript::{Record, Transcript};
@@ -1343,4 +1343,54 @@ fn a_trailing_newline_is_not_reported_as_a_dropped_guidance_line() {
     let screen = render(&app);
     assert!(screen.contains("trailing newline is not sent"), "{screen}");
     assert!(!screen.contains("the guidance line is dropped"), "{screen}");
+}
+
+#[test]
+fn the_credentials_screen_shows_the_mode_the_file_actually_has() {
+    // D-2: the screen printed the mode cached at startup while the live read refused
+    // the widened file; the two facts contradicted each other.
+    let root = scratch("credentials-mode");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    fs::set_permissions(
+        &app.credentials_path,
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("the credentials file is widened");
+    app.show(Screen::Credentials);
+    let screen = render(&app);
+    assert!(screen.contains("0644"), "the real mode is not shown: {screen}");
+    assert!(screen.contains("not ready"), "{screen}");
+}
+
+#[test]
+fn a_one_character_secret_is_counted_in_the_singular() {
+    // D-9: `1 characters` is the product's own voice with a pluralisation gutter.
+    let root = scratch("one-char");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Credentials);
+    app.request_secret(SecretTarget::ModelKey);
+    app.on_key(KeyEvent::from(KeyCode::Char('x')));
+    let screen = render(&app);
+    assert!(screen.contains("1 character, hidden"), "{screen}");
+    assert!(!screen.contains("1 characters"), "{screen}");
+}
+
+#[test]
+fn the_model_key_prompt_names_the_agent_it_writes_for() {
+    // T-4: the subject is chosen on the Agents screen and the write is not undoable.
+    let root = scratch("key-subject");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Agents);
+    app.move_agent_selection(1);
+    app.show(Screen::Credentials);
+    app.request_secret(SecretTarget::ModelKey);
+    let screen = render(&app);
+    assert!(screen.contains("set the model key for `checker`"), "{screen}");
+    assert!(
+        screen.contains("The model key for `checker` is written"),
+        "{screen}"
+    );
 }
