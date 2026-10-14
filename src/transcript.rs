@@ -540,6 +540,18 @@ pub fn first_started_at(run_dir: &Path) -> Option<String> {
         .map(|record| record.timestamp().to_owned())
 }
 
+/// The process id of the run's opening record, when it is there.
+///
+/// A reopened UI uses this to tell a run still in progress from one whose process is
+/// gone: the run's own record says which process it was.
+pub fn first_started_pid(run_dir: &Path) -> Option<u32> {
+    let file = read(run_dir).ok()?;
+    file.records.iter().find_map(|record| match record {
+        Record::RunStarted { pid, .. } => Some(*pid),
+        _ => None,
+    })
+}
+
 /// A short, stable digest of some bytes: FNV-1a, 64-bit, written as hex.
 ///
 /// This is not a cryptographic hash and is not used as one. It exists so that "the

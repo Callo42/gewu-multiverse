@@ -207,7 +207,11 @@ impl Screen {
             let _ = disable_raw_mode();
             return Err(error);
         }
-        let terminal = Terminal::new(CrosstermBackend::new(out))?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+        // Take the whole screen, not just the diff: a UI started on a terminal that
+        // still holds an earlier program's output (for example after a kill) must not
+        // let that text show through the panels as if it were a value.
+        terminal.clear()?;
         Ok(Self {
             terminal,
             active: true,
