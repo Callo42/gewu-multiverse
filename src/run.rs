@@ -191,12 +191,17 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
-    /// The outcome and how long it took, for the runs screen.
+    /// The outcome and how long it took, for the runs table.
+    ///
+    /// Short enough not to be clipped in a narrow table: the run's own reason is shown
+    /// in the note area beside the table, where it can wrap.
     pub fn describe(&self) -> String {
-        let outcome = match (self.outcome, &self.reason) {
-            (Some(outcome), Some(reason)) => format!("{} ({reason})", outcome.as_str()),
-            (Some(outcome), None) => outcome.as_str().to_owned(),
-            (None, _) => "no terminal record".to_owned(),
+        let outcome = match self.outcome {
+            Some(outcome) => outcome.as_str().to_owned(),
+            // A run whose start is recorded but whose end is not is running, not
+            // "unknown": its `plan.json` and opening transcript record are on disk.
+            None if self.started_at.is_some() => "running".to_owned(),
+            None => "no terminal record".to_owned(),
         };
         match self.duration_ms {
             Some(ms) => format!("{outcome}, {:.1}s", ms as f64 / 1000.0),
@@ -264,7 +269,9 @@ fn summarise(agent: &str, run_id: &str, run_dir: &Path) -> RunSummary {
             outcome: None,
             reason: None,
             duration_ms: None,
-            started_at: None,
+            // The opening record is written before the run does anything, so a run in
+            // progress has a start time even though it has no terminal record yet.
+            started_at: transcript::first_started_at(run_dir),
             log,
             dir: run_dir.to_path_buf(),
         };
@@ -417,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_without_a_terminal_record_is_listed_and_says_so() {
+    fn a_run_without_a_terminal_record_is_listed_as_running_not_unknown() {
         let root = scratch_root("recent-unfinished");
         let dir = root.join("scribe").join("run-300-0003-1");
         fs::create_dir_all(&dir).expect("the run directory is created");
@@ -428,6 +435,18 @@ mod tests {
         let runs = recent_runs(&root, &["scribe".to_owned()], 10);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, None);
+        // The opening record is on disk, so the run is in progress, not unknown.
+        assert!(runs[0].describe().contains("running"), "{}", runs[0].describe());
+        assert!(runs[0].started_at.is_some());
+    }
+
+    #[test]
+    fn a_run_directory_with_no_records_at_all_says_it_has_no_terminal_record() {
+        let root = scratch_root("recent-empty-dir");
+        let dir = root.join("scribe").join("run-300-0004-1");
+        fs::create_dir_all(&dir).expect("the run directory is created");
+        let runs = recent_runs(&root, &["scribe".to_owned()], 10);
+        assert_eq!(runs.len(), 1);
         assert!(runs[0].describe().contains("no terminal record"));
     }
 }

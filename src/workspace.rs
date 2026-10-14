@@ -109,6 +109,17 @@ pub enum WorkspaceError {
 }
 
 impl WorkspaceError {
+    /// The underlying reason, led with, for a status line.
+    ///
+    /// Git's own message is what a person needs; the command it ran can be long and
+    /// pushes the reason past the edge of a narrow terminal.
+    pub fn detail(&self) -> String {
+        match self {
+            WorkspaceError::Git { message, .. } => message.clone(),
+            other => other.to_string(),
+        }
+    }
+
     /// The class of failure, as one word a screen can hold.
     pub fn class(&self) -> &'static str {
         match self {
@@ -360,5 +371,22 @@ mod tests {
         // exit code says so.
         let code = askpass_main("Password for 'https://example.org':");
         assert_eq!(code, 1);
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    #[test]
+    fn a_git_refusal_leads_with_gits_own_message() {
+        // N-6: a failed clone must say why, not lead with the long command it ran.
+        let error = WorkspaceError::Git {
+            command: "git clone http://example.invalid/very/long/path.git /tmp/ws".to_owned(),
+            message: "repository not found".to_owned(),
+        };
+        let detail = error.detail();
+        assert!(detail.starts_with("repository not found"), "{detail}");
+        assert!(!detail.starts_with("`git"), "{detail}");
     }
 }
