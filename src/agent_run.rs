@@ -1036,7 +1036,9 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<TreeStats, String> {
         } else if metadata.is_file() {
             let bytes = fs::read(&path)
                 .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-            fs::write(destination.join(&name), &bytes).map_err(|error| {
+            // F-1/F-2: every file the product writes carries the one custody, so a
+            // copied skill is written 0600 like the skill template it came from.
+            crate::mode::write_private(destination.join(&name), &bytes).map_err(|error| {
                 format!(
                     "{} cannot be written: {error}",
                     destination.join(&name).display()
