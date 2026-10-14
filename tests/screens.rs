@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crossterm::event::{KeyCode, KeyEvent};
 use gewu_multiverse::app::{App, Screen, SecretTarget};
 use gewu_multiverse::paths::Layout;
-use gewu_multiverse::run::{RunOutcome, new_run_id};
+use gewu_multiverse::run::{RunOutcome, RunSummary, new_run_id};
 use gewu_multiverse::transcript::{Record, Transcript};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -1460,9 +1460,141 @@ fn the_agent_screen_keeps_a_long_paths_file_name_and_says_when_fields_are_below(
     app.refresh_recent();
     app.show(Screen::AgentConfig);
     let screen = render_at(80, 24, &app);
-    assert!(screen.contains("more fields below"), "{screen}");
+    assert!(screen.contains("more below"), "{screen}");
     // At a taller window the field and its file name are drawn whole, so the path is
     // not inherently clipped — the short window is what the title now declares.
     let tall = render_at(80, 40, &app);
     assert!(tall.contains("run.log"), "{tall}");
+}
+
+
+#[test]
+fn the_credentials_screen_draws_its_own_keys_at_eighty_columns() {
+    // O-3 / P-M1: at 80x24 the `k`/`f`/`A` line was the prose that fell off the
+    // bottom. It is the row the page map requires at this state, so it must be drawn
+    // at the advertised minimum — and the panel must declare whatever else it cannot.
+    let root = scratch("credentials-keys-80");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    for target in [
+        SecretTarget::ModelKey,
+        SecretTarget::ForgejoRoleToken,
+        SecretTarget::ForgejoAdminToken,
+    ] {
+        app.request_secret(target);
+        app.on_paste("throwaway-value");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+    }
+    fs::set_permissions(&app.credentials_path, fs::Permissions::from_mode(0o644))
+        .expect("the credentials file is widened");
+    app.show(Screen::Credentials);
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("k set the model key"), "{screen}");
+    assert!(screen.contains("f set the role token"), "{screen}");
+    assert!(screen.contains("A set the administrator token"), "{screen}");
+    assert!(screen.contains("more below"), "{screen}");
+}
+
+#[test]
+fn the_instruction_screen_draws_what_a_run_sends_at_eighty_columns() {
+    // O-3 / P-M2: "what a run will send" is a page-map must-offer; at 80x24 it used
+    // to be the invisible tail of the panel.
+    let root = scratch("instruction-sent-80");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(paths.instruction(), "do the thing\n").expect("the instruction is written");
+    app.show(Screen::Instructions);
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("A run sends this instruction"), "{screen}");
+    assert!(screen.contains("the trailing newline is not sent"), "{screen}");
+    assert!(screen.contains("more below"), "{screen}");
+}
+
+#[test]
+fn every_panel_and_note_area_that_truncates_declares_it_at_eighty_columns() {
+    // O-3: the class the fifth round left open. The Agent panel was the only surface
+    // that said fields were below the fold; the siblings now take the same rule, and
+    // the two borderless note areas carry the sentence on their last drawn row.
+    let root = scratch("panel-declares-80");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+
+    app.show(Screen::AgentConfig);
+    let agent = render_at(80, 24, &app);
+    assert!(agent.contains("more below"), "{agent}");
+
+    app.show(Screen::Forgejo);
+    let forgejo = render_at(80, 24, &app);
+    assert!(forgejo.contains("more below"), "{forgejo}");
+
+    // The Agents note area has no border to carry a title, so its own last row says so.
+    app.show(Screen::Agents);
+    let agents = render_at(80, 24, &app);
+    assert!(
+        agents.contains("… more below; enlarge the window"),
+        "{agents}"
+    );
+}
+
+#[test]
+fn the_runs_note_area_keeps_the_reason_and_both_offers_at_eighty_columns() {
+    // O-3 / P-M3: the reason leads, and `o`/`T` are both named beside it; a long
+    // reason used to push the `o` line off the bottom at 80x24.
+    let root = scratch("runs-note-80");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_dir = root.join("state").join("scribe").join(new_run_id(1));
+    app.recent = vec![RunSummary {
+        agent: "scribe".to_owned(),
+        run_id: new_run_id(1),
+        outcome: Some(RunOutcome::Failed),
+        reason: Some(
+            "the model call failed (transport): the request could not be sent: \
+             io: Connection refused (os error 111)"
+                .to_owned(),
+        ),
+        duration_ms: Some(17_400),
+        started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        log: run_dir.join("run.log"),
+        dir: run_dir,
+    }];
+    app.run_selected = 0;
+    app.show(Screen::Runs);
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("outcome:"), "{screen}");
+    assert!(screen.contains("Connection refused"), "{screen}");
+    assert!(
+        screen.contains("o opens the log on show"),
+        "the `o` line is not drawn: {screen}"
+    );
+    assert!(
+        screen.contains("T opens the transcript on show"),
+        "the `T` line is not drawn: {screen}"
+    );
+}
+
+#[test]
+fn the_add_agent_form_draws_every_field_and_the_cursor_at_eighty_columns() {
+    // M-1: at 80x24 the form drew four fields and let the cursor walk onto the two
+    // Forgejo rows without drawing them. Every field and the cursor's own row must be
+    // on the screen, and a window too short to hold the form must say so.
+    let root = scratch("form-fields-80");
+    let mut app = app_with_config(&root, EMPTY_CONFIG);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('n')));
+    let first = render_at(80, 24, &app);
+    for label in ["agent name", "model endpoint", "model id", "model key"] {
+        assert!(first.contains(label), "the field {label} is not drawn: {first}");
+    }
+    // Walk to the last field: the cursor must take the view with it.
+    for _ in 0..5 {
+        app.on_key(KeyEvent::from(KeyCode::Down));
+    }
+    let last = render_at(80, 24, &app);
+    assert!(
+        last.contains("> Forgejo role token"),
+        "the cursor's own field is not drawn: {last}"
+    );
+    assert!(last.contains("enlarge the window"), "{last}");
 }
