@@ -397,7 +397,7 @@ fn the_forgejo_screen_shows_a_role_check_and_an_identity_plainly() {
     assert!(screen.contains("administrative view"), "{screen}");
     assert!(screen.contains("root/private"), "{screen}");
     assert!(screen.contains("private"), "{screen}");
-    assert!(screen.contains("root sees 2 repository(ies)"), "{screen}");
+    assert!(screen.contains("root sees 2 repositories"), "{screen}");
     assert!(screen.contains("gewu-scribe"), "{screen}");
     assert!(screen.contains("(created"), "{screen}");
 

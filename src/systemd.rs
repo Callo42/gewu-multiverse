@@ -300,7 +300,7 @@ pub fn render_unit(spec: &UnitSpec) -> String {
 
 [Unit]
 Description=gewu-multiverse agent `{agent}`
-# A failed run is restarted, but not for ever: at most {burst} start(s) in {interval} s.
+# A failed run is restarted, but not for ever: the start limit below bounds it.
 StartLimitIntervalSec={interval}
 StartLimitBurst={burst}
 

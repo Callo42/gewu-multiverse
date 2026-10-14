@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::credentials::Secret;
+use crate::words;
 
 /// How long one model exchange may take, unless the run has less time left.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -224,12 +225,18 @@ impl Reply {
                 format!("replied {:?}", excerpt(text, 80))
             }
             _ if !self.tool_calls.is_empty() => {
-                format!("asked for {} tool call(s)", self.tool_calls.len())
+                format!(
+                    "asked for {}",
+                    words::counted(self.tool_calls.len(), "tool call", "tool calls")
+                )
             }
             _ => "answered with an empty message".to_owned(),
         };
         match self.usage {
-            Some(usage) => format!("{text}; {} token(s) used", usage.total_tokens),
+            Some(usage) => format!(
+                "{text}; {} used",
+                words::counted(usage.total_tokens as usize, "token", "tokens")
+            ),
             None => text,
         }
     }
@@ -768,6 +775,41 @@ mod tests {
         );
         // Anything the product does not know keeps the transport's sentence.
         assert_eq!(in_product_words("a frobnicator failed"), "a frobnicator failed");
+    }
+
+    #[test]
+    fn a_reply_summary_counts_with_the_right_noun() {
+        // C-2: the record drew `asked for 1 tool call(s)` and `5 token(s) used`.
+        let one = Reply {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_owned(),
+                kind: "function".to_owned(),
+                function: FunctionCall {
+                    name: "shell".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+            }),
+            finish_reason: Some("tool_calls".to_owned()),
+            model: None,
+            body: String::new(),
+        };
+        assert_eq!(one.summary(), "asked for 1 tool call; 5 tokens used");
+        let two = Reply {
+            tool_calls: vec![one.tool_calls[0].clone(), one.tool_calls[0].clone()],
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                total_tokens: 1,
+            }),
+            ..one.clone()
+        };
+        assert_eq!(two.summary(), "asked for 2 tool calls; 1 token used");
     }
 
     #[test]
