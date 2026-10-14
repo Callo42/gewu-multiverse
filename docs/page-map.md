@@ -22,7 +22,11 @@ drawn row of a note area — so a scrolled panel never hides its own heading in 
 The declaration is the part that must survive: when a panel's title carries more than
 its name (the Forgejo panel carries its repository range) and both cannot fit, the
 screen name is shortened and then the declaration is shortened, and only if neither
-can hold both does the range move to a line above the list. **The scroll offset belongs
+can hold both does the range move to a line above the list. A column that shows an
+agent's **name** is sized to the shortest width that keeps every configured name
+distinct; a name that still cannot fit is shortened with an ellipsis that keeps both
+ends, never clipped mid-word with no marker, and the failure class in a state column is
+shortened to a word that fits whole. **The scroll offset belongs
 to the screen it was made on**: every way of changing screens (`1`–`6`, tab and
 left/right, `esc`, `enter` into an agent) returns the new screen to its own top, so a
 screen the user never scrolled never opens at another screen's offset. **The below-fold
@@ -95,6 +99,11 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 
 ## Instruction, steps and skills (`3`)
 
+The `path` on this screen is the agent's configured `instruction` document, resolved
+against the configuration directory. The Agent screen and every run read the same file,
+so no screen shows a path the run ignores (P-3); the add-agent form writes the derived
+`agents/<name>/instruction.md`, which stays the common case.
+
 | State | Shows | Must offer |
 |---|---|---|
 | no agent | `no agent to show` + the config path | the in-app path to add one |
@@ -112,6 +121,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | a check was refused | `role check failed (<class>) at <configured url>: <reason>`; a token that is an administrator's but is checked as `member` says so and names `C` | the URL the user configured, led before the reason, and the account's real standing, not a bare class |
 | configured, unread | the URL and role | a sentence that says *not read yet*, not “could not be read” |
 | checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel (or, when that cannot share the title with the overflow declaration, a `repositories a–b of N` line above the list), each `[private]`/`[public]`, what the caller may do; the definition of a role shortens once the check has run, so the list gets the panel (more than one row at 80×24); the key legend is two compact rows, each phrase keeping its object (`v agent token`), and the rows after the list are reserved so the legend is never what the list pushes off | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
+| checked, an identity report on the tail at 80×24 | the panel with the identity report and the clone note after the list | when the extra tail makes the windowed form too tall, the scrolled form is used with `more below; enlarge the window` in the title and `[`/`]` reach every repository and the two-row key legend: the legend is **not** pinned in this state, but it is one `]` away and nothing is hidden silently (P-6) |
 | checked, too short for the windowed form (below 80×24) | the same panel drawn whole — summary, `repositories 1–N of N`, every repository with its `>` marker, the identity report, the clone note and the two-row key legend — with `more below; enlarge the window` (or `↑ more above` once scrolled) in the title | the same discipline as every other panel: `[`/`]` scroll the Forgejo panel too, so the whole repository list and the key legend are **reachable** below 80×24 and at the 72×18 floor, not merely declared; `up/down` still chooses a repository. The refusal never names a panel that is not on this screen |
 | checked rows then `g` | the clone acts as the agent's identity, while the list came from the role token | a failed clone names the account it acted as and says the list came from the role token, so two different tokens are not confused; `g`, `P` and `U` act **only** on this screen — off it, `g` is the list's own top-of-list key, never a Forgejo action |
 | both tokens present | one view at a time, or both | a way to compare the two roles **inside the app** (`c` / `C`); a failed `C` keeps the last good view and shows the failure beside it |
@@ -143,11 +153,11 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | Overlay | State | Must offer |
 |---|---|---|
 | first-run acknowledgment | shown once per configuration directory | own its rows (no bleed from the panel); `y`/`n`; the record path **at the advertised minimum too** (80×24), never a sentence that ends without its object |
-| any overlay over a screen | the panel and the overlay | the footer's status rows stay visible under the overlay — including the help overlay, which used to cover them — so a sentence about what just happened (a paste kept only its first line, a refusal, or the help's own "press PageDown" note) is never cleared away |
+| any overlay over a screen | the panel and the overlay | the footer's status rows stay visible under the overlay — including the help overlay, which used to cover them — so a sentence about what just happened (a paste kept only its first line, a refusal, or the help's own "press PageDown" note) is never cleared away; and the footer's key legend never advertises `q quit` while an overlay owns the keys (there `q` is a letter in a field or a cancel), reading `esc closes this overlay` instead |
 | add-agent form (`n`/`a`) | opened from the Agents screen | name, endpoint, model, key, Forgejo URL, **role** token — every field drawn at 80×24, with the body windowed so the cursor's own row is always drawn; writes the two files; the model key is **required**, so the agent the form creates can run; the form says the agent's own token is separate and is supplied later with `v`; the keys never echoed; **the `enter writes it / esc cancels` action line is in the panel at every size** (including 80×24); a masked field shows how many characters it holds; a bracketed paste keeps the first line, names the rest as unused, and **replaces** the field instead of appending |
 | secret prompt (`k`/`f`/`v`/`A`) | Credentials (`k`, `f`, `A`) and Forgejo (`v`, `A`) | one field, masked, showing how many characters it holds (`1 character` in the singular); writes the named secret to the credentials file, naming the agent it belongs to when the secret is per-agent; never a value on screen; a bracketed paste keeps the first line and replaces |
-| removal confirmation (`d`) | any configured agent | `y` or `enter` removes it from the configuration, `n` or `esc` keeps it — the destructive key is named in the box; the files left on disk are named **only when they exist**, and the run records under the state directory and the credentials file are named too, with where to delete the secret |
-| leftover-secret delete (`D`) | Credentials, when a secret's agent is no longer configured | the agents are named (never a value); `y`/`enter` deletes exactly those entries from the credentials file and says what was deleted; `n`/`esc` keeps them |
+| removal confirmation (`d`) | any configured agent | `y` or `enter` removes it from the configuration, `n`, `esc` or `q` keeps it — the destructive key is named in the box, and `q` is never the destructive one; the files left on disk are named **only when they exist**, and the run records under the state directory and the credentials file are named too, with where to delete the secret |
+| leftover-secret delete (`D`) | Credentials, when a secret's agent is no longer configured | the agents are named (never a value); `y`/`enter` deletes exactly those entries from the credentials file and says what was deleted; `n`, `esc` or `q` keeps them |
 | key help (`?`/`h`/`F1`) | any screen | every key, in groups, with one line of what it does; a **scrollable window** whose title reads `keys a–b of N — ↓/↑ more` when the window is short, so every key survives 80×24; it scrolls with up/down (and `j`/`k`), a page with PageDown/PageUp, and Home/`g` or End/`G` to either end; `[`/`]` scroll a panel or note area and `D` deletes a leftover secret; a key it cannot use says so instead of being swallowed |
 
 ## Hand-offs (editor, pager)
@@ -158,20 +168,20 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | editor, `$EDITOR` unset | `vi` (or `nano` when present) | the program named, and how to leave it — the overlay gives `vi`'s `:wq`/`:q!` and `nano`'s `^X`; an honest “not changed” when nothing was saved |
 | editor on skills (`K`) | a scratch `SKILL.md`, not a directory | what a skill is and the file name |
 | editor on an instruction | a file whose only guidance is one marked placeholder line | **the product's own first placeholder line** is dropped before a run sends the document (a line equal to it later in the user's own document is kept), so guidance is never sent as instruction but the user's text is not deleted; an emergency save left by an interrupted editor is named before the hand-off |
-| pager (`o`, `T`) | the user's own `$PAGER` | the path shown before it opens, and how to leave it (the pager's own `q`), because `esc` is this product's way back but not the pager's |
+| pager (`o`, `T`) | the user's own `$PAGER` | the path shown before it opens, and how to leave it (the pager's own `q`), because `esc` is this product's way back but not the pager's — and `esc` there can begin a sequence that swallows the next key, so the sentence names that trap and says to press `q` again |
 
 ## Signals and abandoned runs
 
 | State | Shows | Must offer |
 |---|---|---|
 | the UI is signalled | — | the runs it started in `tui` mode end with it: the child asks the kernel to end when its parent does |
-| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop (`1 run`, not `1 run(s)`), with the pronoun in the same number (`stop it` / `stop them`) | press `q` again to leave and stop them, or any other key to stay; staying **replaces the warning** with a plain statement rather than re-asking the question; the record of each ended run names the UI closing, not “on request” |
+| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop (`1 run`, not `1 run(s)`), with the pronoun in the same number (`stop it` / `stop them`) | press `q` again to leave and stop them, or any other key to stay; staying **replaces the warning** with a plain statement rather than re-asking the question, and the staying key is **consumed**, so an unbound key cannot erase the statement with `no key is bound to that`; the record of each ended run names the UI closing, not “on request” |
 | the UI is reopened after a run was left behind | the agent as `stopped`, never `idle`; the run's duration is the time it actually ran | the run's own record is closed as `stopped` with a reason, so a second run of the same agent never overlaps an abandoned one, in the same workspace |
 | the UI is reopened after a run finished | the agent's newest terminal outcome, its reason and its elapsed time | the hub seeds each agent from its newest terminal record, so a restart never shows `idle` for an agent whose record says `succeeded`, `stopped` or `failed` |
 | the configuration is re-read (`r`) after an agent was removed by hand | the removed agent's run is stopped, and the note names it once, in the note area | the run does not stay counted but invisible; what the footer counts is what a screen can show; the run's own record names the re-read, never “on request” |
 | the configuration is re-read (`r`) after the run records were deleted | the hub drops an outcome whose record is gone; the hub and the ledger agree; when a cached outcome is dropped the hub says a record it had is no longer there, and an older record left is not called “the last run” | a cached outcome never outlives the record it came from, and a person whose history was edited by hand is told |
 | a start fails before a run ever runs (systemd refuses, the process cannot spawn) | the run state is `failed` with the start's reason, not `unknown start / no terminal record` | the record opened for the start is closed as `failed`, so the next `s` is not blocked by a run that never was |
-| `^C` | — | a control chord is never a plain-letter binding: `^C` asks the same question `q` asks when runs are in flight (naming the runs and the way to stay), and a second `^C` leaves and stops them; with nothing running it leaves at once |
+| `^C` | — | a control chord is never a plain-letter binding: `^C` asks the same question `q` asks when runs are in flight (naming the runs and the way to stay), and a second `^C` leaves and stops them; with nothing running it leaves at once. Inside a hand-off (editor, pager) `^C` belongs to the user's own program: the product catches the signal for itself, so the hand-off's own exit returns to the product instead of killing it and stopping the runs, and when it regains the terminal it asks the same leave question |
 
 ## Every screen — footer
 

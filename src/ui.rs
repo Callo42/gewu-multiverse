@@ -25,6 +25,19 @@ use crate::systemd::Mode;
 /// The space between the field name and its value on the detail screens.
 const LABEL_WIDTH: usize = 16;
 
+/// The comfortable minimum width of a column of agent names.
+///
+/// The hub and the runs list used to fix the name column here and clip whatever was
+/// longer with no marker, so two legal names that shared a prefix read identically
+/// (P-2). The column now grows to the shortest width that keeps every configured name
+/// apart, and never falls below this.
+const NAME_COLUMN_MIN: usize = 14;
+
+/// The room the hub's state column wants for the longest word it can show, and the
+/// least it is given before it ellipsizes (E-7, P-5).
+const STATE_COLUMN_MAX: usize = 19;
+const STATE_COLUMN_MIN: usize = 12;
+
 /// The smallest window the product will draw its panels into.
 ///
 /// Below this, panels and the modal clip silently — an action line or a reason simply
@@ -135,6 +148,10 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
 
     let capacity = parts[0].height.saturating_sub(3) as usize;
     let (first, shown) = visible_window(app.agents().len(), app.selected, capacity);
+    // The name column is sized to the names themselves: a legal name is never clipped
+    // into a neighbour without a marker (P-2), and the state column gets the room for
+    // the longest state word (E-7, P-5).
+    let [name_w, model_w, concurrency_w, supervision_w, state_w] = hub_column_widths(app, parts[0]);
 
     let header = Row::new(["", "agent", "model", "concurrency", "supervision", "state"])
         .style(
@@ -159,22 +176,25 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
                 // monochrome capture, or a person who cannot tell the colours apart,
                 // still sees which row the next key will act on.
                 Cell::from(if at == app.selected { ">" } else { " " }),
-                Cell::from(agent.name.clone()),
-                Cell::from(agent.model.clone()),
+                Cell::from(ellipsise(&agent.name, name_w as usize)),
+                Cell::from(ellipsise(&agent.model, model_w as usize)),
                 Cell::from(agent.concurrency.to_string()),
                 Cell::from(app.supervisor.mode(&agent.name).as_str()),
-                Cell::from(app.supervisor.state(&agent.name).word_with_reason()),
+                Cell::from(ellipsise(
+                    &app.supervisor.state(&agent.name).cell_word(),
+                    state_w as usize,
+                )),
             ])
             .style(style)
         })
         .collect();
     let widths = [
         Constraint::Length(2),
-        Constraint::Length(14),
-        Constraint::Length(16),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Min(18),
+        Constraint::Length(name_w),
+        Constraint::Length(model_w),
+        Constraint::Length(concurrency_w),
+        Constraint::Length(supervision_w),
+        Constraint::Length(state_w),
     ];
     let table = Table::new(rows, widths).header(header).block(
         Block::bordered().title(list_title("agents", first, shown, app.agents().len())),
@@ -320,10 +340,14 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(field("model", &agent.model));
             lines.push(field("endpoint", &agent.endpoint));
             lines.push(field("max turns", &agent.max_turns.to_string()));
-            lines.push(field(
-                "instruction",
-                &agent.instruction.display().to_string(),
-            ));
+            // The instruction the run reads, resolved against the configuration
+            // directory. The Instruction screen and the run's own plan show the same
+            // file, so this screen cannot present a path the run ignores (P-3).
+            let instruction = app
+                .selected_paths()
+                .map(|paths| paths.instruction().display().to_string())
+                .unwrap_or_else(|| agent.instruction.display().to_string());
+            lines.push(field("instruction", &instruction));
             lines.push(field("concurrency", &agent.concurrency.to_string()));
             lines.push(Line::from(""));
             lines.push(field(
@@ -1048,6 +1072,21 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
 
     let capacity = parts[0].height.saturating_sub(3) as usize;
     let (first, shown) = visible_window(app.recent.len(), app.run_selected, capacity);
+    // The same name column as the hub: a run's agent is a configured name, and it is
+    // never clipped into a neighbour without a marker (P-2).
+    const RUN_ID: usize = 22;
+    const STARTED: usize = 20;
+    const OUTCOME_MIN: usize = 12;
+    let inner = (area.width as usize).saturating_sub(2);
+    let available = inner.saturating_sub(4);
+    let names: Vec<&str> = app.recent.iter().map(|run| run.agent.as_str()).collect();
+    let name_budget = available
+        .saturating_sub(2 + RUN_ID + STARTED + OUTCOME_MIN)
+        .max(NAME_COLUMN_MIN);
+    let name_w = name_column_width(&names, name_budget);
+    let outcome_w = available
+        .saturating_sub(2 + name_w + RUN_ID + STARTED)
+        .max(OUTCOME_MIN.min(available));
 
     // The start time is written in RFC 3339 UTC on disk; saying so in the header is
     // what stops it reading as a wrongly-set wall clock (W-4).
@@ -1072,7 +1111,7 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             };
             Row::new(vec![
                 Cell::from(if at == app.run_selected { ">" } else { " " }),
-                Cell::from(run.agent.clone()),
+                Cell::from(ellipsise(&run.agent, name_w)),
                 Cell::from(ellipsise(&run.run_id, 20)),
                 Cell::from(run.started_text()),
                 Cell::from(run.describe()),
@@ -1082,10 +1121,10 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     let widths = [
         Constraint::Length(2),
-        Constraint::Length(12),
-        Constraint::Length(24),
-        Constraint::Length(24),
-        Constraint::Min(18),
+        Constraint::Length(name_w as u16),
+        Constraint::Length(RUN_ID as u16),
+        Constraint::Length(STARTED as u16),
+        Constraint::Length(outcome_w as u16),
     ];
     let table = Table::new(rows, widths).header(header).block(
         Block::bordered().title(list_title("recent runs", first, shown, app.recent.len())),
@@ -1141,7 +1180,7 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         // `esc` is this product's way back everywhere, but not the pager's; name the
         // pager's own key on the screen, before the key is pressed (M-5).
         lines.push(Line::from(Span::styled(
-            "Both open in your $PAGER; leave the pager with q.",
+            "Both open in your $PAGER; leave the pager with q. `esc` is not the pager's key: it can swallow the next key, so if the pager ignores it, press q again.",
             Style::new().fg(Color::DarkGray),
         )));
         // The paths are the detail: named here, below the offers, so a short note area
@@ -1157,6 +1196,72 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         )));
     }
     lines
+}
+
+/// The widths of the hub's five data columns.
+///
+/// The name column is widened to the shortest width that keeps every configured name
+/// distinct, up to the room the window has; the state column is given the room for its
+/// longest word; the model column takes what is left. When the window is too narrow
+/// for all of them, the state gives ground first, then the name falls back to its
+/// comfortable minimum, so identity outlives the labels.
+fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
+    const MARKER: usize = 2;
+    const GAPS: usize = 5;
+    const CONCURRENCY: usize = 11;
+    const SUPERVISION: usize = 11;
+    const MODEL_MIN: usize = 8;
+    let inner = (area.width as usize).saturating_sub(2);
+    let available = inner.saturating_sub(GAPS);
+    let names: Vec<&str> = app.agents().iter().map(|agent| agent.name.as_str()).collect();
+    // The name may use whatever is left once the other columns have their minimums.
+    let name_budget = available
+        .saturating_sub(MARKER + CONCURRENCY + SUPERVISION + STATE_COLUMN_MIN + MODEL_MIN)
+        .max(NAME_COLUMN_MIN);
+    let name = name_column_width(&names, name_budget);
+    let state_wanted = app
+        .agents()
+        .iter()
+        .map(|agent| app.supervisor.state(&agent.name).cell_word().chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(STATE_COLUMN_MIN, STATE_COLUMN_MAX);
+    let state = state_wanted
+        .min(available.saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + MODEL_MIN))
+        .max(STATE_COLUMN_MIN.min(available));
+    let model = available
+        .saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + state)
+        .max(MODEL_MIN.min(available));
+    [
+        name as u16,
+        model as u16,
+        CONCURRENCY as u16,
+        SUPERVISION as u16,
+        state as u16,
+    ]
+}
+
+/// The width of a column of agent names.
+///
+/// A name is at most `MAX_AGENT_NAME_LEN` characters and the configuration refuses
+/// duplicates, so whole names are always distinct. When the window cannot hold the
+/// longest name, the smallest width that still tells every distinct name apart
+/// (keeping both ends) is used; `cap` is the room the caller can give.
+fn name_column_width(names: &[&str], cap: usize) -> usize {
+    let cap = cap.max(NAME_COLUMN_MIN);
+    let mut distinct: Vec<&str> = names.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    for width in NAME_COLUMN_MIN..=cap {
+        let mut rendered: Vec<String> =
+            distinct.iter().map(|name| ellipsise(name, width)).collect();
+        rendered.sort();
+        rendered.dedup();
+        if rendered.len() == distinct.len() {
+            return width;
+        }
+    }
+    cap
 }
 
 /// Shorten text to `max` characters, marking the cut with an ellipsis in the middle.
@@ -1204,12 +1309,18 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: true }),
         parts[0],
     );
+    // The legend is the product's own key list. Under an overlay that owns the plain
+    // keys, `q` is a letter in a field or a cancel, never `quit`, so the line is
+    // replaced with the one thing that is true there (E-2).
+    let legend = if app.overlay_owns_keys() {
+        "esc closes this overlay"
+    } else {
+        "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open   r re-read"
+    };
     frame.render_widget(
-        Paragraph::new(
-            "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open   r re-read",
-        )
-        .style(Style::new().fg(Color::DarkGray))
-        .wrap(Wrap { trim: true }),
+        Paragraph::new(legend)
+            .style(Style::new().fg(Color::DarkGray))
+            .wrap(Wrap { trim: true }),
         parts[1],
     );
     frame.render_widget(
@@ -1771,7 +1882,7 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "y or enter remove it        n or esc keep it",
+            "y or enter remove it        n, esc or q keep it",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -1825,7 +1936,7 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
         Line::from("Their agents are not configured any more. The values are never shown."),
         Line::from(""),
         Line::from(Span::styled(
-            "y or enter delete them        n or esc keep them",
+            "y or enter delete them        n, esc or q keep them",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
