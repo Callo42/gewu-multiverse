@@ -63,6 +63,22 @@ fn program_on_path(name: &str) -> bool {
     })
 }
 
+/// Whether the user has chosen an editor through `$EDITOR` or `$VISUAL`.
+///
+/// When neither is set the tool falls back to `nano` or `vi`; that fallback is
+/// exactly the case where the user needs to be told which program is about to take
+/// the screen, so the UI asks first.
+pub fn editor_is_configured() -> bool {
+    env::var("EDITOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+        || env::var("VISUAL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+}
+
 /// The reading program this process would use.
 pub fn pager() -> String {
     choose_pager(env::var("PAGER").ok())
