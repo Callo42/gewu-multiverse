@@ -2220,6 +2220,11 @@ concurrency = 3
         let action = app.take_action().expect("a steps edit");
         assert_eq!(action.path, paths.steps_file());
         assert!(paths.steps_file().is_file());
+        // N-10: the steps template must not doubt the product by saying model calls
+        // do not exist yet; they do, and the template describes when the steps run.
+        let template = std::fs::read_to_string(paths.steps_file()).expect("the steps read");
+        assert!(!template.contains("Until model calls exist"), "{template}");
+        assert!(template.contains("before the model is"), "{template}");
         app.on_key(key(KeyCode::Char('K')));
         let action = app.take_action().expect("a skills edit");
         // `K` opens a scratch `SKILL.md`, never a directory.

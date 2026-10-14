@@ -373,3 +373,20 @@ mod tests {
         assert_eq!(code, 1);
     }
 }
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    #[test]
+    fn a_git_refusal_leads_with_gits_own_message() {
+        // N-6: a failed clone must say why, not lead with the long command it ran.
+        let error = WorkspaceError::Git {
+            command: "git clone http://example.invalid/very/long/path.git /tmp/ws".to_owned(),
+            message: "repository not found".to_owned(),
+        };
+        let detail = error.detail();
+        assert!(detail.starts_with("repository not found"), "{detail}");
+        assert!(!detail.starts_with("`git"), "{detail}");
+    }
+}
