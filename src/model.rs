@@ -266,8 +266,11 @@ pub enum ModelError {
         /// The status the endpoint answered with.
         status: u16,
     },
-    /// The endpoint does not serve that model.
-    #[error("the endpoint does not serve the model {model:?} (HTTP {status})")]
+    /// The endpoint does not serve that model, or the configured address is a base
+    /// rather than the completions path a run POSTs to.
+    #[error(
+        "the endpoint does not serve the model {model:?} (HTTP {status}); if the configured address is a base URL, it may need the full completions path (usually /chat/completions)"
+    )]
     ModelNotFound {
         /// The model the agent asked for.
         model: String,
@@ -656,6 +659,9 @@ mod tests {
             .expect_err("the model is refused");
         assert_eq!(error.class(), "model_not_found");
         assert!(error.to_string().contains("example-model"));
+        // D-3: a 404 is also what a base URL produces, so the sentence must say the
+        // path may be the problem, not only the model.
+        assert!(error.to_string().contains("/chat/completions"), "{error}");
     }
 
     #[test]

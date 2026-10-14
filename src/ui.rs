@@ -4,8 +4,9 @@
 //! real terminal and, in the tests, an in-memory backend: what the tests show is what
 //! the terminal shows.
 //!
-//! Every screen that has nothing behind it says so, in a line that starts with
-//! `Placeholder`. No screen offers an action the program cannot carry out: the state
+//! Every screen that has nothing behind it says so, in the product's own words and
+//! without a word from inside the product. No screen offers an action the program
+//! cannot carry out: the state
 //! it shows comes from the supervisor, the files it names are read back from disk,
 //! and what is still missing — the model call and the Forgejo work — is named.
 
@@ -45,10 +46,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         );
         return;
     }
+    // The footer grows to hold its status: a reason or a path is never the line that
+    // clips. It may take the body's spare rows down to the body's own minimum, but no
+    // further, so a long message is shown whole without hiding the screen behind it.
+    let max_status = full.height.saturating_sub(9).max(3);
+    // The status keeps its three rows even when it needs fewer, so the ordinary
+    // layout is unchanged; it grows only for a status that does not fit in three.
+    let status = status_rows(&app.status, full.width).clamp(3, max_status);
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
-        Constraint::Length(5),
+        Constraint::Length(status + 2),
     ])
     .split(frame.area());
 
@@ -174,8 +182,10 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
 fn agent_notes(app: &App) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(error) = &app.config_error {
+        // The recovery key belongs with the error, not only in the legend that a short
+        // window clips (T-7): say how to try the file again after fixing it.
         lines.push(Line::from(Span::styled(
-            format!("no agent list: {error}"),
+            format!("no agent list: {error} — fix the file, then press r to read it again"),
             Style::new().fg(Color::Red),
         )));
     }
@@ -193,17 +203,25 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Yellow),
         )));
     }
+    let waiting = app.supervisor.waiting_count();
+    let waiting_noun = if waiting == 1 { "start" } else { "starts" };
     lines.push(Line::from(format!(
-        "Running: {} of {} allowed by the configuration; {} start(s) waiting for a slot.",
+        "Running: {} of {} allowed by the configuration; {waiting} {waiting_noun} waiting for a slot.",
         app.supervisor.running_count(),
         app.supervisor.max_concurrent(),
-        app.supervisor.waiting_count(),
     )));
-    // Why the selected agent's last run failed, on the screen the user looks at.
+    // Why the selected agent's last run failed, on the screen the user looks at. A
+    // start that never became a run is named as a start, not as a run (D-8).
     if let Some(name) = app.selected_name() {
-        if let Some(reason) = app.last_failure(&name) {
+        if let Some(reason) = app.last_run_failure(&name) {
             lines.push(Line::from(Span::styled(
                 format!("the last run of `{name}` did not go well: {reason}"),
+                Style::new().fg(Color::Red),
+            )));
+        }
+        if let Some(reason) = app.last_start_failure(&name) {
+            lines.push(Line::from(Span::styled(
+                format!("the last start of `{name}` did not go well: {reason}"),
                 Style::new().fg(Color::Red),
             )));
         }
@@ -292,6 +310,18 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                     "restarts",
                     &app.supervisor.restart_count(&agent.name).to_string(),
                 ));
+                // A `systemd` record whose user manager cannot be reached is the T-1
+                // state, and it must be visible where the mode is shown: say what is
+                // missing, and that `m` leaves the mode without needing the manager
+                // when no unit file is on disk.
+                if let Some(reason) = app.supervisor.systemd_last_error() {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "the user's systemd cannot be reached: {reason} — press m to leave systemd mode; leaving needs no unit on disk and no manager"
+                        ),
+                        Style::new().fg(Color::Red),
+                    )));
+                }
             }
             if let Some(paths) = app.selected_paths() {
                 lines.push(field(
@@ -335,13 +365,23 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
         "e edit the instruction   K start a new skill   t edit the declared steps   p test the endpoint   s start   x stop   m switch supervision mode   o open the log",
         Style::new().fg(Color::DarkGray),
     )));
+    // A short window does not silently drop the fields below the fold: the panel says
+    // so in its title, which is always drawn (D-7).
+    let inner = area.width.saturating_sub(2) as usize;
+    let overflows = pushed_rows(&lines, inner) > area.height.saturating_sub(2) as usize;
+    let title = if overflows {
+        " agent configuration — more fields below; enlarge the window "
+    } else {
+        " agent configuration "
+    };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" agent configuration "))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
+
 
 /// An agent's instruction, its declared steps and its skills, as they are on disk.
 fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
@@ -365,10 +405,17 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
                             // guidance line is dropped, and the two numbers differ
                             // (P-4).
                             match app.instruction_payload() {
-                                Some((on_disk, sent)) if on_disk != sent => format!(
+                                Some((on_disk, sent, dropped)) if on_disk != sent && dropped => format!(
                                     "{on_disk} bytes on disk; a run sends {sent} — the guidance line is dropped"
                                 ),
-                                Some((on_disk, _)) => format!("{on_disk} bytes"),
+                                // No guidance line to drop: the only difference a run
+                                // can make on its own is the document's trailing
+                                // newline, and naming it for what it is (T-3, D-1) is
+                                // the difference between a fact and a false reason.
+                                Some((on_disk, sent, _)) if on_disk != sent => format!(
+                                    "{on_disk} bytes on disk; a run sends {sent} — the trailing newline is not sent"
+                                ),
+                                Some((on_disk, _, _)) => format!("{on_disk} bytes"),
                                 None => format!("{bytes} bytes"),
                             }
                         },
@@ -393,7 +440,8 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
                     lines.push(field(
                         "  declared",
                         &if exists {
-                            format!("{count} shell step(s), run in the workspace")
+                            let noun = if count == 1 { "step" } else { "steps" };
+                            format!("{count} shell {noun}, run in the workspace")
                         } else {
                             "none — press t to declare some".to_owned()
                         },
@@ -429,8 +477,11 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(agent) = app.selected_agent() {
         lines.push(Line::from(Span::styled(
             format!(
-                "A run sends this instruction, the conversation so far and the declared `shell` tool to {} ({}), runs the tool calls it asks for inside the workspace, and stops when the model finishes or after {} turn(s).",
-                agent.endpoint, agent.model, agent.max_turns
+                "A run sends this instruction, the conversation so far and the declared `shell` tool to {} ({}), runs the tool calls it asks for inside the workspace, and stops when the model finishes or after {} {}.",
+                agent.endpoint,
+                agent.model,
+                agent.max_turns,
+                if agent.max_turns == 1 { "turn" } else { "turns" },
             ),
             Style::new().fg(Color::DarkGray),
         )));
@@ -487,13 +538,35 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                     &format!("{login}{mode} — clones and pull requests act as this account"),
                 ));
             }
-            _ => lines.push(field("agent identity", "not settled — press i")),
+            _ => {
+                // What `i` will do, before it does it: with an administrator token the
+                // tool creates and manages the account `gewu-<agent>`; without one, it
+                // checks the token the user supplies with `v` (D-4).
+                let login = identity::login_for(&agent.name)
+                    .unwrap_or_else(|_| format!("gewu-{}", agent.name));
+                let (_, admin) = app.forgejo_tokens_present();
+                let sentence = if admin {
+                    format!(
+                        "not settled — press i to create `{login}` (managed) on your Forgejo"
+                    )
+                } else {
+                    format!(
+                        "not settled — press i to check the token supplied with v for `{login}`"
+                    )
+                };
+                lines.push(field("agent identity", &sentence));
+            }
         }
     }
-    lines.push(Line::from(Span::styled(
-        ROLE_EXPLANATION,
-        Style::new().fg(Color::DarkGray),
-    )));
+    // The definition of a role is what the screen owes *before* `c` is pressed; once
+    // the check has run, the repositories are what the panel is for, and the list
+    // gets the rows (T-12).
+    if !matches!(app.role_check, Some(Ok(_))) {
+        lines.push(Line::from(Span::styled(
+            ROLE_EXPLANATION,
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     lines.push(Line::from(""));
 
     let mut repo_window: Option<(usize, usize, usize)> = None;
@@ -541,9 +614,10 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 // `more`, and the selection walked onto the undrawn row (W-1).
                 let inner = area.width.saturating_sub(2) as usize;
                 let content_height = area.height.saturating_sub(2) as usize;
-                let used_before = lines.len()
-                    + wrapped_rows(ROLE_EXPLANATION, inner).saturating_sub(1)
-                    + wrapped_rows(&summary, inner).saturating_sub(1);
+                // Count what every line above actually occupies once wrapped: a long
+                // identity sentence or role explanation must not push the selected
+                // repository off the panel (W-1, T-12).
+                let used_before = pushed_rows(&lines, inner);
                 let capacity = content_height.saturating_sub(used_before).max(1);
                 let total = check.repositories.len();
                 let (first, shown) = visible_window(total, app.repo_selected, capacity);
@@ -806,10 +880,11 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
 /// line leads with `? all keys`, so at 80 columns nothing is hidden *silently*;
 /// the full list is one key away.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    // The status gets three rows so a long reason or path wraps instead of being cut;
-    // the legend gets its own row and is built to fit it, tail and all.
+    // The status takes every row the caller gave the footer but the legend's two, so a
+    // long reason or path wraps instead of being cut; the legend gets its own row and
+    // is built to fit it, tail and all.
     let parts = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -843,6 +918,38 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::new().fg(Color::DarkGray)),
         parts[2],
     );
+}
+
+/// How many rows the status needs at one width, wrapping counted.
+///
+/// The footer asks this before it lays itself out, so a status that carries a path, a
+/// mode or git's own multi-line error is given the rows to be read whole (T-2, T-7).
+/// The count is the terminal's own rule: words are kept whole where they fit, and a
+/// word longer than the row (a path) is broken across rows rather than clipped.
+fn status_rows(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let rows: usize = text
+        .lines()
+        .map(|line| wrapped_rows(line, width))
+        .sum();
+    rows.max(1) as u16
+}
+
+/// The rows every line already pushed into a panel will occupy at `width`, wrapping
+/// counted. A window that picks its first row from this number never starts below a
+/// row that has wrapped into several, so the selected row is always drawn.
+fn pushed_rows(lines: &[Line], width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            wrapped_rows(&text, width)
+        })
+        .sum()
 }
 
 /// The short clause the footer carries on every screen.
@@ -925,7 +1032,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height);
+    let height = (NewAgentForm::FIELDS.len() as u16 + 12).min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -939,7 +1046,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = vec![
         Line::from(
-            "Name an agent and point it at a model. The model key and the Forgejo token are written to the credentials file and are never shown.",
+            "Name an agent and point it at a model. The model endpoint is the full address a run POSTs the request to, usually ending in /chat/completions; the model key and the Forgejo token are written to the credentials file and are never shown.",
         ),
         Line::from(Span::styled(
             "The model key is required. The Forgejo fields are optional; a blank URL keeps the sample's placeholder address.",
@@ -960,7 +1067,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             if count == 0 {
                 String::new()
             } else {
-                format!("{} ({count} characters, hidden)", "*".repeat(count.min(12)))
+                format!("{} ({})", "*".repeat(count.min(12)), hidden_count(count))
             }
         } else {
             value.clone()
@@ -1025,15 +1132,12 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     let shown = if count == 0 {
         String::new()
     } else {
-        format!(
-            "{} ({count} characters, hidden)",
-            "*".repeat(count.min(12))
-        )
+        format!("{} ({})", "*".repeat(count.min(12)), hidden_count(count))
     };
     let mut lines: Vec<Line> = vec![
         Line::from(format!(
             "The {} is written to the credentials file and never shown.",
-            prompt.target.describe()
+            prompt.subject()
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -1053,7 +1157,7 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
         ))),
     }
     let block = Block::bordered()
-        .title(format!(" set the {} ", prompt.target.describe()))
+        .title(format!(" set the {} ", prompt.subject()))
         .border_style(Style::new().fg(Color::Cyan));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1061,6 +1165,15 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+/// How much a masked field holds, with the count in the right number.
+fn hidden_count(count: usize) -> String {
+    if count == 1 {
+        "1 character, hidden".to_owned()
+    } else {
+        format!("{count} characters, hidden")
+    }
 }
 
 /// The "remove this agent?" confirmation, so a destructive key is never silent.
@@ -1381,9 +1494,12 @@ fn field(label: &str, value: &str) -> Line<'static> {
 }
 
 /// A line that says plainly that something is not there yet.
+///
+/// The sentence carries its own meaning; it never opens with a word from inside the
+/// product (D-5).
 fn placeholder(text: &str) -> Line<'static> {
     Line::from(Span::styled(
-        format!("Placeholder — {text}."),
+        format!("{text}."),
         Style::new().fg(Color::Yellow),
     ))
 }
@@ -1391,15 +1507,21 @@ fn placeholder(text: &str) -> Line<'static> {
 /// Why there is no agent to show.
 fn no_agent_text(app: &App) -> String {
     match &app.config_error {
-        Some(error) => format!("no agent to show: {error}"),
+        Some(error) => format!(
+            "no agent to show: {error} — fix the file, then press r to read it again"
+        ),
         None => "no agent to show: the configuration lists none".to_owned(),
     }
 }
 
-/// The credentials file's mode, as read back from disk.
+/// The credentials file's mode, as read back from disk *now*.
+///
+/// The cached mode is what a file prepared when the app started had. A user who
+/// widens the file by hand must see the mode it actually has, not a remembered
+/// `0600` beside the refusal that says it is 0644 (D-2).
 fn mode_text(app: &App) -> String {
-    match app.credentials_mode {
-        Some(mode) => crate::mode::render(mode),
-        None => "not read".to_owned(),
+    match crate::mode::mode_of(&app.credentials_path) {
+        Ok(mode) => crate::mode::render(mode),
+        Err(_) => "not read".to_owned(),
     }
 }

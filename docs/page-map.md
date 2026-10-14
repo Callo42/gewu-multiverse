@@ -3,7 +3,10 @@
 Every screen the product can show, and every state a user can be in on it: what the
 screen shows, and **what it must offer a zero-knowledge user at that moment**. The map
 is the standard the screens are built and fixed against; a screen that hides the next
-step, or shows a word the user has not been given, is a defect against its row.
+step, or shows a word the user has not been given, is a defect against its row. This
+map governs the tree it is committed in; a release carries the map as of its own tag,
+so a reader can tell "the product fails its map" from "the map is ahead of the
+product".
 
 A zero-knowledge user has started the product and nothing else. They have not read this
 repository, the README or any page. The product carries them: each state says what it
@@ -44,18 +47,19 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | waiting for a slot | `waiting (1 in line)`; “is waiting its turn: …” | the slot count and the line position; no error |
 | stopped by `x` | `stopped`; “its process group was signalled and is proven gone” once the record is closed | the stop is confirmed, in the past tense, so the status and the row agree; the agent can be started again |
 | failed | `failed (class)`; the last reason in the note area | **why**, on this screen: the class and the run's own reason |
-| error (config unreadable) | `no agent list: <reason>` | the reason in the product's words and a way back (`r`, or the form) |
+| error (config unreadable) | `no agent list: <reason>` | the reason in the product's words, the **real** class (a syntax error is "not valid TOML"; an unknown field is "not a valid configuration"), and a way back named with the error (`press r to read it again`, or the form) |
 
 ## Agent (`2`) — one agent's configuration
 
 | State | Shows | Must offer |
 |---|---|---|
 | no agent | `no agent to show: …` | the same in-app path as the empty Agents screen |
-| configured | name, model, endpoint, max turns, instruction, **concurrency**, run state, supervision, unit/restarts, agent files, workspace, newest log, endpoint test, identity | every word the user needs defined here or on the screen that introduced it; no `identitynot` |
+| configured | name, model, endpoint, max turns, instruction, **concurrency**, run state, supervision, unit/restarts, agent files, workspace, newest log, endpoint test, identity | every word the user needs defined here or on the screen that introduced it; no `identitynot`; when the window is too short for every field, the panel **title** says more is below, so a field is never dropped silently (the paths wrap whole words) |
 | removing | the same fields, with the removal confirmation over them | `d` removes the agent (after asking); the files left on disk are named, so a mistyped agent is not a dead end |
 | failed | run state `failed`; the failure class and the run's reason | the reason stored, not a transient footer line |
 | systemd, unit start failed | run state; unit; restarts | the `systemctl` reason, recoverable |
-| systemd, ready | supervision `systemd (user unit)`; unit name; restarts | what `systemd` changes *before* `m` is pressed |
+| systemd, ready | supervision `systemd (user unit)`; unit name; restarts; the user manager reachable | what `systemd` changes *before* `m` is pressed |
+| systemd, the user manager is not reachable | supervision stays `tui`; the refusal names what is missing and says nothing was changed; on an existing `systemd` record, a red line naming the manager and `m` | the switch into `systemd` is **refused before the mode record changes**, so `m` is never a one-way door; leaving an existing `systemd` record succeeds without the manager when no unit file is on disk, because there is nothing to stop |
 
 ## Instruction, steps and skills (`3`)
 
@@ -63,7 +67,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 |---|---|---|
 | no agent | `no agent to show` + the config path | the in-app path to add one |
 | empty instruction | path, `not there yet — press e to write it`; a file that holds only the guidance placeholder reads the same way, with the reason | `e`, and one line of what a run sends |
-| instruction written | path, **the size on disk and the size a run sends** (with the guidance line named as dropped when they differ), steps, `skills N on disk` | a preview of the instruction, or a key that opens it; what a run will send, not only what is on disk |
+| instruction written | path, **the size on disk and the size a run sends** (the guidance line named as dropped only when it actually was; otherwise the trailing newline named as the difference), steps, `skills N on disk` | a preview of the instruction, or a key that opens it; what a run will send, not only what is on disk |
 | an interrupted edit | `an earlier edit of this instruction was not saved; the editor kept it in <file>` | the emergency-save file named, so the words are recovered, not retyped |
 | steps | path, declared count, or `none — press t` | the template must not doubt the product (“until model calls exist” is false) |
 | skills | `skills N on disk`, one `SKILL.md` per skill | what a *skill* is, and `K` must not hand an editor a directory |
@@ -75,7 +79,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | no token | `role token absent`; `admin token absent (identities are supplied)`; “no role check has been run yet — press c” | what a *role* is, in one line, before `c` is pressed |
 | a check was refused | `role check failed (<class>) at <configured url>: <reason>`; a token that is an administrator's but is checked as `member` says so and names `C` | the URL the user configured, led before the reason, and the account's real standing, not a bare class |
 | configured, unread | the URL and role | a sentence that says *not read yet*, not “could not be read” |
-| checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel, each `[private]`/`[public]`, what the caller may do | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
+| checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel, each `[private]`/`[public]`, what the caller may do; the definition of a role shortens once the check has run, so the list gets the panel (more than one row at 80×24) | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
 | checked rows then `g` | the clone acts as the agent's identity, while the list came from the role token | a failed clone names the account it acted as and says the list came from the role token, so two different tokens are not confused |
 | both tokens present | one view at a time, or both | a way to compare the two roles **inside the app** (`c` / `C`); a failed `C` keeps the last good view and shows the failure beside it |
 | a token is missing | `role token absent` / `admin token absent` / `failed (no_agent_token)` | a one-field, masked prompt (`v` for the agent's own token, `A` for the administrator token) that writes the credentials file, never an editor |
@@ -87,7 +91,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 
 | State | Shows | Must offer |
 |---|---|---|
-| ready | file path, `mode 0600`, the redaction promise | which secret **names** are present (`model key for…`, `Forgejo role token`), never a value; `k` sets a model key and `f` the role token, masked |
+| ready | file path, the mode the file **actually has now** (`0600` when it is right; a widened file shows its real mode and the refusal below), the redaction promise | which secret **names** are present (`model key for…`, `Forgejo role token`), never a value; `k` sets a model key and `f` the role token, masked |
 | after a removal | the removed agent's key, marked `(no agent with that name is configured)` | know that a listed secret belongs to no configured agent, without deleting it silently |
 | a secret is missing | `present  nothing yet — no model key and no Forgejo token` | a key on this screen to supply it (`k`, `f`, `A`), never a file to edit |
 | not ready | `the credentials file is not ready: <reason>` | the reason, and that no value is ever printed. A file that cannot be read is **not** reported as empty |
@@ -108,7 +112,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | first-run acknowledgment | shown once per configuration directory | own its rows (no bleed from the panel); `y`/`n`; the record path **at the advertised minimum too** (80×24), never a sentence that ends without its object |
 | any overlay over a screen | the panel and the overlay | the footer's status rows stay visible under the overlay, so a sentence about what just happened (a paste kept only its first line, a refusal) is never cleared away |
 | add-agent form (`n`/`a`) | opened from the Agents screen | name, endpoint, model, key, Forgejo URL, **role** token; writes the two files; the model key is **required**, so the agent the form creates can run; the form says the agent's own token is separate and is supplied later with `v`; the keys never echoed; **the `enter writes it / esc cancels` action line is in the panel at every size** (including 80×24); a masked field shows how many characters it holds; a bracketed paste keeps the first line, names the rest as unused, and **replaces** the field instead of appending |
-| secret prompt (`k`/`f`/`v`/`A`) | Credentials (`k`, `f`, `A`) and Forgejo (`v`, `A`) | one field, masked, showing how many characters it holds; writes the named secret to the credentials file; never a value on screen; a bracketed paste keeps the first line and replaces |
+| secret prompt (`k`/`f`/`v`/`A`) | Credentials (`k`, `f`, `A`) and Forgejo (`v`, `A`) | one field, masked, showing how many characters it holds (`1 character` in the singular); writes the named secret to the credentials file, naming the agent it belongs to when the secret is per-agent; never a value on screen; a bracketed paste keeps the first line and replaces |
 | removal confirmation (`d`) | any configured agent | `y` removes it from the configuration, `n` keeps it; the files left on disk are named **only when they exist** |
 | key help (`?`/`h`/`F1`) | any screen | every key, in groups, with one line of what it does; a **scrollable window** whose title reads `keys a–b of N — ↓/↑ more` when the window is short, so every key survives 80×24 |
 
@@ -127,10 +131,12 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | the UI is signalled | — | the runs it started in `tui` mode end with it: the child asks the kernel to end when its parent does |
-| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop | press `q` again to leave and stop them, or any other key to stay; the record of each ended run names the UI closing, not “on request” |
+| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop (`1 run`, not `1 run(s)`) | press `q` again to leave and stop them, or any other key to stay; staying **replaces the warning** with a plain statement rather than re-asking the question; the record of each ended run names the UI closing, not “on request” |
 | the UI is reopened after a run was left behind | the agent as `stopped`, never `idle`; the run's duration is the time it actually ran | the run's own record is closed as `stopped` with a reason, so a second run of the same agent never overlaps an abandoned one, in the same workspace |
 | the UI is reopened after a run finished | the agent's newest terminal outcome, its reason and its elapsed time | the hub seeds each agent from its newest terminal record, so a restart never shows `idle` for an agent whose record says `succeeded`, `stopped` or `failed` |
-| the configuration is re-read (`r`) after an agent was removed by hand | the removed agent's run is stopped, and the note names it | the run does not stay counted but invisible; what the footer counts is what a screen can show |
+| the configuration is re-read (`r`) after an agent was removed by hand | the removed agent's run is stopped, and the note names it once, in the note area | the run does not stay counted but invisible; what the footer counts is what a screen can show; the run's own record names the re-read, never “on request” |
+| the configuration is re-read (`r`) after the run records were deleted | the hub drops an outcome whose record is gone; the hub and the ledger agree | a cached outcome never outlives the record it came from |
+| a start fails before a run ever runs (systemd refuses, the process cannot spawn) | the run state is `failed` with the start's reason, not `unknown start / no terminal record` | the record opened for the start is closed as `failed`, so the next `s` is not blocked by a run that never was |
 | `^C` | — | a control chord is never a plain-letter binding: `^C` leaves the UI and stops the runs it started |
 
 ## Every screen — footer
@@ -140,6 +146,6 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | wide terminal | the status line and the key legend | the legend may be long |
 | every screen, every state | a footer clause `Running: N of M`, and `· K finished` once a run has ended since this UI started | the running count and what has finished, wherever the user is, not only on the hub |
 | 80×24 | the status line and the legend | the legend must not silently drop keys: it clips at a key boundary and ends with `? all keys` |
-| any status longer than the width | the status line | wrap it onto the footer's spare lines, never clip a reason or a path |
+| any status longer than the width | the status line, grown past its usual rows when it must be | the footer takes the body's spare rows for the status (never below the body's minimum), so a reason, a path or git's own `fatal:` line is read whole at 80×24, never clipped |
 | a window smaller than 72×18 | one line: “this window is too small to show the product; make it at least 72×18” | that line, instead of clipped panels, a clipped modal or a clipped help overlay |
 | exactly 72×18 (the advertised minimum) | the product, with at least one agent row drawn and the count in the title when more exist | a minimum the product calls usable must show a real row, not a header over nothing |
