@@ -338,6 +338,23 @@ impl EndpointTest {
     }
 }
 
+/// A byte count in the product's own words, so the file that grows with every run has
+/// a size a person can watch (L-3).
+pub fn filesize_text(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{kb:.1} KB");
+    }
+    let mb = kb / 1024.0;
+    if mb < 1024.0 {
+        return format!("{mb:.1} MB");
+    }
+    format!("{:.1} GB", mb / 1024.0)
+}
+
 /// How long ago a test ran, in words, so a success cannot masquerade as current.
 fn tested_age(tested_at_ms: u64) -> String {
     let now = crate::time::now_unix_ms();
@@ -369,6 +386,20 @@ fn tested_age(tested_at_ms: u64) -> String {
             }
         }
     }
+}
+
+/// How long ago a file was last written, in words, or `None` when it cannot be read.
+///
+/// Used for the credentials file: a leftover secret carries no timestamp of its own,
+/// but the file it lives in does, and that is the fact a person deciding whether to
+/// delete it needs (C-4).
+fn file_age(path: &std::path::Path) -> Option<String> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let millis = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(tested_age(millis))
 }
 
 /// Why a Forgejo action did not produce a result, with the class a person can act on.
@@ -446,17 +477,6 @@ fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String 
     }
 }
 
-/// Whether a status sentence is one of the panel-scroll family.
-///
-/// These sentences describe a panel on the screen that made them; carried to another
-/// screen they are false (E-1, P-1).
-fn is_panel_scroll_status(status: &str) -> bool {
-    status.starts_with("the panel scrolled")
-        || status == "the panel is at its top"
-        || status == "the panel is at its end"
-        || status.starts_with("this screen's content is a list")
-}
-
 /// The agent name in a secret label like `model key for \`scribe\``, when there is one.
 fn backticked_agent(label: &str) -> Option<String> {
     let start = label.find('`')? + 1;
@@ -501,6 +521,10 @@ pub struct App {
     pub ack_state: AckState,
     /// Whether the first-run acknowledgment is on screen now.
     pub show_acknowledgment: bool,
+    /// Whether the acknowledgment is on screen in **review** mode: a second person
+    /// asked to read the terms again with `R`, so no key records anything and every
+    /// key simply closes it (C-3).
+    pub ack_review: bool,
     /// The in-TUI add-agent form, when it is open.
     pub add_agent: Option<NewAgentForm>,
     /// A one-field prompt for a secret, when one is open.
@@ -543,6 +567,13 @@ pub struct App {
     pub run_selected: usize,
     /// The recent runs, read from the records on disk.
     pub recent: Vec<RunSummary>,
+    /// How many run records the configured agents have on disk, of which `recent`
+    /// holds the newest [`RECENT_RUNS_LIMIT`]. The difference is what the list and the
+    /// footer count must declare rather than hide (L-1, L-5).
+    pub recent_total: usize,
+    /// What every run record under the state root occupies, and how many belong to
+    /// agents the configuration no longer lists (L-2, L-4).
+    pub footprint: crate::run::RunFootprint,
     /// The result of the last "test this endpoint" action, if any.
     pub endpoint_test: Option<EndpointTest>,
     /// The result of the last role check, if any.
@@ -609,6 +640,7 @@ impl App {
             ack_path,
             ack_state: AckState::Missing,
             show_acknowledgment: false,
+            ack_review: false,
             add_agent: None,
             secret_prompt: None,
             confirm_remove: None,
@@ -625,6 +657,8 @@ impl App {
             selected: 0,
             run_selected: 0,
             recent: Vec::new(),
+            recent_total: 0,
+            footprint: crate::run::RunFootprint::default(),
             endpoint_test: None,
             role_check: None,
             repo_selected: 0,
@@ -830,6 +864,15 @@ impl App {
             .map(|agent| agent.name.clone())
             .collect();
         self.recent = recent_runs(self.layout.state_root(), &names, RECENT_RUNS_LIMIT);
+        // The cap is on the list, not on the records. Measure the records too, so the
+        // screens can say how many older ones exist and how much room they take
+        // (L-1, L-2, L-4): a list that stops at fifty without saying so is the finding.
+        self.footprint =
+            crate::run::state_footprint(self.layout.state_root(), &names);
+        self.recent_total = self
+            .footprint
+            .records
+            .saturating_sub(self.footprint.unconfigured_records);
         self.last_scan = Some(Instant::now());
         if self.run_selected >= self.recent.len() {
             self.run_selected = self.recent.len().saturating_sub(1);
@@ -897,12 +940,18 @@ impl App {
     /// the surface simply tells the truth about who it belongs to.
     pub fn present_secret_labels(&self) -> Vec<String> {
         let configured: Vec<&str> = self.agents().iter().map(|agent| agent.name.as_str()).collect();
+        // The credentials file's own modification time is the closest thing to "when
+        // did this leftover arrive": the secret carries no timestamp, the file does.
+        let age = file_age(&self.credentials_path);
         crate::credentials::present_secret_names(&self.credentials_path)
             .into_iter()
             .map(|name| match backticked_agent(&name) {
-                Some(agent) if !configured.contains(&agent.as_str()) => {
-                    format!("{name} (no agent with that name is configured)")
-                }
+                Some(agent) if !configured.contains(&agent.as_str()) => match &age {
+                    Some(age) => format!(
+                        "{name} (no agent with that name is configured; left by a credentials file last written {age})"
+                    ),
+                    None => format!("{name} (no agent with that name is configured)"),
+                },
                 _ => name,
             })
             .collect()
@@ -986,6 +1035,24 @@ impl App {
                 run.outcome.is_some() && started + duration > self.started_ms
             })
             .count()
+    }
+
+    /// Whether the footer's finished count cannot see every record that might count.
+    ///
+    /// The count is derived from the newest [`RECENT_RUNS_LIMIT`] records, so when
+    /// every one of them finished since this UI started and there are older records
+    /// on disk, the true count may be larger. The footer then says `K+ finished`
+    /// rather than presenting the cap as the whole of the history (L-5).
+    pub fn finished_count_is_capped(&self) -> bool {
+        self.recent_total > self.recent.len()
+            && !self.recent.is_empty()
+            && self.runs_finished_since_start() == self.recent.len()
+    }
+
+    /// A file's size, in the product's own words, or `None` when it cannot be read.
+    pub fn file_size_text(path: &std::path::Path) -> Option<String> {
+        let bytes = std::fs::metadata(path).ok()?.len();
+        Some(filesize_text(bytes))
     }
 
     /// The configuration directory.
@@ -1086,6 +1153,10 @@ impl App {
 
     /// Write the acknowledgment and close the dialog.
     pub fn confirm_acknowledgment(&mut self) {
+        // A review never records: it is a second person reading terms already agreed.
+        // The confirm path is reached only from the first-run modal, which never has
+        // `ack_review` set.
+        self.ack_review = false;
         match risk::record(&self.ack_path) {
             Ok(state) => {
                 self.ack_state = state;
@@ -1110,9 +1181,33 @@ impl App {
     /// Close the dialog without confirming. Starting an agent stays refused.
     pub fn decline_acknowledgment(&mut self) {
         self.show_acknowledgment = false;
+        self.ack_review = false;
         self.status =
             "the risk was not acknowledged, so starting an agent is refused until it is recorded"
                 .to_owned();
+    }
+
+    /// Show the risk acknowledgment again, without changing the record (C-3).
+    ///
+    /// A second person on a configuration directory someone else used can read what
+    /// was agreed, when and under which version, and can read the terms themselves.
+    /// When no record exists this is the ordinary first-run modal, which does record.
+    pub fn review_acknowledgment(&mut self) {
+        self.show_acknowledgment = true;
+        if self.ack_state.is_confirmed() {
+            self.ack_review = true;
+            self.status =
+                "the acknowledged terms are shown again; the record is not changed".to_owned();
+        } else {
+            self.ack_review = false;
+        }
+    }
+
+    /// Close the review without touching the record.
+    fn close_ack_review(&mut self) {
+        self.show_acknowledgment = false;
+        self.ack_review = false;
+        self.status = "the terms were read; the record was not changed".to_owned();
     }
 
     /// Open the add-agent form. `n` and `a` both reach it, and `enter` on an empty
@@ -1142,6 +1237,10 @@ impl App {
             || self.confirm_remove.is_some()
             || self.confirm_forget.is_some()
             || self.show_help
+            // A review of the acknowledgment owns every key too: `q` closes the
+            // review there, it does not quit the product, so the footer must not
+            // advertise `q quit` under it.
+            || (self.show_acknowledgment && self.ack_review)
     }
 
     /// One key while the add-agent form is open.
@@ -2421,6 +2520,12 @@ impl App {
             .map(|dir| dir.join(crate::run::LOG_FILE))
     }
 
+    /// The transcript file of the newest run of one agent, for a screen to name.
+    pub fn latest_run_transcript(&self, name: &str) -> Option<PathBuf> {
+        self.latest_run_dir(name)
+            .map(|dir| dir.join(crate::transcript::TRANSCRIPT_FILE))
+    }
+
     /// Take any work the terminal loop has to do, leaving none behind.
     pub fn take_action(&mut self) -> Option<PendingAction> {
         self.pending.take()
@@ -2623,28 +2728,33 @@ impl App {
     pub fn shift_screen(&mut self, steps: isize) {
         self.screen = self.screen.shifted(steps);
         self.panel_scroll = 0;
-        self.clear_panel_scroll_status();
+        self.clear_screen_status();
     }
 
     /// Show one screen by name.
     pub fn show(&mut self, screen: Screen) {
         if self.screen != screen {
             self.panel_scroll = 0;
-            self.clear_panel_scroll_status();
+            self.clear_screen_status();
         }
         self.screen = screen;
     }
 
-    /// Drop a status sentence that belonged to a panel on the screen being left.
+    /// Drop the status sentence made on the screen being left.
     ///
-    /// The scroll offset is reset on every screen change, but the sentence `the panel
-    /// scrolled — press PageUp or [ to go back` was not: it sat under the next screen
-    /// and said something untrue there (E-1, P-1). Only the scroll family is cleared;
-    /// a refusal or a run's sentence still has something to say on the next screen.
-    fn clear_panel_scroll_status(&mut self) {
-        if is_panel_scroll_status(&self.status) {
-            self.status.clear();
-        }
+    /// A status sentence describes what just happened *on the screen that made it*.
+    /// The scroll sentence (`the panel scrolled — press PageUp or [ to go back`) was
+    /// the first one caught doing this (E-1, P-1), and the ninth-round fix cleared
+    /// only that family, so the unbound-key sentence, the acknowledgment sentence and
+    /// every other screen-local sentence still sat under the next screen and said
+    /// something untrue there (C-1). From this round the rule is the mechanism, not a
+    /// list: **every** status dies with the screen it was made on, so no sentence can
+    /// outlive its screen, and a new sentence cannot be added to a stale family by
+    /// mistake. Sentences that must persist are drawn from the state that owns them
+    /// (the note areas read records, the acknowledgment line reads the record, the
+    /// leave warning owns the keys), never from a status line.
+    fn clear_screen_status(&mut self) {
+        self.status.clear();
     }
 
     /// Whether the screen on show draws a list whose arrows move a selection.
@@ -2957,6 +3067,11 @@ impl App {
             return;
         }
         if self.show_acknowledgment {
+            // A review is read-only: every key closes it and nothing is recorded.
+            if self.ack_review {
+                self.close_ack_review();
+                return;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_acknowledgment(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -3102,6 +3217,10 @@ impl App {
             {
                 self.request_secret(SecretTarget::ForgejoAdminToken);
             }
+            // `R` reads the acknowledged terms again without changing the record, so
+            // a second person on a used configuration directory can see what was
+            // agreed, when and under which version (C-3).
+            KeyCode::Char('R') => self.review_acknowledgment(),
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char(digit) if ('1'..='6').contains(&digit) => {
                 let at = digit as usize - '1' as usize;
@@ -3246,6 +3365,16 @@ mod tests {
         std::fs::write(root.join("config.toml"), config)
             .expect("the test writes the configuration");
         App::with_runner(Layout::rooted_at(root), quiet_runner("app-runner"))
+    }
+
+    #[test]
+    fn a_file_size_reads_in_the_products_own_words() {
+        // L-3: the log and the transcript grow with every run; their sizes are shown in
+        // a unit a person reads, not as a raw byte count.
+        assert_eq!(filesize_text(0), "0 B");
+        assert_eq!(filesize_text(1023), "1023 B");
+        assert_eq!(filesize_text(4096), "4.0 KB");
+        assert_eq!(filesize_text(2 * 1024 * 1024), "2.0 MB");
     }
 
     /// Write model keys, so a start reaches the supervisor rather than being refused
@@ -3414,37 +3543,53 @@ concurrency = 1
     }
 
     #[test]
-    fn a_panel_scroll_status_does_not_outlive_the_screen_it_was_made_on() {
-        // E-1, P-1: the offset was reset on a screen change but the sentence about it
-        // was not, so the next screen opened at its top still reading `the panel
-        // scrolled — press PageUp or [ to go back`.
+    fn no_status_sentence_outlives_the_screen_it_was_made_on() {
+        // E-1, P-1 then C-1: the scroll offset was reset on a screen change but the
+        // sentence about it was not; the ninth round cleared only that family, so the
+        // unbound-key sentence and the acknowledgment sentence still sat under the
+        // next screen. From this round **every** status dies with the screen it was
+        // made on, so a status added later cannot join a stale family by mistake.
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         app.show(Screen::Agents);
         app.scroll_panel_edge(true);
-        assert!(
-            is_panel_scroll_status(&app.status),
-            "the test did not make a scroll status: {}",
-            app.status
-        );
+        assert!(app.status.starts_with("the panel"), "{}", app.status);
         app.show(Screen::AgentConfig);
         assert!(
-            !is_panel_scroll_status(&app.status),
-            "the scroll sentence outlived its screen: {}",
+            app.status.is_empty(),
+            "a scroll sentence outlived its screen: {}",
             app.status
         );
-        app.scroll_panel_edge(true);
+
+        // The unbound-key sentence is not on the hub (C-1's second example).
+        app.show(Screen::Agents);
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(app.status.contains("no key is bound"), "{}", app.status);
+        app.show(Screen::Instructions);
+        assert!(
+            app.status.is_empty(),
+            "the unbound-key sentence outlived its screen: {}",
+            app.status
+        );
+
+        // A refusal, a run's sentence and a "kept" receipt are the same class: they
+        // are made on a screen, and a screen later they are not the truth any more.
+        // Nothing persists through the status line — what persists is state drawn
+        // from the record that owns it (the note areas), not a sentence.
+        let made = "not started: no model key for `one`";
+        app.status = made.to_owned();
         app.shift_screen(1);
         assert!(
-            !is_panel_scroll_status(&app.status),
-            "the scroll sentence outlived the tab change: {}",
+            app.status.is_empty(),
+            "a status outlived its screen: {}",
             app.status
         );
-        // A status that is not about a panel still has something to say, and stays.
-        let kept = "not started: no model key for `one`";
-        app.status = kept.to_owned();
-        app.shift_screen(1);
-        assert_eq!(app.status, kept);
+
+        // The same screen keeps its own sentence: `show` of the screen already on
+        // show is not a screen change.
+        app.status = made.to_owned();
+        app.show(app.screen);
+        assert_eq!(app.status, made);
     }
 
     #[test]
