@@ -101,6 +101,24 @@ fn render(app: &App) -> String {
     text
 }
 
+/// Draw one frame at a chosen size and read the cells back as text.
+fn render_at(width: u16, height: u16, app: &App) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+    terminal
+        .draw(|frame| gewu_multiverse::ui::draw(frame, app))
+        .expect("a frame is drawn");
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let symbol = buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" ");
+            text.push_str(symbol);
+        }
+        text.push('\n');
+    }
+    text
+}
+
 /// Print a screen with a heading, so `--nocapture` reads as a transcript.
 fn show(label: &str, app: &App) {
     println!("===== {label} =====");
@@ -529,4 +547,156 @@ fn an_agent_in_systemd_mode_is_shown_as_supervised_by_a_user_unit() {
     assert!(screen.contains("user unit"), "{screen}");
     assert!(screen.contains("gewu-agent-scribe.service"), "{screen}");
     assert!(screen.contains("restarts"), "{screen}");
+}
+
+/// A configuration with no agents, so the first-contact path is exercised.
+const EMPTY_CONFIG: &str = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+"#;
+
+/// An app over a configuration the test chooses.
+fn app_with_config(root: &Path, config: &str) -> App {
+    fs::write(root.join("config.toml"), config).expect("the configuration is written");
+    App::with_runner(Layout::rooted_at(root.to_path_buf()), quiet_runner("form"))
+}
+
+#[test]
+fn the_acknowledgment_owns_its_rows_at_eighty_columns() {
+    // F-A: the modal must own every row it covers, so the panel behind it never
+    // collides with its edges. At 80×24 the panel border used to survive in column 0.
+    let root = scratch("ack-80");
+    let app = app(&root);
+    assert!(app.show_acknowledgment);
+    let screen = render_at(80, 24, &app);
+    let lines: Vec<&str> = screen.lines().collect();
+    let title_row = lines
+        .iter()
+        .position(|line| line.contains("Before the first agent runs"))
+        .expect("the modal is on screen");
+    // The modal is 15 rows and centred: every one of those rows must have a blank
+    // one-cell margin on the left, never a surviving panel border.
+    for (row, line) in lines.iter().enumerate().skip(title_row).take(15) {
+        assert!(
+            line.starts_with(' '),
+            "the panel bled into the modal margin on row {row}: {line:?}"
+        );
+    }
+    assert!(screen.contains("Until it is recorded"), "{screen}");
+}
+
+#[test]
+fn the_empty_agents_screen_offers_the_in_product_form_by_name() {
+    // F-B: with nothing configured the screen itself offers the form.
+    let root = scratch("empty-form");
+    let mut app = app_with_config(&root, EMPTY_CONFIG);
+    app.show_acknowledgment = false;
+    let screen = render(&app);
+    assert!(screen.contains("No agent is configured yet"), "{screen}");
+    assert!(screen.contains("press n"), "{screen}");
+    app.on_key(KeyEvent::from(KeyCode::Char('n')));
+    assert!(app.adding_agent());
+    let form = render(&app);
+    assert!(form.contains("agent name"), "{form}");
+    assert!(form.contains("model endpoint"), "{form}");
+    assert!(form.contains("model key"), "{form}");
+    assert!(form.contains("Forgejo token"), "{form}");
+    // `a` reaches the same form, and is never silent.
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    app.on_key(KeyEvent::from(KeyCode::Char('a')));
+    assert!(app.adding_agent());
+}
+
+#[test]
+fn the_add_agent_form_writes_both_files_and_never_shows_a_secret() {
+    let root = scratch("form-write");
+    let mut app = app_with_config(&root, EMPTY_CONFIG);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('n')));
+    for character in "scribe".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(character)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+    for character in "http://127.0.0.1:9/v1".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(character)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+    for character in "test-model".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(character)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+    for character in "sk-test-secret-value".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(character)));
+    }
+    // The form masks the key while it is typed; the value is never echoed.
+    let typed = render(&app);
+    assert!(!typed.contains("sk-test-secret-value"), "{typed}");
+    assert!(typed.contains('*'), "{typed}");
+
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert!(!app.adding_agent());
+    assert!(app.status.contains("created `scribe`"), "{}", app.status);
+    assert!(!app.status.contains("sk-test-secret-value"), "{}", app.status);
+
+    // The agent is listed, and both files were written.
+    assert!(app.agents().iter().any(|agent| agent.name == "scribe"));
+    let config = fs::read_to_string(root.join("config.toml")).expect("config readable");
+    assert!(config.contains("name = \"scribe\""), "{config}");
+    let credentials =
+        fs::read_to_string(root.join("credentials.toml")).expect("credentials readable");
+    assert!(credentials.contains("sk-test-secret-value"), "{credentials}");
+
+    // The Credentials screen names the secret; the value never reaches a screen.
+    app.show(Screen::Credentials);
+    let screen = render(&app);
+    assert!(screen.contains("model key for `scribe`"), "{screen}");
+    assert!(!screen.contains("sk-test-secret-value"), "{screen}");
+}
+
+#[test]
+fn question_mark_opens_the_key_reference_and_lists_the_hidden_keys() {
+    // N-1: the legend may be clipped, but the full list is one key away.
+    let root = scratch("help");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('?')));
+    assert!(app.show_help);
+    let screen = render(&app);
+    assert!(screen.contains("keys"), "{screen}");
+    assert!(screen.contains("T open its newest transcript"), "{screen}");
+    assert!(screen.contains("n or a open the add-agent form"), "{screen}");
+    app.on_key(KeyEvent::from(KeyCode::Char('?')));
+    assert!(!app.show_help);
+}
+
+#[test]
+fn the_runs_screen_opens_the_transcript_as_well_as_the_log() {
+    // F-H: the transcript must be reachable inside the application.
+    let root = scratch("runs-transcript");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_id = new_run_id(9);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 1, "/w"))
+        .expect("a record is appended");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            5,
+            None,
+        ))
+        .expect("a record is appended");
+    app.refresh_recent();
+    app.show(Screen::Runs);
+    let screen = render(&app);
+    assert!(screen.contains("T opens the transcript on show"), "{screen}");
+    app.on_key(KeyEvent::from(KeyCode::Char('T')));
+    let action = app.take_action().expect("a view was asked for");
+    assert_eq!(action.path, run_dir.join("transcript.jsonl"));
 }
