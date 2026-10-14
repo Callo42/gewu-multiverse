@@ -1014,7 +1014,15 @@ impl Supervisor {
         }
         match self.systemd.available() {
             Ok(_) => self.systemd.set_manager_error(None),
-            Err(message) => self.systemd.set_manager_error(Some(message)),
+            Err(message) => {
+                // `available` prefixes its sentence already; the screen adds that
+                // prefix of its own, so keep only the detail here.
+                let detail = message
+                    .strip_prefix("the user's systemd cannot be reached: ")
+                    .unwrap_or(&message)
+                    .to_owned();
+                self.systemd.set_manager_error(Some(detail));
+            }
         }
     }
 
