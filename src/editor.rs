@@ -12,7 +12,7 @@
 
 use std::env;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 /// Which editing program to use, given the two variables that can name one.
@@ -85,16 +85,8 @@ pub fn pager() -> String {
 }
 
 /// Hand a path to the editing program and wait for it.
-///
-/// When the program is `nano` its search history is switched off (`-N`): the
-/// hand-off must not leave its own droppings in the person's `HOME`, and nano
-/// otherwise writes `~/.local/share/nano` (H-6's sibling).
 pub fn edit(path: &Path) -> io::Result<ExitStatus> {
-    let mut program = editor();
-    if program.trim() == "nano" {
-        program.push_str(" -N");
-    }
-    run(program, path, Handoff::Edit)
+    run(editor(), path, Handoff::Edit)
 }
 
 /// Hand a path to the reading program and wait for it.
@@ -109,36 +101,99 @@ enum Handoff {
     View,
 }
 
+/// The program name a hand-off string names: its first word, without a directory.
+///
+/// `$EDITOR` may carry options (`nano -w`, `code --wait`), so the name is the first
+/// whitespace-separated word, and it may be an absolute path.
+fn program_name(program: &str) -> &str {
+    let first = program.split_whitespace().next().unwrap_or("");
+    first.rsplit('/').next().unwrap_or(first)
+}
+
+/// A directory the product owns for the lifetime of one hand-off.
+///
+/// A program told to keep its state under `$XDG_DATA_HOME` writes there instead of
+/// in the person's `HOME`; the directory is removed when the hand-off is over, so
+/// nothing is left behind anywhere (F7).
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Scratch {
+    fn make() -> io::Result<Self> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gewu-multiverse-handoff-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The program string and environment a hand-off gets, so the program's own state
+/// does not land in the person's `HOME` (F7).
+///
+/// Every program a hand-off spawns is enumerated and given a state location of its
+/// own where the product can name one: `less` is told its history file is
+/// `/dev/null`; `nano` is given an `$XDG_DATA_HOME` in a scratch directory (its
+/// history and position files go under `nano/` there, not `~/.local/share/nano`);
+/// `vi`, `vim`, `nvim` and `ex` are given `-i NONE`, so no viminfo file is written.
+/// A program the person chose with `$EDITOR`/`$VISUAL`/`$PAGER` that this product
+/// does not know keeps its own files: it is named in the hand-off sentence on the
+/// primary screen, and the product does not pretend to know what it writes.
+fn handoff_plan(
+    program: &str,
+    handoff: Handoff,
+    scratch: &Path,
+) -> (String, Vec<(String, String)>) {
+    let name = program_name(program);
+    let mut program = program.to_owned();
+    let mut env: Vec<(String, String)> = Vec::new();
+    if handoff == Handoff::View {
+        // `less` writes `~/.lesshst` unless it is told not to (H-6).
+        env.push(("LESSHISTFILE".to_owned(), "/dev/null".to_owned()));
+    }
+    if matches!(name, "vi" | "vim" | "nvim" | "ex" | "vim.tiny" | "vim.basic") {
+        // vim writes `~/.viminfo` on exit; `-i NONE` suppresses it.
+        program.push_str(" -i NONE");
+    }
+    if name == "nano" {
+        // nano writes `$XDG_DATA_HOME/nano` (default `~/.local/share/nano`).
+        env.push((
+            "XDG_DATA_HOME".to_owned(),
+            scratch.display().to_string(),
+        ));
+    }
+    (program, env)
+}
+
 /// Run `program` with the path as its one argument, through a shell so that a
 /// program named with its own options (`code --wait`, `less -R`) still works.
 fn run(program: String, path: &Path, handoff: Handoff) -> io::Result<ExitStatus> {
+    let scratch = Scratch::make()?;
+    let (program, env) = handoff_plan(&program, handoff, &scratch.dir);
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
         .arg(format!("exec {program} \"$1\""))
         .arg("sh")
         .arg(path);
-    if handoff == Handoff::View {
-        // `less` writes `~/.lesshst` unless it is told not to. The product hands the
-        // terminal back as it found it, so a person's `HOME` gains no file from
-        // reading a log (H-6).
-        for (key, value) in handoff_env(handoff) {
-            command.env(key, value);
-        }
+    for (key, value) in env {
+        command.env(key, value);
     }
-    command.status()
-}
-
-/// The environment an editor or pager child gets for its own scratch files.
-///
-/// A pager is told its history file is `/dev/null`, so reading a log leaves the
-/// person's `HOME` exactly as it was (H-6). An editor keeps its own settings; the
-/// `nano` history is suppressed by `-N` in [`edit`].
-fn handoff_env(handoff: Handoff) -> Vec<(&'static str, &'static str)> {
-    match handoff {
-        Handoff::Edit => Vec::new(),
-        Handoff::View => vec![("LESSHISTFILE", "/dev/null")],
-    }
+    let status = command.status();
+    drop(scratch);
+    status
 }
 
 #[cfg(test)]
@@ -181,10 +236,31 @@ mod tests {
     #[test]
     fn a_pager_hand_off_writes_no_history_into_the_users_home() {
         // H-6: `less` wrote `~/.lesshst` when `o`/`T` handed it the log or transcript.
-        let env: std::collections::HashMap<_, _> = handoff_env(Handoff::View).into_iter().collect();
+        let scratch = Path::new("/tmp/fxr12-scratch");
+        let (_, env) = handoff_plan("less -R", Handoff::View, scratch);
+        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(env["LESSHISTFILE"], "/dev/null");
-        // An editor gets no pager variable; nano's history is off through `-N`.
-        assert!(handoff_env(Handoff::Edit).is_empty());
+    }
+
+    #[test]
+    fn every_program_the_product_chooses_is_given_its_own_state_location() {
+        // F7: `~/.lesshst` was gone after H-6 but `~/.local/share/nano` remained,
+        // because `-N` is `--noconvert`, not "no history". Each program the product
+        // itself picks now has a state location of its own.
+        let scratch = Path::new("/tmp/fxr12-scratch");
+        let (nano, env) = handoff_plan("nano", Handoff::Edit, scratch);
+        assert_eq!(nano, "nano");
+        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(env["XDG_DATA_HOME"], "/tmp/fxr12-scratch");
+        for vi in ["vi", "vim", "nvim", "/usr/bin/vim"] {
+            let (program, _) = handoff_plan(vi, Handoff::Edit, scratch);
+            assert!(program.ends_with(" -i NONE"), "{program}");
+        }
+        let (less, env) = handoff_plan("less", Handoff::View, scratch);
+        let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(env["LESSHISTFILE"], "/dev/null");
+        assert!(!env.contains_key("XDG_DATA_HOME"));
+        assert_eq!(less, "less");
     }
 
     #[test]
