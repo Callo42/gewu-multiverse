@@ -342,6 +342,17 @@ impl IdentityReport {
     }
 }
 
+/// The status a failed clone shows.
+///
+/// The account the clone acted as and where the repository list came from lead the
+/// sentence, before git's own detail: the detail is two lines and fills the status
+/// area, so a trailing explanation is the part that wraps off the screen (W-3).
+fn clone_failed_status(repo: &str, login: &str, mode: &str, class: &str, detail: &str) -> String {
+    format!(
+        "clone {repo} acted as {login}{mode} (the list came from the role token): failed ({class}): {detail}"
+    )
+}
+
 /// Say how an endpoint test ended.
 fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String {
     match result {
@@ -401,6 +412,14 @@ pub struct App {
     pub editor_configured: bool,
     /// Whether the key-reference overlay is on screen now.
     pub show_help: bool,
+    /// Runs in flight when the user first pressed `q`, while a quit waits to be
+    /// confirmed. Any other key cancels it.
+    pub confirm_quit: Option<usize>,
+    /// How far the key-reference overlay has been scrolled, in logical lines.
+    ///
+    /// The help is longer than a short window can draw, so it is a list like any
+    /// other: it scrolls with `down`/`up` and its title says the range (P-6).
+    pub help_offset: usize,
     /// A line about the freshly written sample configuration, when one was written.
     pub config_note: Option<String>,
     /// The screen on show.
@@ -483,6 +502,8 @@ impl App {
             editor_confirm: None,
             editor_configured: crate::editor::editor_is_configured(),
             show_help: false,
+            confirm_quit: None,
+            help_offset: 0,
             config_note: None,
             screen: Screen::Agents,
             selected: 0,
@@ -1005,6 +1026,16 @@ impl App {
             self.status = "there is no agent to remove".to_owned();
             return;
         };
+        // Removing a running agent would leave its run behind: the record open, the
+        // process alive, the footer still counting it, and no row left to select so
+        // `x` cannot reach it. Refuse, as the supervision switch already does, and
+        // name the run so the warning is about the thing the user would have lost.
+        if let Some(run_id) = self.supervisor.unfinished_run(&name) {
+            self.status = format!(
+                "refused: `{name}` still has run {run_id} going; stop it first (press x), then remove"
+            );
+            return;
+        }
         self.confirm_remove = Some(name.clone());
         self.status = format!(
             "press y to remove `{name}` from the configuration, or n to keep it"
@@ -1141,9 +1172,25 @@ impl App {
         }
     }
 
+    /// Ask to leave. If runs are in flight, name what leaving ends and ask again.
+    pub fn request_quit(&mut self) {
+        let live = self.supervisor.running_count();
+        if live == 0 || self.confirm_quit.is_some() {
+            self.should_quit = true;
+            return;
+        }
+        self.confirm_quit = Some(live);
+        self.status = format!(
+            "leaving stops the {live} run(s) this UI started; press q again to quit and stop them, or any other key to stay"
+        );
+    }
+
     /// Show or hide the key-reference overlay.
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+        if self.show_help {
+            self.help_offset = 0;
+        }
     }
 
     /// Why one agent's most recent run did not go well, when there is a reason.
@@ -1246,7 +1293,16 @@ impl App {
                 );
             }
             Ok(StartDisposition::Busy { run_id }) => {
-                self.status = format!("`{name}` already has run {run_id}");
+                // Lead with the state, not the ledger: the question is "is it running
+                // now?", and the answer is the word `running`, with the way to stop it.
+                let state = self.supervisor.state(&name);
+                self.status = if matches!(state, State::Waiting { .. }) {
+                    format!(
+                        "`{name}` already has a start waiting its turn (run {run_id}); press x to call it off"
+                    )
+                } else {
+                    format!("`{name}` is already running (run {run_id}); press x to stop it")
+                };
             }
             Err(error) => {
                 // Keep the reason on the agent, not only in the transient status line.
@@ -1445,7 +1501,13 @@ impl App {
         };
         self.status = match &result {
             Ok(check) => format!("role check: {}", check.summary()),
-            Err(failure) => format!("role check failed ({}): {}", failure.class, failure.message),
+            // The configured URL leads the refusal: a mistyped path is the common
+            // cause, and the API path alone does not connect the failure to what the
+            // user typed (P-7).
+            Err(failure) => format!(
+                "role check failed ({}) at {}: {}",
+                failure.class, settings.url, failure.message
+            ),
         };
         self.role_check = Some(result);
         self.repo_selected = 0;
@@ -1645,13 +1707,16 @@ impl App {
                     .flatten()
                     .map(|mode| format!(" ({})", mode.as_str()))
                     .unwrap_or_default();
-                self.status = format!(
-                    "cloning {} failed ({}): {} — the repository list came from the role token; the clone acted as {}{}",
-                    repository.full_name,
+                // Lead with the account the clone acted as and where the list came
+                // from: git's own two-line detail fills the status area, so the
+                // sentence that explains *which* token was wrong must come first or
+                // it wraps off the screen (W-3).
+                self.status = clone_failed_status(
+                    &repository.full_name,
+                    &identity.login,
+                    &mode,
                     error.class(),
-                    error.detail(),
-                    identity.login,
-                    mode,
+                    &error.detail(),
                 );
             }
         }
@@ -2107,6 +2172,17 @@ impl App {
         }
     }
 
+    /// The instruction's size on disk and the size a run sends.
+    ///
+    /// A run drops the product's guidance line; the screen shows both numbers and the
+    /// reason for the difference (P-4).
+    pub fn instruction_payload(&self) -> Option<(u64, u64)> {
+        let paths = self.selected_paths()?;
+        let bytes = std::fs::read(paths.instruction()).ok()?;
+        let (on_disk, sent) = crate::agent_run::instruction_payload(&bytes);
+        Some((on_disk as u64, sent as u64))
+    }
+
     /// Whether the instruction document holds nothing but the guidance placeholder.
     ///
     /// The page map distinguishes the empty instruction from the written one; a file
@@ -2290,6 +2366,43 @@ impl App {
     }
 
     /// One key press.
+    /// One bracketed paste, delivered by the terminal as a single event.
+    ///
+    /// A paste is not a burst of keystrokes: the terminal tells the program where it
+    /// starts and ends. Every field this product has takes one line, so the text
+    /// before the first line break is kept — never joined with the next line — the
+    /// rest is named as unused, and the field is **replaced**, so pasting twice does
+    /// not silently double a secret. This is what P-1 and P-2 asked for; without
+    /// bracketed paste the program could not tell a paste from typing.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.show_acknowledgment || self.show_help {
+            return;
+        }
+        let (first, more) = match text.find(['\n', '\r']) {
+            Some(at) => (&text[..at], true),
+            None => (text, false),
+        };
+        let note = if more {
+            "kept the first line; the rest of the paste was not used"
+        } else {
+            "pasted into the field"
+        };
+        if let Some(form) = self.add_agent.as_mut() {
+            form.fields[form.cursor] = first.to_owned();
+            self.status = note.to_owned();
+            return;
+        }
+        if let Some(prompt) = self.secret_prompt.as_mut() {
+            prompt.value = first.to_owned();
+            self.status = note.to_owned();
+            return;
+        }
+        // A paste is never dropped in silence; say where it can land.
+        self.status =
+            "there is no one-line field here to take a paste; press n for the form, or k/f/v/A for a secret"
+                .to_owned();
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         // A control chord is never a plain-letter binding. `^C` is the reflex keystroke
         // for "stop"; here it leaves the UI, and the children it owns are stopped on
@@ -2301,16 +2414,28 @@ impl App {
             }
             return;
         }
+        // A pending "leave and stop the runs?" is cancelled by any key but `q`.
+        if self.confirm_quit.is_some() && key.code != KeyCode::Char('q') {
+            self.confirm_quit = None;
+        }
         if self.show_help {
-            if matches!(
-                key.code,
+            match key.code {
+                // The help is a scrollable list, so a short window can still reach
+                // every key instead of clipping the last group (P-6).
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_offset = self.help_offset.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_offset = self.help_offset.saturating_sub(1);
+                }
                 KeyCode::Esc
-                    | KeyCode::Char('?')
-                    | KeyCode::Char('h')
-                    | KeyCode::Char('q')
-                    | KeyCode::Enter
-            ) {
-                self.show_help = false;
+                | KeyCode::Char('?')
+                | KeyCode::Char('h')
+                | KeyCode::Char('q')
+                | KeyCode::Enter => {
+                    self.show_help = false;
+                }
+                _ => {}
             }
             return;
         }
@@ -2369,7 +2494,9 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            // Leaving ends every `tui` run the UI started; say so and ask once, so a
+            // quit is not a silent stop of work in flight (W-10).
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.shift_screen(1),
             KeyCode::BackTab | KeyCode::Left => self.shift_screen(-1),
             // `?` and `h` open the product's own key reference.
@@ -3038,6 +3165,169 @@ role = "member"
         let text = std::fs::read_to_string(app.config_path()).expect("config readable");
         assert!(text.contains("name = \"two\""), "{text}");
         assert!(!text.contains("name = \"one\""), "{text}");
+    }
+
+    #[test]
+    fn a_running_agent_cannot_be_removed_and_its_run_stays_visible() {
+        // W-2 / W-9: `d` on a running agent used to remove the row and orphan the run
+        // — counted by the footer, invisible on the hub, unreachable by `x`. The
+        // removal is refused now, the agent stays, and the count does not move.
+        let mut app = app_with_sleeping_runner("app-remove-live", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        let running_before = app.supervisor.running_count();
+        assert_eq!(running_before, 1);
+
+        app.on_key(key(KeyCode::Char('d')));
+        assert!(
+            app.confirm_remove.is_none(),
+            "the removal must be refused, not confirmed"
+        );
+        assert!(app.status.contains("refused"), "{}", app.status);
+        assert!(app.status.contains("stop it first"), "{}", app.status);
+        assert!(app.status.contains("run"), "{}", app.status);
+        assert!(
+            app.agents().iter().any(|agent| agent.name == "one"),
+            "the agent is still configured"
+        );
+        assert_eq!(
+            app.supervisor.running_count(),
+            running_before,
+            "the count still matches the one run in flight"
+        );
+        app.shutdown();
+    }
+
+    #[test]
+    fn starting_a_running_agent_says_that_it_is_running() {
+        // W-11: the refusal must lead with the state, not the run id.
+        let mut app = app_with_sleeping_runner("app-start-live", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.status.contains("already running"), "{}", app.status);
+        assert!(app.status.contains("press x"), "{}", app.status);
+        app.shutdown();
+    }
+
+    #[test]
+    fn quitting_with_a_run_in_flight_asks_once_and_names_what_stops() {
+        // W-10: `q` used to end a run without a word.
+        let mut app = app_with_sleeping_runner("app-quit-live", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.should_quit, "the first q asks, it does not leave");
+        assert!(app.status.contains("stops"), "{}", app.status);
+        assert!(app.status.contains("press q again"), "{}", app.status);
+
+        // Any other key cancels the pending quit.
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(!app.should_quit);
+        assert!(app.confirm_quit.is_none());
+
+        app.on_key(key(KeyCode::Char('q')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit, "the second q leaves");
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_failed_clone_names_the_account_before_gits_detail() {
+        // W-3: the explanation must be the part that survives the status area.
+        let status = clone_failed_status(
+            "uxadmin/admin-private",
+            "gewu-ghost",
+            " (managed)",
+            "not_found",
+            "Cloning into 'admin-private'...\nremote: Repository not found",
+        );
+        let account = status.find("gewu-ghost").expect("the account is named");
+        let detail = status.find("Cloning into").expect("git's detail is there");
+        assert!(account < detail, "{status}");
+        assert!(
+            status.contains("the list came from the role token"),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_run_reports_the_time_it_actually_ran() {
+        // W-6: a run left behind by a dead UI is closed with its real duration, not
+        // `0.0s`.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let run_id = "run-100-0001-9";
+        let dir = app.layout.state_root().join("one").join(run_id);
+        std::fs::create_dir_all(&dir).expect("the run directory is created");
+        let started = crate::time::now_unix_ms().saturating_sub(21_000);
+        let line = format!(
+            "{{\"event\":\"run_started\",\"ts\":\"{}\",\"run_id\":\"{run_id}\",\"agent\":\"one\",\"pid\":4000000000,\"workspace\":\"/w\"}}\n",
+            crate::time::rfc3339(started)
+        );
+        std::fs::write(dir.join(crate::transcript::TRANSCRIPT_FILE), line)
+            .expect("the opening record is written");
+        app.reload();
+        match app.supervisor.state("one") {
+            State::Finished { duration_ms, .. } => {
+                assert!(duration_ms >= 20_000, "duration was {duration_ms} ms");
+            }
+            other => panic!("expected a finished state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_paste_into_a_one_line_field_keeps_one_line_and_replaces() {
+        // P-1: two lines pasted into a one-line field are never joined. P-2: a second
+        // paste replaces the field instead of doubling it.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_paste("scribe\nendpoint = http://evil.example");
+        let form = app.add_agent.as_ref().expect("the form is open");
+        assert_eq!(form.fields[0], "scribe");
+        assert!(!form.fields[0].contains('\n'));
+        assert!(app.status.contains("first line"), "{}", app.status);
+        app.on_paste("scribe");
+        assert_eq!(app.add_agent.as_ref().expect("the form").fields[0], "scribe");
+        app.on_key(key(KeyCode::Esc));
+
+        app.show(Screen::Credentials);
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_paste("secret-one\nsecret-two");
+        app.on_paste("secret-two");
+        assert_eq!(
+            app.secret_prompt.as_ref().expect("the prompt is open").value,
+            "secret-two"
+        );
     }
 
     #[test]

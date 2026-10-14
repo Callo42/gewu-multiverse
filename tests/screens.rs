@@ -1096,3 +1096,176 @@ fn the_removal_confirmation_only_promises_files_that_exist() {
     let with_files = render(&app);
     assert!(with_files.contains("are left on disk"), "{with_files}");
 }
+
+/// One repository, as a role check reports it, for the windowing tests.
+fn repository(full_name: &str, private: bool) -> gewu_multiverse::forgejo::Repository {
+    let (namespace, name) = full_name.split_once('/').expect("namespace/name");
+    gewu_multiverse::forgejo::Repository {
+        full_name: full_name.to_owned(),
+        namespace: namespace.to_owned(),
+        name: name.to_owned(),
+        private,
+        default_branch: None,
+        html_url: None,
+        permissions: gewu_multiverse::forgejo::Permissions::default(),
+    }
+}
+
+/// A role check with three repositories, as the wave-4 fixture had.
+fn three_repository_check() -> gewu_multiverse::forgejo::RoleCheck {
+    use gewu_multiverse::config::Role;
+    use gewu_multiverse::forgejo::{RoleCheck, Viewer};
+    RoleCheck {
+        url: "https://forgejo.example.org".to_owned(),
+        role: Role::Member,
+        viewer: Viewer {
+            login: "uxmember".to_owned(),
+            email: None,
+            description: None,
+            is_admin: false,
+        },
+        repositories: vec![
+            repository("uxadmin/admin-private", true),
+            repository("uxmember/demo-private", true),
+            repository("uxmember/demo-public", false),
+        ],
+        private_visible: 2,
+    }
+}
+
+#[test]
+fn the_repository_list_never_hides_a_row_the_selection_can_reach() {
+    // W-1: the X-1 class on the Forgejo repository list. At the 80x24 size the list
+    // is longer than the panel; the selected row must still be drawn, and the title
+    // must say which rows are on show, so a repository is never hidden silently.
+    let root = scratch("repo-window");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.role_check = Some(Ok(three_repository_check()));
+    app.show(Screen::Forgejo);
+
+    let wide = render(&app);
+    assert!(wide.contains("uxmember/demo-public"), "{wide}");
+
+    for _ in 0..2 {
+        app.move_repo_selection(1);
+    }
+    assert_eq!(app.repo_selected, 2);
+    let narrow = render_at(80, 24, &app);
+    assert!(
+        narrow.contains("> uxmember/demo-public"),
+        "the selected repository is not drawn or not marked: {narrow}"
+    );
+    assert!(
+        narrow.contains("of 3"),
+        "the title does not say how many repositories there are: {narrow}"
+    );
+}
+
+#[test]
+fn the_runs_screen_says_its_start_column_is_utc() {
+    // W-4: the start is UTC; the screen must not leave the user comparing it with a
+    // wall clock and guessing.
+    let root = scratch("runs-utc");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_id = new_run_id(1);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 4321, "/w"))
+        .expect("a record is appended");
+    transcript
+        .append(&Record::run_finished(&run_id, RunOutcome::Succeeded, Some(0), 1000, None))
+        .expect("a record is appended");
+    app.refresh_recent();
+    app.show(Screen::Runs);
+    let screen = render(&app);
+    assert!(screen.contains("started (UTC)"), "{screen}");
+}
+
+#[test]
+fn the_first_run_modal_shows_the_whole_record_path_at_eighty_columns() {
+    // W-7: the acknowledgment promises the record path; at 80x24 the sentence used
+    // to end without its object.
+    let root = scratch("ack-path");
+    let mut app = app(&root);
+    app.show_acknowledgment = true;
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("The record will be written to"), "{screen}");
+    // The long path wraps across two rows, but it is drawn: the sentence has its
+    // object on the screen, which is what the finding asked for.
+    assert!(screen.contains("risk-acknowledgment.t"), "{screen}");
+}
+
+#[test]
+fn the_add_agent_form_names_the_submit_key_at_eighty_columns() {
+    // P-3: at 80x24 the intro prose pushed the body's action line off the panel.
+    let root = scratch("form-submit");
+    let mut app = app_with_config(&root, EMPTY_CONFIG);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('n')));
+    let form = render_at(80, 24, &app);
+    assert!(form.contains("enter writes it"), "{form}");
+    assert!(form.contains("esc cancels"), "{form}");
+}
+
+#[test]
+fn a_refused_role_check_names_the_configured_url() {
+    // P-7: connect the failure to the address the user typed.
+    use gewu_multiverse::app::ForgejoFailure;
+    let root = scratch("role-url");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.role_check = Some(Err(ForgejoFailure {
+        class: "not_found".to_owned(),
+        message: "the Forgejo has nothing at /api/v1/user (HTTP 404)".to_owned(),
+    }));
+    app.show(Screen::Forgejo);
+    let screen = render(&app);
+    assert!(screen.contains("https://forgejo.example.org"), "{screen}");
+    assert!(screen.contains("not_found"), "{screen}");
+}
+
+#[test]
+fn the_key_reference_scrolls_so_every_key_survives_a_short_window() {
+    // P-6: at 80x24 the help used to clip the last groups with no way to reach them.
+    let root = scratch("help-scroll");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('?')));
+    let first = render_at(80, 24, &app);
+    assert!(first.contains("of 13"), "the range is missing: {first}");
+    // Scroll to the end; the last line must be reachable.
+    for _ in 0..20 {
+        app.on_key(KeyEvent::from(KeyCode::Down));
+    }
+    let last = render_at(80, 24, &app);
+    assert!(
+        last.contains("esc or enter close it"),
+        "the last help line is unreachable: {last}"
+    );
+}
+
+#[test]
+fn the_instruction_screen_says_what_a_run_will_send() {
+    // P-4: the size on disk is not the size a run sends; the screen must say both,
+    // with the reason.
+    let root = scratch("instruction-sent");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(
+        paths.instruction(),
+        format!(
+            "{}\nwrite a note\n",
+            gewu_multiverse::agent_run::INSTRUCTION_PLACEHOLDER
+        ),
+    )
+    .expect("the instruction is written");
+    app.show(Screen::Instructions);
+    let screen = render(&app);
+    assert!(screen.contains("a run sends"), "{screen}");
+    assert!(screen.contains("the guidance line is dropped"), "{screen}");
+}
