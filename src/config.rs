@@ -424,7 +424,10 @@ max_concurrent_agents = 10
 # [[agents]]
 # name = "example-agent"
 # model = "example-model"
-# endpoint = "https://model.example.org/v1"
+# The full address a run POSTs the model request to. A base such as
+# "https://model.example.org/v1" is not enough: the path matters, and the
+# usual one ends in /chat/completions.
+# endpoint = "https://model.example.org/v1/chat/completions"
 # How many model turns one run may take before the declared bound stops it (1 to 256).
 # max_turns = 24
 # The instruction path shown on the agent's screen. The run reads the derived
@@ -549,6 +552,13 @@ concurrency = 2
         // The sample's agent block is commented out, so "commented sample" is true and
         // a fresh installation never lists an agent the user did not make.
         assert!(config.agents.is_empty());
+    }
+
+    #[test]
+    fn the_sample_names_the_full_completions_path() {
+        // D-3: the commented sample is the only example a zero-knowledge user meets,
+        // and a base URL there is a trap.
+        assert!(SAMPLE.contains("/chat/completions"), "{SAMPLE}");
     }
 
     #[test]

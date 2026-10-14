@@ -4,8 +4,9 @@
 //! real terminal and, in the tests, an in-memory backend: what the tests show is what
 //! the terminal shows.
 //!
-//! Every screen that has nothing behind it says so, in a line that starts with
-//! `Placeholder`. No screen offers an action the program cannot carry out: the state
+//! Every screen that has nothing behind it says so, in the product's own words and
+//! without a word from inside the product. No screen offers an action the program
+//! cannot carry out: the state
 //! it shows comes from the supervisor, the files it names are read back from disk,
 //! and what is still missing — the model call and the Forgejo work — is named.
 
@@ -515,7 +516,24 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                     &format!("{login}{mode} — clones and pull requests act as this account"),
                 ));
             }
-            _ => lines.push(field("agent identity", "not settled — press i")),
+            _ => {
+                // What `i` will do, before it does it: with an administrator token the
+                // tool creates and manages the account `gewu-<agent>`; without one, it
+                // checks the token the user supplies with `v` (D-4).
+                let login = identity::login_for(&agent.name)
+                    .unwrap_or_else(|_| format!("gewu-{}", agent.name));
+                let (_, admin) = app.forgejo_tokens_present();
+                let sentence = if admin {
+                    format!(
+                        "not settled — press i to create `{login}` (managed) on your Forgejo"
+                    )
+                } else {
+                    format!(
+                        "not settled — press i to check the token supplied with v for `{login}`"
+                    )
+                };
+                lines.push(field("agent identity", &sentence));
+            }
         }
     }
     lines.push(Line::from(Span::styled(
@@ -569,9 +587,10 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 // `more`, and the selection walked onto the undrawn row (W-1).
                 let inner = area.width.saturating_sub(2) as usize;
                 let content_height = area.height.saturating_sub(2) as usize;
-                let used_before = lines.len()
-                    + wrapped_rows(ROLE_EXPLANATION, inner).saturating_sub(1)
-                    + wrapped_rows(&summary, inner).saturating_sub(1);
+                // Count what every line above actually occupies once wrapped: a long
+                // identity sentence or role explanation must not push the selected
+                // repository off the panel (W-1, T-12).
+                let used_before = pushed_rows(&lines, inner);
                 let capacity = content_height.saturating_sub(used_before).max(1);
                 let total = check.repositories.len();
                 let (first, shown) = visible_window(total, app.repo_selected, capacity);
@@ -884,37 +903,26 @@ fn status_rows(text: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
     let rows: usize = text
         .lines()
-        .map(|line| wrapped_line_rows(line, width))
+        .map(|line| wrapped_rows(line, width))
         .sum();
     rows.max(1) as u16
 }
 
-/// The rows one explicit line takes when word-wrapped into `width` columns.
-fn wrapped_line_rows(line: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut rows = 1usize;
-    let mut col = 0usize;
-    for word in line.split_whitespace() {
-        let len = word.chars().count();
-        if col > 0 {
-            if col + 1 + len <= width {
-                col += 1 + len;
-                continue;
-            }
-            rows += 1;
-        }
-        if len <= width {
-            col = len;
-        } else {
-            let mut remaining = len;
-            while remaining > width {
-                rows += 1;
-                remaining -= width;
-            }
-            col = remaining;
-        }
-    }
-    rows
+/// The rows every line already pushed into a panel will occupy at `width`, wrapping
+/// counted. A window that picks its first row from this number never starts below a
+/// row that has wrapped into several, so the selected row is always drawn.
+fn pushed_rows(lines: &[Line], width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            wrapped_rows(&text, width)
+        })
+        .sum()
 }
 
 /// The short clause the footer carries on every screen.
@@ -997,7 +1005,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height);
+    let height = (NewAgentForm::FIELDS.len() as u16 + 12).min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1011,7 +1019,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = vec![
         Line::from(
-            "Name an agent and point it at a model. The model key and the Forgejo token are written to the credentials file and are never shown.",
+            "Name an agent and point it at a model. The model endpoint is the full address a run POSTs the request to, usually ending in /chat/completions; the model key and the Forgejo token are written to the credentials file and are never shown.",
         ),
         Line::from(Span::styled(
             "The model key is required. The Forgejo fields are optional; a blank URL keeps the sample's placeholder address.",
@@ -1459,9 +1467,12 @@ fn field(label: &str, value: &str) -> Line<'static> {
 }
 
 /// A line that says plainly that something is not there yet.
+///
+/// The sentence carries its own meaning; it never opens with a word from inside the
+/// product (D-5).
 fn placeholder(text: &str) -> Line<'static> {
     Line::from(Span::styled(
-        format!("Placeholder — {text}."),
+        format!("{text}."),
         Style::new().fg(Color::Yellow),
     ))
 }
