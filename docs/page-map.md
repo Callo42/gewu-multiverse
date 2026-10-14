@@ -39,8 +39,8 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | partially configured | one or more rows: name, model, concurrency, supervision, state; the selected row carries `>` | each row readable **and present**; the last failure named, not only the word `failed`; `concurrency` and `max turns` defined in the note area |
 | ready (idle) | rows with `idle`; the concurrency count and the note about `tui` | the keys that matter (`p`, `s`, `c`, `e`, `d`) visible or one `?` away |
 | many agents (more than fit) | a window of rows whose title reads `agents a–b of N — ↓/↑ more`; the selected row is always drawn and marked `>` | no agent is hidden **silently**, and the selection never moves onto a row that is not drawn |
-| removing | a confirmation over the list | `y` removes the agent from `config.toml`; `n` keeps it; the files left on disk are named, or the confirmation says it had none yet |
-| running | `running (Ns)`; `Running: 1 of N allowed` | the run id and the stop key named; the Runs screen agrees |
+| removing | a confirmation over the list | `y` removes the agent from `config.toml`; `n` keeps it; the files left on disk are named, or the confirmation says it had none yet. An agent with a run in flight is **refused** with its run named and the stop key (`x`) offered, so removing it can never orphan the run |
+| running | `running (Ns)`; `Running: 1 of N allowed` | the run id and the stop key named; the Runs screen agrees; the success word is the same one Runs uses (`succeeded`, not `exited 0`) |
 | waiting for a slot | `waiting (1 in line)`; “is waiting its turn: …” | the slot count and the line position; no error |
 | stopped by `x` | `stopped`; “its process group was signalled and is proven gone” once the record is closed | the stop is confirmed, in the past tense, so the status and the row agree; the agent can be started again |
 | failed | `failed (class)`; the last reason in the note area | **why**, on this screen: the class and the run's own reason |
@@ -63,7 +63,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 |---|---|---|
 | no agent | `no agent to show` + the config path | the in-app path to add one |
 | empty instruction | path, `not there yet — press e to write it`; a file that holds only the guidance placeholder reads the same way, with the reason | `e`, and one line of what a run sends |
-| instruction written | path, size, steps, `skills N on disk` | a preview of the instruction, or a key that opens it |
+| instruction written | path, **the size on disk and the size a run sends** (with the guidance line named as dropped when they differ), steps, `skills N on disk` | a preview of the instruction, or a key that opens it; what a run will send, not only what is on disk |
 | an interrupted edit | `an earlier edit of this instruction was not saved; the editor kept it in <file>` | the emergency-save file named, so the words are recovered, not retyped |
 | steps | path, declared count, or `none — press t` | the template must not doubt the product (“until model calls exist” is false) |
 | skills | `skills N on disk`, one `SKILL.md` per skill | what a *skill* is, and `K` must not hand an editor a directory |
@@ -73,8 +73,9 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | no token | `role token absent`; `admin token absent (identities are supplied)`; “no role check has been run yet — press c” | what a *role* is, in one line, before `c` is pressed |
+| a check was refused | `role check failed (<class>) at <configured url>: <reason>`; a token that is an administrator's but is checked as `member` says so and names `C` | the URL the user configured, led before the reason, and the account's real standing, not a bare class |
 | configured, unread | the URL and role | a sentence that says *not read yet*, not “could not be read” |
-| checked (one token) | the view, the repositories, each `[private]`/`[public]`, what the caller may do | which repository is selected, in text (a `>` marker), not only in colour |
+| checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel, each `[private]`/`[public]`, what the caller may do | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
 | checked rows then `g` | the clone acts as the agent's identity, while the list came from the role token | a failed clone names the account it acted as and says the list came from the role token, so two different tokens are not confused |
 | both tokens present | one view at a time, or both | a way to compare the two roles **inside the app** (`c` / `C`); a failed `C` keeps the last good view and shows the failure beside it |
 | a token is missing | `role token absent` / `admin token absent` / `failed (no_agent_token)` | a one-field, masked prompt (`v` for the agent's own token, `A` for the administrator token) that writes the credentials file, never an editor |
@@ -96,19 +97,19 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | empty | “No run has been recorded yet…” | where records will appear, and how a run is started |
-| a run in progress | `running (<elapsed>)` (not `unknown start`) | the start time from `plan.json`, and that the run has not ended |
-| finished | outcome with its reason and duration; the reason leads the note area, so it is never the line that wraps off | `o` the log, `T` the **transcript**, both named |
-| many runs | newest first; a window whose title reads `recent runs a–b of N — ↓/↑ more`; the selected row carries `>` | `enter` opens the run's agent; selection readable in text, and never on a hidden row |
+| a run in progress | `running (<elapsed>)` (not `unknown start`); the transcript carries a `model_request_sent` written **before** each call, and the log says `waiting for the model`, so a wait is not a wedge | the start time from the run's own opening transcript record (not `plan.json`, which carries none), and that the run has not ended |
+| finished | outcome with its reason and duration; the reason leads the note area, so it is never the line that wraps off | `o` the log, `T` the **transcript**, both named; a run left by a dead UI reports the time it actually ran, never `0.0s` |
+| many runs | newest first; a window whose title reads `recent runs a–b of N — ↓/↑ more`; the selected row carries `>`; the `started (UTC)` column says which clock it is | `enter` opens the run's agent; selection readable in text, and never on a hidden row |
 
 ## Overlays
 
 | Overlay | State | Must offer |
 |---|---|---|
-| first-run acknowledgment | shown once per configuration directory | own its rows (no bleed from the panel); `y`/`n`; the record path |
-| add-agent form (`n`/`a`) | opened from the Agents screen | name, endpoint, model, key, Forgejo URL, **role** token; writes the two files; the model key is **required**, so the agent the form creates can run; the form says the agent's own token is separate and is supplied later with `v`; the keys never echoed |
-| secret prompt (`k`/`f`/`v`/`A`) | Credentials (`k`, `f`, `A`) and Forgejo (`v`, `A`) | one field, masked; writes the named secret to the credentials file; never a value on screen |
+| first-run acknowledgment | shown once per configuration directory | own its rows (no bleed from the panel); `y`/`n`; the record path **at the advertised minimum too** (80×24), never a sentence that ends without its object |
+| add-agent form (`n`/`a`) | opened from the Agents screen | name, endpoint, model, key, Forgejo URL, **role** token; writes the two files; the model key is **required**, so the agent the form creates can run; the form says the agent's own token is separate and is supplied later with `v`; the keys never echoed; **the `enter writes it / esc cancels` action line is in the panel at every size** (including 80×24); a masked field shows how many characters it holds; a bracketed paste keeps the first line, names the rest as unused, and **replaces** the field instead of appending |
+| secret prompt (`k`/`f`/`v`/`A`) | Credentials (`k`, `f`, `A`) and Forgejo (`v`, `A`) | one field, masked, showing how many characters it holds; writes the named secret to the credentials file; never a value on screen; a bracketed paste keeps the first line and replaces |
 | removal confirmation (`d`) | any configured agent | `y` removes it from the configuration, `n` keeps it; the files left on disk are named **only when they exist** |
-| key help (`?`/`h`/`F1`) | any screen | every key, in groups, with one line of what it does |
+| key help (`?`/`h`/`F1`) | any screen | every key, in groups, with one line of what it does; a **scrollable window** whose title reads `keys a–b of N — ↓/↑ more` when the window is short, so every key survives 80×24 |
 
 ## Hand-offs (editor, pager)
 
@@ -117,7 +118,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | editor, `$EDITOR` set | the user's own editor | a status line naming the program before it opens |
 | editor, `$EDITOR` unset | `vi` (or `nano` when present) | the program named, and how to leave; an honest “not changed” when nothing was saved |
 | editor on skills (`K`) | a scratch `SKILL.md`, not a directory | what a skill is and the file name |
-| editor on an instruction | a file whose only guidance is one marked placeholder line | the placeholder is dropped before a run sends the document, so guidance is never sent as instruction; an emergency save left by an interrupted editor is named before the hand-off |
+| editor on an instruction | a file whose only guidance is one marked placeholder line | **the product's own first placeholder line** is dropped before a run sends the document (a line equal to it later in the user's own document is kept), so guidance is never sent as instruction but the user's text is not deleted; an emergency save left by an interrupted editor is named before the hand-off |
 | pager (`o`, `T`) | the user's own `$PAGER` | the path shown before it opens |
 
 ## Signals and abandoned runs
@@ -125,7 +126,8 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | the UI is signalled | — | the runs it started in `tui` mode end with it: the child asks the kernel to end when its parent does |
-| the UI is reopened after a run was left behind | the agent as `stopped`, never `idle` | the run's own record is closed as `stopped` with a reason, so a second run of the same agent never overlaps an abandoned one, in the same workspace |
+| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop | press `q` again to leave and stop them, or any other key to stay; the record of each ended run names the UI closing, not “on request” |
+| the UI is reopened after a run was left behind | the agent as `stopped`, never `idle`; the run's duration is the time it actually ran | the run's own record is closed as `stopped` with a reason, so a second run of the same agent never overlaps an abandoned one, in the same workspace |
 | the UI is reopened after a run finished | the agent's newest terminal outcome, its reason and its elapsed time | the hub seeds each agent from its newest terminal record, so a restart never shows `idle` for an agent whose record says `succeeded`, `stopped` or `failed` |
 | `^C` | — | a control chord is never a plain-letter binding: `^C` leaves the UI and stops the runs it started |
 

@@ -448,6 +448,21 @@ fn model_loop(
             api_key: secret.clone(),
             timeout: model::DEFAULT_TIMEOUT.min(remaining),
         };
+        // Say the call is in flight *before* it is made: a person opening the log or
+        // the transcript mid-run must be able to tell a slow model from a wedged run
+        // (W-5). The record carries the send time; the reply record follows.
+        if let Err(error) = transcript.append(&Record::model_request_sent(
+            &plan.run_id,
+            turn,
+            &plan.endpoint,
+            &plan.model,
+        )) {
+            return RunEnd::failed(format!("the transcript cannot be written: {error}"));
+        }
+        log.line(&format!(
+            "[turn {turn}] waiting for the model {} at {}",
+            plan.model, plan.endpoint
+        ));
         let exchange = match model::chat(
             &config,
             &messages,
@@ -769,6 +784,37 @@ fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
     status.signal()
 }
 
+/// Drop the product's own guidance line from an instruction document.
+///
+/// The template puts the placeholder on the first line, so that is the line this
+/// removes. A later line that happens to hold the same text is the user's own
+/// document and is kept; the Instruction screen uses [`instruction_payload`] to show
+/// how the two sizes differ.
+fn strip_placeholder(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut dropped = false;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if !dropped && line.trim() == INSTRUCTION_PLACEHOLDER {
+            dropped = true;
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+/// The instruction's size on disk and the size a run sends.
+///
+/// A run drops the product's guidance line before it sends the document; the screen
+/// must show both numbers, so a person can see what the model will receive rather
+/// than only what is on disk (P-4).
+///
+/// Returns `(on disk, a run sends)`.
+pub fn instruction_payload(bytes: &[u8]) -> (usize, usize) {
+    (bytes.len(), strip_placeholder(bytes).len())
+}
+
 /// Read the agent's instruction document.
 fn read_instruction(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = match fs::metadata(path) {
@@ -818,13 +864,11 @@ fn read_instruction(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     // The template's placeholder is guidance, never instruction: drop it before the
-    // document is sent, and refuse a document that is nothing else.
-    let text = String::from_utf8_lossy(&bytes);
-    let kept: Vec<&str> = text
-        .lines()
-        .filter(|line| line.trim() != INSTRUCTION_PLACEHOLDER)
-        .collect();
-    let cleaned = kept.join("\n");
+    // document is sent, and refuse a document that is nothing else. Only the
+    // product's own first line is dropped: a placeholder a user pasted into their own
+    // document is their text, and deleting every matching line would silently remove
+    // it (P-4).
+    let cleaned = strip_placeholder(&bytes);
     if cleaned.trim().is_empty() {
         return Err(format!(
             "the instruction document {} is still the placeholder; write what the agent should do",
@@ -1082,6 +1126,7 @@ mod tests {
                 "skills_discovered",
                 "instruction_read",
                 "run_limits",
+                "model_request_sent",
                 "model_request",
                 "model_reply",
                 "child_exit",
@@ -1543,6 +1588,31 @@ mod tests {
         fs::write(&path, format!("{INSTRUCTION_PLACEHOLDER}\n")).expect("instruction");
         let error = read_instruction(&path).expect_err("still the placeholder");
         assert!(error.contains("placeholder"), "{error}");
+    }
+
+    #[test]
+    fn a_pasted_placeholder_line_is_the_users_own_text() {
+        // P-4: only the product's first line is guidance; the same text inside the
+        // user's document must not be deleted silently.
+        let root = scratch_root("agent-run-placeholder-kept");
+        let path = root.join("instruction.md");
+        let doc = format!(
+            "{INSTRUCTION_PLACEHOLDER}\nmy first line\n{INSTRUCTION_PLACEHOLDER}\nmy last line\n"
+        );
+        fs::write(&path, &doc).expect("instruction");
+        let read = read_instruction(&path).expect("the instruction reads");
+        let read = String::from_utf8(read).expect("text");
+        assert!(read.contains("my first line"), "{read}");
+        assert!(read.contains("my last line"), "{read}");
+        assert!(
+            read.contains(INSTRUCTION_PLACEHOLDER),
+            "the pasted guidance line must survive: {read}"
+        );
+        assert!(!read.starts_with(INSTRUCTION_PLACEHOLDER), "{read}");
+        let (on_disk, sent) = instruction_payload(doc.as_bytes());
+        assert_eq!(on_disk, doc.len());
+        assert_eq!(sent, read.len());
+        assert!(on_disk > sent, "the two sizes differ");
     }
 
     #[test]
