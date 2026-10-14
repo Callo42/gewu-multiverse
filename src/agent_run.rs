@@ -51,6 +51,15 @@ use crate::transcript::{self, ModelToolCall, ModelUsage, Record, SkillRef, Trans
 /// The largest instruction document a run will read.
 pub const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
 
+/// The guidance line the product's own instruction template opens with.
+///
+/// The template is not an instruction: it is a placeholder that tells the user where
+/// to write one. A run drops any line that is exactly this text before it sends the
+/// document, so a person who types *below* the guidance does not send the guidance to
+/// the model as if it were their instruction.
+pub const INSTRUCTION_PLACEHOLDER: &str =
+    "<replace this line with what the agent should do; a run reads this document before it does anything>";
+
 /// The largest amount of a single tool's output that is kept, over both streams.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -91,6 +100,21 @@ impl RunEnd {
     /// Whether this run did everything it was asked to do.
     pub fn is_success(&self) -> bool {
         self.exit_code == 0
+    }
+}
+
+/// Ask the kernel to signal this process when the parent that started it dies.
+///
+/// The terminal UI starts a run as its own child and stops it before the UI leaves.
+/// A UI that is killed outright — even with `SIGKILL`, which cannot be caught — gets
+/// no chance to do that, so the child asks the kernel to deliver `SIGTERM` when the
+/// parent goes. A run therefore does not outlive the UI that started it, and an
+/// abandoned run cannot keep making model calls. On a platform without the call the
+/// startup reconciliation still closes the run's record.
+fn ask_to_end_with_the_parent() {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = nix::sys::prctl::set_pdeathsig(Some(nix::sys::signal::Signal::SIGTERM));
     }
 }
 
@@ -156,6 +180,7 @@ impl RunLog {
 /// This never panics. Every problem becomes a sentence in the log and in the
 /// transcript, and a non-zero exit code for the process that supervised the run.
 pub fn execute(run_dir: &Path) -> RunEnd {
+    ask_to_end_with_the_parent();
     let mut log = match RunLog::open(run_dir) {
         Ok(log) => log,
         Err(error) => {
@@ -792,7 +817,21 @@ fn read_instruction(path: &Path) -> Result<Vec<u8>, String> {
             path.display()
         ));
     }
-    Ok(bytes)
+    // The template's placeholder is guidance, never instruction: drop it before the
+    // document is sent, and refuse a document that is nothing else.
+    let text = String::from_utf8_lossy(&bytes);
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| line.trim() != INSTRUCTION_PLACEHOLDER)
+        .collect();
+    let cleaned = kept.join("\n");
+    if cleaned.trim().is_empty() {
+        return Err(format!(
+            "the instruction document {} is still the placeholder; write what the agent should do",
+            path.display()
+        ));
+    }
+    Ok(cleaned.into_bytes())
 }
 
 /// Install the effective skill set into the run directory, byte for byte.
@@ -1482,6 +1521,28 @@ mod tests {
                 .contains("no instruction document"),
             "the reason names the missing document"
         );
+    }
+
+    #[test]
+    fn the_instruction_template_placeholder_is_never_sent() {
+        // C-3: the template's guidance is not instruction. A run drops the placeholder
+        // line and sends only what the user wrote beneath it.
+        let root = scratch_root("agent-run-placeholder");
+        let path = root.join("instruction.md");
+        fs::write(
+            &path,
+            format!("{INSTRUCTION_PLACEHOLDER}\n\nwrite a note\n"),
+        )
+        .expect("instruction");
+        let read = read_instruction(&path).expect("the instruction reads");
+        let read = String::from_utf8(read).expect("text");
+        assert!(read.contains("write a note"), "{read}");
+        assert!(!read.contains("replace this line"), "{read}");
+
+        // A document that is nothing but the placeholder is refused, never sent.
+        fs::write(&path, format!("{INSTRUCTION_PLACEHOLDER}\n")).expect("instruction");
+        let error = read_instruction(&path).expect_err("still the placeholder");
+        assert!(error.contains("placeholder"), "{error}");
     }
 
     #[test]

@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{AgentConfig, Config, ConfigError, Role};
 use crate::credentials::{self, CredentialsFile};
@@ -153,6 +153,65 @@ impl NewAgentForm {
 impl Default for NewAgentForm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Which secret a one-field prompt is collecting.
+///
+/// The add-agent form collects the first model key and Forgejo token; this is how a
+/// secret that is needed *after* the agent exists is supplied without opening the
+/// credentials file in an editor. A value is never drawn: the prompt masks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretTarget {
+    /// The model key for the selected agent.
+    ModelKey,
+    /// The token for the configured Forgejo role.
+    ForgejoRoleToken,
+    /// The Forgejo administrator token, used to manage identities.
+    ForgejoAdminToken,
+    /// The selected agent's own Forgejo token, used to settle a supplied identity.
+    ForgejoAgentToken,
+}
+
+impl SecretTarget {
+    /// The words the prompt and the status line use.
+    pub fn describe(self) -> &'static str {
+        match self {
+            SecretTarget::ModelKey => "model key",
+            SecretTarget::ForgejoRoleToken => "Forgejo role token",
+            SecretTarget::ForgejoAdminToken => "Forgejo administrator token",
+            SecretTarget::ForgejoAgentToken => "agent's Forgejo token",
+        }
+    }
+
+    /// Whether the secret belongs to one agent, rather than to the connection.
+    pub fn needs_agent(self) -> bool {
+        matches!(
+            self,
+            SecretTarget::ModelKey | SecretTarget::ForgejoAgentToken
+        )
+    }
+}
+
+/// A one-field, masked prompt for a secret that is written to the credentials file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretPrompt {
+    /// Which secret is being collected.
+    pub target: SecretTarget,
+    /// What has been typed so far. Drawn as `*`, never as itself.
+    pub value: String,
+    /// Why the last attempt to record it did not work.
+    pub error: Option<String>,
+}
+
+impl SecretPrompt {
+    /// A blank prompt for one target.
+    pub fn new(target: SecretTarget) -> Self {
+        Self {
+            target,
+            value: String::new(),
+            error: None,
+        }
     }
 }
 
@@ -308,6 +367,10 @@ pub struct App {
     pub show_acknowledgment: bool,
     /// The in-TUI add-agent form, when it is open.
     pub add_agent: Option<NewAgentForm>,
+    /// A one-field prompt for a secret, when one is open.
+    pub secret_prompt: Option<SecretPrompt>,
+    /// An agent waiting on the "remove it?" confirmation, when one is open.
+    pub confirm_remove: Option<String>,
     /// An edit waiting on the no-editor confirmation, when `$EDITOR` is unset.
     pub editor_confirm: Option<PendingAction>,
     /// Whether the user set `$EDITOR`/`$VISUAL`. Read once, so tests can vary it.
@@ -382,6 +445,8 @@ impl App {
             ack_state: AckState::Missing,
             show_acknowledgment: false,
             add_agent: None,
+            secret_prompt: None,
+            confirm_remove: None,
             editor_confirm: None,
             editor_configured: crate::editor::editor_is_configured(),
             show_help: false,
@@ -473,7 +538,42 @@ impl App {
         }
         self.clamp_selection();
         self.refresh_recent();
+        self.reconcile_abandoned_runs();
         self.status = self.reload_status();
+    }
+
+    /// Close the records of default-mode runs a previous UI left behind.
+    ///
+    /// A `tui` run is a child of the UI that started it. When that UI is gone, nothing
+    /// is left to reap the child or write its ending, and a reopened UI would call the
+    /// agent `idle` while its orphan was still working — then start a second run of the
+    /// same agent. The run's own opening record carries the process id, so a run whose
+    /// process is no longer alive is closed here, as `stopped`, with a reason. A run
+    /// whose process *is* alive is left alone: it is genuinely in progress.
+    fn reconcile_abandoned_runs(&mut self) {
+        let names: Vec<String> = self.agents().iter().map(|agent| agent.name.clone()).collect();
+        for name in names {
+            if self.supervisor.mode(&name) != Mode::Tui {
+                continue;
+            }
+            if self.supervisor.state(&name).is_live() {
+                continue;
+            }
+            let Some(run) = self.recent.iter().find(|run| run.agent == name) else {
+                continue;
+            };
+            if run.outcome.is_some() {
+                continue;
+            }
+            let Some(pid) = crate::transcript::first_started_pid(&run.dir) else {
+                continue;
+            };
+            if crate::supervisor::process_alive(pid) {
+                continue;
+            }
+            self.supervisor
+                .note_abandoned(&name, &run.dir, &run.run_id);
+        }
     }
 
     /// Read the recent run records again.
@@ -728,13 +828,27 @@ impl App {
             return Err("the agent needs a name".to_owned());
         }
         if let Some(problem) = crate::config::agent_name_problem(&name) {
-            return Err(format!("`{name}` cannot be an agent name: {problem}"));
+            // The reason comes first and the echoed value is not repeated: a very long
+            // name used to push the reason off the status area, leaving the user with
+            // their own typing and no word of what was wrong.
+            return Err(format!("cannot use that name for an agent: {problem}"));
         }
         if endpoint.is_empty() {
             return Err("the agent needs a model endpoint".to_owned());
         }
         if model.is_empty() {
             return Err("the agent needs a model id".to_owned());
+        }
+        // The first fix round let the form create an agent with no key, and the
+        // product's own next step was then to edit `[model_keys]` in a file. Require
+        // the key here: an agent the form creates can run, and no screen's only way
+        // forward is a developer instruction.
+        if model_key.is_empty() {
+            return Err(
+                "the agent needs a model key so a run can start; it is written to the \
+                 credentials file and never shown"
+                    .to_owned(),
+            );
         }
         if self.agents().iter().any(|agent| agent.name == name) {
             return Err(format!("an agent named `{name}` already exists"));
@@ -763,6 +877,143 @@ impl App {
         )
         .map_err(|error| error.to_string())?;
         Ok(name)
+    }
+
+    /// Ask to remove the selected agent from the configuration.
+    ///
+    /// The first fix round made *adding* an agent a first-class in-app action;
+    /// changing or removing one was still file-only, so one wrong digit meant leaving
+    /// the product. Removal is the smaller half that unblocks the goal: the agent can
+    /// be removed and added again. It asks first, because it is destructive, and the
+    /// confirmation says what is left on disk.
+    pub fn request_remove_agent(&mut self) {
+        let Some(name) = self.selected_name() else {
+            self.status = "there is no agent to remove".to_owned();
+            return;
+        };
+        self.confirm_remove = Some(name.clone());
+        self.status = format!(
+            "press y to remove `{name}` from the configuration, or n to keep it"
+        );
+    }
+
+    /// Remove the agent the confirmation is about, and write the configuration back.
+    fn confirm_remove_agent(&mut self) {
+        let Some(name) = self.confirm_remove.take() else {
+            return;
+        };
+        let Some(existing) = self.config.clone() else {
+            self.status = format!(
+                "the configuration file cannot be read, so `{name}` cannot be removed"
+            );
+            return;
+        };
+        let kept: Vec<AgentConfig> = existing
+            .agents
+            .iter()
+            .filter(|agent| agent.name != name)
+            .cloned()
+            .collect();
+        let text = render_full_config(&existing, &kept);
+        if let Err(error) = Config::from_text(&self.config_path(), &text) {
+            self.status = error.to_string();
+            return;
+        }
+        if let Err(error) = std::fs::write(self.config_path(), text) {
+            self.status = format!(
+                "{} cannot be written: {error}",
+                self.config_path().display()
+            );
+            return;
+        }
+        let left = self
+            .layout
+            .agent(&name)
+            .map(|paths| paths.config_dir().display().to_string())
+            .unwrap_or_else(|_| "its files".to_owned());
+        self.reload();
+        self.status = format!(
+            "removed `{name}` from the configuration; its files under {left} were left on disk"
+        );
+    }
+
+    /// Drop the removal confirmation without removing anything.
+    fn cancel_remove_agent(&mut self) {
+        if let Some(name) = self.confirm_remove.take() {
+            self.status = format!("`{name}` was kept");
+        }
+    }
+
+    /// Open a one-field prompt for a secret the credentials file should hold.
+    pub fn request_secret(&mut self, target: SecretTarget) {
+        if target.needs_agent() && self.selected_name().is_none() {
+            self.status = "the configuration lists no agent for that secret".to_owned();
+            return;
+        }
+        self.secret_prompt = Some(SecretPrompt::new(target));
+        self.status = format!(
+            "type the {} and press enter; it is written to the credentials file and never shown",
+            target.describe()
+        );
+    }
+
+    /// One key while the secret prompt is open.
+    fn on_secret_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.submit_secret(),
+            KeyCode::Esc => {
+                self.secret_prompt = None;
+                self.status = "no secret was written".to_owned();
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.secret_prompt.as_mut() {
+                    prompt.value.pop();
+                }
+            }
+            KeyCode::Char(character) => {
+                if let Some(prompt) = self.secret_prompt.as_mut() {
+                    prompt.value.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Write the secret the prompt holds, and say only that it was recorded.
+    fn submit_secret(&mut self) {
+        let Some(prompt) = self.secret_prompt.clone() else {
+            return;
+        };
+        let value = prompt.value.trim().to_owned();
+        if value.is_empty() {
+            if let Some(open) = self.secret_prompt.as_mut() {
+                open.error = Some("a secret cannot be empty".to_owned());
+            }
+            return;
+        }
+        let agent = self.selected_name();
+        let subject = agent.clone().unwrap_or_else(|| "the connection".to_owned());
+        let (table, key) = match prompt.target {
+            SecretTarget::ModelKey => (Some("model_keys"), subject.clone()),
+            SecretTarget::ForgejoAgentToken => (Some("forgejo_agent_tokens"), subject.clone()),
+            SecretTarget::ForgejoRoleToken => (None, "forgejo_token".to_owned()),
+            SecretTarget::ForgejoAdminToken => (None, "forgejo_admin_token".to_owned()),
+        };
+        match credentials::record_secret(&self.credentials_path, table, &key, &value) {
+            Ok(()) => {
+                self.secret_prompt = None;
+                self.reload();
+                self.status = format!(
+                    "recorded the {} for {subject}; the Credentials screen lists it by name",
+                    prompt.target.describe()
+                );
+            }
+            Err(error) => {
+                if let Some(open) = self.secret_prompt.as_mut() {
+                    open.error = Some(error.to_string());
+                }
+            }
+        }
     }
 
     /// Show or hide the key-reference overlay.
@@ -1107,8 +1358,27 @@ impl App {
                 failure.class, failure.message
             ),
         };
-        self.role_check = Some(result);
-        self.repo_selected = 0;
+        // A failed administrator check must not wipe a good view the user already has:
+        // keep the last successful list and show the failure beside it instead.
+        match result {
+            Ok(check) => {
+                self.role_check = Some(Ok(check));
+                self.repo_selected = 0;
+            }
+            Err(failure) => {
+                let keep = matches!(self.role_check, Some(Ok(_)));
+                let message = format!(
+                    "role check with the administrator token failed ({}): {}",
+                    failure.class, failure.message
+                );
+                if keep {
+                    self.forgejo_note = Some(message);
+                } else {
+                    self.role_check = Some(Err(failure));
+                    self.repo_selected = 0;
+                }
+            }
+        }
     }
 
     /// Settle the selected agent's Forgejo identity.
@@ -1628,13 +1898,23 @@ impl App {
                         status.code(),
                         action.label
                     );
-                } else if changed {
-                    self.status = format!(
-                        "{} was edited in {program}; the files were read again",
-                        action.label
-                    );
                 } else {
-                    self.status = format!("{} was not changed ({program})", action.label);
+                    // `declared steps` is plural; `instruction` and `new skill` are not.
+                    let verb = if action.label.contains("steps") || action.label.contains("skills")
+                    {
+                        "were"
+                    } else {
+                        "was"
+                    };
+                    if changed {
+                        self.status = format!(
+                            "{} {verb} edited in {program}; the files were read again",
+                            action.label
+                        );
+                    } else {
+                        self.status =
+                            format!("{} {verb} not changed ({program})", action.label);
+                    }
                 }
             }
             (ActionKind::Edit, Err(error)) => {
@@ -1793,6 +2073,16 @@ impl App {
 
     /// One key press.
     pub fn on_key(&mut self, key: KeyEvent) {
+        // A control chord is never a plain-letter binding. `^C` is the reflex keystroke
+        // for "stop"; here it leaves the UI, and the children it owns are stopped on
+        // the way out. Before this, `^C` fell through to the plain `c` binding and ran
+        // the Forgejo role check, reaching the network while a run kept going.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+            }
+            return;
+        }
         if self.show_help {
             if matches!(
                 key.code,
@@ -1826,6 +2116,22 @@ impl App {
             }
             return;
         }
+        if self.secret_prompt.is_some() {
+            self.on_secret_key(key);
+            return;
+        }
+        if self.confirm_remove.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_remove_agent();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.cancel_remove_agent();
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.show_acknowledgment {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_acknowledgment(),
@@ -1833,7 +2139,13 @@ impl App {
                     self.decline_acknowledgment();
                 }
                 KeyCode::Char('q') => self.should_quit = true,
-                _ => {}
+                // The modal is correctly modal, but a swallowed key must not be
+                // silent: say what answers this screen, so a person who pressed `s`
+                // first is not left to guess.
+                _ => {
+                    self.status =
+                        "answer this screen first: y to acknowledge, or n for not now".to_owned();
+                }
             }
             return;
         }
@@ -1851,7 +2163,10 @@ impl App {
             // `C` runs the role check with the administrator token, so the two roles
             // can be compared in the app.
             KeyCode::Char('C') => self.request_admin_role_check(),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Up => self.move_selection(-1),
+            // `k` moves up everywhere except the Credentials screen, where it opens the
+            // prompt for a model key.
+            KeyCode::Char('k') if self.screen != Screen::Credentials => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Enter => self.open_selected_agent(),
             KeyCode::Esc => self.screen = Screen::Agents,
@@ -1878,12 +2193,35 @@ impl App {
             KeyCode::Char('o') => self.request_view_log(),
             // `k` moves up; the skills directory is opened with `K`.
             KeyCode::Char('K') => self.request_edit(EditTarget::Skills),
+            // `d` removes an agent, after a confirmation; a mistyped agent is no
+            // longer a dead end that ends in a text editor.
+            KeyCode::Char('d') | KeyCode::Delete => self.request_remove_agent(),
+            // A secret needed after the agent exists is supplied here, masked, without
+            // handing the credentials file to an editor.
+            KeyCode::Char('k') if self.screen == Screen::Credentials => {
+                self.request_secret(SecretTarget::ModelKey);
+            }
+            KeyCode::Char('f') if self.screen == Screen::Credentials => {
+                self.request_secret(SecretTarget::ForgejoRoleToken);
+            }
+            KeyCode::Char('v') if self.screen == Screen::Forgejo => {
+                self.request_secret(SecretTarget::ForgejoAgentToken);
+            }
+            KeyCode::Char('A')
+                if matches!(self.screen, Screen::Credentials | Screen::Forgejo) =>
+            {
+                self.request_secret(SecretTarget::ForgejoAdminToken);
+            }
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char(digit) if ('1'..='6').contains(&digit) => {
                 let at = digit as usize - '1' as usize;
                 self.screen = Screen::ALL[at];
             }
-            _ => {}
+            // A press that cannot act must not be silent: say so, and name the way to
+            // the full list. Silence reads as a frozen program.
+            _ => {
+                self.status = "no key is bound to that — press ? for the list".to_owned();
+            }
         }
     }
 }
@@ -1896,10 +2234,31 @@ const STOP_ALL_BUDGET_SECS: u64 = 10;
 /// The configuration has no comments of its own to keep once the tool writes it; the
 /// file it produces is valid, checked by the caller, and holds no secret.
 fn render_config(existing: &Config, url: &str, name: &str, endpoint: &str, model: &str) -> String {
+    let mut with_url = existing.clone();
+    with_url.forgejo.url = url.to_owned();
+    let added = AgentConfig {
+        name: name.to_owned(),
+        model: model.to_owned(),
+        endpoint: endpoint.to_owned(),
+        max_turns: crate::config::DEFAULT_MAX_TURNS,
+        instruction: PathBuf::from(format!("agents/{name}/instruction.md")),
+        concurrency: 1,
+    };
+    let mut agents = existing.agents.clone();
+    agents.push(added);
+    render_full_config(&with_url, &agents)
+}
+
+/// Render a whole configuration from its parts, preserving every field.
+///
+/// Used when the tool rewrites the configuration itself — adding an agent or removing
+/// one — so the file it writes is valid, carries no secret, and names no URL the user
+/// did not give it.
+fn render_full_config(existing: &Config, agents: &[AgentConfig]) -> String {
     let mut text = String::new();
-    text.push_str("# gewu-multiverse configuration (written by the add-agent form)\n\n");
+    text.push_str("# gewu-multiverse configuration (written by the tool)\n\n");
     text.push_str("[forgejo]\n");
-    text.push_str(&format!("url = {}\n", quote(url)));
+    text.push_str(&format!("url = {}\n", quote(&existing.forgejo.url)));
     text.push_str(&format!("role = {}\n\n", quote(existing.forgejo.role.as_str())));
     text.push_str("[limits]\n");
     text.push_str(&format!(
@@ -1910,18 +2269,9 @@ fn render_config(existing: &Config, url: &str, name: &str, endpoint: &str, model
         "max_concurrent_agents = {}\n\n",
         existing.limits.max_concurrent_agents
     ));
-    for agent in &existing.agents {
+    for agent in agents {
         write_agent_block(&mut text, agent);
     }
-    let added = AgentConfig {
-        name: name.to_owned(),
-        model: model.to_owned(),
-        endpoint: endpoint.to_owned(),
-        max_turns: crate::config::DEFAULT_MAX_TURNS,
-        instruction: PathBuf::from(format!("agents/{name}/instruction.md")),
-        concurrency: 1,
-    };
-    write_agent_block(&mut text, &added);
     text
 }
 
@@ -1955,10 +2305,12 @@ fn ensure_editable(target: EditTarget, path: &std::path::Path, agent: &str) -> s
         std::fs::create_dir_all(parent)?;
     }
     let text = match target {
+        // The guidance is a single marked placeholder, not prose in the document: the
+        // run drops any line that is exactly this text before it sends the document,
+        // so a person who types below the guidance never sends the guidance itself.
         EditTarget::Instruction => format!(
-            "# Instruction for the agent `{agent}`\n\n\
-             Write, in plain language, what this agent should do. A run reads this\n\
-             document before it does anything, and the declared steps run afterwards.\n"
+            "{}\n",
+            crate::agent_run::INSTRUCTION_PLACEHOLDER
         ),
         EditTarget::Steps => format!(
             "# Declared shell steps for one run of `{agent}`, one command per line.\n\
@@ -2417,6 +2769,187 @@ role = "member"
         assert_eq!(
             app.last_failure("one").as_deref(),
             Some("the model call failed (transport): connection refused")
+        );
+    }
+
+    const NO_AGENTS: &str = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+"#;
+
+    #[test]
+    fn an_abandoned_run_is_closed_as_stopped_not_shown_as_idle() {
+        // S-1: a `tui` run is a child of the UI. A reopened UI must not call the agent
+        // idle while the run's own record says it never ended.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let run_id = "run-100-0001-2";
+        let dir = app.layout.state_root().join("one").join(run_id);
+        std::fs::create_dir_all(&dir).expect("the run directory is created");
+        let mut transcript =
+            crate::transcript::Transcript::open(&dir).expect("a transcript is opened");
+        // A process id that cannot be running.
+        transcript
+            .append(&crate::transcript::Record::run_started(
+                run_id,
+                "one",
+                4_000_000_000,
+                "/w",
+            ))
+            .expect("a record is appended");
+        app.reload();
+        let state = app.supervisor.state("one");
+        assert!(!state.is_live());
+        assert_eq!(state.word(), "stopped");
+        assert!(crate::transcript::terminal_record(&dir).is_some());
+    }
+
+    #[test]
+    fn removing_an_agent_asks_first_and_writes_the_configuration() {
+        // C-4: a mistyped agent must be removable inside the product.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.confirm_remove.as_deref(), Some("one"));
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(app.agents().iter().any(|agent| agent.name == "one"));
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(!app.agents().iter().any(|agent| agent.name == "one"));
+        let text = std::fs::read_to_string(app.config_path()).expect("config readable");
+        assert!(text.contains("name = \"two\""), "{text}");
+        assert!(!text.contains("name = \"one\""), "{text}");
+    }
+
+    #[test]
+    fn the_form_requires_a_model_key() {
+        // S-2: the form must not create an agent the product cannot run.
+        let root = scratch_root("app-form-key");
+        std::fs::write(root.join("config.toml"), NO_AGENTS).expect("written");
+        let mut app =
+            App::with_runner(Layout::rooted_at(root), quiet_runner("app-form-key-runner"));
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::Char('n')));
+        for character in "scribe".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Tab));
+        for character in "http://127.0.0.1:9/v1".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('m')));
+        // The model key is left empty on purpose.
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.adding_agent());
+        assert!(app.status.contains("model key"), "{}", app.status);
+        assert!(app.agents().is_empty());
+    }
+
+    #[test]
+    fn a_very_long_invalid_name_puts_the_reason_first_and_does_not_echo_it() {
+        // S-5: a long invalid name used to push the reason off the status area.
+        let root = scratch_root("app-long-name");
+        std::fs::write(root.join("config.toml"), NO_AGENTS).expect("written");
+        let mut app =
+            App::with_runner(Layout::rooted_at(root), quiet_runner("app-long-name-runner"));
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::Char('n')));
+        for _ in 0..200 {
+            app.on_key(key(KeyCode::Char('a')));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.status.starts_with("cannot use that name"), "{}", app.status);
+        assert!(app.status.contains("longer than 32"), "{}", app.status);
+        assert!(!app.status.contains("aaaa"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_secret_prompt_writes_the_key_and_never_shows_it() {
+        // C-5: a secret needed after the agent exists is supplied in the product.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.show(Screen::Credentials);
+        app.on_key(key(KeyCode::Char('k')));
+        assert!(app.secret_prompt.is_some());
+        for character in "sk-secret-xyz".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.secret_prompt.is_none());
+        let text = std::fs::read_to_string(&app.credentials_path).expect("credentials");
+        assert!(text.contains("sk-secret-xyz"), "{text}");
+        assert!(!app.status.contains("sk-secret-xyz"), "{}", app.status);
+    }
+
+    #[test]
+    fn control_c_leaves_the_ui_and_does_not_run_the_role_check() {
+        // S-3: a control chord must never fall through to a plain-letter binding.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+        assert!(app.role_check.is_none());
+    }
+
+    #[test]
+    fn a_plural_file_is_reported_with_a_plural_verb() {
+        // C-11: `the declared steps … were not changed`.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.steps_file(), "echo one\n").expect("the steps file");
+        let action = PendingAction {
+            kind: ActionKind::Edit,
+            path: paths.steps_file().to_path_buf(),
+            label: "the declared steps of `one`".to_owned(),
+            before: stamp(paths.steps_file()),
+        };
+        app.note_action(&action, Ok(success()));
+        assert!(app.status.contains("were not changed"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_failed_administrator_check_keeps_the_last_good_role_view() {
+        // S-10: `C` without an administrator token must not wipe the member view.
+        use crate::config::Role;
+        use crate::forgejo::{Permissions, Repository, RoleCheck, Viewer};
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let repository = Repository {
+            full_name: "uxmember/demo-public".to_owned(),
+            namespace: "uxmember".to_owned(),
+            name: "demo-public".to_owned(),
+            private: false,
+            default_branch: None,
+            html_url: None,
+            permissions: Permissions::default(),
+        };
+        app.role_check = Some(Ok(RoleCheck {
+            url: "https://forgejo.example.org".to_owned(),
+            role: Role::Member,
+            viewer: Viewer {
+                login: "uxmember".to_owned(),
+                email: None,
+                description: None,
+                is_admin: false,
+            },
+            repositories: vec![repository],
+            private_visible: 0,
+        }));
+        app.request_admin_role_check();
+        assert!(app.status.contains("administrator token"), "{}", app.status);
+        assert!(
+            matches!(app.role_check, Some(Ok(_))),
+            "the good member view was wiped: {:?}",
+            app.role_check
+        );
+        assert!(
+            app.forgejo_note
+                .as_deref()
+                .is_some_and(|note| note.contains("administrator token")),
+            "the failure is not shown beside the view"
         );
     }
 }
