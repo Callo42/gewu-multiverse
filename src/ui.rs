@@ -72,6 +72,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_secret_prompt(frame, app);
     } else if app.confirm_remove.is_some() {
         draw_remove_confirm(frame, app);
+    } else if app.confirm_forget.is_some() {
+        draw_forget_confirm(frame, app);
     } else if app.show_help {
         draw_help(frame, app);
     }
@@ -176,12 +178,17 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(table, parts[0]);
 
     // A note area that runs out of rows declares its tail instead of dropping it
-    // without a word — the same rule the panels follow in their titles (O-3).
-    let notes = declared_notes(
-        agent_notes(app),
-        area.width as usize,
-        parts[1].height as usize,
-    );
+    // without a word — the same rule the panels follow in their titles (O-3). A note
+    // area the user is scrolling keeps its own tail instead.
+    let notes = if app.panel_scroll > 0 {
+        scrolled(&agent_notes(app), app.panel_scroll)
+    } else {
+        declared_notes(
+            agent_notes(app),
+            area.width as usize,
+            parts[1].height as usize,
+        )
+    };
     frame.render_widget(
         Paragraph::new(Text::from(notes)).wrap(Wrap { trim: true }),
         parts[1],
@@ -224,12 +231,25 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
     // start that never became a run is named as a start, not as a run (D-8).
     if let Some(name) = app.selected_name() {
         if let Some(reason) = app.last_run_failure(&name) {
+            // Y-4: when a record the hub had is gone, the newest record left is not
+            // silently promoted to "the last run". Say a record went missing, and
+            // call the older failure what it is.
+            let label = if app.forgotten_run.as_deref() == Some(name.as_str()) {
+                format!("the newest run record left for `{name}` did not go well")
+            } else {
+                format!("the last run of `{name}` did not go well")
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{label}: {}", crate::model::in_product_words(&reason)),
+                Style::new().fg(Color::Red),
+            )));
+        }
+        if app.forgotten_run.as_deref() == Some(name.as_str()) {
             lines.push(Line::from(Span::styled(
                 format!(
-                    "the last run of `{name}` did not go well: {}",
-                    crate::model::in_product_words(&reason)
+                    "a run record the hub had for `{name}` is no longer there; what is shown is what the records left on disk say"
                 ),
-                Style::new().fg(Color::Red),
+                Style::new().fg(Color::Yellow),
             )));
         }
         if let Some(reason) = app.last_start_failure(&name) {
@@ -290,7 +310,7 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
 }
 
 /// One agent's configuration, read from the configuration file and the supervisor.
-fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
+fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     match app.selected_agent() {
         None => lines.push(Line::from(no_agent_text(app))),
@@ -353,7 +373,18 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                 )));
             }
             match app.latest_run_log(&agent.name) {
-                Some(log) => lines.push(field("newest log", &log.display().to_string())),
+                Some(log) if log.is_file() => {
+                    lines.push(field("newest log", &log.display().to_string()));
+                }
+                // Y-7: a path to a file that is no longer there is not a thing. Mark it
+                // gone, rather than presenting it as if `o` would open it.
+                Some(log) => lines.push(field(
+                    "newest log",
+                    &format!(
+                        "{} — gone, the record has no log; press o to see what it says",
+                        log.display()
+                    ),
+                )),
                 None => lines.push(field("newest log", "no run yet")),
             }
             if let Some(run_id) = app.supervisor.state(&agent.name).run_id() {
@@ -361,7 +392,19 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
             }
             if let Some(test) = &app.endpoint_test {
                 if test.agent == agent.name {
-                    lines.push(field("endpoint test", &test.describe()));
+                    // Y-5: a result about an endpoint or model that has since changed is
+                    // history; it is dated and marked, never shown as if it were now.
+                    if test.is_current_for(agent) {
+                        lines.push(field("endpoint test", &test.describe()));
+                    } else {
+                        lines.push(field(
+                            "endpoint test",
+                            &format!(
+                                "not current — the endpoint or model changed since it ran ({}); press p to test it again",
+                                test.describe()
+                            ),
+                        ));
+                    }
                 }
             }
             match crate::credentials::recorded_login(&app.credentials_path, &agent.name) {
@@ -384,18 +427,20 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
     // A short window does not silently drop the fields below the fold: the panel says
     // so in its title, which is always drawn (D-7); the same rule is applied to every
     // sibling panel and note area (O-3).
-    let title = panel_title("agent configuration", panel_overflows(&lines, area));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    lines
+}
+
+/// Draw the Agent screen, windowed by the panel's own scroll key.
+fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = agent_config_lines(app);
+    let overflows = panel_overflows(&lines, area) && app.panel_scroll == 0;
+    let (title, _) = fit_title(area.width as usize, "agent configuration", None, None, overflows);
+    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
 }
 
 
 /// An agent's instruction, its declared steps and its skills, as they are on disk.
-fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
+fn instruction_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     match app.selected_agent() {
         None => lines.push(Line::from(no_agent_text(app))),
@@ -502,27 +547,37 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
          you can keep or rename. A run installs the skills it finds into the run directory.",
         Style::new().fg(Color::DarkGray),
     )));
-    let title = panel_title("instruction, steps and skills", panel_overflows(&lines, area));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: false }),
-        area,
+    lines
+}
+
+/// Draw the Instruction screen, windowed by the panel's own scroll key.
+fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = instruction_lines(app);
+    let overflows = panel_overflows(&lines, area) && app.panel_scroll == 0;
+    let (title, _) = fit_title(
+        area.width as usize,
+        "instruction, steps and skills",
+        None,
+        None,
+        overflows,
     );
+    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
 }
 
 /// The Forgejo connection, the role check and the repository list.
 fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+    let inner = area.width.saturating_sub(2) as usize;
+    let content_height = area.height.saturating_sub(2) as usize;
+    let mut head: Vec<Line> = Vec::new();
     match &app.config {
-        None => lines.push(Line::from(no_agent_text(app))),
+        None => head.push(Line::from(no_agent_text(app))),
         Some(config) => {
-            lines.push(field("url", &config.forgejo.url));
-            lines.push(field("role", config.forgejo.role.as_str()));
+            head.push(field("url", &config.forgejo.url));
+            head.push(field("role", config.forgejo.role.as_str()));
         }
     }
     let (member, admin) = app.forgejo_tokens_present();
-    lines.push(field(
+    head.push(field(
         "role token",
         if member {
             "in the credentials file"
@@ -530,7 +585,7 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
             "absent"
         },
     ));
-    lines.push(field(
+    head.push(field(
         "admin token",
         if admin {
             "configured (identities are managed)"
@@ -550,7 +605,7 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                     .flatten()
                     .map(|mode| format!(" ({})", mode.as_str()))
                     .unwrap_or_default();
-                lines.push(field(
+                head.push(field(
                     "agent identity",
                     &format!("{login}{mode} — clones and pull requests act as this account"),
                 ));
@@ -564,14 +619,12 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 let (_, admin) = app.forgejo_tokens_present();
                 let sentence = if admin {
                     format!(
-                        "not settled — press i to create `{login}` (managed) on your Forgejo"
+                        "not settled — press i for `{login}`; the account is created and managed"
                     )
                 } else {
-                    format!(
-                        "not settled — press i to check the token supplied with v for `{login}`"
-                    )
+                    format!("not settled — press i for `{login}`; the token is from v")
                 };
-                lines.push(field("agent identity", &sentence));
+                head.push(field("agent identity", &sentence));
             }
         }
     }
@@ -579,18 +632,48 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     // the check has run, the repositories are what the panel is for, and the list
     // gets the rows (T-12).
     if !matches!(app.role_check, Some(Ok(_))) {
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             ROLE_EXPLANATION,
             Style::new().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::from(""));
+    head.push(Line::from(""));
 
-    let mut repo_window: Option<(usize, usize, usize)> = None;
+    // The rows after the repository list — the identity report, a clone note and the
+    // key legend — are counted against the list's window, so the legend (which names
+    // `v`, the key that supplies the agent's own token) is never itself the content
+    // that falls off the panel (Y-8).
+    let mut tail: Vec<Line> = Vec::new();
+    if let Some(report) = &app.identity_report {
+        tail.push(Line::from(""));
+        tail.push(Line::from(format!(
+            "identity for `{}`: {}",
+            report.agent,
+            report.describe()
+        )));
+    }
+    if let Some(note) = &app.forgejo_note {
+        tail.push(Line::from(note.clone()));
+    }
+    tail.push(Line::from(""));
+    let legend = forgejo_legend();
+    let tail_rows = pushed_rows(&tail, inner) + pushed_rows(&legend, inner);
+
+    let long_name = "Forgejo connection and role check";
+    let short_name = "Forgejo";
+    let mut repo_rows: Vec<Line> = Vec::new();
+    let title: String;
     match &app.role_check {
-        None => lines.push(placeholder(
-            "no role check has been run yet — press c to list what the configured token can see",
-        )),
+        None => {
+            head.push(placeholder(
+                "no role check has been run yet — press c to list what the configured token can see",
+            ));
+            let lines = assemble(head, repo_rows, tail, legend);
+            let overflows = pushed_rows(&lines, inner) > content_height;
+            title = fit_title(area.width as usize, long_name, Some(short_name), None, overflows).0;
+            draw_panel(frame, lines, title, area);
+            return;
+        }
         Some(Err(failure)) => {
             // P-7: a refusal names the URL the user configured, not only the API path,
             // so a mistyped path connects to what was typed.
@@ -599,13 +682,18 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 .as_ref()
                 .map(|config| config.forgejo.url.clone())
                 .unwrap_or_else(|| "the configured address".to_owned());
-            lines.push(Line::from(Span::styled(
+            head.push(Line::from(Span::styled(
                 format!(
                     "role check failed ({}) at {at}: {}",
                     failure.class, failure.message
                 ),
                 Style::new().fg(Color::Red),
-            )))
+            )));
+            let lines = assemble(head, repo_rows, tail, legend);
+            let overflows = pushed_rows(&lines, inner) > content_height;
+            title = fit_title(area.width as usize, long_name, Some(short_name), None, overflows).0;
+            draw_panel(frame, lines, title, area);
+            return;
         }
         Some(Ok(check)) => {
             let summary = format!(
@@ -617,89 +705,164 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 },
                 check.summary()
             );
-            lines.push(Line::from(summary.clone()));
-            lines.push(Line::from(""));
+            head.push(Line::from(summary));
+            head.push(Line::from(""));
             if check.repositories.is_empty() {
-                lines.push(Line::from(
+                head.push(Line::from(
                     "the token can see no repository on this instance",
                 ));
-            } else {
-                // The repository list takes the Agents/Runs rule, not a rule of its
-                // own: the window is chosen so the selected repository is always
-                // drawn, and the panel title says which rows are on show. Before
-                // this, at 80x24 a repository was dropped with no range and no
-                // `more`, and the selection walked onto the undrawn row (W-1).
-                let inner = area.width.saturating_sub(2) as usize;
-                let content_height = area.height.saturating_sub(2) as usize;
-                // Count what every line above actually occupies once wrapped: a long
-                // identity sentence or role explanation must not push the selected
-                // repository off the panel (W-1, T-12).
-                let used_before = pushed_rows(&lines, inner);
-                let capacity = content_height.saturating_sub(used_before).max(1);
-                let total = check.repositories.len();
-                let (first, shown) = visible_window(total, app.repo_selected, capacity);
-                for (at, repository) in check
-                    .repositories
-                    .iter()
-                    .enumerate()
-                    .skip(first)
-                    .take(shown)
-                {
-                    let style = if at == app.repo_selected {
-                        Style::new().fg(Color::Black).bg(Color::Cyan)
-                    } else {
-                        Style::new()
-                    };
-                    // The selected row is marked in text as well as colour: a
-                    // monochrome capture, or a person who cannot tell the colours
-                    // apart, still sees which repository `g` and `P` will act on.
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{} {}",
-                            if at == app.repo_selected { '>' } else { ' ' },
-                            repository.line()
-                        ),
-                        style,
+                let lines = assemble(head, repo_rows, tail, legend);
+                let overflows = pushed_rows(&lines, inner) > content_height;
+                title =
+                    fit_title(area.width as usize, long_name, Some(short_name), None, overflows).0;
+                draw_panel(frame, lines, title, area);
+                return;
+            }
+            let total = check.repositories.len();
+            // First pass: assume the repository range stays in the title.
+            let (_first, _shown, overflows, range) = forgejo_window(
+                &head,
+                total,
+                app.repo_selected,
+                inner,
+                content_height,
+                tail_rows,
+            );
+            let (first_title, dropped) = fit_title(
+                area.width as usize,
+                long_name,
+                Some(short_name),
+                range.as_deref(),
+                overflows,
+            );
+            if dropped {
+                // The title cannot hold both the range and the declaration: the
+                // declaration wins, and the range moves to a line above the list, so
+                // neither is lost (Y-1).
+                if let Some(range) = range {
+                    head.push(Line::from(Span::styled(
+                        range,
+                        Style::new().fg(Color::DarkGray),
                     )));
                 }
-                repo_window = Some((first, shown, total));
+                let (_, _, overflows, _) = forgejo_window(
+                    &head,
+                    total,
+                    app.repo_selected,
+                    inner,
+                    content_height,
+                    tail_rows,
+                );
+                title = fit_title(
+                    area.width as usize,
+                    long_name,
+                    Some(short_name),
+                    None,
+                    overflows,
+                )
+                .0;
+            } else {
+                title = first_title;
             }
+            // The window the title has just described is the one drawn: the range line
+            // (when it moved to the body) is part of `head`, so it is counted here.
+            repo_rows = render_repositories(check, app, inner, content_height, tail_rows, &head);
         }
     }
-    if let Some(report) = &app.identity_report {
-        lines.push(Line::from(""));
-        lines.push(Line::from(format!(
-            "identity for `{}`: {}",
-            report.agent,
-            report.describe()
+    let lines = assemble(head, repo_rows, tail, legend);
+    draw_panel(frame, lines, title, area);
+}
+
+/// The Forgejo key legend, two compact rows.
+///
+/// Each phrase keeps its object: `v agent token` says what `v` sets, and the panel
+/// clips whole rows, never half a sentence (Y-8). Keeping it to two rows is also what
+/// leaves the repository list more than one row at 80×24.
+fn forgejo_legend() -> Vec<Line<'static>> {
+    [
+        "c role   C admin role   v agent token   A admin token   i identity",
+        "up/down choose one   g clone   P pull request   U update the newest",
+    ]
+    .iter()
+    .map(|line| Line::from(Span::styled((*line).to_owned(), Style::new().fg(Color::DarkGray))))
+    .collect()
+}
+
+/// Put a panel's three parts together in reading order.
+fn assemble(
+    head: Vec<Line<'static>>,
+    repo_rows: Vec<Line<'static>>,
+    tail: Vec<Line<'static>>,
+    legend: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    let mut lines = head;
+    lines.extend(repo_rows);
+    lines.extend(tail);
+    lines.extend(legend);
+    lines
+}
+
+/// The repository window, with the rows above it and the tail below it both reserved.
+///
+/// Returns the first row, the number of rows and whether the panel's content overflows
+/// its window. Reserving the tail is what keeps the key legend on the panel instead of
+/// letting the repository list push it off (Y-8).
+fn forgejo_window(
+    head: &[Line<'static>],
+    total: usize,
+    selected: usize,
+    inner: usize,
+    content_height: usize,
+    tail_rows: usize,
+) -> (usize, usize, bool, Option<String>) {
+    let head_rows = pushed_rows(head, inner);
+    let capacity = content_height
+        .saturating_sub(head_rows + tail_rows)
+        .max(1);
+    let (first, shown) = visible_window(total, selected, capacity);
+    let overflows = head_rows + shown + tail_rows > content_height;
+    let range = (total > shown)
+        .then(|| list_title("repositories", first, shown, total).trim().to_owned());
+    (first, shown, overflows, range)
+}
+
+/// The repository rows for the window the title just described.
+fn render_repositories(
+    check: &crate::forgejo::RoleCheck,
+    app: &App,
+    inner: usize,
+    content_height: usize,
+    tail_rows: usize,
+    head: &[Line<'static>],
+) -> Vec<Line<'static>> {
+    let total = check.repositories.len();
+    let (first, shown, _, _) = forgejo_window(head, total, app.repo_selected, inner, content_height, tail_rows);
+    let mut rows = Vec::new();
+    for (at, repository) in check
+        .repositories
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+    {
+        let style = if at == app.repo_selected {
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::new()
+        };
+        // The selected row is marked in text as well as colour: a monochrome capture,
+        // or a person who cannot tell the colours apart, still sees which repository
+        // `g` and `P` will act on.
+        rows.push(Line::from(Span::styled(
+            format!(
+                "{} {}",
+                if at == app.repo_selected { '>' } else { ' ' },
+                repository.line()
+            ),
+            style,
         )));
     }
-    if let Some(note) = &app.forgejo_note {
-        lines.push(Line::from(note.clone()));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "c check the role   C check it as the administrator token   v set the agent's own token   A set the administrator token   i settle the agent's identity   up/down choose a repository   g clone it into the agent's workspace   P open a pull request as the agent   U update the newest one",
-        Style::new().fg(Color::DarkGray),
-    )));
-    let mut title = " Forgejo connection and role check ".to_owned();
-    if let Some((first, shown, total)) = repo_window {
-        if total > shown {
-            title = format!(
-                " Forgejo connection and role check —{}",
-                list_title("repositories", first, shown, total)
-            );
-        }
-    }
-    // The repository window answers for the rows it hides; the panel's own tail (the
-    // key line) answers here, so a short window declares it too (O-3).
-    let title = declare_below(title, panel_overflows(&lines, area));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    rows
 }
 
 /// The one sentence that explains what a role is and what an identity is.
@@ -739,7 +902,7 @@ fn wrapped_rows(text: &str, width: usize) -> usize {
 }
 
 /// Where the credentials file is, and the mode it has.
-fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
+fn credentials_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(field("file", &app.credentials_path.display().to_string()));
     lines.push(field("mode", &mode_text(app)));
@@ -789,13 +952,15 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
         "The model key for an agent is read from this file at the point of a model call, and is redacted from every transcript, log and error the tool writes.",
         Style::new().fg(Color::DarkGray),
     )));
-    let title = panel_title("credentials file", panel_overflows(&lines, area));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    lines
+}
+
+/// Draw the Credentials screen, windowed by the panel's own scroll key.
+fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = credentials_lines(app);
+    let overflows = panel_overflows(&lines, area) && app.panel_scroll == 0;
+    let (title, _) = fit_title(area.width as usize, "credentials file", None, None, overflows);
+    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
 }
 
 /// The recent runs, read from the records on disk.
@@ -803,10 +968,16 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     // The same rule as the agent list: never silently drop a run, and never let the
     // selection land on a row that is not drawn. The note area takes the rows its own
     // content needs (the reason leads, and `o`/`T` must survive beside it), never
-    // leaving the list with less than its border, its header and one run (O-3, P-M3).
+    // leaving the list with less than its border, its header and **three** runs: a
+    // window of one row is a window a person cannot survey (O-3, P-M3, Y-3).
     let notes = run_notes(app);
-    let needed = pushed_rows(&notes, area.width.saturating_sub(2) as usize) as u16 + 2;
-    let notes_height = needed.clamp(4, area.height.saturating_sub(4).max(4));
+    let inner = area.width.saturating_sub(2) as usize;
+    let needed = pushed_rows(&notes, inner) as u16 + 2;
+    // Border, header and three run rows belong to the list before the note area takes
+    // anything.
+    let list_min = 6;
+    let notes_max = area.height.saturating_sub(list_min).max(4);
+    let notes_height = needed.clamp(4, notes_max);
     let parts =
         Layout::vertical([Constraint::Min(4), Constraint::Length(notes_height)]).split(area);
 
@@ -856,13 +1027,9 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(table, parts[0]);
 
-    let title = panel_title("run records", panel_overflows(&notes, parts[1]));
-    frame.render_widget(
-        Paragraph::new(Text::from(notes))
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: true }),
-        parts[1],
-    );
+    let overflows = panel_overflows(&notes, parts[1]) && app.panel_scroll == 0;
+    let (title, _) = fit_title(parts[1].width as usize, "run records", None, None, overflows);
+    draw_panel(frame, scrolled(&notes, app.panel_scroll), title, parts[1]);
 }
 
 /// The lines under the run list, for the run on show.
@@ -892,21 +1059,24 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         } else {
             lines.push(Line::from(format!("outcome: {}", run.describe())));
         }
-        // The transcript is the run's own record; `T` opens it here, never only from a
-        // path the README happens to name.
-        lines.push(Line::from(format!(
-            "T opens the transcript on show: {}",
-            run.dir.join(crate::transcript::TRANSCRIPT_FILE).display()
-        )));
-        lines.push(Line::from(format!(
-            "o opens the log on show: {}",
-            run.log.display()
-        )));
+        // The offers lead the reason's tail: `T` and `o` are the page map's must-offers
+        // at 80×24, so they are on one line above the paths and the prose, and cannot
+        // be the rows the note area drops (O-3, P-M3).
+        lines.push(Line::from(
+            "T opens the transcript on show   o opens the log on show",
+        ));
         // `esc` is this product's way back everywhere, but not the pager's; name the
         // pager's own key on the screen, before the key is pressed (M-5).
         lines.push(Line::from(Span::styled(
             "Both open in your $PAGER; leave the pager with q.",
             Style::new().fg(Color::DarkGray),
+        )));
+        // The paths are the detail: named here, below the offers, so a short note area
+        // drops them rather than the offers (they stay reachable with `[`/`]`).
+        lines.push(Line::from(format!(
+            "the transcript is at {} and the log at {}",
+            run.dir.join(crate::transcript::TRANSCRIPT_FILE).display(),
+            run.log.display()
         )));
         lines.push(Line::from(Span::styled(
             "The outcome is decided by the process, not by what it wrote.",
@@ -1021,23 +1191,121 @@ fn panel_overflows(lines: &[Line], area: Rect) -> bool {
         > area.height.saturating_sub(2) as usize
 }
 
-/// A panel title that declares the content below the fold, when there is any.
-fn panel_title(base: &str, overflows: bool) -> String {
-    if overflows {
-        format!(" {base} — more below; enlarge the window ")
-    } else {
-        format!(" {base} ")
+/// The sentence a bordered panel puts in its title when its content does not fit.
+///
+/// It is the one thing that must never be the part the terminal clips: a user who
+/// cannot see the sentence cannot know that anything is below the fold (Y-1).
+const MORE_BELOW: &str = "more below; enlarge the window";
+
+/// Compose a bordered panel's title from its parts, in the order they are read.
+fn compose_title(base: &str, extra: Option<&str>, declaration: Option<&str>) -> String {
+    let mut text = format!(" {}", base.trim());
+    if let Some(extra) = extra {
+        text.push_str(" — ");
+        text.push_str(extra.trim());
+    }
+    if let Some(declaration) = declaration {
+        text.push_str(" — ");
+        text.push_str(declaration);
+    }
+    text.push(' ');
+    text
+}
+
+/// A bordered panel title that always fits the width it is drawn into.
+///
+/// The declaration is what tells a user that content is below the fold, so it is the
+/// part that must survive; when a panel carries more than its name — the Forgejo
+/// panel carries its repository range — and both cannot fit, the shortened screen name
+/// is used, then the shortened declaration, and only then is the range left out (the
+/// caller names it in the body instead). Returns the title and whether the range was
+/// left out of it (Y-1).
+fn fit_title(
+    width: usize,
+    base: &str,
+    short: Option<&str>,
+    extra: Option<&str>,
+    declare: bool,
+) -> (String, bool) {
+    let room = width.saturating_sub(2).max(1);
+    let declaration = |full: bool| -> Option<&'static str> {
+        if !declare {
+            None
+        } else if full {
+            Some(MORE_BELOW)
+        } else {
+            Some("more below")
+        }
+    };
+    let names: Vec<&str> = match short {
+        Some(short) => vec![base, short],
+        None => vec![base],
+    };
+    // Prefer the full declaration and the full name, with the range; fall back one
+    // step at a time, and drop the range only when nothing else can hold both.
+    for full in [true, false] {
+        for name in &names {
+            if let Some(extra) = extra {
+                let candidate = compose_title(name, Some(extra), declaration(full));
+                if candidate.chars().count() <= room {
+                    return (candidate, false);
+                }
+            }
+        }
+    }
+    for full in [true, false] {
+        for name in &names {
+            let candidate = compose_title(name, None, declaration(full));
+            if candidate.chars().count() <= room {
+                return (candidate, extra.is_some());
+            }
+        }
+    }
+    (
+        compose_title(base, None, Some("more below")),
+        extra.is_some(),
+    )
+}
+
+/// Slice a panel's logical lines so its body can be scrolled with a key.
+///
+/// The offset counts logical lines, not terminal rows: a line that wraps still moves
+/// as one. The last line can always be brought to the top, so the very end of a panel
+/// is reachable however short the window is (Y-2).
+fn scrolled(lines: &[Line<'static>], offset: usize) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let first = offset.min(lines.len() - 1);
+    lines[first..].to_vec()
+}
+
+/// How many logical lines the panel or note area on show can scroll through.
+///
+/// This is the number of lines `[`/`]` (and, on a screen with no list, the arrows and
+/// page keys) can move the window over. A screen whose content is a list with its own
+/// keys — Forgejo — reports zero: its list is already windowed and reachable, so there
+/// is nothing for the panel's own scroll to reach (Y-2).
+#[must_use]
+pub fn panel_total_lines(app: &App) -> usize {
+    match app.screen {
+        Screen::AgentConfig => agent_config_lines(app).len(),
+        Screen::Instructions => instruction_lines(app).len(),
+        Screen::Credentials => credentials_lines(app).len(),
+        Screen::Agents => agent_notes(app).len(),
+        Screen::Runs => run_notes(app).len(),
+        Screen::Forgejo => 0,
     }
 }
 
-/// Append the overflow declaration to a title that already carries something else
-/// (the Forgejo panel carries its repository range).
-fn declare_below(title: String, overflows: bool) -> String {
-    if overflows {
-        format!("{} — more below; enlarge the window ", title.trim_end())
-    } else {
-        title
-    }
+/// Draw one bordered panel, already windowed by the caller.
+fn draw_panel(frame: &mut Frame, lines: Vec<Line<'static>>, title: String, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::bordered().title(title))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Keep a note area's tail, replacing what does not fit with a line that says so.
@@ -1045,7 +1313,7 @@ fn declare_below(title: String, overflows: bool) -> String {
 /// The Agents and Runs note areas are plain paragraphs with no title to carry the
 /// declaration, so the last row carries it instead: the tail is dropped from the
 /// bottom and one row is reserved for the sentence, which is never itself clipped
-/// (O-3).
+/// (O-3). A note area the user is already scrolling keeps its own tail instead.
 fn declared_notes(mut lines: Vec<Line<'static>>, width: usize, height: usize) -> Vec<Line<'static>> {
     if height == 0 || pushed_rows(&lines, width) <= height {
         return lines;
@@ -1312,7 +1580,46 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = 7.min(screen.height);
+    let config_dir = app
+        .selected_paths()
+        .map(|paths| paths.config_dir().display().to_string())
+        .unwrap_or_else(|| "its files".to_owned());
+    let state_dir = app.state_root().join(name).display().to_string();
+    let config_exists = app
+        .selected_paths()
+        .map(|paths| paths.config_dir().is_dir())
+        .unwrap_or(false);
+    let state_exists = app.state_root().join(name).is_dir();
+    // The confirmation's job is to say exactly what stays, and where. A sentence that
+    // promises files to a user who never wrote any is a small lie that makes them hunt
+    // for a directory that does not exist; one that names only the agent directory
+    // leaves the run records and the secret unaccounted for (Y-6).
+    let question = if config_exists || state_exists {
+        format!(
+            "Remove `{name}` from the configuration? Its files under {config_dir} and its run records under {state_dir} are left on disk."
+        )
+    } else {
+        format!(
+            "Remove `{name}` from the configuration? It has no files under {config_dir} yet, and no run records."
+        )
+    };
+    let lines: Vec<Line> = vec![
+        Line::from(question),
+        Line::from(format!(
+            "Its secret in {} is left too, marked on the Credentials screen; press D there to delete a secret whose agent is gone.",
+            app.credentials_path.display()
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y or enter remove it        n or esc keep it",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let rows = pushed_rows(&lines, width.saturating_sub(2) as usize) as u16;
+    let height = (rows + 2).min(screen.height).max(6);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1323,37 +1630,62 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
-    let left = app
-        .selected_paths()
-        .map(|paths| paths.config_dir().display().to_string())
-        .unwrap_or_else(|| "its files".to_owned());
-    let has_files = app
-        .selected_paths()
-        .map(|paths| paths.config_dir().is_dir())
-        .unwrap_or(false);
-    // The confirmation's job is to say exactly what stays. A sentence that promises
-    // files to a user who never wrote any is a small lie that makes them hunt for a
-    // directory that does not exist.
-    let question = if has_files {
-        format!(
-            "Remove `{name}` from the configuration? Its files under {left} are left on disk."
-        )
-    } else {
-        format!("Remove `{name}` from the configuration? It has no files under {left} yet.")
+    let block = Block::bordered()
+        .title(" remove an agent ")
+        .border_style(Style::new().fg(Color::Red));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// The "delete the secrets a removed agent left?" confirmation.
+///
+/// A removal leaves the agent's model key and its own Forgejo token in the credentials
+/// file; until now nothing in the product could delete them (Y-6). The box names the
+/// agents, never a value.
+fn draw_forget_confirm(frame: &mut Frame, app: &App) {
+    let Some(agents) = &app.confirm_forget else {
+        return;
     };
+    let screen = overlay_area(frame.area());
+    let width = (screen.width.saturating_sub(2)).min(76);
+    let names = agents
+        .iter()
+        .map(|agent| format!("`{agent}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let lines: Vec<Line> = vec![
-        Line::from(question),
+        Line::from(format!(
+            "Delete the leftover secrets for {names} from {}?",
+            app.credentials_path.display()
+        )),
+        Line::from("Their agents are not configured any more. The values are never shown."),
         Line::from(""),
         Line::from(Span::styled(
-            "y or enter remove it        n or esc keep it",
+            "y or enter delete them        n or esc keep them",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
     ];
+    let rows = pushed_rows(&lines, width.saturating_sub(2) as usize) as u16;
+    let height = (rows + 2).min(screen.height).max(6);
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
     let block = Block::bordered()
-        .title(" remove an agent ")
+        .title(" delete leftover secrets ")
         .border_style(Style::new().fg(Color::Red));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1485,11 +1817,14 @@ const HELP_LINES: &[&str] = &[
     "           e edit its instruction   t edit its declared steps   K start a new skill",
     "           o open its newest log   T open its newest transcript   d remove it",
     "A new one: n or a open the add-agent form (also enter on an empty list)",
+    "Panel:     [ / ] scroll the panel or note area; on Agent, Instruction and Credentials",
+    "           the arrows and PageUp/PageDown move it too, so its last line is reachable",
     "Forgejo:   c check the configured role   C check the administrator token",
     "           i settle the agent's identity   up/down choose a repository",
     "           g clone it   P open a pull request   U update the newest one",
     "Secrets:   k set the model key (Credentials)   f set the role token (Credentials)",
     "           v set the agent's own Forgejo token (Forgejo)   A set the administrator token",
+    "           D delete the leftover secrets of agents no longer configured (Credentials)",
     "Files:     r re-read config.toml and credentials.toml   q quit   ^C quit and stop runs",
     "Help:      ? or h or F1 show this list   esc or enter close it",
 ];

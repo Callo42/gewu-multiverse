@@ -674,6 +674,49 @@ pub fn record_secret(
     })
 }
 
+/// Remove the per-agent secrets for agents that are no longer configured.
+///
+/// Removing an agent leaves its model key and its own Forgejo token in the credentials
+/// file, marked on the Credentials screen as belonging to no configured agent. This
+/// deletes exactly those entries, holding the file to its private mode; the values are
+/// never read back onto a screen. It returns the labels removed so the screen can say
+/// what happened (Y-6).
+pub fn remove_agent_secrets(
+    path: &Path,
+    agents: &[String],
+) -> Result<Vec<String>, CredentialsError> {
+    let mut root = read_value(path)?;
+    let mut removed = Vec::new();
+    if let Some(root) = root.as_table_mut() {
+        for (table, label) in [
+            ("model_keys", "model key"),
+            ("forgejo_agent_tokens", "Forgejo token"),
+        ] {
+            if let Some(entries) = root.get_mut(table).and_then(toml::Value::as_table_mut) {
+                for agent in agents {
+                    if entries.remove(agent).is_some() {
+                        removed.push(format!("{label} for `{agent}`"));
+                    }
+                }
+            }
+        }
+    }
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    let text = toml::to_string_pretty(&root).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    removed.sort();
+    Ok(removed)
+}
+
 /// Read the credentials file, refusing one that is not a private plain file.
 fn read_value(path: &Path) -> Result<toml::Value, CredentialsError> {
     let metadata = match fs::symlink_metadata(path) {

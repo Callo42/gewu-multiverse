@@ -1254,7 +1254,7 @@ fn the_key_reference_scrolls_so_every_key_survives_a_short_window() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('?')));
     let first = render_at(80, 24, &app);
-    assert!(first.contains("of 13"), "the range is missing: {first}");
+    assert!(first.contains("of 16"), "the range is missing: {first}");
     // Scroll to the end; the last line must be reachable.
     for _ in 0..20 {
         app.on_key(KeyEvent::from(KeyCode::Down));
@@ -1526,7 +1526,11 @@ fn every_panel_and_note_area_that_truncates_declares_it_at_eighty_columns() {
 
     app.show(Screen::Forgejo);
     let forgejo = render_at(80, 24, &app);
-    assert!(forgejo.contains("more below"), "{forgejo}");
+    // The unread Forgejo panel fits at 80×24 after the legend was compacted (Y-8):
+    // nothing is below the fold, so there is no declaration to make, and the legend
+    // must be drawn whole.
+    assert!(forgejo.contains("up/down choose one"), "{forgejo}");
+    assert!(forgejo.contains("c role"), "{forgejo}");
 
     // The Agents note area has no border to carry a title, so its own last row says so.
     app.show(Screen::Agents);
@@ -1679,4 +1683,287 @@ fn a_stored_transport_reason_is_shown_in_the_product_words() {
     app.show(Screen::Runs);
     let runs = render_at(80, 24, &app);
     assert!(!runs.contains("os error 111"), "{runs}");
+}
+
+#[test]
+fn the_forgejo_title_never_clips_its_overflow_declaration_at_eighty_columns() {
+    // Y-1: with a repository range present, the title carried both the range and the
+    // declaration at 80×24 and the terminal clipped the declaration to `more bel`.
+    // The rule: the declaration is never the part that is clipped. At a short window
+    // the shortened screen name keeps the range *and* the whole declaration.
+    let root = scratch("forgejo-title");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let mut check = three_repository_check();
+    for index in 0..4 {
+        check
+            .repositories
+            .push(repository(&format!("uxmember/extra-{index}"), false));
+    }
+    app.role_check = Some(Ok(check));
+    app.show(Screen::Forgejo);
+
+    // A short window (18 rows, the advertised floor's height) forces the panel to
+    // declare, with the repository range still present.
+    let short = render_at(80, 18, &app);
+    let title_line = short
+        .lines()
+        .find(|line| line.contains("┌ Forgejo"))
+        .unwrap_or_default();
+    assert!(
+        title_line.contains("repositories 1–1 of 7"),
+        "the repository range left the title: {title_line:?}"
+    );
+    assert!(
+        title_line.contains("more below; enlarge the window"),
+        "the declaration is clipped or missing: {title_line:?}"
+    );
+}
+
+#[test]
+fn the_forgejo_legend_keeps_each_phrase_whole() {
+    // Y-8: the legend used to be one wrapped line, and the panel cut it mid-phrase at
+    // `v set the agent's`. Each phrase now has a row of its own, and `v` keeps its
+    // object.
+    let root = scratch("forgejo-legend");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Forgejo);
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("v agent token"), "{screen}");
+    assert!(screen.contains("A admin token"), "{screen}");
+    // No drawn row ends with a possessive that has lost its noun.
+    for line in screen.lines() {
+        let trimmed = line.trim_end_matches(['│', ' ']);
+        assert!(
+            !trimmed.ends_with("agent's") && !trimmed.ends_with("the agent's own"),
+            "a legend phrase is clipped mid-phrase: {trimmed:?}"
+        );
+    }
+}
+
+#[test]
+fn a_panel_scrolls_to_its_last_line_and_the_arrows_are_not_swallowed() {
+    // Y-2: the panel declared `more below` and the arrows did nothing at all. On a
+    // screen with no list, the arrows and page keys now move the panel, `[`/`]` move
+    // it on every screen, and every press says where the panel is.
+    let root = scratch("panel-scroll");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Credentials);
+    let first = render_at(80, 24, &app);
+    assert!(first.contains("more below"), "{first}");
+
+    // The arrows act on the panel here (no list on this screen).
+    app.on_key(KeyEvent::from(KeyCode::PageDown));
+    assert!(app.panel_scroll > 0, "PageDown did not move the panel");
+    assert!(
+        app.status.contains("scrolled") || app.status.contains("at its end"),
+        "PageDown was swallowed in silence: {}",
+        app.status
+    );
+    app.on_key(KeyEvent::from(KeyCode::Home));
+    assert_eq!(app.panel_scroll, 0, "Home did not return to the top");
+
+    // The last line, which the fold hid, is reachable with End.
+    app.on_key(KeyEvent::from(KeyCode::End));
+    let last = render_at(80, 24, &app);
+    assert!(
+        last.contains("redacted from every transcript"),
+        "the tail of the panel is unreachable: {last}"
+    );
+    assert!(app.status.contains("at its end"), "{}", app.status);
+
+    // `]` scrolls the panel on a screen whose arrows belong to a list.
+    app.show(Screen::Agents);
+    app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    assert!(app.panel_scroll > 0, "`]` did not scroll the note area");
+}
+
+#[test]
+fn the_runs_note_leaves_the_list_more_than_one_row_at_eighty_columns() {
+    // Y-3: the note area took two thirds of the height and the run list had one row.
+    // A person who comes back to survey several runs must see several.
+    let root = scratch("runs-rows");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.recent = (0..5)
+        .map(|index| {
+            let run_dir = root.join("state").join("scribe").join(new_run_id(index));
+            RunSummary {
+                agent: "scribe".to_owned(),
+                run_id: new_run_id(index),
+                outcome: Some(RunOutcome::Failed),
+                reason: Some("the model call failed (transport): the endpoint refused the connection".to_owned()),
+                duration_ms: Some(1_000 + index),
+                started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+                log: run_dir.join("run.log"),
+                dir: run_dir,
+            }
+        })
+        .collect();
+    app.run_selected = 0;
+    app.show(Screen::Runs);
+    let screen = render_at(80, 24, &app);
+    assert!(
+        !screen.contains("1–1 of 5"),
+        "the run list is one row tall again: {screen}"
+    );
+    assert!(
+        screen.contains("of 5"),
+        "the window does not say how many runs there are: {screen}"
+    );
+    // The reason and both offers still fit beside the list.
+    assert!(screen.contains("outcome:"), "{screen}");
+    assert!(screen.contains("T opens the transcript on show"), "{screen}");
+    assert!(screen.contains("o opens the log on show"), "{screen}");
+    assert!(screen.contains("leave the pager with q"), "{screen}");
+}
+
+#[test]
+fn a_record_the_hub_had_that_is_gone_is_named_and_not_called_the_last_run() {
+    // Y-4: deleting the newest record silently promoted an older failure to "the last
+    // run". The hub says a record it had is gone, and calls the older record what it is.
+    let root = scratch("forgotten-record");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_dir = root.join("state").join("scribe").join(new_run_id(1));
+    app.recent = vec![RunSummary {
+        agent: "scribe".to_owned(),
+        run_id: new_run_id(1),
+        outcome: Some(RunOutcome::Failed),
+        reason: Some("the endpoint refused the connection".to_owned()),
+        duration_ms: Some(120),
+        started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        log: run_dir.join("run.log"),
+        dir: run_dir,
+    }];
+    app.forgotten_run = Some("scribe".to_owned());
+    app.show(Screen::Agents);
+    let screen = render_at(80, 24, &app);
+    assert!(
+        screen.contains("a run record the hub had for `scribe` is no longer there"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("the newest run record left for `scribe`"),
+        "the older failure is still called the last run: {screen}"
+    );
+    assert!(
+        !screen.contains("the last run of `scribe` did not go well"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn an_endpoint_test_is_dated_and_marked_when_the_endpoint_changed() {
+    // Y-5: the result outlived the endpoint it tested and read as current. It is now
+    // dated, and a result about another endpoint is marked not current.
+    let root = scratch("endpoint-stale");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.endpoint_test = Some(gewu_multiverse::app::EndpointTest {
+        agent: "scribe".to_owned(),
+        endpoint: "https://model.example.org/v1".to_owned(),
+        model: "example-model".to_owned(),
+        result: Ok("the endpoint answered: replied `ok`; 3 tokens used".to_owned()),
+        tested_at_ms: gewu_multiverse::time::now_unix_ms(),
+    });
+    app.show(Screen::AgentConfig);
+    let fresh = render_at(80, 40, &app);
+    assert!(fresh.contains("tested just now"), "{fresh}");
+
+    // The configuration now names a different endpoint: the old result is history.
+    app.endpoint_test = Some(gewu_multiverse::app::EndpointTest {
+        endpoint: "http://127.0.0.1:2/v1".to_owned(),
+        ..app.endpoint_test.take().expect("the test result")
+    });
+    let stale = render_at(80, 40, &app);
+    assert!(stale.contains("not current"), "{stale}");
+    assert!(stale.contains("press p to test it again"), "{stale}");
+}
+
+#[test]
+fn a_removal_names_the_run_records_and_the_secret_and_credentials_deletes_it() {
+    // Y-6: the removal box named only the agent directory, the run records were hidden
+    // and the leftover secret had no delete. The box now names all three places, and
+    // `D` on Credentials deletes the secret of an agent no longer configured.
+    let root = scratch("remove-leftovers");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    // Give `scribe` a model key, then remove the agent from the configuration.
+    app.request_secret(SecretTarget::ModelKey);
+    app.on_paste("sk-throwaway-for-this-test");
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert!(app
+        .present_secret_labels()
+        .iter()
+        .any(|label| label.contains("model key for `scribe`")));
+
+    let state_dir = app.state_root().join("scribe");
+    fs::create_dir_all(&state_dir).expect("a run record directory");
+    let declared = app.selected_name().expect("the selected agent");
+    app.confirm_remove = Some(declared);
+    app.on_key(KeyEvent::from(KeyCode::Char('y')));
+
+    // The leftover secret is marked, and `D` offers to delete it.
+    app.show(Screen::Credentials);
+    let marked = render_at(80, 24, &app);
+    assert!(
+        marked.contains("no agent with that name is configured"),
+        "{marked}"
+    );
+    app.on_key(KeyEvent::from(KeyCode::Char('D')));
+    let confirm = render_at(80, 24, &app);
+    assert!(confirm.contains("Delete the leftover secrets"), "{confirm}");
+    assert!(confirm.contains("`scribe`"), "{confirm}");
+    app.on_key(KeyEvent::from(KeyCode::Char('y')));
+    assert!(
+        !app.present_secret_labels()
+            .iter()
+            .any(|label| label.contains("model key for `scribe`")),
+        "the leftover secret survived: {:?}",
+        app.present_secret_labels()
+    );
+    assert!(app.status.contains("deleted"), "{}", app.status);
+
+    // The removal confirmation names the run records and the credentials file too.
+    let remaining = app.selected_name().expect("a remaining agent");
+    app.ensure_agent(&remaining).expect("the agent files");
+    fs::create_dir_all(app.state_root().join(&remaining)).expect("a run record directory");
+    app.confirm_remove = Some(remaining);
+    app.show(Screen::Agents);
+    let boxed = render_at(80, 24, &app);
+    assert!(boxed.contains("run records under"), "{boxed}");
+}
+
+#[test]
+fn a_newest_log_that_is_gone_is_marked() {
+    // Y-7: the Agent screen named a log path for a file that had been deleted, as if it
+    // were a thing. A record with no log says so.
+    let root = scratch("log-gone");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_id = new_run_id(1);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 42, "/w"))
+        .expect("a record");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            7,
+            None,
+        ))
+        .expect("a record");
+    // No run.log is written.
+    app.reload();
+    app.show(Screen::AgentConfig);
+    let screen = render_at(80, 40, &app);
+    assert!(screen.contains("newest log"), "{screen}");
+    assert!(screen.contains("gone, the record has no log"), "{screen}");
 }
