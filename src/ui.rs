@@ -95,6 +95,10 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let tabs = Tabs::new(titles)
         .select(app.screen.index())
         .divider(" ")
+        // No side padding: the divider already separates the names, and the padding
+        // was what pushed `6 Runs` past 72 columns, clipping it to `6 Ru` at the
+        // advertised floor (A-4). Every number keeps its whole name here.
+        .padding("", "")
         .highlight_style(
             Style::new()
                 .fg(Color::Black)
@@ -178,17 +182,14 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(table, parts[0]);
 
     // A note area that runs out of rows declares its tail instead of dropping it
-    // without a word — the same rule the panels follow in their titles (O-3). A note
-    // area the user is scrolling keeps its own tail instead.
-    let notes = if app.panel_scroll > 0 {
-        scrolled(&agent_notes(app), app.panel_scroll)
-    } else {
-        declared_notes(
-            agent_notes(app),
-            area.width as usize,
-            parts[1].height as usize,
-        )
-    };
+    // without a word — the same rule the panels follow in their titles (O-3) — and a
+    // note area scrolled away from its top says so too (A-1).
+    let notes = note_window(
+        agent_notes(app),
+        area.width as usize,
+        parts[1].height as usize,
+        app.panel_scroll,
+    );
     frame.render_widget(
         Paragraph::new(Text::from(notes)).wrap(Wrap { trim: true }),
         parts[1],
@@ -433,8 +434,16 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
 /// Draw the Agent screen, windowed by the panel's own scroll key.
 fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
     let lines = agent_config_lines(app);
-    let overflows = panel_overflows(&lines, area) && app.panel_scroll == 0;
-    let (title, _) = fit_title(area.width as usize, "agent configuration", None, None, overflows);
+    let above = app.panel_scroll > 0;
+    let below = panel_overflows_from(&lines, area, app.panel_scroll);
+    let (title, _) = fit_title(
+        area.width as usize,
+        "agent configuration",
+        None,
+        None,
+        above,
+        below,
+    );
     draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
 }
 
@@ -553,13 +562,15 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
 /// Draw the Instruction screen, windowed by the panel's own scroll key.
 fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
     let lines = instruction_lines(app);
-    let overflows = panel_overflows(&lines, area) && app.panel_scroll == 0;
+    let above = app.panel_scroll > 0;
+    let below = panel_overflows_from(&lines, area, app.panel_scroll);
     let (title, _) = fit_title(
         area.width as usize,
         "instruction, steps and skills",
         None,
         None,
-        overflows,
+        above,
+        below,
     );
     draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
 }
@@ -568,6 +579,201 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     let inner = area.width.saturating_sub(2) as usize;
     let content_height = area.height.saturating_sub(2) as usize;
+    let (mut head, all_repos) = forgejo_head_and_repos(app);
+    let (tail, legend) = forgejo_frame(app);
+    let tail_rows = pushed_rows(&tail, inner) + pushed_rows(&legend, inner);
+
+    let long_name = "Forgejo connection and role check";
+    let short_name = "Forgejo";
+    let total = all_repos.len();
+
+    // The windowed form is what the title describes, and it is drawn whenever it fits
+    // and the user has not scrolled it: that is how the key legend stays on the panel
+    // at 80×24 (Y-8). When it does not fit, the same content is drawn whole and
+    // scrolled with `[`/`]` instead, so the list and the legend are reachable rather
+    // than only declared (A-3).
+    let (_first, _shown, overflows, range) = forgejo_window(
+        &head,
+        total,
+        app.repo_selected,
+        inner,
+        content_height,
+        tail_rows,
+    );
+    if !overflows && app.panel_scroll == 0 {
+        let (first_title, dropped) = fit_title(
+            area.width as usize,
+            long_name,
+            Some(short_name),
+            range.as_deref(),
+            false,
+            false,
+        );
+        let title = if dropped {
+            // The title cannot hold both the range and the declaration: the
+            // declaration wins, and the range moves to a line above the list, so
+            // neither is lost (Y-1).
+            if let Some(range) = range {
+                head.push(note_marker(&range));
+            }
+            fit_title(
+                area.width as usize,
+                long_name,
+                Some(short_name),
+                None,
+                false,
+                false,
+            )
+            .0
+        } else {
+            first_title
+        };
+        // The window the title has just described is the one drawn: the range line
+        // (when it moved to the body) is part of `head`, so it is counted here.
+        let (first, shown, _, _) = forgejo_window(
+            &head,
+            total,
+            app.repo_selected,
+            inner,
+            content_height,
+            tail_rows,
+        );
+        let repo_rows: Vec<Line> = all_repos[first..first + shown].to_vec();
+        let lines = assemble(head, repo_rows, tail, legend);
+        draw_panel(frame, lines, title, area);
+        return;
+    }
+
+    // The scrollable form: every repository is drawn, the range is a line above the
+    // list, and the tail and legend end the panel. `[`/`]` (and the arrows, on this
+    // screen the list keeps them) move the window over it.
+    let lines = forgejo_scrolled_lines(app);
+    let above = app.panel_scroll > 0;
+    let below = panel_overflows_from(&lines, area, app.panel_scroll);
+    let (title, _) = fit_title(
+        area.width as usize,
+        long_name,
+        Some(short_name),
+        None,
+        above,
+        below,
+    );
+    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
+}
+
+/// The Forgejo key legend, two compact rows.
+///
+/// Each phrase keeps its object: `v agent token` says what `v` sets, and the panel
+/// clips whole rows, never half a sentence (Y-8). Keeping it to two rows is also what
+/// leaves the repository list more than one row at 80×24.
+fn forgejo_legend() -> Vec<Line<'static>> {
+    [
+        "c role   C admin role   v agent token   A admin token   i identity",
+        "up/down choose one   g clone   P pull request   U update the newest",
+    ]
+    .iter()
+    .map(|line| {
+        Line::from(Span::styled(
+            (*line).to_owned(),
+            Style::new().fg(Color::DarkGray),
+        ))
+    })
+    .collect()
+}
+
+/// Put a panel's three parts together in reading order.
+fn assemble(
+    head: Vec<Line<'static>>,
+    repo_rows: Vec<Line<'static>>,
+    tail: Vec<Line<'static>>,
+    legend: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    let mut lines = head;
+    lines.extend(repo_rows);
+    lines.extend(tail);
+    lines.extend(legend);
+    lines
+}
+
+/// The repository window, with the rows above it and the tail below it both reserved.
+///
+/// Returns the first row, the number of rows and whether the panel's content overflows
+/// its window. Reserving the tail is what keeps the key legend on the panel instead of
+/// letting the repository list push it off (Y-8).
+fn forgejo_window(
+    head: &[Line<'static>],
+    total: usize,
+    selected: usize,
+    inner: usize,
+    content_height: usize,
+    tail_rows: usize,
+) -> (usize, usize, bool, Option<String>) {
+    let head_rows = pushed_rows(head, inner);
+    let capacity = content_height.saturating_sub(head_rows + tail_rows).max(1);
+    let (first, shown) = visible_window(total, selected, capacity);
+    let overflows = head_rows + shown + tail_rows > content_height;
+    let range = (total > shown).then(|| {
+        list_title("repositories", first, shown, total)
+            .trim()
+            .to_owned()
+    });
+    (first, shown, overflows, range)
+}
+
+/// Every repository as a drawn row, for both the windowed and the scrolled form.
+///
+/// The selected row is marked in text as well as colour: a monochrome capture, or a
+/// person who cannot tell the colours apart, still sees which repository `g` and `P`
+/// will act on.
+fn repository_rows(check: &crate::forgejo::RoleCheck, app: &App) -> Vec<Line<'static>> {
+    check
+        .repositories
+        .iter()
+        .enumerate()
+        .map(|(at, repository)| {
+            let style = if at == app.repo_selected {
+                Style::new().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::new()
+            };
+            Line::from(Span::styled(
+                format!(
+                    "{} {}",
+                    if at == app.repo_selected { '>' } else { ' ' },
+                    repository.line()
+                ),
+                style,
+            ))
+        })
+        .collect()
+}
+
+/// The scrollable form of the Forgejo panel, every repository drawn.
+///
+/// The repository list is named above itself (the title may not be able to carry the
+/// range and the overflow declaration at once — Y-1), and the tail and the key legend
+/// close the panel exactly as they do in the windowed form, so `[`/`]` can always
+/// reach them (A-3).
+fn forgejo_scrolled_lines(app: &App) -> Vec<Line<'static>> {
+    let (head, all_repos) = forgejo_head_and_repos(app);
+    let (tail, legend) = forgejo_frame(app);
+    let mut lines = head;
+    if !all_repos.is_empty() {
+        let total = all_repos.len();
+        lines.push(note_marker(&format!("repositories 1–{total} of {total}")));
+    }
+    lines.extend(all_repos);
+    lines.extend(tail);
+    lines.extend(legend);
+    lines
+}
+
+/// The rows above the repository list and every repository row, for the state on
+/// show.
+///
+/// Both the windowed form and the scrollable form are built from these rows, so the
+/// list a title describes and the list `[`/`]` reaches can never disagree (A-3).
+fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut head: Vec<Line> = Vec::new();
     match &app.config {
         None => head.push(Line::from(no_agent_text(app))),
@@ -639,41 +845,11 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     }
     head.push(Line::from(""));
 
-    // The rows after the repository list — the identity report, a clone note and the
-    // key legend — are counted against the list's window, so the legend (which names
-    // `v`, the key that supplies the agent's own token) is never itself the content
-    // that falls off the panel (Y-8).
-    let mut tail: Vec<Line> = Vec::new();
-    if let Some(report) = &app.identity_report {
-        tail.push(Line::from(""));
-        tail.push(Line::from(format!(
-            "identity for `{}`: {}",
-            report.agent,
-            report.describe()
-        )));
-    }
-    if let Some(note) = &app.forgejo_note {
-        tail.push(Line::from(note.clone()));
-    }
-    tail.push(Line::from(""));
-    let legend = forgejo_legend();
-    let tail_rows = pushed_rows(&tail, inner) + pushed_rows(&legend, inner);
-
-    let long_name = "Forgejo connection and role check";
-    let short_name = "Forgejo";
-    let mut repo_rows: Vec<Line> = Vec::new();
-    let title: String;
+    let mut all_repos: Vec<Line> = Vec::new();
     match &app.role_check {
-        None => {
-            head.push(placeholder(
-                "no role check has been run yet — press c to list what the configured token can see",
-            ));
-            let lines = assemble(head, repo_rows, tail, legend);
-            let overflows = pushed_rows(&lines, inner) > content_height;
-            title = fit_title(area.width as usize, long_name, Some(short_name), None, overflows).0;
-            draw_panel(frame, lines, title, area);
-            return;
-        }
+        None => head.push(placeholder(
+            "no role check has been run yet — press c to list what the configured token can see",
+        )),
         Some(Err(failure)) => {
             // P-7: a refusal names the URL the user configured, not only the API path,
             // so a mistyped path connects to what was typed.
@@ -689,11 +865,6 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Style::new().fg(Color::Red),
             )));
-            let lines = assemble(head, repo_rows, tail, legend);
-            let overflows = pushed_rows(&lines, inner) > content_height;
-            title = fit_title(area.width as usize, long_name, Some(short_name), None, overflows).0;
-            draw_panel(frame, lines, title, area);
-            return;
         }
         Some(Ok(check)) => {
             let summary = format!(
@@ -711,158 +882,35 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 head.push(Line::from(
                     "the token can see no repository on this instance",
                 ));
-                let lines = assemble(head, repo_rows, tail, legend);
-                let overflows = pushed_rows(&lines, inner) > content_height;
-                title =
-                    fit_title(area.width as usize, long_name, Some(short_name), None, overflows).0;
-                draw_panel(frame, lines, title, area);
-                return;
-            }
-            let total = check.repositories.len();
-            // First pass: assume the repository range stays in the title.
-            let (_first, _shown, overflows, range) = forgejo_window(
-                &head,
-                total,
-                app.repo_selected,
-                inner,
-                content_height,
-                tail_rows,
-            );
-            let (first_title, dropped) = fit_title(
-                area.width as usize,
-                long_name,
-                Some(short_name),
-                range.as_deref(),
-                overflows,
-            );
-            if dropped {
-                // The title cannot hold both the range and the declaration: the
-                // declaration wins, and the range moves to a line above the list, so
-                // neither is lost (Y-1).
-                if let Some(range) = range {
-                    head.push(Line::from(Span::styled(
-                        range,
-                        Style::new().fg(Color::DarkGray),
-                    )));
-                }
-                let (_, _, overflows, _) = forgejo_window(
-                    &head,
-                    total,
-                    app.repo_selected,
-                    inner,
-                    content_height,
-                    tail_rows,
-                );
-                title = fit_title(
-                    area.width as usize,
-                    long_name,
-                    Some(short_name),
-                    None,
-                    overflows,
-                )
-                .0;
             } else {
-                title = first_title;
+                all_repos = repository_rows(check, app);
             }
-            // The window the title has just described is the one drawn: the range line
-            // (when it moved to the body) is part of `head`, so it is counted here.
-            repo_rows = render_repositories(check, app, inner, content_height, tail_rows, &head);
         }
     }
-    let lines = assemble(head, repo_rows, tail, legend);
-    draw_panel(frame, lines, title, area);
+    (head, all_repos)
 }
 
-/// The Forgejo key legend, two compact rows.
+/// The rows after the repository list: the identity report and a clone note, then the
+/// key legend.
 ///
-/// Each phrase keeps its object: `v agent token` says what `v` sets, and the panel
-/// clips whole rows, never half a sentence (Y-8). Keeping it to two rows is also what
-/// leaves the repository list more than one row at 80×24.
-fn forgejo_legend() -> Vec<Line<'static>> {
-    [
-        "c role   C admin role   v agent token   A admin token   i identity",
-        "up/down choose one   g clone   P pull request   U update the newest",
-    ]
-    .iter()
-    .map(|line| Line::from(Span::styled((*line).to_owned(), Style::new().fg(Color::DarkGray))))
-    .collect()
-}
-
-/// Put a panel's three parts together in reading order.
-fn assemble(
-    head: Vec<Line<'static>>,
-    repo_rows: Vec<Line<'static>>,
-    tail: Vec<Line<'static>>,
-    legend: Vec<Line<'static>>,
-) -> Vec<Line<'static>> {
-    let mut lines = head;
-    lines.extend(repo_rows);
-    lines.extend(tail);
-    lines.extend(legend);
-    lines
-}
-
-/// The repository window, with the rows above it and the tail below it both reserved.
-///
-/// Returns the first row, the number of rows and whether the panel's content overflows
-/// its window. Reserving the tail is what keeps the key legend on the panel instead of
-/// letting the repository list push it off (Y-8).
-fn forgejo_window(
-    head: &[Line<'static>],
-    total: usize,
-    selected: usize,
-    inner: usize,
-    content_height: usize,
-    tail_rows: usize,
-) -> (usize, usize, bool, Option<String>) {
-    let head_rows = pushed_rows(head, inner);
-    let capacity = content_height
-        .saturating_sub(head_rows + tail_rows)
-        .max(1);
-    let (first, shown) = visible_window(total, selected, capacity);
-    let overflows = head_rows + shown + tail_rows > content_height;
-    let range = (total > shown)
-        .then(|| list_title("repositories", first, shown, total).trim().to_owned());
-    (first, shown, overflows, range)
-}
-
-/// The repository rows for the window the title just described.
-fn render_repositories(
-    check: &crate::forgejo::RoleCheck,
-    app: &App,
-    inner: usize,
-    content_height: usize,
-    tail_rows: usize,
-    head: &[Line<'static>],
-) -> Vec<Line<'static>> {
-    let total = check.repositories.len();
-    let (first, shown, _, _) = forgejo_window(head, total, app.repo_selected, inner, content_height, tail_rows);
-    let mut rows = Vec::new();
-    for (at, repository) in check
-        .repositories
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(shown)
-    {
-        let style = if at == app.repo_selected {
-            Style::new().fg(Color::Black).bg(Color::Cyan)
-        } else {
-            Style::new()
-        };
-        // The selected row is marked in text as well as colour: a monochrome capture,
-        // or a person who cannot tell the colours apart, still sees which repository
-        // `g` and `P` will act on.
-        rows.push(Line::from(Span::styled(
-            format!(
-                "{} {}",
-                if at == app.repo_selected { '>' } else { ' ' },
-                repository.line()
-            ),
-            style,
+/// They are counted against the list's window, so the legend (which names `v`, the key
+/// that supplies the agent's own token) is never itself the content that falls off the
+/// panel at 80×24 (Y-8).
+fn forgejo_frame(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let mut tail: Vec<Line> = Vec::new();
+    if let Some(report) = &app.identity_report {
+        tail.push(Line::from(""));
+        tail.push(Line::from(format!(
+            "identity for `{}`: {}",
+            report.agent,
+            report.describe()
         )));
     }
-    rows
+    if let Some(note) = &app.forgejo_note {
+        tail.push(Line::from(note.clone()));
+    }
+    tail.push(Line::from(""));
+    (tail, forgejo_legend())
 }
 
 /// The one sentence that explains what a role is and what an identity is.
@@ -931,6 +979,15 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
         "k set the model key   f set the role token   A set the administrator token",
         Style::new().fg(Color::DarkGray),
     )));
+    // The screen that shows a leftover secret is the screen that must offer its
+    // delete: when the file holds a key for an agent no longer configured, `D` joins
+    // the legend instead of living only on a help page (A-5).
+    if !app.leftover_secret_agents().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "D delete the leftover secrets of agents no longer configured",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     lines.push(Line::from(""));
     match &app.credentials_error {
         None => lines.push(Line::from(
@@ -958,8 +1015,16 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
 /// Draw the Credentials screen, windowed by the panel's own scroll key.
 fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     let lines = credentials_lines(app);
-    let overflows = panel_overflows(&lines, area) && app.panel_scroll == 0;
-    let (title, _) = fit_title(area.width as usize, "credentials file", None, None, overflows);
+    let above = app.panel_scroll > 0;
+    let below = panel_overflows_from(&lines, area, app.panel_scroll);
+    let (title, _) = fit_title(
+        area.width as usize,
+        "credentials file",
+        None,
+        None,
+        above,
+        below,
+    );
     draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
 }
 
@@ -1027,8 +1092,16 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(table, parts[0]);
 
-    let overflows = panel_overflows(&notes, parts[1]) && app.panel_scroll == 0;
-    let (title, _) = fit_title(parts[1].width as usize, "run records", None, None, overflows);
+    let above = app.panel_scroll > 0;
+    let below = panel_overflows_from(&notes, parts[1], app.panel_scroll);
+    let (title, _) = fit_title(
+        parts[1].width as usize,
+        "run records",
+        None,
+        None,
+        above,
+        below,
+    );
     draw_panel(frame, scrolled(&notes, app.panel_scroll), title, parts[1]);
 }
 
@@ -1191,11 +1264,59 @@ fn panel_overflows(lines: &[Line], area: Rect) -> bool {
         > area.height.saturating_sub(2) as usize
 }
 
+/// Whether a scrolled panel still has content below the fold.
+///
+/// The question is asked of the lines from `offset` on, not of the whole panel: the
+/// sixth round computed it for the unscrolled state only, so a scrolled panel dropped
+/// the declaration entirely (A-1).
+fn panel_overflows_from(lines: &[Line<'static>], area: Rect, offset: usize) -> bool {
+    panel_overflows(&scrolled(lines, offset), area)
+}
+
 /// The sentence a bordered panel puts in its title when its content does not fit.
 ///
 /// It is the one thing that must never be the part the terminal clips: a user who
 /// cannot see the sentence cannot know that anything is below the fold (Y-1).
 const MORE_BELOW: &str = "more below; enlarge the window";
+
+/// The shorter form of the same sentence, for a title with no room for it all.
+const MORE_BELOW_SHORT: &str = "more below";
+
+/// The marker a panel or note area carries when it is scrolled away from its own
+/// top.
+///
+/// The sixth round's rule was only computed for the down direction, so a panel the
+/// user (or a screen change) had scrolled hid its own heading in silence (A-1). A
+/// panel whose first drawn row is not its first line says so, in the same place the
+/// `more below` sentence goes.
+const MORE_ABOVE: &str = "↑ more above";
+
+/// The shorter form of the marker, for a title with no room for it all.
+const MORE_ABOVE_SHORT: &str = "↑ above";
+
+/// The first drawn row of a scrolled borderless note area.
+const MORE_ABOVE_NOTE: &str = "↑ more above — press [ to go back";
+
+/// The last drawn row of a scrolled borderless note area whose tail still does not
+/// fit.
+const MORE_BELOW_NOTE: &str = "… more below; enlarge the window";
+
+/// What a title says about the content it cannot draw, in both directions.
+///
+/// `full` asks for the sentence as it is normally read; otherwise a compact form is
+/// offered so a title that cannot hold the whole thing still carries the meaning
+/// (the Y-1 rule: the declaration is the part that must survive).
+fn declaration_text(above: bool, below: bool, full: bool) -> Option<String> {
+    match (above, below, full) {
+        (false, false, _) => None,
+        (true, true, true) => Some(format!("{MORE_ABOVE} — {MORE_BELOW}")),
+        (true, true, false) => Some(format!("{MORE_ABOVE_SHORT}; {MORE_BELOW_SHORT}")),
+        (true, false, true) => Some(MORE_ABOVE.to_owned()),
+        (true, false, false) => Some(MORE_ABOVE_SHORT.to_owned()),
+        (false, true, true) => Some(MORE_BELOW.to_owned()),
+        (false, true, false) => Some(MORE_BELOW_SHORT.to_owned()),
+    }
+}
 
 /// Compose a bordered panel's title from its parts, in the order they are read.
 fn compose_title(base: &str, extra: Option<&str>, declaration: Option<&str>) -> String {
@@ -1225,44 +1346,40 @@ fn fit_title(
     base: &str,
     short: Option<&str>,
     extra: Option<&str>,
-    declare: bool,
+    above: bool,
+    below: bool,
 ) -> (String, bool) {
     let room = width.saturating_sub(2).max(1);
-    let declaration = |full: bool| -> Option<&'static str> {
-        if !declare {
-            None
-        } else if full {
-            Some(MORE_BELOW)
-        } else {
-            Some("more below")
-        }
-    };
+    let declarations = [
+        declaration_text(above, below, true),
+        declaration_text(above, below, false),
+    ];
     let names: Vec<&str> = match short {
         Some(short) => vec![base, short],
         None => vec![base],
     };
     // Prefer the full declaration and the full name, with the range; fall back one
     // step at a time, and drop the range only when nothing else can hold both.
-    for full in [true, false] {
+    for declaration in &declarations {
         for name in &names {
             if let Some(extra) = extra {
-                let candidate = compose_title(name, Some(extra), declaration(full));
+                let candidate = compose_title(name, Some(extra), declaration.as_deref());
                 if candidate.chars().count() <= room {
                     return (candidate, false);
                 }
             }
         }
     }
-    for full in [true, false] {
+    for declaration in &declarations {
         for name in &names {
-            let candidate = compose_title(name, None, declaration(full));
+            let candidate = compose_title(name, None, declaration.as_deref());
             if candidate.chars().count() <= room {
                 return (candidate, extra.is_some());
             }
         }
     }
     (
-        compose_title(base, None, Some("more below")),
+        compose_title(base, None, declaration_text(above, below, false).as_deref()),
         extra.is_some(),
     )
 }
@@ -1283,9 +1400,11 @@ fn scrolled(lines: &[Line<'static>], offset: usize) -> Vec<Line<'static>> {
 /// How many logical lines the panel or note area on show can scroll through.
 ///
 /// This is the number of lines `[`/`]` (and, on a screen with no list, the arrows and
-/// page keys) can move the window over. A screen whose content is a list with its own
-/// keys — Forgejo — reports zero: its list is already windowed and reachable, so there
-/// is nothing for the panel's own scroll to reach (Y-2).
+/// page keys) can move the window over. Every surface with content reports its own
+/// line count — Forgejo included, where the list, the prose and the legend are one
+/// scrollable panel below 80×24 (A-3): the count is the scrollable form of that panel
+/// (`forgejo_scrolled_lines`), so the offset can reach the repository list and the key
+/// legend however short the window is.
 #[must_use]
 pub fn panel_total_lines(app: &App) -> usize {
     match app.screen {
@@ -1294,7 +1413,7 @@ pub fn panel_total_lines(app: &App) -> usize {
         Screen::Credentials => credentials_lines(app).len(),
         Screen::Agents => agent_notes(app).len(),
         Screen::Runs => run_notes(app).len(),
-        Screen::Forgejo => 0,
+        Screen::Forgejo => forgejo_scrolled_lines(app).len(),
     }
 }
 
@@ -1313,19 +1432,60 @@ fn draw_panel(frame: &mut Frame, lines: Vec<Line<'static>>, title: String, area:
 /// The Agents and Runs note areas are plain paragraphs with no title to carry the
 /// declaration, so the last row carries it instead: the tail is dropped from the
 /// bottom and one row is reserved for the sentence, which is never itself clipped
-/// (O-3). A note area the user is already scrolling keeps its own tail instead.
-fn declared_notes(mut lines: Vec<Line<'static>>, width: usize, height: usize) -> Vec<Line<'static>> {
+/// (O-3).
+fn declared_notes(
+    mut lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
     if height == 0 || pushed_rows(&lines, width) <= height {
         return lines;
     }
     while !lines.is_empty() && pushed_rows(&lines, width) + 1 > height {
         lines.pop();
     }
-    lines.push(Line::from(Span::styled(
-        "… more below; enlarge the window",
-        Style::new().fg(Color::DarkGray),
-    )));
+    lines.push(note_marker(MORE_BELOW_NOTE));
     lines
+}
+
+/// A dim sentence used for a note area's own edge markers.
+fn note_marker(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_owned(),
+        Style::new().fg(Color::DarkGray),
+    ))
+}
+
+/// Window a borderless note area, saying which way its content continues.
+///
+/// At the top the rule is the sixth round's: the tail is dropped and the last row says
+/// `more below`. Scrolled away from the top, the first drawn row says there is content
+/// above (A-1) — and the tail still declares itself if it does not fit either. This is
+/// the note-area form of the same both-direction rule the bordered panels carry in
+/// their titles.
+fn note_window(
+    lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+    offset: usize,
+) -> Vec<Line<'static>> {
+    if offset == 0 || height == 0 {
+        return declared_notes(lines, width, height);
+    }
+    let rest = scrolled(&lines, offset);
+    let mut out = vec![note_marker(MORE_ABOVE_NOTE)];
+    let room = height.saturating_sub(1);
+    let mut rest = rest;
+    if pushed_rows(&rest, width) > room {
+        while !rest.is_empty() && pushed_rows(&rest, width) + 1 > room {
+            rest.pop();
+        }
+        out.extend(rest);
+        out.push(note_marker(MORE_BELOW_NOTE));
+    } else {
+        out.extend(rest);
+    }
+    out
 }
 
 /// The short clause the footer carries on every screen.
