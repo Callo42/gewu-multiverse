@@ -923,9 +923,9 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     let Some(form) = &app.add_agent else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height.saturating_sub(2));
+    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1006,9 +1006,9 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     let Some(prompt) = &app.secret_prompt else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = 8.min(screen.height.saturating_sub(2));
+    let height = 8.min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1068,9 +1068,9 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     let Some(name) = &app.confirm_remove else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = 7.min(screen.height.saturating_sub(2));
+    let height = 7.min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1129,10 +1129,10 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     let Some(action) = &app.editor_confirm else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let program = crate::editor::editor();
     let width = (screen.width.saturating_sub(2)).min(74);
-    let height = 7.min(screen.height.saturating_sub(2));
+    let height = 7.min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1341,6 +1341,20 @@ fn list_title(base: &str, first: usize, shown: usize, total: usize) -> String {
         (false, false) => {}
     }
     format!(" {base} {extra} ")
+}
+
+/// The area an overlay may cover: the body, with the footer's status rows left free.
+///
+/// A modal that clears the status row silently hides the sentence that explains what
+/// just happened — a paste that kept only its first line, or why a form was refused.
+/// The footer is the product's voice; overlays do not cover it.
+fn overlay_area(screen: Rect) -> Rect {
+    Rect {
+        x: screen.x,
+        y: screen.y.saturating_add(3),
+        width: screen.width,
+        height: screen.height.saturating_sub(8),
+    }
 }
 
 /// A centered rectangle inside `area`, never larger than it.

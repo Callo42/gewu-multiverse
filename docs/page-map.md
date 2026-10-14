@@ -106,6 +106,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | Overlay | State | Must offer |
 |---|---|---|
 | first-run acknowledgment | shown once per configuration directory | own its rows (no bleed from the panel); `y`/`n`; the record path **at the advertised minimum too** (80×24), never a sentence that ends without its object |
+| any overlay over a screen | the panel and the overlay | the footer's status rows stay visible under the overlay, so a sentence about what just happened (a paste kept only its first line, a refusal) is never cleared away |
 | add-agent form (`n`/`a`) | opened from the Agents screen | name, endpoint, model, key, Forgejo URL, **role** token; writes the two files; the model key is **required**, so the agent the form creates can run; the form says the agent's own token is separate and is supplied later with `v`; the keys never echoed; **the `enter writes it / esc cancels` action line is in the panel at every size** (including 80×24); a masked field shows how many characters it holds; a bracketed paste keeps the first line, names the rest as unused, and **replaces** the field instead of appending |
 | secret prompt (`k`/`f`/`v`/`A`) | Credentials (`k`, `f`, `A`) and Forgejo (`v`, `A`) | one field, masked, showing how many characters it holds; writes the named secret to the credentials file; never a value on screen; a bracketed paste keeps the first line and replaces |
 | removal confirmation (`d`) | any configured agent | `y` removes it from the configuration, `n` keeps it; the files left on disk are named **only when they exist** |
@@ -129,6 +130,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | the UI is left with `q` while a run is in flight | one warning naming how many runs will stop | press `q` again to leave and stop them, or any other key to stay; the record of each ended run names the UI closing, not “on request” |
 | the UI is reopened after a run was left behind | the agent as `stopped`, never `idle`; the run's duration is the time it actually ran | the run's own record is closed as `stopped` with a reason, so a second run of the same agent never overlaps an abandoned one, in the same workspace |
 | the UI is reopened after a run finished | the agent's newest terminal outcome, its reason and its elapsed time | the hub seeds each agent from its newest terminal record, so a restart never shows `idle` for an agent whose record says `succeeded`, `stopped` or `failed` |
+| the configuration is re-read (`r`) after an agent was removed by hand | the removed agent's run is stopped, and the note names it | the run does not stay counted but invisible; what the footer counts is what a screen can show |
 | `^C` | — | a control chord is never a plain-letter binding: `^C` leaves the UI and stops the runs it started |
 
 ## Every screen — footer

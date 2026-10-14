@@ -1183,6 +1183,11 @@ fn the_runs_screen_says_its_start_column_is_utc() {
     app.show(Screen::Runs);
     let screen = render(&app);
     assert!(screen.contains("started (UTC)"), "{screen}");
+    // The stamp itself fits the narrow column and keeps its zone marker.
+    assert!(
+        screen.contains("Z"),
+        "the start time has no zone marker: {screen}"
+    );
 }
 
 #[test]
@@ -1268,4 +1273,21 @@ fn the_instruction_screen_says_what_a_run_will_send() {
     let screen = render(&app);
     assert!(screen.contains("a run sends"), "{screen}");
     assert!(screen.contains("the guidance line is dropped"), "{screen}");
+}
+
+#[test]
+fn a_paste_note_is_not_hidden_by_the_form() {
+    // P-1/P-2: the sentence that says what the paste kept must stay on screen; the
+    // modal must not clear the footer that carries it.
+    let root = scratch("paste-note");
+    let mut app = app_with_config(&root, EMPTY_CONFIG);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('n')));
+    for _ in 0..3 {
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+    }
+    app.on_paste("sk-first-line\nSK-SECOND-LINE");
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("first line"), "{screen}");
+    assert!(screen.contains("13 characters, hidden"), "{screen}");
 }

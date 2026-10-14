@@ -581,6 +581,41 @@ impl Supervisor {
         self.last_error.as_deref()
     }
 
+    /// Stop every unfinished run whose agent is not in `configured`, and return their
+    /// names.
+    ///
+    /// The configuration file is hand-editable and `r` re-reads it. An agent removed
+    /// from the file while its run is in flight would otherwise leave the run counted
+    /// by the footer but invisible on the hub and unreachable by `x` — the same
+    /// orphaned-run class as W-2, reached through a different door. The run is stopped
+    /// here, so what the screens count is what the screens can show.
+    pub fn stop_unlisted(&mut self, configured: &[String]) -> Vec<String> {
+        let listed = |name: &str| configured.iter().any(|configured| configured == name);
+        let mut names: Vec<String> = Vec::new();
+        for name in self.live.keys().cloned().collect::<Vec<_>>() {
+            if !listed(&name) {
+                names.push(name);
+            }
+        }
+        for name in self.queue.iter().map(|queued| queued.name.clone()).collect::<Vec<_>>() {
+            if !listed(&name) && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for (name, mode) in self.modes.clone() {
+            if mode == Mode::Systemd && !listed(&name) && !names.contains(&name) {
+                self.systemd.poll_now();
+                if self.systemd.is_live(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        for name in &names {
+            self.stop(name);
+        }
+        names
+    }
+
     /// A run of this agent that has not finished: live, stopping, or waiting for a
     /// slot.
     ///
