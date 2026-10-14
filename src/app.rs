@@ -39,6 +39,8 @@ const RECENT_RUNS_LIMIT: usize = 50;
 /// How many rows one page key moves a list, and the help overlay.
 const LIST_PAGE: isize = 5;
 const HELP_PAGE: usize = 5;
+/// How many logical lines `PageDown`/`PageUp` move a panel's own scroll.
+const PANEL_PAGE: isize = 5;
 
 /// The screens of the terminal UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +304,9 @@ pub struct EndpointTest {
     pub model: String,
     /// On success, a one-line summary of the reply; on failure, its class and message.
     pub result: Result<String, EndpointFailure>,
+    /// When the test was run, in unix milliseconds. A result with no time can outlive
+    /// the endpoint it tested and still read as current (Y-5).
+    pub tested_at_ms: u64,
 }
 
 /// Why the endpoint test failed, with the class a person can act on.
@@ -317,7 +322,52 @@ pub struct EndpointFailure {
 impl EndpointTest {
     /// One line for the status bar and the agent screen.
     pub fn describe(&self) -> String {
-        describe_endpoint_result(&self.result)
+        format!(
+            "{} — tested {}",
+            describe_endpoint_result(&self.result),
+            tested_age(self.tested_at_ms)
+        )
+    }
+
+    /// Whether this result is still a claim about the agent as it is configured now.
+    ///
+    /// A test of a different endpoint or model is history, not the current state, and
+    /// must not be shown as if it were (Y-5).
+    pub fn is_current_for(&self, agent: &crate::config::AgentConfig) -> bool {
+        self.agent == agent.name && self.endpoint == agent.endpoint && self.model == agent.model
+    }
+}
+
+/// How long ago a test ran, in words, so a success cannot masquerade as current.
+fn tested_age(tested_at_ms: u64) -> String {
+    let now = crate::time::now_unix_ms();
+    let seconds = now.saturating_sub(tested_at_ms) / 1000;
+    match seconds {
+        0..=59 => "just now".to_owned(),
+        60..=3599 => {
+            let minutes = seconds / 60;
+            if minutes == 1 {
+                "1 minute ago".to_owned()
+            } else {
+                format!("{minutes} minutes ago")
+            }
+        }
+        3600..=86_399 => {
+            let hours = seconds / 3600;
+            if hours == 1 {
+                "1 hour ago".to_owned()
+            } else {
+                format!("{hours} hours ago")
+            }
+        }
+        _ => {
+            let days = seconds / 86_400;
+            if days == 1 {
+                "1 day ago".to_owned()
+            } else {
+                format!("{days} days ago")
+            }
+        }
     }
 }
 
@@ -432,6 +482,9 @@ pub struct App {
     pub secret_prompt: Option<SecretPrompt>,
     /// An agent waiting on the "remove it?" confirmation, when one is open.
     pub confirm_remove: Option<String>,
+    /// The leftover per-agent secrets (agents no longer configured) waiting on a delete
+    /// confirmation, when one is open (Y-6).
+    pub confirm_forget: Option<Vec<String>>,
     /// An edit waiting on the no-editor confirmation, when `$EDITOR` is unset.
     pub editor_confirm: Option<PendingAction>,
     /// Whether the user set `$EDITOR`/`$VISUAL`. Read once, so tests can vary it.
@@ -446,6 +499,15 @@ pub struct App {
     /// The help is longer than a short window can draw, so it is a list like any
     /// other: it scrolls with `down`/`up` and its title says the range (P-6).
     pub help_offset: usize,
+    /// How far the screen's own panel or note area has been scrolled, in logical
+    /// lines (Y-2). A panel that overflows can be read to its last line with `[`/`]`,
+    /// and on a screen whose content is not a list the arrows and page keys move it
+    /// too, so no key is swallowed in silence.
+    pub panel_scroll: usize,
+    /// The agent whose cached outcome was dropped on the last reload because its run
+    /// record is gone (Y-4). While set, the hub says so and does not call an older
+    /// record "the last run".
+    pub forgotten_run: Option<String>,
     /// A line about the freshly written sample configuration, when one was written.
     pub config_note: Option<String>,
     /// The screen on show.
@@ -525,11 +587,14 @@ impl App {
             add_agent: None,
             secret_prompt: None,
             confirm_remove: None,
+            confirm_forget: None,
             editor_confirm: None,
             editor_configured: crate::editor::editor_is_configured(),
             show_help: false,
             confirm_quit: None,
             help_offset: 0,
+            panel_scroll: 0,
+            forgotten_run: None,
             config_note: None,
             screen: Screen::Agents,
             selected: 0,
@@ -657,6 +722,8 @@ impl App {
             .iter()
             .map(|agent| agent.name.clone())
             .collect();
+        // This pass is the one place that can notice a record the hub had is gone.
+        self.forgotten_run = None;
         for name in names {
             // An outcome whose record is gone is dropped before seeding, so `r` after
             // deleting the run records puts the hub back in step with the ledger
@@ -668,6 +735,9 @@ impl App {
                 let dir = self.layout.state_root().join(&name).join(&run_id);
                 if crate::transcript::terminal_record(&dir).is_none() {
                     self.supervisor.forget_state(&name);
+                    // Say so once, and never let the next-oldest record pass silently
+                    // for "the last run" (Y-4).
+                    self.forgotten_run = Some(name.clone());
                 }
             }
             if self.supervisor.state(&name) != State::Idle {
@@ -811,6 +881,65 @@ impl App {
                 _ => name,
             })
             .collect()
+    }
+
+    /// The agents named by a secret in the credentials file that the configuration no
+    /// longer lists.
+    ///
+    /// These are exactly the entries a removal leaves behind. Naming them is what lets
+    /// the Credentials screen offer to delete them instead of only marking them (Y-6).
+    pub fn leftover_secret_agents(&self) -> Vec<String> {
+        let configured: Vec<&str> = self.agents().iter().map(|agent| agent.name.as_str()).collect();
+        let mut agents: Vec<String> = Vec::new();
+        for name in crate::credentials::present_secret_names(&self.credentials_path) {
+            if let Some(agent) = backticked_agent(&name) {
+                if !configured.contains(&agent.as_str()) && !agents.contains(&agent) {
+                    agents.push(agent);
+                }
+            }
+        }
+        agents.sort();
+        agents
+    }
+
+    /// Ask to delete the secrets left by agents that are not configured any more.
+    pub fn request_forget_secrets(&mut self) {
+        let agents = self.leftover_secret_agents();
+        if agents.is_empty() {
+            self.status =
+                "every secret in the credentials file belongs to a configured agent; there is nothing to delete"
+                    .to_owned();
+            return;
+        }
+        let names = agents
+            .iter()
+            .map(|agent| format!("`{agent}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.status =
+            format!("press y to delete the leftover secrets for {names}, or n to keep them");
+        self.confirm_forget = Some(agents);
+    }
+
+    /// Delete the leftover secrets the confirmation is about.
+    fn confirm_forget_secrets(&mut self) {
+        let Some(agents) = self.confirm_forget.take() else {
+            return;
+        };
+        match crate::credentials::remove_agent_secrets(&self.credentials_path, &agents) {
+            Ok(removed) if removed.is_empty() => {
+                self.status = "the leftover secrets were already gone".to_owned();
+            }
+            Ok(removed) => {
+                self.status = format!(
+                    "deleted from the credentials file: {} — the values were never shown",
+                    removed.join(", ")
+                );
+            }
+            Err(error) => {
+                self.status = format!("the leftover secrets could not be deleted: {error}");
+            }
+        }
     }
 
     /// How many runs have finished since this UI started.
@@ -1563,6 +1692,7 @@ impl App {
             endpoint: agent.endpoint,
             model: agent.model,
             result,
+            tested_at_ms: crate::time::now_unix_ms(),
         });
     }
 
@@ -2413,11 +2543,71 @@ impl App {
     /// Move a step along the tab bar.
     pub fn shift_screen(&mut self, steps: isize) {
         self.screen = self.screen.shifted(steps);
+        self.panel_scroll = 0;
     }
 
     /// Show one screen by name.
     pub fn show(&mut self, screen: Screen) {
+        if self.screen != screen {
+            self.panel_scroll = 0;
+        }
         self.screen = screen;
+    }
+
+    /// Whether the screen on show draws a list whose arrows move a selection.
+    ///
+    /// On the screens that do not — Agent, Instruction, Credentials — the arrows and
+    /// page keys move the panel itself, so a key is never swallowed without a word or
+    /// an effect (Y-2).
+    fn screen_has_list(&self) -> bool {
+        matches!(self.screen, Screen::Agents | Screen::Runs | Screen::Forgejo)
+    }
+
+    /// Scroll the panel or note area on show by `steps` logical lines.
+    ///
+    /// The offset names a line, not a terminal row, so a wrapped line moves as one and
+    /// the last line can always be brought to the top: the tail of every overflowing
+    /// panel is reachable at the advertised minimum (Y-2).
+    pub fn scroll_panel(&mut self, steps: isize) {
+        let total = crate::ui::panel_total_lines(self);
+        if total == 0 {
+            self.status =
+                "this screen's list moves with up/down; its panel has nothing to scroll"
+                    .to_owned();
+            return;
+        }
+        let last = total.saturating_sub(1);
+        let before = self.panel_scroll.min(last);
+        let after = (before as isize + steps).clamp(0, last as isize) as usize;
+        self.panel_scroll = after;
+        if after == before {
+            self.status = if steps < 0 {
+                "the panel is at its top".to_owned()
+            } else {
+                "the panel is at its end".to_owned()
+            };
+        } else {
+            let back = if steps < 0 { "PageDown or ]" } else { "PageUp or [" };
+            self.status = format!("the panel scrolled — press {back} to go back");
+        }
+    }
+
+    /// Move the panel on show to its first or last line.
+    pub fn scroll_panel_edge(&mut self, last: bool) {
+        let total = crate::ui::panel_total_lines(self);
+        if total == 0 {
+            self.status =
+                "this screen's list moves with up/down; its panel has nothing to scroll"
+                    .to_owned();
+            return;
+        }
+        if last {
+            self.panel_scroll = total.saturating_sub(1);
+            self.status = "the panel is at its end".to_owned();
+        } else {
+            self.panel_scroll = 0;
+            self.status = "the panel is at its top".to_owned();
+        }
     }
 
     /// Move the selection on the screen on show.
@@ -2646,6 +2836,19 @@ impl App {
             }
             return;
         }
+        if self.confirm_forget.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_forget_secrets();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_forget = None;
+                    self.status = "the leftover secrets were kept".to_owned();
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.show_acknowledgment {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_acknowledgment(),
@@ -2679,20 +2882,68 @@ impl App {
             // `C` runs the role check with the administrator token, so the two roles
             // can be compared in the app.
             KeyCode::Char('C') => self.request_admin_role_check(),
-            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Up => {
+                if self.screen_has_list() {
+                    self.move_selection(-1);
+                } else {
+                    self.scroll_panel(-1);
+                }
+            }
             // `k` moves up everywhere except the Credentials screen, where it opens the
             // prompt for a model key.
-            KeyCode::Char('k') if self.screen != Screen::Credentials => self.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Char('k') if self.screen != Screen::Credentials => {
+                if self.screen_has_list() {
+                    self.move_selection(-1);
+                } else {
+                    self.scroll_panel(-1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.screen_has_list() {
+                    self.move_selection(1);
+                } else {
+                    self.scroll_panel(1);
+                }
+            }
             // Page, home and end motion on every windowed list and on the help overlay:
             // the conventions a person brings from any other list (C-4). `g` is the
             // same "top" key everywhere except the Forgejo screen, where it is the
             // clone key the page map names; it never acts on a repository from another
-            // screen (C-6).
-            KeyCode::PageDown => self.move_selection(LIST_PAGE),
-            KeyCode::PageUp => self.move_selection(-LIST_PAGE),
-            KeyCode::Home => self.select_edge(false),
-            KeyCode::End | KeyCode::Char('G') => self.select_edge(true),
+            // screen (C-6). On a screen whose content is a panel, the same keys move
+            // the panel instead of a selection that is not there, so no key is
+            // swallowed without a word or an effect (Y-2).
+            KeyCode::PageDown => {
+                if self.screen_has_list() {
+                    self.move_selection(LIST_PAGE);
+                } else {
+                    self.scroll_panel(PANEL_PAGE);
+                }
+            }
+            KeyCode::PageUp => {
+                if self.screen_has_list() {
+                    self.move_selection(-LIST_PAGE);
+                } else {
+                    self.scroll_panel(-PANEL_PAGE);
+                }
+            }
+            KeyCode::Home => {
+                if self.screen_has_list() {
+                    self.select_edge(false);
+                } else {
+                    self.scroll_panel_edge(false);
+                }
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                if self.screen_has_list() {
+                    self.select_edge(true);
+                } else {
+                    self.scroll_panel_edge(true);
+                }
+            }
+            // `[` and `]` scroll the panel or note area on every screen, including the
+            // ones where the arrows and page keys belong to the list (Y-2).
+            KeyCode::Char('[') => self.scroll_panel(-1),
+            KeyCode::Char(']') => self.scroll_panel(1),
             KeyCode::Enter => self.open_selected_agent(),
             KeyCode::Esc => self.screen = Screen::Agents,
             KeyCode::Char('s') => self.request_agent_start(),
@@ -2702,7 +2953,13 @@ impl App {
             KeyCode::Char('c') => self.request_role_check(),
             KeyCode::Char('i') => self.request_identity(),
             KeyCode::Char('g') if self.screen == Screen::Forgejo => self.request_clone(),
-            KeyCode::Char('g') => self.select_edge(false),
+            KeyCode::Char('g') => {
+                if self.screen_has_list() {
+                    self.select_edge(false);
+                } else {
+                    self.scroll_panel_edge(false);
+                }
+            }
             KeyCode::Char('P') if self.screen == Screen::Forgejo => {
                 self.request_pull_request();
             }
@@ -2721,6 +2978,11 @@ impl App {
             // handing the credentials file to an editor.
             KeyCode::Char('k') if self.screen == Screen::Credentials => {
                 self.request_secret(SecretTarget::ModelKey);
+            }
+            // `D` deletes the secrets a removed agent left behind, so "what should I
+            // clean" has an answer inside the product (Y-6).
+            KeyCode::Char('D') if self.screen == Screen::Credentials => {
+                self.request_forget_secrets();
             }
             KeyCode::Char('f') if self.screen == Screen::Credentials => {
                 self.request_secret(SecretTarget::ForgejoRoleToken);
@@ -3335,7 +3597,39 @@ role = "member"
             app.recent.iter().all(|run| run.agent != "one"),
             "the ledger holds no record"
         );
+        // Y-4: the hub knows a record it had is gone, so it can say so instead of
+        // silently promoting an older record to "the last run".
+        assert_eq!(app.forgotten_run.as_deref(), Some("one"));
         app.shutdown();
+    }
+
+    #[test]
+    fn an_endpoint_test_is_dated_and_knows_when_the_endpoint_changed() {
+        // Y-5: a result with no time outlives the endpoint it tested and reads as
+        // current. It is dated, and a result about another endpoint is not current.
+        use crate::config::AgentConfig;
+        let test = EndpointTest {
+            agent: "one".to_owned(),
+            endpoint: "http://127.0.0.1:1/v1".to_owned(),
+            model: "m".to_owned(),
+            result: Ok("the endpoint answered".to_owned()),
+            tested_at_ms: crate::time::now_unix_ms(),
+        };
+        assert!(test.describe().contains("tested just now"), "{}", test.describe());
+        let same = AgentConfig {
+            name: "one".to_owned(),
+            model: "m".to_owned(),
+            endpoint: "http://127.0.0.1:1/v1".to_owned(),
+            max_turns: 4,
+            instruction: std::path::PathBuf::from("instruction.md"),
+            concurrency: 1,
+        };
+        assert!(test.is_current_for(&same));
+        let changed = AgentConfig {
+            endpoint: "http://127.0.0.1:2/v1".to_owned(),
+            ..same
+        };
+        assert!(!test.is_current_for(&changed));
     }
 
     #[test]
