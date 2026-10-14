@@ -259,6 +259,9 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
     assert!(agent.contains("e edit the instruction"), "{agent}");
     assert!(agent.contains("p test the"), "{agent}");
     assert!(agent.contains("max turns"), "{agent}");
+    // An unsettled identity's label must not collide with its value (G-9).
+    assert!(!agent.contains("identitynot"), "{agent}");
+    assert!(!agent.contains("requests"), "the limit is called concurrency: {agent}");
 
     // The runs screen has nothing to list yet, and says so rather than claiming a run.
     app.show(Screen::Runs);
