@@ -1032,7 +1032,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             if count == 0 {
                 String::new()
             } else {
-                format!("{} ({count} characters, hidden)", "*".repeat(count.min(12)))
+                format!("{} ({})", "*".repeat(count.min(12)), hidden_count(count))
             }
         } else {
             value.clone()
@@ -1097,15 +1097,12 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     let shown = if count == 0 {
         String::new()
     } else {
-        format!(
-            "{} ({count} characters, hidden)",
-            "*".repeat(count.min(12))
-        )
+        format!("{} ({})", "*".repeat(count.min(12)), hidden_count(count))
     };
     let mut lines: Vec<Line> = vec![
         Line::from(format!(
             "The {} is written to the credentials file and never shown.",
-            prompt.target.describe()
+            prompt.subject()
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -1125,7 +1122,7 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
         ))),
     }
     let block = Block::bordered()
-        .title(format!(" set the {} ", prompt.target.describe()))
+        .title(format!(" set the {} ", prompt.subject()))
         .border_style(Style::new().fg(Color::Cyan));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1133,6 +1130,15 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+/// How much a masked field holds, with the count in the right number.
+fn hidden_count(count: usize) -> String {
+    if count == 1 {
+        "1 character, hidden".to_owned()
+    } else {
+        format!("{count} characters, hidden")
+    }
 }
 
 /// The "remove this agent?" confirmation, so a destructive key is never silent.
@@ -1470,10 +1476,14 @@ fn no_agent_text(app: &App) -> String {
     }
 }
 
-/// The credentials file's mode, as read back from disk.
+/// The credentials file's mode, as read back from disk *now*.
+///
+/// The cached mode is what a file prepared when the app started had. A user who
+/// widens the file by hand must see the mode it actually has, not a remembered
+/// `0600` beside the refusal that says it is 0644 (D-2).
 fn mode_text(app: &App) -> String {
-    match app.credentials_mode {
-        Some(mode) => crate::mode::render(mode),
-        None => "not read".to_owned(),
+    match crate::mode::mode_of(&app.credentials_path) {
+        Ok(mode) => crate::mode::render(mode),
+        Err(_) => "not read".to_owned(),
     }
 }
