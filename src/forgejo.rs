@@ -222,8 +222,12 @@ impl RoleCheck {
     /// The role comes first, so a narrow footer clips the counts rather than the word
     /// that says which view this is.
     pub fn summary(&self) -> String {
+        // The word for the view leads, so a narrow footer clips the counts rather than
+        // the word that says which view this is; the counts are compact so the checked
+        // panel still gives the repository list more than one row at 80×24 even when
+        // the token belongs to an administrator.
         let mut text = format!(
-            "as {}, {} sees {}, {} of them private",
+            "as {}, {} sees {}, {} private",
             if self.administrative() {
                 "an administrator"
             } else {
@@ -239,7 +243,7 @@ impl RoleCheck {
         // and name the key that shows the other view (W-8).
         if self.viewer.is_admin && !self.administrative() {
             text.push_str(&format!(
-                "; the token belongs to `{}`, an administrator — press C for the administrative view",
+                "; `{}` is an administrator — press C for that view",
                 self.viewer.login
             ));
         }
@@ -1026,7 +1030,7 @@ mod tests {
         };
         assert_eq!(
             check.summary(),
-            "as an administrator, root sees 0 repositories, 3 of them private"
+            "as an administrator, root sees 0 repositories, 3 private"
         );
         assert_eq!(check.summary().matches("private").count(), 1);
     }

@@ -2572,7 +2572,7 @@ impl App {
         let total = crate::ui::panel_total_lines(self);
         if total == 0 {
             self.status =
-                "this screen's list moves with up/down; its panel has nothing to scroll"
+                "this screen's content is a list: up/down move it, and the panel below is declared — enlarge the window to read it"
                     .to_owned();
             return;
         }
@@ -2597,7 +2597,7 @@ impl App {
         let total = crate::ui::panel_total_lines(self);
         if total == 0 {
             self.status =
-                "this screen's list moves with up/down; its panel has nothing to scroll"
+                "this screen's content is a list: up/down move it, and the panel below is declared — enlarge the window to read it"
                     .to_owned();
             return;
         }
