@@ -366,11 +366,15 @@ fn clone_failed_status(repo: &str, login: &str, mode: &str, class: &str, detail:
     )
 }
 
-/// Say how an endpoint test ended.
+/// Say how an endpoint test ended, in the product's own words.
 fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String {
     match result {
         Ok(summary) => format!("the endpoint answered: {summary}"),
-        Err(failure) => format!("failed ({}): {}", failure.class, failure.message),
+        Err(failure) => format!(
+            "failed ({}): {}",
+            failure.class,
+            crate::model::in_product_words(&failure.message)
+        ),
     }
 }
 
@@ -1249,16 +1253,14 @@ impl App {
     /// The reason is read from the run's own record, so it is there on the screen the
     /// user looks at after a failure, not only in a transient footer line.
     pub fn last_failure(&self, name: &str) -> Option<String> {
-        self.last_run_failure(name)
+        self.newest_failed_run(name)
             .or_else(|| self.last_start_failure(name))
             .or_else(|| self.supervisor.last_error().map(str::to_owned))
     }
 
-    /// Why one agent's most recent *run* did not go well, from the run's own record.
-    ///
-    /// Kept apart from a start that never produced a run, so the hub does not call a
-    /// failed start "the last run" (D-8).
-    pub fn last_run_failure(&self, name: &str) -> Option<String> {
+    /// Why one agent's most recent *failed* run did not go well, for the historical
+    /// `last failure` field on the Agent screen.
+    fn newest_failed_run(&self, name: &str) -> Option<String> {
         if let State::Finished {
             outcome: RunOutcome::Failed,
             reason: Some(reason),
@@ -1271,6 +1273,30 @@ impl App {
             .iter()
             .find(|run| run.agent == name && run.outcome == Some(RunOutcome::Failed))
             .and_then(|run| run.reason.clone())
+    }
+
+    /// Why the agent's **newest** terminal run did not go well, from the run's own
+    /// record.
+    ///
+    /// Kept apart from a start that never produced a run (D-8), and answered from the
+    /// newest record, terminal or not: after a recovery the next run succeeded, and an
+    /// older failure is not "the last run" (O-1). A record that is not terminal yet is
+    /// not a last run either.
+    pub fn last_run_failure(&self, name: &str) -> Option<String> {
+        match self.supervisor.state(name) {
+            State::Finished {
+                outcome: RunOutcome::Failed,
+                reason: Some(reason),
+                ..
+            } => Some(reason),
+            State::Finished { .. } => None,
+            _ => self
+                .recent
+                .iter()
+                .find(|run| run.agent == name)
+                .filter(|run| run.outcome == Some(RunOutcome::Failed))
+                .and_then(|run| run.reason.clone()),
+        }
     }
 
     /// Why one agent's most recent *start* did not go well, when it never became a run.
@@ -1503,7 +1529,10 @@ impl App {
         };
         let short = match &result {
             Ok(_) => "ok".to_owned(),
-            Err(failure) => format!("failed ({})", failure.class),
+            // The class alone is not the reason: the footer grows to hold the same
+            // sentence the Agent screen shows, so a refused connection or a bad name
+            // is read at 80×24, not just the word `transport` (O-2).
+            Err(_) => describe_endpoint_result(&result),
         };
         self.status = format!("endpoint test for `{}`: {short}", agent.name);
         self.endpoint_test = Some(EndpointTest {
@@ -3241,6 +3270,54 @@ role = "member"
         assert_eq!(
             app.last_start_failure("one").as_deref(),
             Some("systemd could not start it")
+        );
+    }
+
+    #[test]
+    fn the_last_run_is_the_newest_record_not_the_newest_failure() {
+        // O-1: after the network returned, a fresh run succeeded and the hub still
+        // said "the last run ... did not go well", because it searched for the newest
+        // failure rather than reading the newest record. The Agent screen's
+        // `last failure` keeps the history; the hub's sentence is about the last run.
+        let mut app = app_with(GOOD);
+        let failed = RunSummary {
+            agent: "one".to_owned(),
+            run_id: "run-100-0001-1".to_owned(),
+            outcome: Some(RunOutcome::Failed),
+            reason: Some(
+                "the model call failed (transport): io: Connection refused (os error 111)"
+                    .to_owned(),
+            ),
+            duration_ms: Some(0),
+            started_at: None,
+            log: PathBuf::from("/l"),
+            dir: PathBuf::from("/d"),
+        };
+        let succeeded = RunSummary {
+            agent: "one".to_owned(),
+            run_id: "run-200-0001-1".to_owned(),
+            outcome: Some(RunOutcome::Succeeded),
+            reason: Some("the model finished after 1 turn".to_owned()),
+            duration_ms: Some(10),
+            started_at: None,
+            log: PathBuf::from("/l"),
+            dir: PathBuf::from("/d"),
+        };
+        app.recent = vec![succeeded.clone(), failed.clone()];
+        assert!(
+            app.last_run_failure("one").is_none(),
+            "an older failure is not the last run"
+        );
+        assert_eq!(
+            app.last_failure("one").as_deref(),
+            failed.reason.as_deref(),
+            "the historical failure is still named on the Agent screen"
+        );
+        // When the newest record is the failure, it is named.
+        app.recent = vec![failed.clone(), succeeded];
+        assert_eq!(
+            app.last_run_failure("one").as_deref(),
+            failed.reason.as_deref()
         );
     }
 

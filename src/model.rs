@@ -534,6 +534,26 @@ fn transport_error(config: &ModelConfig, error: ureq::Error) -> ModelError {
     }
 }
 
+/// The transport's own words, in the product's words where the meaning is known.
+///
+/// `io:` is the transport library's prefix and `(os error 111)` its errno; neither is
+/// a word the product taught a zero-knowledge user (O-4). A screen reads a reason
+/// through this; the run log and the transcript keep the transport's exact sentence,
+/// which is what a person auditing the failure afterwards reads.
+pub fn in_product_words(text: &str) -> String {
+    if text.contains("Connection refused") {
+        "the endpoint refused the connection".to_owned()
+    } else if text.contains("Connection reset") || text.contains("Connection aborted") {
+        "the connection dropped".to_owned()
+    } else if text.contains("lookup address information")
+        || text.contains("Name or service not known")
+    {
+        "the address could not be resolved".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
 /// A bounded excerpt of some text, with a marker when it was cut.
 pub fn excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {
@@ -725,6 +745,29 @@ mod tests {
             chat(&config, &[Message::user("hi")], &[], None).expect_err("the empty key is refused");
         assert_eq!(error.class(), "missing_key");
         assert_eq!(stub.requests().len(), 0, "nothing was sent");
+    }
+
+    #[test]
+    fn the_transport_gutter_is_translated_for_the_screens_only() {
+        // O-4: `io:` and `(os error N)` are the transport library's words, not the
+        // product's. A screen reads the sentence through `in_product_words`; the
+        // stored record keeps the transport's own words for an audit afterwards.
+        assert_eq!(
+            in_product_words("io: Connection refused (os error 111)"),
+            "the endpoint refused the connection"
+        );
+        assert_eq!(
+            in_product_words("io: Connection reset by peer (os error 104)"),
+            "the connection dropped"
+        );
+        assert_eq!(
+            in_product_words(
+                "io: failed to lookup address information: Name or service not known"
+            ),
+            "the address could not be resolved"
+        );
+        // Anything the product does not know keeps the transport's sentence.
+        assert_eq!(in_product_words("a frobnicator failed"), "a frobnicator failed");
     }
 
     #[test]
