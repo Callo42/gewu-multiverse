@@ -256,6 +256,9 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
             plan.workspace.display()
         ));
     }
+    // F-1: the workspace is the product's directory (below its own agent directory,
+    // already 0700), so it carries the same custody.
+    let _ = crate::mode::set_mode(&plan.workspace, crate::mode::PRIVATE_DIR_MODE);
 
     let skills = match install_skills(&plan.skills_dir, run_dir) {
         Ok(skills) => skills,
@@ -951,6 +954,13 @@ fn install_skills(skills_dir: &Path, run_dir: &Path) -> Result<Vec<SkillRef>, St
             destination_root.display()
         )
     })?;
+    // F-1: one custody for the run's own directory tree too.
+    crate::mode::hold_dir_private_below(run_dir, &destination_root).map_err(|source| {
+        format!(
+            "the run's skills directory {} cannot be restricted: {source}",
+            destination_root.display()
+        )
+    })?;
 
     let mut skills = Vec::new();
     for name in names {
@@ -997,6 +1007,13 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<TreeStats, String> {
             destination.display()
         )
     })?;
+    // F-1: a copied skill directory carries the product's custody too.
+    crate::mode::set_mode(destination, crate::mode::PRIVATE_DIR_MODE).map_err(|error| {
+        format!(
+            "the skill directory {} cannot be restricted: {error}",
+            destination.display()
+        )
+    })?;
     let mut stats = TreeStats::default();
     let entries = fs::read_dir(source)
         .map_err(|error| format!("the skill {} cannot be read: {error}", source.display()))?;
@@ -1019,7 +1036,9 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<TreeStats, String> {
         } else if metadata.is_file() {
             let bytes = fs::read(&path)
                 .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-            fs::write(destination.join(&name), &bytes).map_err(|error| {
+            // F-1/F-2: every file the product writes carries the one custody, so a
+            // copied skill is written 0600 like the skill template it came from.
+            crate::mode::write_private(destination.join(&name), &bytes).map_err(|error| {
                 format!(
                     "{} cannot be written: {error}",
                     destination.join(&name).display()

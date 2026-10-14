@@ -1263,11 +1263,10 @@ impl Supervisor {
             return Err(StartError::Credentials { agent: name });
         }
         agent.ensure()?;
-        let run_dir = agent.run_dir(run_id);
-        fs::create_dir_all(&run_dir).map_err(|source| StartError::Prepare {
+        let run_dir = agent.ensure_run_dir(run_id).map_err(|error| StartError::Prepare {
             agent: name.clone(),
             run_id: run_id.to_owned(),
-            source,
+            source: std::io::Error::other(error.to_string()),
         })?;
         let plan = RunPlan {
             run_id: run_id.to_owned(),

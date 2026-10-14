@@ -26,6 +26,29 @@ pub fn mode_of(path: &Path) -> io::Result<u32> {
     Ok(fs::metadata(path)?.permissions().mode() & 0o7777)
 }
 
+/// Hold one existing directory, and every directory between it and `stop`, to mode
+/// 0700. `stop` itself is included; nothing above it is ever touched, and a path
+/// that is not below `stop` is held to 0700 on its own only.
+///
+/// `fs::create_dir_all` makes the intermediate directories with the process umask,
+/// so a path like `<root>/agents/<name>` would otherwise leave `agents/` at `0775`
+/// while `<name>` is `0700` (F-1). This walks the chain the product owns and gives
+/// every link the one custody the product promises for its directories.
+pub fn hold_dir_private_below(stop: &Path, path: &Path) -> io::Result<()> {
+    if !path.starts_with(stop) {
+        return set_mode(path, PRIVATE_DIR_MODE);
+    }
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        set_mode(dir, PRIVATE_DIR_MODE)?;
+        if dir == stop {
+            break;
+        }
+        current = dir.parent();
+    }
+    Ok(())
+}
+
 /// Render a mode the way `chmod` writes it, for people to read.
 pub fn render(mode: u32) -> String {
     format!("{:04o}", mode)

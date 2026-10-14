@@ -802,19 +802,25 @@ fn secret_at(path: &Path, value: &toml::Value, key: &str) -> Result<Secret, Cred
     }
 }
 
-/// A string under a table, or a top-level string when `key` is empty.
+/// The text at one table key, when the file holds a non-empty string there.
+///
+/// An empty string is the same as absent for every caller: a login, an email or a
+/// mode that is empty is not a recorded identity, and reporting it as one put an
+/// empty account on a screen (W2-A's sibling on the identity lines).
 fn text_at(value: &toml::Value, table: &str, key: &str) -> Option<String> {
-    if key.is_empty() {
-        return value
+    let text = if key.is_empty() {
+        value
             .get(table)
             .and_then(toml::Value::as_str)
-            .map(str::to_owned);
-    }
-    value
-        .get(table)
-        .and_then(|table| table.get(key))
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned)
+            .map(str::to_owned)
+    } else {
+        value
+            .get(table)
+            .and_then(|table| table.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    text.filter(|text| !text.trim().is_empty())
 }
 
 #[cfg(test)]

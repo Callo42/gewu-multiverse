@@ -1080,6 +1080,12 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
             Style::new().fg(Color::Red),
         ))),
     }
+    // F-2: the configuration file is written 0600 too, and every directory the
+    // product creates is 0700. The one exception is named, so the sentence is the
+    // whole custody and an auditor can check it against the filesystem.
+    lines.push(Line::from(
+        "The configuration file is written with mode 0600 too; every directory the product makes inside its own configuration and state directories is held to 0700, and the one systemd unit is 0644 because it holds no secret — it names paths only.",
+    ));
     lines.push(Line::from(
         "Its contents are never printed: nothing here is shown, logged or put on a command line.",
     ));

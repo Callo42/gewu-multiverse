@@ -1410,7 +1410,7 @@ impl App {
         };
         let text = render_config(&existing, &url, &name, &endpoint, &model);
         Config::from_text(&self.config_path(), &text).map_err(|error| error.to_string())?;
-        std::fs::write(self.config_path(), text).map_err(|error| {
+        crate::mode::write_private(self.config_path(), text.as_bytes()).map_err(|error| {
             format!("{} cannot be written: {error}", self.config_path().display())
         })?;
         credentials::record_form_secrets(
@@ -1473,7 +1473,7 @@ impl App {
             self.status = error.to_string();
             return;
         }
-        if let Err(error) = std::fs::write(self.config_path(), text) {
+        if let Err(error) = crate::mode::write_private(self.config_path(), text.as_bytes()) {
             self.status = format!(
                 "{} cannot be written: {error}",
                 self.config_path().display()
@@ -2115,10 +2115,11 @@ impl App {
         let login = credentials::recorded_login(&self.credentials_path, agent)
             .ok()
             .flatten()?;
+        // W2-A's sibling on the identity line: an email that was never recorded is
+        // not an empty one. Without both, the identity is not settled.
         let email = credentials::recorded_email(&self.credentials_path, agent)
             .ok()
-            .flatten()
-            .unwrap_or_default();
+            .flatten()?;
         let mode = identity::recorded_mode(&self.credentials_path)
             .ok()
             .flatten();
@@ -2210,25 +2211,32 @@ impl App {
             }
             Err(error) => return format!("the repository could not be read ({})", error.detail()),
         };
-        let agent_identity = format!(
-            "{} <{}>",
+        // W2-A: the product can only compare the repository's identity against an
+        // identity the credentials file actually records. Building one out of two
+        // empty strings made every repository read as "not the agent's" before any
+        // identity was settled, a claim the product cannot support.
+        let recorded = match (
             credentials::recorded_login(&self.credentials_path, name)
                 .ok()
-                .flatten()
-                .unwrap_or_default(),
+                .flatten(),
             credentials::recorded_email(&self.credentials_path, name)
                 .ok()
-                .flatten()
-                .unwrap_or_default(),
-        );
-        let whose = match &state.local_identity {
-            Some(identity) if *identity == agent_identity => {
+                .flatten(),
+        ) {
+            (Some(login), Some(email)) => Some(format!("{login} <{email}>")),
+            _ => None,
+        };
+        let whose = match (&state.local_identity, &recorded) {
+            (Some(identity), Some(agent_identity)) if identity == agent_identity => {
                 format!("the local git identity is the agent's ({identity})")
             }
-            Some(identity) => {
+            (Some(identity), Some(_)) => {
                 format!("the local git identity is {identity}, not the agent's")
             }
-            None => "no local git identity is set".to_owned(),
+            (Some(identity), None) => format!(
+                "the local git identity is {identity}; no Forgejo identity is recorded for this agent yet, so the product cannot say whether it is the agent's — press i to settle one"
+            ),
+            (None, _) => "no local git identity is set".to_owned(),
         };
         let changed = match state.changed {
             0 => "clean".to_owned(),
@@ -3666,6 +3674,9 @@ fn foreign_path(text: &str, live: &str) -> Option<String> {
 fn write_template(path: &std::path::Path, template: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // F-1: the directory this hand-off makes (a new skill's directory) is the
+        // product's, and carries the product's custody.
+        crate::mode::set_mode(parent, crate::mode::PRIVATE_DIR_MODE)?;
     }
     crate::mode::write_private(path, template)
 }
@@ -5382,5 +5393,67 @@ concurrency = 3
         assert!(app.status.starts_with("stopped"), "{}", app.status);
         assert!(app.status.contains("is proven gone"), "{}", app.status);
         app.shutdown();
+    }
+
+    /// Run one git command in `dir`, failing the test if git refuses.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn the_workspace_sentence_admits_when_no_identity_is_recorded() {
+        // W2-A: before any Forgejo identity is recorded, the sentence compared the
+        // repository's local git identity against an identity built from two empty
+        // strings and called it "not the agent's" — a claim the product cannot make.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
+        let workspace = paths.workspace().to_path_buf();
+        git(&workspace, &["init", "-q"]);
+        git(&workspace, &["config", "user.name", "gewu-one"]);
+        git(
+            &workspace,
+            &["config", "user.email", "gewu-one@agents.invalid"],
+        );
+        std::fs::write(workspace.join("README"), "hello\n").expect("a file");
+        git(&workspace, &["add", "README"]);
+        git(&workspace, &["commit", "-q", "-m", "first"]);
+
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("no Forgejo identity is recorded"), "{note}");
+        assert!(note.contains("cannot say whether it is the agent's"), "{note}");
+        assert!(!note.contains("not the agent's"), "{note}");
+
+        // A recorded, matching identity makes the true claim.
+        let matching = "[forgejo_logins]\n\"one\" = \"gewu-one\"\n\n[forgejo_emails]\n\"one\" = \"gewu-one@agents.invalid\"\n";
+        crate::mode::write_private(app.layout.credentials_file(), matching.as_bytes())
+            .expect("credentials");
+        let note = app.workspace_note_for("one");
+        assert!(
+            note.contains("the local git identity is the agent's"),
+            "{note}"
+        );
+
+        // A recorded identity that differs stays "not the agent's".
+        let different = "[forgejo_logins]\n\"one\" = \"someone-else\"\n\n[forgejo_emails]\n\"one\" = \"someone-else@agents.invalid\"\n";
+        crate::mode::write_private(app.layout.credentials_file(), different.as_bytes())
+            .expect("credentials");
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("not the agent's"), "{note}");
+        assert!(!note.contains("cannot say whether"), "{note}");
     }
 }
