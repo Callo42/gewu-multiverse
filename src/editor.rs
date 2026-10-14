@@ -34,8 +34,33 @@ pub fn choose_pager(pager: Option<String>) -> String {
 }
 
 /// The editing program this process would use.
+///
+/// `$EDITOR` and `$VISUAL` win when either is set. With neither, `nano` is chosen
+/// ahead of `vi` when it is installed: `vi` is the honest last resort, but a person
+/// who set no editor is exactly the person who does not know it, so a friendlier
+/// editor is preferred when the machine has one.
 pub fn editor() -> String {
-    choose_editor(env::var("EDITOR").ok(), env::var("VISUAL").ok())
+    let editor = env::var("EDITOR").ok().filter(|value| !value.trim().is_empty());
+    let visual = env::var("VISUAL").ok().filter(|value| !value.trim().is_empty());
+    if editor.is_some() || visual.is_some() {
+        return choose_editor(editor, visual);
+    }
+    if program_on_path("nano") {
+        "nano".to_owned()
+    } else {
+        "vi".to_owned()
+    }
+}
+
+/// Whether an executable named `name` is on `PATH`.
+fn program_on_path(name: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+    })
 }
 
 /// The reading program this process would use.
@@ -86,9 +111,20 @@ mod tests {
     }
 
     #[test]
-    fn vi_is_the_last_resort() {
+    fn vi_is_the_last_resort_when_no_editor_is_installed() {
+        // The pure chooser still falls back to `vi`; `editor()` may prefer `nano`
+        // when the machine has one, which is tested below.
         assert_eq!(choose_editor(None, None), "vi");
     }
+
+    #[test]
+    fn an_explicit_editor_is_never_overridden_by_nano() {
+        // Setting `$EDITOR` to `vi` is a choice; the fallback must not second-guess it.
+        // The environment is process-wide, so only the pure chooser is asserted here.
+        assert_eq!(choose_editor(Some("vi".to_owned()), None), "vi");
+        assert_eq!(choose_editor(Some("emacs".to_owned()), None), "emacs");
+    }
+
 
     #[test]
     fn a_pager_is_chosen_with_a_sensible_last_resort() {

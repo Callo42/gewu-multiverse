@@ -109,6 +109,17 @@ pub enum WorkspaceError {
 }
 
 impl WorkspaceError {
+    /// The underlying reason, led with, for a status line.
+    ///
+    /// Git's own message is what a person needs; the command it ran can be long and
+    /// pushes the reason past the edge of a narrow terminal.
+    pub fn detail(&self) -> String {
+        match self {
+            WorkspaceError::Git { message, .. } => message.clone(),
+            other => other.to_string(),
+        }
+    }
+
     /// The class of failure, as one word a screen can hold.
     pub fn class(&self) -> &'static str {
         match self {

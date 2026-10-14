@@ -217,17 +217,20 @@ impl RoleCheck {
     }
 
     /// One line for the status bar.
+    ///
+    /// The role comes first, so a narrow footer clips the counts rather than the word
+    /// that says which view this is.
     pub fn summary(&self) -> String {
         format!(
-            "{} sees {} repository(ies), {} of them private, as {}",
-            self.viewer.login,
-            self.repositories.len(),
-            self.private_visible,
+            "as {}, {} sees {} repository(ies), {} of them private",
             if self.administrative() {
                 "an administrator"
             } else {
                 "an ordinary member"
             },
+            self.viewer.login,
+            self.repositories.len(),
+            self.private_visible,
         )
     }
 }
@@ -968,5 +971,28 @@ mod tests {
         assert!(line.contains("root/demo"), "{line}");
         assert!(line.contains("private"), "{line}");
         assert!(line.contains("write"), "{line}");
+    }
+
+    #[test]
+    fn the_role_check_summary_leads_with_the_role() {
+        // F-F: a narrow footer must clip the counts, never the word that says which
+        // view this is. The private count appears once, not twice.
+        let check = RoleCheck {
+            url: "https://forgejo.example.org".to_owned(),
+            role: Role::Admin,
+            viewer: Viewer {
+                login: "root".to_owned(),
+                email: None,
+                description: None,
+                is_admin: true,
+            },
+            repositories: Vec::new(),
+            private_visible: 3,
+        };
+        assert_eq!(
+            check.summary(),
+            "as an administrator, root sees 0 repository(ies), 3 of them private"
+        );
+        assert_eq!(check.summary().matches("private").count(), 1);
     }
 }

@@ -126,6 +126,24 @@ impl State {
         }
     }
 
+    /// One word for a table cell, with the failure class when the reason names one.
+    ///
+    /// A person looking at the list after a failure needs more than `failed`: the
+    /// class (`transport`, `missing_key`, …) is what tells them what to change.
+    pub fn word_with_reason(&self) -> String {
+        match self {
+            State::Finished {
+                outcome: RunOutcome::Failed,
+                reason: Some(reason),
+                ..
+            } => match failure_class(reason) {
+                Some(class) => format!("failed ({class})"),
+                None => "failed".to_owned(),
+            },
+            _ => self.word(),
+        }
+    }
+
     /// The run this state is about, if any.
     pub fn run_id(&self) -> Option<&str> {
         match self {
@@ -145,6 +163,20 @@ impl State {
             State::Starting { .. } | State::Running { .. } | State::Stopping { .. }
         )
     }
+}
+
+/// The class a failure reason names, when it names one.
+///
+/// A model-call reason reads `the model call failed (transport): …`, so the class is
+/// the word in parentheses; a missing key is named without one.
+fn failure_class(reason: &str) -> Option<&str> {
+    if reason.contains("model key cannot be read") {
+        return Some("missing_key");
+    }
+    let start = reason.find("failed (")? + "failed (".len();
+    let rest = &reason[start..];
+    let end = rest.find(')')?;
+    Some(&rest[..end])
 }
 
 /// What happened when a start was asked for.
@@ -1966,5 +1998,19 @@ esac
             1,
             "{log}"
         );
+    }
+
+    #[test]
+    fn a_failure_reason_names_its_class_for_the_state_cell() {
+        // F-G: `failed (transport)` is more use than `failed`.
+        assert_eq!(
+            failure_class("the model call failed (transport): connection refused"),
+            Some("transport")
+        );
+        assert_eq!(
+            failure_class("the model key cannot be read: no key"),
+            Some("missing_key")
+        );
+        assert_eq!(failure_class("run run-1 exited with code 1"), None);
     }
 }
