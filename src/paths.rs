@@ -185,6 +185,19 @@ impl AgentPaths {
         })
     }
 
+    /// The same agent, reading the instruction document the configuration names.
+    ///
+    /// The instruction path is relative to the configuration directory and is checked
+    /// when the configuration is read (no absolute path, no `..`), so joining it to
+    /// the root can only reach inside the configuration directory. The common case —
+    /// the form writes `agents/<name>/instruction.md` — is the derived default, but a
+    /// hand-written configuration may point the field elsewhere, and then every screen
+    /// and the run must read that file (P-3).
+    pub fn with_instruction(mut self, instruction: PathBuf) -> Self {
+        self.instruction = instruction;
+        self
+    }
+
     /// The agent's name.
     pub fn name(&self) -> &str {
         &self.name
@@ -226,10 +239,18 @@ impl AgentPaths {
     }
 
     /// Create the configuration directory, the skills directory and the workspace.
+    ///
+    /// A configured instruction may live in a directory of its own (for example
+    /// `instructions/scribe.md`), so the instruction's parent is created too: the
+    /// editor writes the file there, and `e` must not fail because the directory the
+    /// configuration named does not exist yet.
     pub fn ensure(&self) -> Result<(), PathError> {
         ensure_private_dir(&self.config_dir)?;
         ensure_private_dir(&self.skills_dir)?;
         ensure_private_dir(&self.workspace)?;
+        if let Some(parent) = self.instruction.parent() {
+            ensure_private_dir(parent)?;
+        }
         Ok(())
     }
 }

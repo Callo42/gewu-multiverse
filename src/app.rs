@@ -446,6 +446,17 @@ fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String 
     }
 }
 
+/// Whether a status sentence is one of the panel-scroll family.
+///
+/// These sentences describe a panel on the screen that made them; carried to another
+/// screen they are false (E-1, P-1).
+fn is_panel_scroll_status(status: &str) -> bool {
+    status.starts_with("the panel scrolled")
+        || status == "the panel is at its top"
+        || status == "the panel is at its end"
+        || status.starts_with("this screen's content is a list")
+}
+
 /// The agent name in a secret label like `model key for \`scribe\``, when there is one.
 fn backticked_agent(label: &str) -> Option<String> {
     let start = label.find('`')? + 1;
@@ -1016,10 +1027,35 @@ impl App {
         self.selected_agent().map(|agent| agent.name.clone())
     }
 
+    /// The paths of one configured agent, reading the instruction the configuration
+    /// names rather than the derived default.
+    ///
+    /// The instruction field is checked when the configuration is read, so the join
+    /// can only reach inside the configuration directory. Every screen and every run
+    /// goes through this, so they agree on the file (P-3).
+    fn agent_paths(&self, name: &str) -> Result<crate::paths::AgentPaths, crate::paths::PathError> {
+        let paths = self.layout.agent(name)?;
+        match self.agents().iter().find(|agent| agent.name == name) {
+            Some(agent) => Ok(paths.with_instruction(self.layout.root().join(&agent.instruction))),
+            None => Ok(paths),
+        }
+    }
+
+    /// The configured agent's paths, prepared on disk (including the instruction's
+    /// parent directory, which a configured path may place elsewhere).
+    fn ensure_agent_paths(
+        &self,
+        name: &str,
+    ) -> Result<crate::paths::AgentPaths, crate::paths::PathError> {
+        let paths = self.agent_paths(name)?;
+        paths.ensure()?;
+        Ok(paths)
+    }
+
     /// The paths derived from the selected agent's name, when there is one.
     pub fn selected_paths(&self) -> Option<crate::paths::AgentPaths> {
         let name = self.selected_name()?;
-        match self.layout.agent(&name) {
+        match self.agent_paths(&name) {
             Ok(paths) => Some(paths),
             Err(error) => {
                 // A name that cannot name a directory is shown, never used.
@@ -1075,7 +1111,8 @@ impl App {
     pub fn decline_acknowledgment(&mut self) {
         self.show_acknowledgment = false;
         self.status =
-            "the risk was not acknowledged, so starting an agent is refused until it is".to_owned();
+            "the risk was not acknowledged, so starting an agent is refused until it is recorded"
+                .to_owned();
     }
 
     /// Open the add-agent form. `n` and `a` both reach it, and `enter` on an empty
@@ -1090,6 +1127,21 @@ impl App {
     /// Whether the add-agent form is open.
     pub fn adding_agent(&self) -> bool {
         self.add_agent.is_some()
+    }
+
+    /// Whether an overlay is up and owns the plain keys.
+    ///
+    /// The footer's key legend is the product's own list. Under one of these overlays
+    /// `q` is not `quit` — it is a letter in a field, a cancel, or a keep — so the
+    /// legend must not advertise `q quit` there. The first-run acknowledgment is not
+    /// in this set: `q` really does quit it, so its legend stays as it was (E-2).
+    pub fn overlay_owns_keys(&self) -> bool {
+        self.add_agent.is_some()
+            || self.editor_confirm.is_some()
+            || self.secret_prompt.is_some()
+            || self.confirm_remove.is_some()
+            || self.confirm_forget.is_some()
+            || self.show_help
     }
 
     /// One key while the add-agent form is open.
@@ -1383,6 +1435,17 @@ impl App {
         self.ask_to_leave("q");
     }
 
+    /// Ask to leave after a hand-off caught a `^C`.
+    ///
+    /// The UI is not in raw mode while an editor or a pager has the terminal, so
+    /// `^C` there is a `SIGINT`; the product catches it and, when the hand-off's own
+    /// exit returns, takes the same leave path the TUI's `^C` takes: one warning that
+    /// names the runs when work is in flight, and an immediate, non-destructive leave
+    /// when none is (E-3).
+    pub fn request_leave_after_handoff(&mut self) {
+        self.ask_to_leave("ctrl-c");
+    }
+
     /// Ask to leave, naming the chord that must be pressed again to go through with it.
     ///
     /// `^C` is the reflex "cancel the thing that is running" chord, and here it does
@@ -1494,7 +1557,7 @@ impl App {
         // A fresh attempt clears the previous start failure, so a stale message does
         // not sit beside a run that has since worked.
         self.start_failure = None;
-        let paths = match self.layout.ensure_agent(&name) {
+        let paths = match self.ensure_agent_paths(&name) {
             Ok(paths) => paths,
             Err(error) => {
                 self.status = format!("`{name}` cannot be prepared: {error}");
@@ -2186,7 +2249,7 @@ impl App {
             self.status = "the configuration lists no agent to edit".to_owned();
             return;
         };
-        let paths = match self.layout.ensure_agent(&name) {
+        let paths = match self.ensure_agent_paths(&name) {
             Ok(paths) => paths,
             Err(error) => {
                 self.status = format!("`{name}` cannot be prepared: {error}");
@@ -2560,14 +2623,28 @@ impl App {
     pub fn shift_screen(&mut self, steps: isize) {
         self.screen = self.screen.shifted(steps);
         self.panel_scroll = 0;
+        self.clear_panel_scroll_status();
     }
 
     /// Show one screen by name.
     pub fn show(&mut self, screen: Screen) {
         if self.screen != screen {
             self.panel_scroll = 0;
+            self.clear_panel_scroll_status();
         }
         self.screen = screen;
+    }
+
+    /// Drop a status sentence that belonged to a panel on the screen being left.
+    ///
+    /// The scroll offset is reset on every screen change, but the sentence `the panel
+    /// scrolled — press PageUp or [ to go back` was not: it sat under the next screen
+    /// and said something untrue there (E-1, P-1). Only the scroll family is cleared;
+    /// a refusal or a run's sentence still has something to say on the next screen.
+    fn clear_panel_scroll_status(&mut self) {
+        if is_panel_scroll_status(&self.status) {
+            self.status.clear();
+        }
     }
 
     /// Whether the screen on show draws a list whose arrows move a selection.
@@ -2777,9 +2854,14 @@ impl App {
         // the standing status is replaced: a warning that keeps asking a question
         // already answered reads as a question the product did not hear (D-6).
         if self.confirm_quit.is_some() && key.code != KeyCode::Char('q') {
+            // The warning invited any other key to stay, so that key does exactly one
+            // thing: it stays. Consuming it keeps a later branch from overwriting the
+            // reassurance — an unbound key used to answer `no key is bound to that`
+            // and the product never said the run was still going (E-8).
             self.confirm_quit = None;
             self.status =
                 "the run continues and this UI stays; q will ask again before leaving".to_owned();
+            return;
         }
         if self.show_help {
             match key.code {
@@ -2845,7 +2927,13 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm_remove_agent();
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                // `q` is the product's quit key, but under a destructive confirmation
+                // it is never the destructive one: it keeps the agent, like `n` and
+                // `esc` (E-2). A swallowed key that the footer advertises is worse.
+                KeyCode::Char('n')
+                | KeyCode::Char('N')
+                | KeyCode::Char('q')
+                | KeyCode::Esc => {
                     self.cancel_remove_agent();
                 }
                 _ => {}
@@ -2857,7 +2945,10 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm_forget_secrets();
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                KeyCode::Char('n')
+                | KeyCode::Char('N')
+                | KeyCode::Char('q')
+                | KeyCode::Esc => {
                     self.confirm_forget = None;
                     self.status = "the leftover secrets were kept".to_owned();
                 }
@@ -3202,14 +3293,14 @@ max_concurrent_agents = 10
 name = "one"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "one.md"
+instruction = "agents/one/instruction.md"
 concurrency = 1
 
 [[agents]]
 name = "two"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "two.md"
+instruction = "agents/two/instruction.md"
 concurrency = 3
 "#;
 
@@ -3263,6 +3354,121 @@ concurrency = 3
         );
         assert!(app.status.contains('e'), "{}", app.status);
         assert_eq!(app.supervisor.running_count(), 0);
+    }
+
+    #[test]
+    fn a_configured_instruction_path_is_the_one_every_screen_and_the_run_use() {
+        // P-3: the field used to be echoed on the Agent screen and silently ignored.
+        // A path with a space, outside the derived default, proves that the path the
+        // Instruction screen reads, the path the run plan carries and the path the
+        // start checks are one and the same.
+        let root = scratch_root("app-instruction-field");
+        let config = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+
+[limits]
+run_timeout_secs = 30
+max_concurrent_agents = 10
+
+[[agents]]
+name = "one"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "my instructions/agent one.md"
+concurrency = 1
+"#;
+        std::fs::write(root.join("config.toml"), config).expect("the configuration is written");
+        let mut app = App::with_runner(
+            Layout::rooted_at(root.clone()),
+            quiet_runner("app-instruction-field"),
+        );
+        app.on_key(key(KeyCode::Char('y')));
+        let configured = root.join("my instructions/agent one.md");
+        std::fs::create_dir_all(configured.parent().expect("a parent")).expect("the directory");
+        std::fs::write(&configured, "do something\n").expect("the instruction is written");
+        let derived = app
+            .layout
+            .agent("one")
+            .expect("the derived paths")
+            .instruction()
+            .to_path_buf();
+        assert_ne!(derived, configured, "the probe must not be the derived default");
+        let summary = app
+            .instruction_summary()
+            .expect("the selected agent has an instruction");
+        assert_eq!(
+            summary.0, configured,
+            "the Instruction screen names the configured file"
+        );
+        assert!(summary.1, "the configured file is there");
+        assert!(
+            !derived.exists(),
+            "the derived path is not invented beside the configured one"
+        );
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        assert!(app.status.contains("started `one`"), "{}", app.status);
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_panel_scroll_status_does_not_outlive_the_screen_it_was_made_on() {
+        // E-1, P-1: the offset was reset on a screen change but the sentence about it
+        // was not, so the next screen opened at its top still reading `the panel
+        // scrolled — press PageUp or [ to go back`.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.show(Screen::Agents);
+        app.scroll_panel_edge(true);
+        assert!(
+            is_panel_scroll_status(&app.status),
+            "the test did not make a scroll status: {}",
+            app.status
+        );
+        app.show(Screen::AgentConfig);
+        assert!(
+            !is_panel_scroll_status(&app.status),
+            "the scroll sentence outlived its screen: {}",
+            app.status
+        );
+        app.scroll_panel_edge(true);
+        app.shift_screen(1);
+        assert!(
+            !is_panel_scroll_status(&app.status),
+            "the scroll sentence outlived the tab change: {}",
+            app.status
+        );
+        // A status that is not about a panel still has something to say, and stays.
+        let kept = "not started: no model key for `one`";
+        app.status = kept.to_owned();
+        app.shift_screen(1);
+        assert_eq!(app.status, kept);
+    }
+
+    #[test]
+    fn q_keeps_at_a_destructive_confirmation_instead_of_being_swallowed() {
+        // E-2: `q` was the product's quit key and did nothing at all in the two
+        // destructive confirmations, while the footer advertised `q quit`. It now
+        // keeps, exactly like `n` and `esc`, so the advertised key is never silent
+        // and never the destructive one by accident.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.confirm_remove = Some("one".to_owned());
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.confirm_remove.is_none(), "the confirmation stayed");
+        assert!(app.status.contains("was kept"), "{}", app.status);
+        assert_eq!(app.agents().len(), 2, "the agent was removed by `q`");
+
+        app.confirm_forget = Some(vec!["ghost".to_owned()]);
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.confirm_forget.is_none(), "the leftover confirmation stayed");
+        assert!(
+            app.status.contains("leftover secrets were kept"),
+            "{}",
+            app.status
+        );
     }
 
     #[test]
@@ -3909,7 +4115,7 @@ max_concurrent_agents = 10
 name = "two"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "two.md"
+instruction = "agents/two/instruction.md"
 concurrency = 3
 "#;
         let mut app = app_with_sleeping_runner("app-reload-orphan", GOOD);

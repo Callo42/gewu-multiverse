@@ -146,6 +146,26 @@ impl State {
         }
     }
 
+    /// One word for a table cell on the hub, where the column is narrow.
+    ///
+    /// The failure class is shortened where the long form would be clipped in the
+    /// middle of a token (`failed (missing_key)` → `failed (key)`); the Agent screen
+    /// keeps the long form, which fits there (E-7, P-5).
+    pub fn cell_word(&self) -> String {
+        match self {
+            State::Finished {
+                outcome: RunOutcome::Failed,
+                reason: Some(reason),
+                ..
+            } => match failure_class(reason) {
+                Some("missing_key") => "failed (key)".to_owned(),
+                Some(class) => format!("failed ({class})"),
+                None => "failed".to_owned(),
+            },
+            _ => self.word(),
+        }
+    }
+
     /// The run this state is about, if any.
     pub fn run_id(&self) -> Option<&str> {
         match self {

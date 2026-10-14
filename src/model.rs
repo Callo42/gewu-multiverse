@@ -548,6 +548,16 @@ fn transport_error(config: &ModelConfig, error: ureq::Error) -> ModelError {
 /// through this; the run log and the transcript keep the transport's exact sentence,
 /// which is what a person auditing the failure afterwards reads.
 pub fn in_product_words(text: &str) -> String {
+    // A run that reaches a missing model key records the credentials file and the
+    // `[model_keys]` section in its audit trail; a screen a person acts from must not
+    // (A-2, E-6, P-4). The product has its own key for exactly this, so the screen
+    // sentence names the screen and the key, and the agent whose key is gone. The
+    // run's own log and transcript keep the file's sentence: they are the audit trail.
+    if let Some(name) = missing_model_key_agent(text) {
+        return format!(
+            "the model key for `{name}` is gone — press 5 and then k on the Credentials screen to add one"
+        );
+    }
     if text.contains("Connection refused") {
         "the endpoint refused the connection".to_owned()
     } else if text.contains("Connection reset") || text.contains("Connection aborted") {
@@ -559,6 +569,18 @@ pub fn in_product_words(text: &str) -> String {
     } else {
         text.to_owned()
     }
+}
+
+/// The agent a run's missing-model-key reason names, when it names one.
+///
+/// The credentials error reads `… records no model key for the agent `NAME`; add one
+/// under [model_keys]`; the name is the part the screen's own sentence needs.
+fn missing_model_key_agent(text: &str) -> Option<&str> {
+    let marker = "no model key for the agent `";
+    let start = text.find(marker)? + marker.len();
+    let rest = &text[start..];
+    let end = rest.find('`')?;
+    Some(&rest[..end])
 }
 
 /// A bounded excerpt of some text, with a marker when it was cut.
@@ -775,6 +797,21 @@ mod tests {
         );
         // Anything the product does not know keeps the transport's sentence.
         assert_eq!(in_product_words("a frobnicator failed"), "a frobnicator failed");
+    }
+
+    #[test]
+    fn a_runs_missing_model_key_reads_as_the_products_own_key() {
+        // E-6, P-4: the run's reason carries the file and the TOML section; every
+        // screen that shows it must render the product's own key instead, and name
+        // the agent whose key is gone.
+        let reason = "the model key cannot be read: the credentials file /tmp/example/credentials.toml records no model key for the agent `beta`; add one under [model_keys]";
+        let shown = in_product_words(reason);
+        assert_eq!(
+            shown,
+            "the model key for `beta` is gone — press 5 and then k on the Credentials screen to add one"
+        );
+        assert!(!shown.contains("[model_keys]"), "{shown}");
+        assert!(!shown.contains("credentials.toml"), "{shown}");
     }
 
     #[test]

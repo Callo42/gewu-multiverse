@@ -43,14 +43,14 @@ max_concurrent_agents = 2
 name = "scribe"
 model = "example-model"
 endpoint = "https://model.example.org/v1"
-instruction = "instructions/scribe.md"
+instruction = "agents/scribe/instruction.md"
 concurrency = 2
 
 [[agents]]
 name = "checker"
 model = "other-model"
 endpoint = "https://model.example.org/v1"
-instruction = "instructions/checker.md"
+instruction = "agents/checker/instruction.md"
 concurrency = 1
 "#;
 
@@ -853,42 +853,42 @@ max_concurrent_agents = 10
 name = "a1"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "a1.md"
+instruction = "agents/a1/instruction.md"
 concurrency = 1
 
 [[agents]]
 name = "a2"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "a2.md"
+instruction = "agents/a2/instruction.md"
 concurrency = 1
 
 [[agents]]
 name = "a3"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "a3.md"
+instruction = "agents/a3/instruction.md"
 concurrency = 1
 
 [[agents]]
 name = "a4"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "a4.md"
+instruction = "agents/a4/instruction.md"
 concurrency = 1
 
 [[agents]]
 name = "a5"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "a5.md"
+instruction = "agents/a5/instruction.md"
 concurrency = 1
 
 [[agents]]
 name = "a6"
 model = "m"
 endpoint = "https://m.example.org"
-instruction = "a6.md"
+instruction = "agents/a6/instruction.md"
 concurrency = 1
 "#;
 
@@ -1623,7 +1623,7 @@ role = "member"
 name = "scribe"
 model = "example-model"
 endpoint = "http://127.0.0.1:1/v1/chat/completions"
-instruction = "instructions/scribe.md"
+instruction = "agents/scribe/instruction.md"
 concurrency = 1
 "#;
     let root = scratch("endpoint-failure-80");
@@ -1868,6 +1868,217 @@ fn a_record_the_hub_had_that_is_gone_is_named_and_not_called_the_last_run() {
 }
 
 #[test]
+fn a_missing_model_key_reason_reads_as_the_products_own_key_on_every_screen() {
+    // E-6, P-4: a start that was queued while the key existed reaches the missing-key
+    // path when its turn comes. The run's stored reason carries the credentials file
+    // and `[model_keys]`; the hub note area, the Agent screen and the Runs outcome
+    // note must all render the product's own key instead.
+    let root = scratch("missing-key-surfaces");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let reason = "the model key cannot be read: the credentials file /tmp/example/credentials.toml records no model key for the agent `scribe`; add one under [model_keys]".to_owned();
+    let run_dir = root.join("state").join("scribe").join(new_run_id(1));
+    app.recent = vec![RunSummary {
+        agent: "scribe".to_owned(),
+        run_id: new_run_id(1),
+        outcome: Some(RunOutcome::Failed),
+        reason: Some(reason),
+        duration_ms: Some(0),
+        started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        log: run_dir.join("run.log"),
+        dir: run_dir,
+    }];
+    // The sentence wraps at 80 columns, so the test checks its two halves rather
+    // than one unbroken line.
+    let key_is_gone = "the model key for `scribe` is gone";
+    let fix = "press 5 and then k";
+
+    app.show(Screen::Agents);
+    let hub = render_at(80, 24, &app);
+    assert!(hub.contains(key_is_gone), "the hub note does not: {hub}");
+    assert!(hub.contains(fix), "the hub note names no fix: {hub}");
+    assert!(!hub.contains("[model_keys]"), "the hub names a TOML section: {hub}");
+
+    app.show(Screen::AgentConfig);
+    let agent = render_at(80, 40, &app);
+    assert!(agent.contains(key_is_gone), "the Agent screen does not: {agent}");
+    assert!(agent.contains(fix), "the Agent screen names no fix: {agent}");
+    assert!(
+        !agent.contains("[model_keys]"),
+        "the Agent screen names a TOML section: {agent}"
+    );
+
+    app.show(Screen::Runs);
+    app.run_selected = 0;
+    let runs = render_at(80, 24, &app);
+    assert!(runs.contains(key_is_gone), "the Runs outcome note does not: {runs}");
+    assert!(
+        !runs.contains("[model_keys]"),
+        "the Runs outcome names a TOML section: {runs}"
+    );
+}
+
+#[test]
+fn the_forgejo_legend_is_always_reachable_with_an_identity_report_at_eighty_by_twenty_four() {
+    // P-6: with an identity report on the tail the windowed form no longer fits at
+    // 80×24, so the product draws the scrolled form. The page map now says the legend
+    // is not pinned in that state; this guard proves it is one `]` away and never
+    // hidden in silence.
+    use gewu_multiverse::app::{ForgejoFailure, IdentityReport};
+    let root = scratch("forgejo-identity-legend");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let mut check = three_repository_check();
+    for index in 0..7 {
+        check
+            .repositories
+            .push(repository(&format!("org/extra-{index}"), false));
+    }
+    app.role_check = Some(Ok(check));
+    app.identity_report = Some(IdentityReport {
+        agent: "scribe".to_owned(),
+        result: Err(ForgejoFailure {
+            class: "identity".to_owned(),
+            message:
+                "the token was refused for a reason long enough to wrap on the panel at eighty columns"
+                    .to_owned(),
+        }),
+    });
+    app.show(Screen::Forgejo);
+    let mut reached = false;
+    for _ in 0..40 {
+        let screen = render_at(80, 24, &app);
+        if screen.contains("v agent token") && screen.contains("i identity") {
+            reached = true;
+            break;
+        }
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    }
+    assert!(
+        reached,
+        "the key legend is unreachable at 80×24 with an identity report"
+    );
+}
+
+#[test]
+fn the_footer_never_advertises_q_quit_under_an_overlay_that_owns_the_keys() {
+    // E-2: the footer's `q quit` sat under the add-agent form, the secret prompt and
+    // the confirmations, where `q` is a letter in a field or a cancel. The legend is
+    // replaced while an overlay owns the keys, so the product never advertises a key
+    // that does something else (or nothing).
+    let root = scratch("footer-legend");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Agents);
+    let plain = render_at(80, 24, &app);
+    assert!(plain.contains("q quit"), "the plain legend lost `q quit`: {plain}");
+
+    app.confirm_remove = Some("scribe".to_owned());
+    let overlay = render_at(80, 24, &app);
+    assert!(
+        !overlay.contains("q quit"),
+        "the footer still advertises quit under a confirmation: {overlay}"
+    );
+    assert!(
+        overlay.contains("esc closes this overlay"),
+        "the footer does not say what the keys do here: {overlay}"
+    );
+    assert!(
+        overlay.contains("remove it"),
+        "the confirmation's own action line is missing: {overlay}"
+    );
+}
+
+#[test]
+fn a_legal_agent_name_is_never_clipped_into_an_ambiguous_neighbour() {
+    // P-2: the hub clipped every name at 14 characters with no ellipsis, so two legal
+    // names that shared the first 14 read identically. The column is widened to the
+    // shortest width that tells the names apart, and the shortened form keeps both
+    // ends of the name.
+    let root = scratch("long-names");
+    let config = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+
+[limits]
+run_timeout_secs = 30
+max_concurrent_agents = 2
+
+[[agents]]
+name = "cccccccccccccc"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "agents/cccccccccccccc/instruction.md"
+concurrency = 1
+
+[[agents]]
+name = "cccccccccccccc-different"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "agents/cccccccccccccc-different/instruction.md"
+concurrency = 1
+"#;
+    fs::write(root.join("config.toml"), config).expect("the configuration is written");
+    let mut app = App::with_runner(Layout::rooted_at(root), quiet_runner("long-names"));
+    app.show_acknowledgment = false;
+    app.show(Screen::Agents);
+    let hub = render_at(80, 24, &app);
+    // The first name is exactly 14 characters and is drawn whole; the second is
+    // shortened with an ellipsis and keeps its distinguishing tail.
+    assert!(hub.contains("cccccccccccccc"), "the first name is missing: {hub}");
+    assert!(
+        hub.contains("fferent"),
+        "the second name cannot be told from the first: {hub}"
+    );
+    assert!(
+        hub.contains('…'),
+        "the clipped name carries no marker: {hub}"
+    );
+}
+
+#[test]
+fn the_hub_state_column_never_clips_a_word_mid_token() {
+    // E-7, P-5: the fixed state column clipped `failed (missing_key)` to
+    // `failed (missing_ke` and `waiting (1 in line)` to `waiting (1 in line`, with no
+    // marker. The column is sized to the longest state word it can show, and the
+    // failure class for a missing key is shortened so it fits whole.
+    let root = scratch("state-column");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_id = new_run_id(1);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 42, "/w"))
+        .expect("a record");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Failed,
+            None,
+            0,
+            Some(
+                "the model key cannot be read: the credentials file /tmp/example/credentials.toml records no model key for the agent `scribe`; add one under [model_keys]"
+                    .to_owned(),
+            ),
+        ))
+        .expect("a record");
+    app.reload();
+    app.show(Screen::Agents);
+    let hub = render_at(80, 24, &app);
+    assert!(
+        hub.contains("failed (key)"),
+        "the state word is not whole: {hub}"
+    );
+    assert!(
+        !hub.contains("failed (missing_ke"),
+        "the state word is clipped mid-token: {hub}"
+    );
+}
+
+#[test]
 fn an_endpoint_test_is_dated_and_marked_when_the_endpoint_changed() {
     // Y-5: the result outlived the endpoint it tested and read as current. It is now
     // dated, and a result about another endpoint is marked not current.
@@ -2034,6 +2245,58 @@ fn a_screen_never_opens_at_another_screens_scroll_offset_and_a_scrolled_panel_sa
     }
     app.on_key(KeyEvent::from(KeyCode::Esc));
     assert_eq!(app.panel_scroll, 0, "`esc` carried the offset");
+}
+
+#[test]
+fn a_screen_shows_the_instruction_path_the_run_reads() {
+    // P-3: the Agent screen echoed the configuration's `instruction` field while the
+    // Instruction screen and every run read the derived agents/<name>/instruction.md.
+    // A configured path with a space, outside the derived default, proves the two
+    // screens now name the same file the run reads.
+    let root = scratch("instruction-field");
+    let config = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+
+[limits]
+run_timeout_secs = 30
+max_concurrent_agents = 2
+
+[[agents]]
+name = "scribe"
+model = "example-model"
+endpoint = "https://model.example.org/v1"
+instruction = "my instructions/scribe.md"
+concurrency = 1
+"#;
+    fs::write(root.join("config.toml"), config).expect("the configuration is written");
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("instruction-field"),
+    );
+    app.show_acknowledgment = false;
+    let configured = root.join("my instructions/scribe.md");
+    fs::create_dir_all(configured.parent().expect("a parent")).expect("the directory");
+    fs::write(&configured, "do something\n").expect("the instruction is written");
+    let derived = root.join("agents/scribe/instruction.md");
+
+    app.show(Screen::AgentConfig);
+    let agent = render_at(200, 40, &app);
+    assert!(
+        agent.contains(&configured.display().to_string()),
+        "the Agent screen does not name the configured instruction: {agent}"
+    );
+    assert!(
+        !agent.contains(&derived.display().to_string()),
+        "the Agent screen still names the ignored derived path: {agent}"
+    );
+    app.show(Screen::Instructions);
+    let instruction = render_at(200, 40, &app);
+    assert!(
+        instruction.contains(&configured.display().to_string()),
+        "the Instruction screen does not agree with the run: {instruction}"
+    );
 }
 
 #[test]
