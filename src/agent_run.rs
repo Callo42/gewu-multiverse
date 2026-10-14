@@ -198,13 +198,12 @@ pub fn execute(run_dir: &Path) -> RunEnd {
         started.elapsed().as_millis() as u64,
         end.reason.clone(),
     ));
-    log.line(&format!(
-        "agent process exiting {}",
-        match &end.reason {
-            Some(reason) => format!("with code {} ({reason})", end.exit_code),
-            None => "cleanly (exit 0)".to_owned(),
-        }
-    ));
+    // The reason was just written as its own line; do not repeat it here, so a
+    // failure sentence appears in the log exactly once.
+    match &end.reason {
+        Some(_) => log.line(&format!("agent process exiting with code {}", end.exit_code)),
+        None => log.line("agent process exiting cleanly (exit 0)"),
+    }
     end
 }
 
@@ -274,7 +273,8 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
         Ok(secret) => secret,
         Err(error) => {
             let reason = format!("the model key cannot be read: {error}");
-            log.line(&reason);
+            // The sentence is written to the log once, by `execute`, from the run's
+            // own reason; writing it here as well made it appear twice.
             let _ = transcript.append(&Record::model_call_failed(
                 &plan.run_id,
                 0,
@@ -433,7 +433,7 @@ fn model_loop(
             Err(error) => {
                 let class = error.class();
                 let reason = format!("the model call failed ({class}): {error}");
-                log.line(&reason);
+                // Written once, by `execute`, from the run's own reason.
                 let _ = transcript.append(&Record::model_call_failed(
                     &plan.run_id,
                     turn,
@@ -1316,6 +1316,13 @@ mod tests {
         assert!(file.records.iter().any(
             |record| matches!(record, Record::ModelCallFailed { class, .. } if class == "bad_key")
         ));
+        // F-J: the failure sentence appears in the log exactly once, not twice.
+        let log_text = fs::read_to_string(dir.join(crate::run::LOG_FILE)).expect("the log reads");
+        assert_eq!(
+            log_text.matches("the model call failed (bad_key)").count(),
+            1,
+            "{log_text}"
+        );
     }
 
     #[test]

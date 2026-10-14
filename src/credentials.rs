@@ -455,6 +455,47 @@ fn push_secret(text: Option<&str>, secrets: &mut Vec<Secret>) {
     }
 }
 
+/// The *names* of the secrets the file holds, never their values.
+///
+/// The Credentials screen shows these so a person can confirm a key loaded, while the
+/// value itself is never read onto a screen, a log or a command line.
+pub fn present_secret_names(path: &Path) -> Vec<String> {
+    let Ok(value) = read_value(path) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if non_empty(value.get("forgejo_token").and_then(toml::Value::as_str)) {
+        names.push("Forgejo role token".to_owned());
+    }
+    if non_empty(value.get("forgejo_admin_token").and_then(toml::Value::as_str)) {
+        names.push("Forgejo administrator token".to_owned());
+    }
+    if non_empty(value.get("model_key").and_then(toml::Value::as_str)) {
+        names.push("a model key shared by every agent".to_owned());
+    }
+    if let Some(keys) = value.get("model_keys").and_then(toml::Value::as_table) {
+        for (agent, text) in keys {
+            if non_empty(text.as_str()) {
+                names.push(format!("model key for `{agent}`"));
+            }
+        }
+    }
+    if let Some(tokens) = value.get("forgejo_agent_tokens").and_then(toml::Value::as_table) {
+        for (agent, text) in tokens {
+            if non_empty(text.as_str()) {
+                names.push(format!("Forgejo token for `{agent}`"));
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Whether a value is a non-empty string.
+fn non_empty(text: Option<&str>) -> bool {
+    text.map(str::trim).is_some_and(|text| !text.is_empty())
+}
+
 /// The Forgejo login recorded for an agent, when one was recorded.
 pub fn recorded_login(path: &Path, agent: &str) -> Result<Option<String>, CredentialsError> {
     let value = read_value(path)?;
@@ -528,6 +569,51 @@ pub fn record_agent_identity(
     crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
         path: path.to_path_buf(),
         source,
+    })
+}
+
+/// Write the secrets a first-run form collected, preserving everything else.
+///
+/// A value is written but never returned, logged or shown; the screen only ever holds
+/// the *name* of a secret.
+pub fn record_form_secrets(
+    path: &Path,
+    agent: &str,
+    model_key: Option<&str>,
+    forgejo_token: Option<&str>,
+) -> Result<(), CredentialsError> {
+    let mut value = read_value(path)?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| CredentialsError::MissingToken {
+            path: path.to_path_buf(),
+            key: "the credentials file".to_owned(),
+        })?;
+    if let Some(token) = forgejo_token.map(str::trim).filter(|text| !text.is_empty()) {
+        table.insert(
+            "forgejo_token".to_owned(),
+            toml::Value::String(token.to_owned()),
+        );
+    }
+    if let Some(key) = model_key.map(str::trim).filter(|text| !text.is_empty()) {
+        let keys = table
+            .entry("model_keys".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let Some(keys) = keys.as_table_mut() {
+            keys.insert(agent.to_owned(), toml::Value::String(key.to_owned()));
+        }
+    }
+    let text =
+        toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
+            path: path.to_path_buf(),
+            source: io::Error::other(error),
+        })?;
+    let text = format!("# gewu-multiverse credentials (written by the add-agent form)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| {
+        CredentialsError::Rewrite {
+            path: path.to_path_buf(),
+            source,
+        }
     })
 }
 
@@ -960,5 +1046,56 @@ mod tests {
                 .as_deref(),
             Some("supplied")
         );
+    }
+}
+
+#[cfg(test)]
+mod form_tests {
+    use super::*;
+    use crate::test_support::scratch_root;
+
+    #[test]
+    fn the_form_writes_a_key_and_a_token_and_preserves_the_rest() {
+        let root = scratch_root("credentials-form");
+        let path = root.join("credentials.toml");
+        CredentialsFile::prepare(&path).expect("the file is prepared");
+        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"))
+            .expect("the form's secrets are written");
+        // The token and the key are there.
+        assert_eq!(
+            forgejo_token(&path).expect("a token").expose(),
+            "role-token"
+        );
+        assert_eq!(
+            model_key(&path, "scribe").expect("a key").expose(),
+            "sk-form-key"
+        );
+        // A second call preserves what the first wrote.
+        record_form_secrets(&path, "other", Some("sk-other"), None)
+            .expect("a second agent is written");
+        assert_eq!(
+            forgejo_token(&path).expect("a token").expose(),
+            "role-token"
+        );
+        assert_eq!(
+            model_key(&path, "scribe").expect("a key").expose(),
+            "sk-form-key"
+        );
+    }
+
+    #[test]
+    fn the_present_names_are_names_and_never_values() {
+        let root = scratch_root("credentials-present");
+        let path = root.join("credentials.toml");
+        CredentialsFile::prepare(&path).expect("the file is prepared");
+        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"))
+            .expect("the form's secrets are written");
+        let names = present_secret_names(&path);
+        assert!(names.iter().any(|name| name == "model key for `scribe`"));
+        assert!(names.iter().any(|name| name == "Forgejo role token"));
+        for name in &names {
+            assert!(!name.contains("sk-form-key"), "{name}");
+            assert!(!name.contains("role-token"), "{name}");
+        }
     }
 }
