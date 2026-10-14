@@ -227,10 +227,16 @@ impl RunSummary {
     }
 
     /// When the run started, as written in the transcript.
+    /// When the run started, as a compact UTC stamp that fits the table.
+    ///
+    /// The full record keeps its milliseconds and its `Z`; the table needs a form
+    /// that is not clipped before the `Z`, so the clock on screen is never ambiguous
+    /// (W-4).
     pub fn started_text(&self) -> String {
-        self.started_at
-            .clone()
-            .unwrap_or_else(|| "unknown start".to_owned())
+        match self.started_at.as_deref().and_then(crate::time::parse_rfc3339) {
+            Some(start) => crate::time::compact_utc(start),
+            None => "unknown start".to_owned(),
+        }
     }
 }
 

@@ -29,6 +29,18 @@ pub fn rfc3339(unix_ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
+/// Write an instant as a compact UTC stamp: `YYYY-MM-DD HH:MM:SSZ`.
+///
+/// The Runs table has a narrow `started` column; the full RFC 3339 form is clipped
+/// there, losing the `Z` and leaving the clock ambiguous. This form fits and keeps
+/// the zone marker (W-4).
+pub fn compact_utc(unix_ms: u64) -> String {
+    let full = rfc3339(unix_ms);
+    let (date, rest) = full.split_once('T').unwrap_or((full.as_str(), ""));
+    let time = rest.split('.').next().unwrap_or("");
+    format!("{date} {time}Z")
+}
+
 /// The calendar date for a count of days since 1970-01-01.
 ///
 /// This is Howard Hinnant's `civil_from_days`, which is exact for every date the
@@ -127,6 +139,12 @@ mod tests {
     fn a_time_in_the_far_future_still_has_a_calendar_date() {
         // 2100-03-01T00:00:00Z — a century year that is not a leap year.
         assert_eq!(rfc3339(4_107_542_400_000), "2100-03-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn the_compact_form_fits_a_table_and_keeps_its_zone() {
+        assert_eq!(compact_utc(1_709_210_096_789), "2024-02-29 12:34:56Z");
+        assert!(compact_utc(1_709_210_096_789).len() <= 20);
     }
 
     #[test]

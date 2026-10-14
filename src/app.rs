@@ -597,6 +597,26 @@ impl App {
         self.reconcile_abandoned_runs();
         self.seed_states_from_records();
         self.status = self.reload_status();
+        self.stop_unconfigured_runs();
+    }
+
+    /// Stop any run whose agent a re-read configuration no longer lists.
+    ///
+    /// `config.toml` is hand-editable. Without this, an agent removed from the file
+    /// while it ran left the run counted but invisible and unstoppable — the W-2
+    /// orphan shape through the reload door.
+    fn stop_unconfigured_runs(&mut self) {
+        let names: Vec<String> = self.agents().iter().map(|agent| agent.name.clone()).collect();
+        let stopped = self.supervisor.stop_unlisted(&names);
+        if !stopped.is_empty() {
+            let listed = stopped.join(", ");
+            self.config_note = Some(format!(
+                "the configuration no longer lists {listed}; its run was stopped so that nothing runs unseen"
+            ));
+            self.status = format!(
+                "the configuration no longer lists {listed}; its run was stopped so that nothing runs unseen"
+            );
+        }
     }
 
     /// Give each agent the state of its newest finished run.
@@ -3203,6 +3223,70 @@ role = "member"
             app.supervisor.running_count(),
             running_before,
             "the count still matches the one run in flight"
+        );
+        app.shutdown();
+    }
+
+    #[test]
+    fn an_agent_removed_from_the_file_does_not_leave_an_unseen_run() {
+        // The orphaned-run class through the reload door: hand-edit the file, press
+        // `r`, and the run must not stay counted but invisible.
+        let only_two = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+
+[limits]
+run_timeout_secs = 30
+max_concurrent_agents = 10
+
+[[agents]]
+name = "two"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "two.md"
+concurrency = 3
+"#;
+        let mut app = app_with_sleeping_runner("app-reload-orphan", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+
+        std::fs::write(app.config_path(), only_two).expect("the file is hand-edited");
+        app.reload();
+        assert!(
+            !app.agents().iter().any(|agent| agent.name == "one"),
+            "the agent is gone from the configuration"
+        );
+        // The stop is signalled on reload; the poll proves it gone, as it does for a
+        // stop asked for with `x`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && (app.supervisor.state("one").is_live() || app.supervisor.running_count() > 0)
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !app.supervisor.state("one").is_live(),
+            "its run must not stay live and unseen"
+        );
+        assert_eq!(app.supervisor.running_count(), 0, "nothing runs unseen");
+        assert!(
+            app.config_note
+                .as_deref()
+                .unwrap_or("")
+                .contains("no longer lists"),
+            "{:?}",
+            app.config_note
         );
         app.shutdown();
     }
