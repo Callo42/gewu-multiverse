@@ -69,6 +69,30 @@ Options:
 No secret is ever passed as an argument; put secrets in the credentials file,
 which is created with mode 0600.";
 
+/// The help text, with one honest closing line naming the binary and how to remove
+/// it (F8).
+///
+/// The install left a single file somewhere; nothing in the product said where it
+/// was or that removing it is the whole uninstall, so a person handing the machine
+/// back had to remember the installer's line. `current_exe` is the binary actually
+/// running, so the sentence is true of this build wherever it was put; the fallback
+/// names the installer's own default when the path cannot be read.
+pub fn help_text() -> String {
+    let closing = match std::env::current_exe() {
+        Ok(path) => format!(
+            "This program is one file — {} — and removing it is the whole uninstall.\n\
+             The configuration and state directories above are left as they are.",
+            path.display()
+        ),
+        Err(_) => "This program is one file (the installer puts it at \
+                    ~/.local/bin/gewu-multiverse by default), and removing it is the\n\
+                    whole uninstall. The configuration and state directories above are\n\
+                    left as they are."
+            .to_owned(),
+    };
+    format!("{HELP}\n\n{closing}")
+}
+
 /// Read the arguments, without the program name.
 pub fn parse_args<I>(args: I) -> Result<Invocation, String>
 where
@@ -240,5 +264,24 @@ mod tests {
     fn the_help_text_says_where_secrets_go() {
         assert!(HELP.contains("credentials file"));
         assert!(HELP.contains("0600"));
+    }
+
+    #[test]
+    fn the_help_text_says_where_the_binary_is_and_how_to_remove_it() {
+        // F8: a person handing the machine back had no sentence about the 5.8 MB file
+        // the installer left. The closing line names the running binary and the whole
+        // uninstall.
+        let text = help_text();
+        assert!(text.starts_with(HELP), "the option list is unchanged");
+        assert!(text.contains("removing it is the whole uninstall"), "{text}");
+        assert!(
+            text.contains("configuration and state directories above are left"),
+            "{text}"
+        );
+        // The named path is this test binary's own, so the sentence is true of the
+        // artifact it is printed from.
+        if let Ok(exe) = std::env::current_exe() {
+            assert!(text.contains(&exe.display().to_string()), "{text}");
+        }
     }
 }

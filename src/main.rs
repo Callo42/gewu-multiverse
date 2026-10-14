@@ -29,7 +29,7 @@ use crossterm::terminal::{
 };
 use gewu_multiverse::agent_run;
 use gewu_multiverse::app::{ActionKind, App, PendingAction};
-use gewu_multiverse::cli::{Cli, HELP, Invocation, parse_args};
+use gewu_multiverse::cli::{Cli, Invocation, help_text, parse_args};
 use gewu_multiverse::editor;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::ui;
@@ -59,14 +59,14 @@ fn main() -> ExitCode {
     let invocation = match parse_args(arguments) {
         Ok(invocation) => invocation,
         Err(message) => {
-            eprintln!("gewu-multiverse: {message}\n\n{HELP}");
+            eprintln!("gewu-multiverse: {message}\n\n{}", help_text());
             return ExitCode::FAILURE;
         }
     };
 
     match invocation {
         Invocation::Help => {
-            println!("{HELP}");
+            println!("{}", help_text());
             ExitCode::SUCCESS
         }
         Invocation::Version => {

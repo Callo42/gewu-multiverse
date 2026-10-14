@@ -204,11 +204,16 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     // A note area that runs out of rows declares its tail instead of dropping it
     // without a word — the same rule the panels follow in their titles (O-3) — and a
     // note area scrolled away from its top says so too (A-1).
+    // While the first-run modal owns the screen, the note area behind it does not
+    // declare that more is below: the sentence would point at rows the modal hides,
+    // which is noise, not an offer (W-5). The declaration returns the moment the
+    // modal closes. Everywhere else the both-direction rule holds unchanged.
     let notes = note_window(
         agent_notes(app),
         area.width as usize,
         parts[1].height as usize,
         app.panel_scroll,
+        !app.show_acknowledgment,
     );
     frame.render_widget(
         Paragraph::new(Text::from(notes)).wrap(Wrap { trim: true }),
@@ -274,7 +279,7 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
                 format!("the last run of `{name}` did not go well")
             };
             lines.push(Line::from(Span::styled(
-                format!("{label}: {}", crate::model::in_product_words(&reason)),
+                format!("{label}: {}", app.reason_with_history(&name, &reason)),
                 Style::new().fg(Color::Red),
             )));
         }
@@ -364,7 +369,7 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             if let Some(reason) = app.last_failure(&agent.name) {
                 lines.push(field(
                     "last failure",
-                    &crate::model::in_product_words(&reason),
+                    &app.reason_with_history(&agent.name, &reason),
                 ));
             }
             let mode = app.supervisor.mode(&agent.name);
@@ -397,6 +402,13 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     &paths.config_dir().display().to_string(),
                 ));
                 lines.push(field("workspace", &paths.workspace().display().to_string()));
+                // W-2: a workspace that already has history is not only a path. The
+                // branch, the commit and its age, whether it is dirty and whose
+                // identity its commits carry are read from the repository; what the
+                // product cannot read (no repository, no git) is said plainly.
+                if let Some(note) = app.workspace_note() {
+                    lines.push(field("repository", note));
+                }
             }
             if let Some(problem) = app.selected_paths_problem() {
                 lines.push(Line::from(Span::styled(
@@ -1282,7 +1294,7 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from(format!(
                 "outcome: {} — {}",
                 run.describe(),
-                crate::model::in_product_words(reason)
+                app.reason_with_history(&run.agent, reason)
             )));
         } else {
             lines.push(Line::from(format!("outcome: {}", run.describe())));
@@ -1652,13 +1664,39 @@ pub fn panel_total_lines(app: &App) -> usize {
 }
 
 /// Draw one bordered panel, already windowed by the caller.
+///
+/// A bordered panel never draws half a wrapped line: ratatui would clip the last
+/// wrapped row at the border, and a sentence that ends at a box edge reads as a
+/// rendering bug (W-3). Whole logical lines are dropped from the bottom until what
+/// is left fits; the title's `more below` declaration is what says the rest exists,
+/// and `[`/`]` reaches it.
 fn draw_panel(frame: &mut Frame, lines: Vec<Line<'static>>, title: String, area: Rect) {
+    let width = area.width.saturating_sub(2) as usize;
+    let height = area.height.saturating_sub(2) as usize;
+    let lines = fit_panel_lines(lines, width, height);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Drop whole logical lines from the bottom until what is left fits the panel.
+///
+/// A bordered panel never draws half a wrapped line: ratatui would clip the last
+/// wrapped row at the border, and a sentence that ends at a box edge reads as a
+/// rendering bug (W-3). The panel title's `more below` declaration says the rest
+/// exists, and `[`/`]` reaches it.
+fn fit_panel_lines(
+    mut lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    while !lines.is_empty() && pushed_rows(&lines, width) > height {
+        lines.pop();
+    }
+    lines
 }
 
 /// Keep a note area's tail, replacing what does not fit with a line that says so.
@@ -1671,7 +1709,11 @@ fn declared_notes(
     mut lines: Vec<Line<'static>>,
     width: usize,
     height: usize,
+    declare: bool,
 ) -> Vec<Line<'static>> {
+    if !declare {
+        return lines;
+    }
     if height == 0 || pushed_rows(&lines, width) <= height {
         return lines;
     }
@@ -1702,9 +1744,13 @@ fn note_window(
     width: usize,
     height: usize,
     offset: usize,
+    declare: bool,
 ) -> Vec<Line<'static>> {
+    if !declare {
+        return lines;
+    }
     if offset == 0 || height == 0 {
-        return declared_notes(lines, width, height);
+        return declared_notes(lines, width, height, declare);
     }
     let rest = scrolled(&lines, offset);
     let mut out = vec![note_marker(MORE_ABOVE_NOTE)];
@@ -2114,9 +2160,16 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
+    // The verb agrees with the label: `the declared steps … open`, `the instruction
+    // … opens`. One fixed wording cannot be true of both (F6).
+    let verb = if action.target.map(|target| target.is_plural()).unwrap_or(false) {
+        "open"
+    } else {
+        "opens"
+    };
     let mut lines: Vec<Line> = vec![
         Line::from(format!(
-            "No `$EDITOR` is set, so {} opens in:",
+            "No `$EDITOR` is set, so {} {verb} in:",
             action.label
         )),
         Line::from(Span::styled(
@@ -2131,9 +2184,12 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     } else if program.trim() == "nano" {
         // The overlay names the program; it must also say how to leave it, or a person
         // who presses `e` is stranded in an editor whose screen says esc does nothing
-        // (M-4).
+        // (M-4). The wording must be true in **both** cases: with nothing changed,
+        // `^X` leaves at once and never asks, so a sentence that promises a prompt and
+        // a `N` sends the person's `N` to the product, where it opens the add-agent
+        // form (F5). `if it asks` is the part that is true either way.
         lines.push(Line::from(
-            "  In nano: ^X leaves; press Y and enter to save, or N to leave without saving.",
+            "  In nano: ^X leaves; if it asks, Y and enter saves and N does not.",
         ));
     }
     lines.push(Line::from(Span::styled(
@@ -2426,5 +2482,55 @@ fn mode_text(app: &App) -> String {
     match crate::mode::mode_of(&app.credentials_path) {
         Ok(mode) => crate::mode::render(mode),
         Err(_) => "not read".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(count: usize) -> Vec<Line<'static>> {
+        (0..count)
+            .map(|at| Line::from(format!("line {at}")))
+            .collect()
+    }
+
+    #[test]
+    fn a_bordered_panel_never_draws_half_a_wrapped_line() {
+        // W-3: at 80×24 the identity report was the panel's last row, wrapped and cut
+        // at the border mid-sentence. A logical line that does not fit whole is not
+        // drawn at all; the title's `more below` says the rest exists.
+        let long = vec![Line::from("short"), Line::from("x".repeat(30))];
+        // 1 + 3 wrapped rows fit exactly at height 4: both logical lines are kept.
+        assert_eq!(fit_panel_lines(long.clone(), 10, 4).len(), 2);
+        // One row fewer: the wrapped line cannot be drawn whole, so it is dropped.
+        assert_eq!(
+            fit_panel_lines(long, 10, 3).len(),
+            1,
+            "a partial wrap must not be drawn"
+        );
+        // The helper never invents rows.
+        assert_eq!(fit_panel_lines(lines(5), 20, 100).len(), 5);
+    }
+
+    #[test]
+    fn a_note_area_can_be_drawn_without_its_overflow_declaration() {
+        // W-5: under the first-run modal the note area declared `more below` at a row
+        // the modal hid. With the declaration suppressed, the content is drawn as it
+        // is and no sentence points at hidden rows; everywhere else the rule holds.
+        let over = lines(30);
+        let declared = note_window(over.clone(), 20, 4, 0, true);
+        assert_eq!(
+            declared.last().map(|line| line.spans[0].content.as_ref()),
+            Some(MORE_BELOW_NOTE)
+        );
+        let suppressed = note_window(over, 20, 4, 0, false);
+        assert!(
+            suppressed
+                .iter()
+                .all(|line| line.spans[0].content.as_ref() != MORE_BELOW_NOTE),
+            "the declaration was drawn under the modal"
+        );
+        assert_eq!(suppressed.len(), 30, "the content itself is unchanged");
     }
 }
