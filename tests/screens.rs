@@ -658,6 +658,14 @@ fn the_add_agent_form_writes_both_files_and_never_shows_a_secret() {
     assert!(app.agents().iter().any(|agent| agent.name == "scribe"));
     let config = fs::read_to_string(root.join("config.toml")).expect("config readable");
     assert!(config.contains("name = \"scribe\""), "{config}");
+    // F-2: the configuration file carries the same 0600 as the credentials file it
+    // names secrets in.
+    let config_mode = fs::metadata(root.join("config.toml"))
+        .expect("config described")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(config_mode, 0o600, "the configuration is not private");
     let credentials =
         fs::read_to_string(root.join("credentials.toml")).expect("credentials readable");
     assert!(credentials.contains("sk-test-secret-value"), "{credentials}");

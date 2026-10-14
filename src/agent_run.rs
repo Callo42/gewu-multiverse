@@ -256,6 +256,9 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
             plan.workspace.display()
         ));
     }
+    // F-1: the workspace is the product's directory (below its own agent directory,
+    // already 0700), so it carries the same custody.
+    let _ = crate::mode::set_mode(&plan.workspace, crate::mode::PRIVATE_DIR_MODE);
 
     let skills = match install_skills(&plan.skills_dir, run_dir) {
         Ok(skills) => skills,
@@ -951,6 +954,13 @@ fn install_skills(skills_dir: &Path, run_dir: &Path) -> Result<Vec<SkillRef>, St
             destination_root.display()
         )
     })?;
+    // F-1: one custody for the run's own directory tree too.
+    crate::mode::hold_dir_private_below(run_dir, &destination_root).map_err(|source| {
+        format!(
+            "the run's skills directory {} cannot be restricted: {source}",
+            destination_root.display()
+        )
+    })?;
 
     let mut skills = Vec::new();
     for name in names {
@@ -994,6 +1004,13 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<TreeStats, String> {
     fs::create_dir_all(destination).map_err(|error| {
         format!(
             "the skill directory {} cannot be created: {error}",
+            destination.display()
+        )
+    })?;
+    // F-1: a copied skill directory carries the product's custody too.
+    crate::mode::set_mode(destination, crate::mode::PRIVATE_DIR_MODE).map_err(|error| {
+        format!(
+            "the skill directory {} cannot be restricted: {error}",
             destination.display()
         )
     })?;
