@@ -195,6 +195,47 @@ timeout bounds it from the outside. Both bounds are visible in the run's record.
 
 ## Install
 
+### Prebuilt binary (no Rust needed)
+
+Each release carries a prebuilt **x86_64 Linux** tarball, so you can try the tool
+without a compiler. It needs a 64-bit x86_64 Linux machine with **glibc 2.39 or newer**
+(for example Ubuntu 24.04 or newer, Debian 13 or newer, Fedora 40 or newer) and a
+terminal. Nothing else: no Rust toolchain, no build step, no service.
+
+The tarball holds the binary (`gewu-multiverse`), this README and both licences. Its
+name records the revision it was built from:
+
+```sh
+# 1. download the tarball and its checksum (replace the tag if you use another release)
+base=https://github.com/Callo42/gewu-multiverse/releases/download/v0.1.0
+name=gewu-multiverse-ea4704f-x86_64-linux.tar.gz
+curl -LO "$base/$name"
+curl -LO "$base/$name.sha256"
+
+# 2. verify the checksum
+sha256sum -c "$name.sha256"
+
+# 3. unpack and put the binary on your PATH
+mkdir -p "$HOME/.local/bin"
+tar xzf "$name"
+install -m 0755 "${name%.tar.gz}/gewu-multiverse" "$HOME/.local/bin/"
+```
+
+If `~/.local/bin` is not on your `PATH` yet, add it:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"   # put this in your shell profile to keep it
+```
+
+Now run it — see [First run](#first-run) and the
+[Quickstart](#quickstart-from-nothing-to-a-running-agent):
+
+```sh
+gewu-multiverse
+```
+
+### From source (needs Rust)
+
 ```sh
 cargo install --git https://github.com/Callo42/gewu-multiverse
 ```
