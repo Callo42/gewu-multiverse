@@ -141,8 +141,11 @@ pub struct AgentConfig {
 }
 
 /// The default bound on model turns in one run.
+pub const DEFAULT_MAX_TURNS: u32 = 24;
+
+/// The default bound on model turns in one run.
 fn default_max_turns() -> u32 {
-    24
+    DEFAULT_MAX_TURNS
 }
 
 /// Everything that can go wrong while reading the configuration file.
@@ -203,9 +206,7 @@ pub enum ConfigError {
         source: io::Error,
     },
     /// The file did not exist, so a commented sample was written in its place.
-    #[error(
-        "{path} did not exist, so a commented sample was written there; edit it, then press r to re-read it"
-    )]
+    #[error("{path} did not exist, so a commented sample configuration was written there")]
     SampleWritten {
         /// The sample that was written.
         path: PathBuf,
@@ -417,18 +418,20 @@ run_timeout_secs = 900
 # How many agents may run at once (1 to 64). A start beyond this waits its turn.
 max_concurrent_agents = 10
 
-# One entry per agent. Remove the block if you want no agents.
-[[agents]]
-name = "example-agent"
-model = "example-model"
-endpoint = "https://model.example.org/v1"
+# One entry per agent. This block is commented out, so a fresh installation lists no
+# agent and cannot start one by accident. Press n in the product to add your first
+# agent, or copy this block and remove the leading `#` from each line.
+# [[agents]]
+# name = "example-agent"
+# model = "example-model"
+# endpoint = "https://model.example.org/v1"
 # How many model turns one run may take before the declared bound stops it (1 to 256).
-max_turns = 24
+# max_turns = 24
 # The instruction path shown on the agent's screen. The run reads the derived
 # agents/<name>/instruction.md, which `e` writes; this field does not move it.
-instruction = "agents/example-agent/instruction.md"
+# instruction = "agents/example-agent/instruction.md"
 # How many model requests this agent may keep in flight at once (1 to 16).
-concurrency = 2
+# concurrency = 2
 "#;
 
 /// What is wrong with a URL, if anything.
@@ -543,7 +546,9 @@ concurrency = 2
     #[test]
     fn the_sample_is_a_valid_configuration() {
         let config = Config::from_text(path(), SAMPLE).expect("the sample is accepted");
-        assert_eq!(config.agents.len(), 1);
+        // The sample's agent block is commented out, so "commented sample" is true and
+        // a fresh installation never lists an agent the user did not make.
+        assert!(config.agents.is_empty());
     }
 
     #[test]

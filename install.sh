@@ -55,8 +55,9 @@ mkdir -p "$dir"
 install -m 0755 "$bin" "$dir/gewu-multiverse"
 say "installed $dir/gewu-multiverse ($tag)"
 
+on_path=0
 case ":$PATH:" in
-    *":$dir:"*) ;;
+    *":$dir:"*) on_path=1 ;;
     *) say "note: $dir is not on PATH — add it with: export PATH=\"$dir:\$PATH\"" ;;
 esac
 
@@ -65,4 +66,11 @@ if ! "$dir/gewu-multiverse" --version >/dev/null 2>&1; then
     say "      cargo install --git https://github.com/$repo"
     exit 1
 fi
-say "run it with: gewu-multiverse"
+# The closing line must be a command that resolves. When the directory is not on
+# PATH, the bare name would print `command not found` on the user's first command
+#.
+if [ "$on_path" = 1 ]; then
+    say "run it with: gewu-multiverse"
+else
+    say "run it with: $dir/gewu-multiverse"
+fi
