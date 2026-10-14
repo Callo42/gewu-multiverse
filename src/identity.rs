@@ -114,13 +114,17 @@ pub enum IdentityError {
     },
     /// The configuration says an administrator should manage identities, but no
     /// administrator token is in the credentials file.
+    //
+    // A-2's class: a refusal a user acts on names the product's own keys for the fix
+    // (`A` for the administrator token, `v` for the agent's), never a file and a TOML
+    // section. The credentials file is still named on the Credentials screen.
     #[error(
-        "no administrator token is configured (`forgejo_admin_token`), so no agent identity can be created; add one, or supply each agent's token under [forgejo_agent_tokens]"
+        "no administrator token is configured, so no agent identity can be created; press A on the Credentials screen to add one, or v on the Forgejo screen to supply the agent's own token"
     )]
     NoAdminToken,
     /// No token was supplied for this agent, and there is no administrator token.
     #[error(
-        "the credentials file records no Forgejo token for the agent `{agent}`; add one under [forgejo_agent_tokens]"
+        "the credentials file records no Forgejo token for the agent `{agent}`; press v on the Forgejo screen to supply it"
     )]
     NoAgentToken {
         /// The agent whose token is absent.
