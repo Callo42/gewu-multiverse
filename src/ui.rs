@@ -45,10 +45,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         );
         return;
     }
+    // The footer grows to hold its status: a reason or a path is never the line that
+    // clips. It may take the body's spare rows down to the body's own minimum, but no
+    // further, so a long message is shown whole without hiding the screen behind it.
+    let max_status = full.height.saturating_sub(9).max(3);
+    // The status keeps its three rows even when it needs fewer, so the ordinary
+    // layout is unchanged; it grows only for a status that does not fit in three.
+    let status = status_rows(&app.status, full.width).clamp(3, max_status);
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
-        Constraint::Length(5),
+        Constraint::Length(status + 2),
     ])
     .split(frame.area());
 
@@ -174,8 +181,10 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
 fn agent_notes(app: &App) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(error) = &app.config_error {
+        // The recovery key belongs with the error, not only in the legend that a short
+        // window clips (T-7): say how to try the file again after fixing it.
         lines.push(Line::from(Span::styled(
-            format!("no agent list: {error}"),
+            format!("no agent list: {error} — fix the file, then press r to read it again"),
             Style::new().fg(Color::Red),
         )));
     }
@@ -818,10 +827,11 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
 /// line leads with `? all keys`, so at 80 columns nothing is hidden *silently*;
 /// the full list is one key away.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    // The status gets three rows so a long reason or path wraps instead of being cut;
-    // the legend gets its own row and is built to fit it, tail and all.
+    // The status takes every row the caller gave the footer but the legend's two, so a
+    // long reason or path wraps instead of being cut; the legend gets its own row and
+    // is built to fit it, tail and all.
     let parts = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -855,6 +865,49 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::new().fg(Color::DarkGray)),
         parts[2],
     );
+}
+
+/// How many rows the status needs at one width, wrapping counted.
+///
+/// The footer asks this before it lays itself out, so a status that carries a path, a
+/// mode or git's own multi-line error is given the rows to be read whole (T-2, T-7).
+/// The count is the terminal's own rule: words are kept whole where they fit, and a
+/// word longer than the row (a path) is broken across rows rather than clipped.
+fn status_rows(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let rows: usize = text
+        .lines()
+        .map(|line| wrapped_line_rows(line, width))
+        .sum();
+    rows.max(1) as u16
+}
+
+/// The rows one explicit line takes when word-wrapped into `width` columns.
+fn wrapped_line_rows(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in line.split_whitespace() {
+        let len = word.chars().count();
+        if col > 0 {
+            if col + 1 + len <= width {
+                col += 1 + len;
+                continue;
+            }
+            rows += 1;
+        }
+        if len <= width {
+            col = len;
+        } else {
+            let mut remaining = len;
+            while remaining > width {
+                rows += 1;
+                remaining -= width;
+            }
+            col = remaining;
+        }
+    }
+    rows
 }
 
 /// The short clause the footer carries on every screen.
@@ -1403,7 +1456,9 @@ fn placeholder(text: &str) -> Line<'static> {
 /// Why there is no agent to show.
 fn no_agent_text(app: &App) -> String {
     match &app.config_error {
-        Some(error) => format!("no agent to show: {error}"),
+        Some(error) => format!(
+            "no agent to show: {error} — fix the file, then press r to read it again"
+        ),
         None => "no agent to show: the configuration lists none".to_owned(),
     }
 }

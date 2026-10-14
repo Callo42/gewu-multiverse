@@ -610,12 +610,11 @@ impl App {
         let stopped = self.supervisor.stop_unlisted(&names);
         if !stopped.is_empty() {
             let listed = stopped.join(", ");
+            // The sentence lives in the note area only: the status line drew it too,
+            // so the same words appeared twice on one screen (T-10).
             self.config_note = Some(format!(
                 "the configuration no longer lists {listed}; its run was stopped so that nothing runs unseen"
             ));
-            self.status = format!(
-                "the configuration no longer lists {listed}; its run was stopped so that nothing runs unseen"
-            );
         }
     }
 
@@ -3288,6 +3287,13 @@ concurrency = 3
                 .contains("no longer lists"),
             "{:?}",
             app.config_note
+        );
+        // T-10: the note lives in the note area only; the status line must not draw
+        // the same sentence a second time.
+        assert!(
+            !app.status.contains("no longer lists"),
+            "the reload note is drawn twice: {}",
+            app.status
         );
         app.shutdown();
     }

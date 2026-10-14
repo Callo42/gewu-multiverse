@@ -1291,3 +1291,42 @@ fn a_paste_note_is_not_hidden_by_the_form() {
     assert!(screen.contains("first line"), "{screen}");
     assert!(screen.contains("13 characters, hidden"), "{screen}");
 }
+
+#[test]
+fn a_long_status_gets_the_rows_to_be_read_whole_at_eighty_columns() {
+    // T-2 / C-6 / N-6: a failed clone's cause is git's own `fatal:` line, which
+    // follows the progress chatter. At the advertised minimum the footer must hold
+    // both, not just the first.
+    let root = scratch("status-grow");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.status = concat!(
+        "clone root/alpha acted as gewu-scribe (managed) (the list came from the role token): ",
+        "failed (git): Cloning into '/tmp/alpha'...\n",
+        "fatal: unable to access 'http://127.0.0.1:39511/root/alpha.git/': ",
+        "Failed to connect to 127.0.0.1 port 39511 after 0 ms: Couldn't connect to server"
+    )
+    .to_owned();
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("clone root/alpha acted as"), "{screen}");
+    assert!(screen.contains("fatal: unable to access"), "{screen}");
+    // Growing the footer never hides the screen behind it: the agent row is still
+    // drawn at the minimum.
+    assert!(screen.contains("scribe"), "{screen}");
+}
+
+#[test]
+fn a_broken_configuration_names_the_key_that_reads_it_again() {
+    // T-7: the recovery key belongs with the error, not only in the legend a short
+    // window clips; and the diagnostic is not clipped by a fixed three-row status.
+    let root = scratch("config-key");
+    fs::write(root.join("config.toml"), "[[agents]\nname = \"scribe\"\n").expect("broken file");
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("config-key"),
+    );
+    app.show_acknowledgment = false;
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("no agent list"), "{screen}");
+    assert!(screen.contains("press r to read it"), "{screen}");
+}
