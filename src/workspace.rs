@@ -225,6 +225,76 @@ pub fn set_identity(repository: &Path, identity: &GitIdentity) -> Result<(), Wor
     Ok(())
 }
 
+/// What a workspace's own repository is, as far as the product can read it.
+///
+/// A workspace with history is otherwise only a path on the Agent screen, so a
+/// person about to run an agent cannot tell what branch or commit it is on, whether
+/// it is dirty, or whose identity its commits carry (W-2). Every field here is read
+/// from the repository itself, or is `None` when git cannot answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceState {
+    /// The checked-out branch, or the short commit when HEAD is detached.
+    pub branch: String,
+    /// The short object name of HEAD, or empty in a repository with no commits.
+    pub commit: String,
+    /// When HEAD was committed, in unix seconds; `0` with no commits.
+    pub committed_at: u64,
+    /// How many paths `git status` reports changed.
+    pub changed: usize,
+    /// The repository's local `user.name <user.email>`, when one is set.
+    pub local_identity: Option<String>,
+}
+
+/// Read the repository in `workspace`, when there is one.
+///
+/// `Ok(None)` is a directory that holds no repository — the product says so plainly
+/// rather than guessing. `Err(GitMissing)` is a machine with no git, which is also
+/// said plainly (W-2). A repository with no commits is a state, not an error.
+pub fn inspect(workspace: &Path) -> Result<Option<WorkspaceState>, WorkspaceError> {
+    if !workspace.join(".git").exists() {
+        return Ok(None);
+    }
+    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], workspace, None)?
+        .trim()
+        .to_owned();
+    // A repository with no commit has no HEAD to log; that is an empty history, not
+    // a failure to read one.
+    let head = run_git(&["log", "-1", "--format=%h%n%ct"], workspace, None).unwrap_or_default();
+    let mut head_lines = head.lines();
+    let commit = head_lines.next().unwrap_or("").trim().to_owned();
+    let committed_at = head_lines
+        .next()
+        .unwrap_or("0")
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let status = run_git(&["status", "--porcelain"], workspace, None)?;
+    let changed = status
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let name = run_git(&["config", "user.name"], workspace, None)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty());
+    let email = run_git(&["config", "user.email"], workspace, None)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty());
+    let local_identity = match (name, email) {
+        (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
+        (Some(name), None) => Some(name),
+        _ => None,
+    };
+    Ok(Some(WorkspaceState {
+        branch,
+        commit,
+        committed_at,
+        changed,
+        local_identity,
+    }))
+}
+
 /// The branch a workspace's repository is on.
 pub fn current_branch(repository: &Path) -> Result<String, WorkspaceError> {
     let text = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], repository, None)?;
@@ -399,6 +469,41 @@ mod tests {
             .status()
             .expect("git runs");
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn a_workspace_with_history_reports_its_branch_commit_and_identity() {
+        // W-2: a workspace that already has history was only ever a path on the Agent
+        // screen. What the product can read from the repository is read; a directory
+        // that is not a repository is said to be one, not guessed at.
+        let root = crate::test_support::scratch_root("workspace-inspect");
+        let repository = root.join("repo");
+        std::fs::create_dir_all(&repository).expect("the repository directory");
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.name", "gewu-scribe"]);
+        git(&repository, &["config", "user.email", "gewu-scribe@agents.invalid"]);
+        std::fs::write(repository.join("README"), "mine\n").expect("a file");
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-q", "-m", "mine"]);
+        let state = inspect(&repository)
+            .expect("git runs")
+            .expect("a repository");
+        assert_eq!(state.branch, "main");
+        assert!(!state.commit.is_empty(), "the commit is named");
+        assert!(state.committed_at > 0, "the commit has a time");
+        assert_eq!(state.changed, 0, "the fresh commit is clean");
+        assert_eq!(
+            state.local_identity,
+            Some("gewu-scribe <gewu-scribe@agents.invalid>".to_owned())
+        );
+        // A directory that is not a repository is a state, not an error.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).expect("the plain directory");
+        assert_eq!(inspect(&plain).expect("git is not even asked"), None);
+        // A change is counted.
+        std::fs::write(repository.join("README"), "changed\n").expect("an edit");
+        let state = inspect(&repository).expect("git runs").expect("a repository");
+        assert_eq!(state.changed, 1);
     }
 
     #[test]
