@@ -148,9 +148,11 @@ impl State {
 
     /// One word for a table cell on the hub, where the column is narrow.
     ///
-    /// The failure class is shortened where the long form would be clipped in the
-    /// middle of a token (`failed (missing_key)` → `failed (key)`); the Agent screen
-    /// keeps the long form, which fits there (E-7, P-5).
+    /// The failure class is shortened to a word that fits whole — the page map's own
+    /// rule for a state column — rather than ellipsised into a fragment
+    /// (`failed (s…er_error)`, L-6). `missing_key` already became `key`; every class
+    /// the model and Forgejo clients produce now has a whole word too. The Agent
+    /// screen keeps the long form, which fits there (E-7, P-5).
     pub fn cell_word(&self) -> String {
         match self {
             State::Finished {
@@ -158,8 +160,7 @@ impl State {
                 reason: Some(reason),
                 ..
             } => match failure_class(reason) {
-                Some("missing_key") => "failed (key)".to_owned(),
-                Some(class) => format!("failed ({class})"),
+                Some(class) => format!("failed ({})", short_failure_class(class)),
                 None => "failed".to_owned(),
             },
             _ => self.word(),
@@ -199,6 +200,26 @@ fn failure_class(reason: &str) -> Option<&str> {
     let rest = &reason[start..];
     let end = rest.find(')')?;
     Some(&rest[..end])
+}
+
+/// A failure class as one whole word for the hub's narrow state column (L-6).
+///
+/// A class the map has not seen is returned unchanged: it is still a word, and the
+/// state column's own width rule ellipsises only what genuinely cannot fit.
+fn short_failure_class(class: &str) -> &str {
+    match class {
+        "missing_key" => "key",
+        "bad_key" => "bad key",
+        "malformed_reply" => "reply",
+        "model_not_found" => "no model",
+        "rate_limited" => "rate",
+        "server_error" => "server",
+        "timeout" => "timeout",
+        "transport" => "transport",
+        "bad_url" => "bad url",
+        "missing_token" => "token",
+        other => other,
+    }
 }
 
 /// What happened when a start was asked for.
@@ -1591,6 +1612,36 @@ mod tests {
         };
         assert_eq!(state.word(), "succeeded");
         assert_eq!(state.word_with_reason(), "succeeded");
+    }
+
+    #[test]
+    fn a_failure_class_is_a_whole_word_on_the_hub() {
+        // L-6: `failed (server_error)` was ellipsised to `failed (s…er_error)` on the
+        // hub — not a word. Every class the model and Forgejo clients produce now
+        // shortens to a whole word, and the column width accommodates them.
+        let cases = [
+            ("the model call failed (server_error): the endpoint answered 500", "failed (server)"),
+            ("the model call failed (malformed_reply): no choices", "failed (reply)"),
+            ("the model call failed (model_not_found): no such model", "failed (no model)"),
+            ("the model call failed (rate_limited): slow down", "failed (rate)"),
+            ("the model call failed (transport): the connection dropped", "failed (transport)"),
+            ("the model call failed (timeout): too slow", "failed (timeout)"),
+            ("the model call failed (bad_key): the endpoint refused it", "failed (bad key)"),
+        ];
+        for (reason, expected) in cases {
+            let state = State::Finished {
+                run_id: "run-1".to_owned(),
+                outcome: RunOutcome::Failed,
+                reason: Some(reason.to_owned()),
+                duration_ms: 1,
+            };
+            assert_eq!(state.cell_word(), expected, "{reason}");
+            assert!(
+                !state.cell_word().contains('…'),
+                "a class was ellipsised: {}",
+                state.cell_word()
+            );
+        }
     }
 
     #[test]
