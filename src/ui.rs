@@ -902,6 +902,12 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             "o opens the log on show: {}",
             run.log.display()
         )));
+        // `esc` is this product's way back everywhere, but not the pager's; name the
+        // pager's own key on the screen, before the key is pressed (M-5).
+        lines.push(Line::from(Span::styled(
+            "Both open in your $PAGER; leave the pager with q.",
+            Style::new().fg(Color::DarkGray),
+        )));
         lines.push(Line::from(Span::styled(
             "The outcome is decided by the process, not by what it wrote.",
             Style::new().fg(Color::DarkGray),
