@@ -46,6 +46,62 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Read the `rfc3339` form back into milliseconds since the Unix epoch.
+///
+/// [`rfc3339`] is the only writer, so this reads exactly that shape; anything else
+/// is `None`, never a guess. It exists so a run in progress can report how long it
+/// has been going from the start time its own record carries.
+pub fn parse_rfc3339(text: &str) -> Option<u64> {
+    let (date, rest) = text.split_once('T')?;
+    let (time, fraction) = match rest.split_once('.') {
+        Some((time, fraction)) => (time, fraction.strip_suffix('Z')?),
+        None => (rest.strip_suffix('Z')?, "0"),
+    };
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    // Milliseconds are exactly three digits, as `rfc3339` writes them.
+    let millis: i64 = if fraction.is_empty() {
+        0
+    } else {
+        let padded = format!("{fraction:0<3}");
+        padded.get(0..3)?.parse().ok()?
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second;
+    if seconds < 0 {
+        return None;
+    }
+    Some((seconds as u64) * 1000 + millis as u64)
+}
+
+/// The count of days since 1970-01-01 for a calendar date.
+///
+/// The inverse of [`civil_from_days`], and the same algorithm's other half.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let month = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +127,26 @@ mod tests {
     fn a_time_in_the_far_future_still_has_a_calendar_date() {
         // 2100-03-01T00:00:00Z — a century year that is not a leap year.
         assert_eq!(rfc3339(4_107_542_400_000), "2100-03-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn the_written_form_reads_back_to_the_same_instant() {
+        for instant in [
+            0,
+            1_609_459_200_000,
+            1_709_210_096_789,
+            4_107_542_400_000,
+        ] {
+            let text = rfc3339(instant);
+            assert_eq!(parse_rfc3339(&text), Some(instant), "{text}");
+        }
+    }
+
+    #[test]
+    fn anything_that_is_not_the_written_form_is_not_guessed() {
+        assert_eq!(parse_rfc3339(""), None);
+        assert_eq!(parse_rfc3339("not a time"), None);
+        assert_eq!(parse_rfc3339("2026-10-14T09:50:30.123"), None);
+        assert_eq!(parse_rfc3339("2026-13-14T09:50:30.123Z"), None);
     }
 }

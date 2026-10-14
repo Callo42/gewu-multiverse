@@ -121,7 +121,7 @@ impl EditTarget {
 /// never drawn as their value: `ui` masks them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAgentForm {
-    /// name, endpoint, model, model key, Forgejo URL, Forgejo token.
+    /// name, endpoint, model, model key, Forgejo URL, Forgejo role token.
     pub fields: [String; 6],
     /// Which field the next key types into.
     pub cursor: usize,
@@ -137,7 +137,7 @@ impl NewAgentForm {
         ("model id", false),
         ("model key", true),
         ("Forgejo URL", false),
-        ("Forgejo token", true),
+        ("Forgejo role token", true),
     ];
 
     /// A blank form, ready at the first field.
@@ -232,6 +232,23 @@ fn stamp(path: &std::path::Path) -> Option<FileStamp> {
         len: metadata.len(),
         modified: metadata.modified().ok(),
     })
+}
+
+/// An editor's emergency save for a file, when one is there.
+///
+/// nano writes `<name>.save`, vim writes `.<name>.swp`. Both are the user's words,
+/// kept by the editor when an interruption stopped the save; the product names the
+/// file rather than pretending the edit never happened.
+fn editor_backup(path: &std::path::Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let dir = path.parent()?;
+    for candidate in [format!("{name}.save"), format!(".{name}.swp")] {
+        let candidate = dir.join(candidate);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// What the terminal loop must step out of the UI to do.
@@ -333,6 +350,13 @@ fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String 
     }
 }
 
+/// The agent name in a secret label like `model key for \`scribe\``, when there is one.
+fn backticked_agent(label: &str) -> Option<String> {
+    let start = label.find('`')? + 1;
+    let end = label[start..].find('`')? + start;
+    Some(label[start..end].to_owned())
+}
+
 /// A Forgejo failure, as a screen holds it.
 fn failure_of(error: forgejo::ForgejoError) -> ForgejoFailure {
     ForgejoFailure {
@@ -397,6 +421,15 @@ pub struct App {
     pub identity_report: Option<IdentityReport>,
     /// The last start that was refused or failed, with the reason.
     pub start_failure: Option<(String, String)>,
+    /// An agent whose stop was signalled and whose ending has not been read yet.
+    ///
+    /// The status line says `stopping` at the moment the signal is sent; when the
+    /// record closes, the same agent's status is rewritten as `stopped … is proven
+    /// gone`, so the row and the status never disagree about whether the stop is done.
+    pending_stop: Option<String>,
+    /// When this UI started, so the footer can say what finished while the user was
+    /// looking at another screen.
+    started_ms: u64,
     /// A line about the last repository or pull-request action.
     pub forgejo_note: Option<String>,
     /// When the recent runs were last read.
@@ -460,6 +493,8 @@ impl App {
             repo_selected: 0,
             identity_report: None,
             start_failure: None,
+            pending_stop: None,
+            started_ms: crate::time::now_unix_ms(),
             forgejo_note: None,
             last_scan: None,
             status: String::new(),
@@ -539,7 +574,45 @@ impl App {
         self.clamp_selection();
         self.refresh_recent();
         self.reconcile_abandoned_runs();
+        self.seed_states_from_records();
         self.status = self.reload_status();
+    }
+
+    /// Give each agent the state of its newest finished run.
+    ///
+    /// The supervisor only knows what it has watched in this session, so a reopened UI
+    /// used to show every agent as `idle` — including agents whose newest record is
+    /// `succeeded`, `stopped` or `failed`. The records are on disk; this reads the
+    /// newest terminal one per agent and puts its outcome, reason and duration on the
+    /// screen the user lands on. A live or already-finished state is left alone.
+    fn seed_states_from_records(&mut self) {
+        let names: Vec<String> = self
+            .agents()
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
+        for name in names {
+            if self.supervisor.state(&name) != State::Idle {
+                continue;
+            }
+            let Some(run) = self
+                .recent
+                .iter()
+                .find(|run| run.agent == name && run.outcome.is_some())
+            else {
+                continue;
+            };
+            let Some(outcome) = run.outcome else {
+                continue;
+            };
+            self.supervisor.note_last_outcome(
+                &name,
+                &run.run_id,
+                outcome,
+                run.reason.clone(),
+                run.duration_ms.unwrap_or(0),
+            );
+        }
     }
 
     /// Close the records of default-mode runs a previous UI left behind.
@@ -640,6 +713,47 @@ impl App {
             .flatten()
             .is_some();
         (role, admin)
+    }
+
+    /// The secret names present in the credentials file, with a note when a name
+    /// belongs to no configured agent.
+    ///
+    /// Removing an agent rewrites `config.toml`; its model key and token stay in the
+    /// credentials file, and a person auditing what exists should not see a name for
+    /// an agent that does not. The secret is not deleted behind the user's back —
+    /// the surface simply tells the truth about who it belongs to.
+    pub fn present_secret_labels(&self) -> Vec<String> {
+        let configured: Vec<&str> = self.agents().iter().map(|agent| agent.name.as_str()).collect();
+        crate::credentials::present_secret_names(&self.credentials_path)
+            .into_iter()
+            .map(|name| match backticked_agent(&name) {
+                Some(agent) if !configured.contains(&agent.as_str()) => {
+                    format!("{name} (no agent with that name is configured)")
+                }
+                _ => name,
+            })
+            .collect()
+    }
+
+    /// How many runs have finished since this UI started.
+    ///
+    /// The one number that answers "what happened while I was looking elsewhere".
+    /// It is read from the same records the Runs screen lists: a run's end is its
+    /// start time plus its recorded duration.
+    pub fn runs_finished_since_start(&self) -> usize {
+        self.recent
+            .iter()
+            .filter(|run| {
+                let Some(started) = run.started_at.as_deref().and_then(crate::time::parse_rfc3339)
+                else {
+                    return false;
+                };
+                let Some(duration) = run.duration_ms else {
+                    return false;
+                };
+                run.outcome.is_some() && started + duration > self.started_ms
+            })
+            .count()
     }
 
     /// The configuration directory.
@@ -931,10 +1045,21 @@ impl App {
             .agent(&name)
             .map(|paths| paths.config_dir().display().to_string())
             .unwrap_or_else(|_| "its files".to_owned());
+        let had_files = self
+            .layout
+            .agent(&name)
+            .map(|paths| paths.config_dir().is_dir())
+            .unwrap_or(false);
         self.reload();
-        self.status = format!(
-            "removed `{name}` from the configuration; its files under {left} were left on disk"
-        );
+        self.status = if had_files {
+            format!(
+                "removed `{name}` from the configuration; its files under {left} were left on disk"
+            )
+        } else {
+            format!(
+                "removed `{name}` from the configuration; it had no files under {left} yet"
+            )
+        };
     }
 
     /// Drop the removal confirmation without removing anything.
@@ -1138,9 +1263,12 @@ impl App {
             return;
         };
         self.status = match self.supervisor.stop(&name) {
-            StopDisposition::Signalled => format!(
-                "stopping `{name}`: its process group was signalled and will be proven gone"
-            ),
+            StopDisposition::Signalled => {
+                self.pending_stop = Some(name.clone());
+                format!(
+                    "stopping `{name}`: its process group was signalled and will be proven gone"
+                )
+            }
             StopDisposition::Cancelled => format!("`{name}` was called off while it waited"),
             StopDisposition::Nothing => format!("`{name}` is not running"),
             StopDisposition::Failed { reason } => {
@@ -1507,11 +1635,23 @@ impl App {
                 self.forgejo_note = Some(note);
             }
             Err(error) => {
+                // Name the account the clone acted as, and where the list came from:
+                // the repository list is the role token's view, but the clone runs as
+                // the agent's own identity, and the two can disagree. A bare
+                // `Repository not found` leaves the user guessing which of their
+                // several tokens was wrong.
+                let mode = identity::recorded_mode(&self.credentials_path)
+                    .ok()
+                    .flatten()
+                    .map(|mode| format!(" ({})", mode.as_str()))
+                    .unwrap_or_default();
                 self.status = format!(
-                    "cloning {} failed ({}): {}",
+                    "cloning {} failed ({}): {} — the repository list came from the role token; the clone acted as {}{}",
                     repository.full_name,
                     error.class(),
-                    error.detail()
+                    error.detail(),
+                    identity.login,
+                    mode,
                 );
             }
         }
@@ -1745,6 +1885,19 @@ impl App {
             );
             return;
         }
+        // An interrupted editor can leave its unsaved buffer beside the file. Saying
+        // so before the hand-off, and naming the file, is the difference between a
+        // person recovering their words and retyping them.
+        let recovery = if target == EditTarget::Instruction {
+            editor_backup(&path).map(|backup| {
+                format!(
+                    " — an earlier edit of this instruction was not saved; the editor kept it in {} — open that file to recover",
+                    backup.display()
+                )
+            })
+        } else {
+            None
+        };
         let before = stamp(&path);
         let action = PendingAction {
             kind: ActionKind::Edit,
@@ -1759,12 +1912,17 @@ impl App {
         let program = crate::editor::editor();
         if self.editor_configured {
             self.pending = Some(action);
-            self.status = format!("opening the {} of `{name}` in {program}", target.label());
+            self.status = format!(
+                "opening the {} of `{name}` in {program}{}",
+                target.label(),
+                recovery.as_deref().unwrap_or("")
+            );
         } else {
             self.editor_confirm = Some(action);
             self.status = format!(
-                "no $EDITOR is set: press enter to open the {} of `{name}` in {program}",
-                target.label()
+                "no $EDITOR is set: press enter to open the {} of `{name}` in {program}{}",
+                target.label(),
+                recovery.as_deref().unwrap_or("")
             );
         }
     }
@@ -1929,6 +2087,16 @@ impl App {
         }
     }
 
+    /// The editor's emergency save for the selected instruction, when one exists.
+    ///
+    /// nano writes `<name>.save` on an interrupted edit and vim writes `.‹name›.swp`;
+    /// the words are not lost, but the product has to name the file for a
+    /// zero-knowledge user to find them.
+    pub fn instruction_backup(&self) -> Option<PathBuf> {
+        let paths = self.selected_paths()?;
+        editor_backup(paths.instruction())
+    }
+
     /// What the instruction screen needs to know about the instruction document.
     pub fn instruction_summary(&self) -> Option<(PathBuf, bool, u64)> {
         let paths = self.selected_paths()?;
@@ -1936,6 +2104,30 @@ impl App {
         match std::fs::metadata(&path) {
             Ok(metadata) => Some((path, metadata.is_file(), metadata.len())),
             Err(_) => Some((path, false, 0)),
+        }
+    }
+
+    /// Whether the instruction document holds nothing but the guidance placeholder.
+    ///
+    /// The page map distinguishes the empty instruction from the written one; a file
+    /// that is only the template is still empty, and reporting its byte count as
+    /// content makes a person believe they wrote something they did not.
+    pub fn instruction_is_only_placeholder(&self) -> bool {
+        let Some(paths) = self.selected_paths() else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(paths.instruction()) else {
+            return false;
+        };
+        let mut lines = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        match lines.next() {
+            Some(line) => {
+                line == crate::agent_run::INSTRUCTION_PLACEHOLDER && lines.next().is_none()
+            }
+            None => false,
         }
     }
 
@@ -1979,12 +2171,38 @@ impl App {
     /// records. The terminal loop calls this on every tick.
     pub fn tick(&mut self) {
         self.supervisor.poll(Instant::now());
+        self.note_stop_proven();
         let stale = match self.last_scan {
             Some(at) => at.elapsed() >= RECENT_RUNS_REFRESH,
             None => true,
         };
         if stale {
             self.refresh_recent();
+        }
+    }
+
+    /// When a signalled stop's record has closed, say so in the past tense.
+    ///
+    /// The row already reads `stopped`; leaving the status at `stopping` makes a
+    /// person who watches the state cell think the stop is not finished. This is the
+    /// one place the two are brought back into agreement, once the record is on disk.
+    fn note_stop_proven(&mut self) {
+        let Some(name) = self.pending_stop.clone() else {
+            return;
+        };
+        let proven = matches!(
+            self.supervisor.state(&name),
+            State::Finished {
+                outcome: RunOutcome::Stopped,
+                ..
+            }
+        ) || (self.supervisor.mode(&name) == Mode::Systemd
+            && !self.supervisor.state(&name).is_live());
+        if proven {
+            self.status = format!(
+                "stopped `{name}`: its process group was signalled and is proven gone"
+            );
+            self.pending_stop = None;
         }
     }
 
@@ -2951,5 +3169,158 @@ role = "member"
                 .is_some_and(|note| note.contains("administrator token")),
             "the failure is not shown beside the view"
         );
+    }
+
+    /// Write one finished run's records for an agent.
+    fn write_finished_run(
+        app: &App,
+        agent: &str,
+        run_id: &str,
+        outcome: RunOutcome,
+        duration_ms: u64,
+        reason: Option<&str>,
+    ) {
+        let dir = app.layout.state_root().join(agent).join(run_id);
+        std::fs::create_dir_all(&dir).expect("the run directory is created");
+        let mut transcript =
+            crate::transcript::Transcript::open(&dir).expect("a transcript is opened");
+        transcript
+            .append(&crate::transcript::Record::run_started(run_id, agent, 1, "/w"))
+            .expect("a record is appended");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                run_id,
+                outcome,
+                Some(0),
+                duration_ms,
+                reason.map(str::to_owned),
+            ))
+            .expect("a record is appended");
+    }
+
+    #[test]
+    fn a_reopened_ui_shows_the_newest_terminal_outcome_not_idle() {
+        // I-1: the hub is where a person lands after a restart; it must not forget.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        write_finished_run(
+            &app,
+            "one",
+            "run-100-0001-9",
+            RunOutcome::Failed,
+            500,
+            Some("the model call failed (transport): connection refused"),
+        );
+        app.reload();
+        assert_eq!(app.supervisor.state("one").word(), "failed");
+        assert!(
+            app.supervisor
+                .state("one")
+                .word_with_reason()
+                .contains("transport"),
+            "{}",
+            app.supervisor.state("one").word_with_reason()
+        );
+        // An agent with no record is still idle: the seed does not invent state.
+        assert_eq!(app.supervisor.state("two").word(), "idle");
+    }
+
+    #[test]
+    fn an_instruction_holding_only_the_placeholder_is_reported_as_empty() {
+        // I-4: a byte count is not content; the template is the empty state.
+        let app = app_with(GOOD);
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(
+            paths.instruction(),
+            format!("{}\n", crate::agent_run::INSTRUCTION_PLACEHOLDER),
+        )
+        .expect("the template is written");
+        assert!(app.instruction_is_only_placeholder());
+        std::fs::write(paths.instruction(), "write a note\n").expect("an instruction is written");
+        assert!(!app.instruction_is_only_placeholder());
+    }
+
+    #[test]
+    fn an_interrupted_editors_emergency_save_is_named() {
+        // I-3: the words were not lost, but a zero-knowledge user cannot find them.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.editor_configured = true;
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "the placeholder was overwritten\n")
+            .expect("the instruction is written");
+        let backup = paths.instruction().with_extension("md.save");
+        std::fs::write(&backup, "half a paragraph\n").expect("the emergency save is written");
+        assert_eq!(app.instruction_backup(), Some(backup.clone()));
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.status.contains("not saved"), "{}", app.status);
+        assert!(
+            app.status.contains("instruction.md.save"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_credential_for_a_removed_agent_is_marked_as_belonging_to_none() {
+        // X-6: a name with no configured agent is a ghost a person audits.
+        let app = app_with(GOOD);
+        let text = "[model_keys]\n\"gone\" = \"gw-x\"\n\"one\" = \"gw-y\"\n";
+        crate::mode::write_private(app.layout.credentials_file(), text.as_bytes())
+            .expect("the credentials are written");
+        let labels = app.present_secret_labels();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("`gone`") && label.contains("no agent")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "model key for `one`"),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_footer_counts_what_finished_since_this_ui_started() {
+        // I-5: the answer to "what happened while I was looking elsewhere".
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.started_ms = 0;
+        write_finished_run(&app, "one", "run-100-0002-1", RunOutcome::Succeeded, 5, None);
+        app.refresh_recent();
+        assert_eq!(app.runs_finished_since_start(), 1);
+        // A run that ended before this UI started is not "since".
+        app.started_ms = crate::time::now_unix_ms().saturating_add(1_000_000);
+        assert_eq!(app.runs_finished_since_start(), 0);
+    }
+
+    #[test]
+    fn the_stop_status_agrees_with_the_row_once_the_record_is_closed() {
+        // X-7: the row reads `stopped` while the status said `stopping`.
+        let mut app = app_with_sleeping_runner("app-stop-status", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.status.contains("stopping"), "{}", app.status);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && app.supervisor.state("one").word() != "stopped" {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.tick();
+        assert_eq!(app.supervisor.state("one").word(), "stopped");
+        assert!(app.status.starts_with("stopped"), "{}", app.status);
+        assert!(app.status.contains("is proven gone"), "{}", app.status);
+        app.shutdown();
     }
 }

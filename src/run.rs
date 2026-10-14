@@ -194,18 +194,35 @@ impl RunSummary {
     /// The outcome and how long it took, for the runs table.
     ///
     /// Short enough not to be clipped in a narrow table: the run's own reason is shown
-    /// in the note area beside the table, where it can wrap.
+    /// in the note area beside the table, where it can wrap. A run that is still going
+    /// says how long it has been going, from the start time its own record carries —
+    /// the one thing a person returning to the screen wants and the finish-state
+    /// column already knows how to render.
     pub fn describe(&self) -> String {
-        let outcome = match self.outcome {
-            Some(outcome) => outcome.as_str().to_owned(),
+        self.describe_at(crate::time::now_unix_ms())
+    }
+
+    /// [`RunSummary::describe`] against a chosen clock, so the elapsed time is testable.
+    pub fn describe_at(&self, now_ms: u64) -> String {
+        match self.outcome {
+            Some(outcome) => {
+                let outcome = outcome.as_str().to_owned();
+                match self.duration_ms {
+                    Some(ms) => format!("{outcome}, {:.1}s", ms as f64 / 1000.0),
+                    None => outcome,
+                }
+            }
             // A run whose start is recorded but whose end is not is running, not
             // "unknown": its `plan.json` and opening transcript record are on disk.
-            None if self.started_at.is_some() => "running".to_owned(),
-            None => "no terminal record".to_owned(),
-        };
-        match self.duration_ms {
-            Some(ms) => format!("{outcome}, {:.1}s", ms as f64 / 1000.0),
-            None => outcome,
+            None => match self.started_at.as_deref() {
+                Some(started) => match crate::time::parse_rfc3339(started) {
+                    Some(start) if now_ms > start => {
+                        format!("running ({}s)", (now_ms - start) / 1000)
+                    }
+                    _ => "running".to_owned(),
+                },
+                None => "no terminal record".to_owned(),
+            },
         }
     }
 
@@ -448,5 +465,23 @@ mod tests {
         let runs = recent_runs(&root, &["scribe".to_owned()], 10);
         assert_eq!(runs.len(), 1);
         assert!(runs[0].describe().contains("no terminal record"));
+    }
+
+    #[test]
+    fn a_run_in_progress_reports_how_long_it_has_been_going() {
+        // X-5: `running` alone leaves the one question the screen answers.
+        let run = RunSummary {
+            agent: "scribe".to_owned(),
+            run_id: "run-100-0001-1".to_owned(),
+            outcome: None,
+            reason: None,
+            duration_ms: None,
+            started_at: Some(crate::time::rfc3339(1_000_000)),
+            log: PathBuf::from("/tmp/run.log"),
+            dir: PathBuf::from("/tmp/run"),
+        };
+        assert_eq!(run.describe_at(1_012_000), "running (12s)");
+        // A clock before the recorded start never prints a negative age.
+        assert_eq!(run.describe_at(500), "running");
     }
 }
