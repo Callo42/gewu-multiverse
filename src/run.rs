@@ -335,6 +335,90 @@ pub fn started_stamp() -> String {
     rfc3339(now_unix_ms())
 }
 
+/// What the run records occupy on disk, and which of them the configuration no longer
+/// lists.
+///
+/// The list of runs is capped at fifty so a screen stays a screen; the *records* are
+/// not capped, they accumulate for ever. This measurement is what lets the product
+/// say how much room they take and how many are not on the list, instead of leaving
+/// a person to find the state directory by hand (L-1, L-2, L-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RunFootprint {
+    /// Every run directory under the state root, configured or not.
+    pub records: usize,
+    /// The bytes those directories occupy, recursively.
+    pub bytes: u64,
+    /// How many of `records` belong to an agent the configuration no longer lists.
+    pub unconfigured_records: usize,
+}
+
+/// Measure every run record under `state_root`, not only the configured agents'.
+///
+/// Reading *every* agent directory is deliberate: a removed agent's records stay on
+/// disk, and a screen that only counted the configured agents would hide them (L-4).
+pub fn state_footprint(state_root: &Path, configured: &[String]) -> RunFootprint {
+    let mut footprint = RunFootprint::default();
+    let entries = match fs::read_dir(state_root) {
+        Ok(entries) => entries,
+        Err(_) => return footprint,
+    };
+    for agent_entry in entries.flatten() {
+        let agent_dir = agent_entry.path();
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let agent = agent_entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .unwrap_or_default();
+        let known = configured.iter().any(|name| name == &agent);
+        let runs = match fs::read_dir(&agent_dir) {
+            Ok(runs) => runs,
+            Err(_) => continue,
+        };
+        for run_entry in runs.flatten() {
+            let run_dir = run_entry.path();
+            let Some(run_id) = run_dir.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !run_dir.is_dir() || !looks_like_run_id(run_id) {
+                continue;
+            }
+            footprint.records += 1;
+            footprint.bytes = footprint.bytes.saturating_add(directory_bytes(&run_dir));
+            if !known {
+                footprint.unconfigured_records += 1;
+            }
+        }
+    }
+    footprint
+}
+
+/// The bytes one directory occupies, recursively. Symbolic links are not followed, so
+/// a record that links elsewhere cannot make the measurement loop.
+fn directory_bytes(path: &Path) -> u64 {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            total = total.saturating_add(directory_bytes(&entry.path()));
+        } else if let Ok(metadata) = entry.metadata() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +528,38 @@ mod tests {
         assert_eq!(runs[0].run_id, "run-200-0002-1");
         assert_eq!(runs[0].outcome, Some(RunOutcome::Stopped));
         assert_eq!(runs[1].outcome, Some(RunOutcome::Succeeded));
+    }
+
+    #[test]
+    fn the_footprint_counts_every_record_and_its_room() {
+        // L-1/L-2/L-4: the list is capped, but the records are not. The footprint
+        // measures every run directory — including one whose agent the configuration
+        // no longer lists — and its room on disk, so a screen can say what accumulates
+        // instead of hiding it.
+        let root = scratch_root("footprint");
+        for (agent, ids) in [
+            ("scribe", vec!["run-100-0001-1", "run-200-0002-1"]),
+            ("ghost", vec!["run-300-0003-1"]),
+        ] {
+            for id in ids {
+                let dir = root.join(agent).join(id);
+                fs::create_dir_all(&dir).expect("the run directory is created");
+                fs::write(dir.join("run.log"), vec![b'x'; 10]).expect("a log is written");
+            }
+        }
+        // A directory that is not a run id is not a record.
+        fs::create_dir_all(root.join("scribe").join("skills")).expect("a stray directory");
+        let footprint = state_footprint(&root, &["scribe".to_owned()]);
+        assert_eq!(footprint.records, 3, "every record is counted");
+        assert_eq!(
+            footprint.unconfigured_records, 1,
+            "the removed agent's record is named"
+        );
+        assert!(
+            footprint.bytes >= 30,
+            "the room is measured: {}",
+            footprint.bytes
+        );
     }
 
     #[test]
