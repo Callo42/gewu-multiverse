@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
 use crate::app::{App, NewAgentForm, Screen};
+use crate::identity;
 use crate::risk;
 use crate::run::RunOutcome;
 use crate::systemd::Mode;
@@ -106,18 +107,30 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 /// The list of agents and their state.
 fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     // The note area carries the words the list uses, the failure reason and the
-    // supervision explanation; give it the rows to say all of it without clipping.
-    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(area);
+    // supervision explanation; give it the rows to say all of it without clipping —
+    // but never at the cost of the list itself. The table keeps the four rows it
+    // needs for its border, its header and **at least one agent**, even at the
+    // smallest size the product calls usable, so a configured agent is never
+    // invisible.
+    let notes_height = area.height.saturating_sub(4).min(8);
+    let parts =
+        Layout::vertical([Constraint::Min(4), Constraint::Length(notes_height)]).split(area);
 
-    let header = Row::new(["agent", "model", "concurrency", "supervision", "state"]).style(
-        Style::new()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
+    let capacity = parts[0].height.saturating_sub(3) as usize;
+    let (first, shown) = visible_window(app.agents().len(), app.selected, capacity);
+
+    let header = Row::new(["", "agent", "model", "concurrency", "supervision", "state"])
+        .style(
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
     let rows: Vec<Row> = app
         .agents()
         .iter()
         .enumerate()
+        .skip(first)
+        .take(shown)
         .map(|(at, agent)| {
             let style = if at == app.selected {
                 Style::new().fg(Color::Black).bg(Color::Cyan)
@@ -125,6 +138,10 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new()
             };
             Row::new(vec![
+                // The selected row carries a textual marker as well as colour: a
+                // monochrome capture, or a person who cannot tell the colours apart,
+                // still sees which row the next key will act on.
+                Cell::from(if at == app.selected { ">" } else { " " }),
                 Cell::from(agent.name.clone()),
                 Cell::from(agent.model.clone()),
                 Cell::from(agent.concurrency.to_string()),
@@ -135,15 +152,16 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let widths = [
+        Constraint::Length(2),
         Constraint::Length(14),
         Constraint::Length(16),
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Min(18),
     ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::bordered().title(" agents "));
+    let table = Table::new(rows, widths).header(header).block(
+        Block::bordered().title(list_title("agents", first, shown, app.agents().len())),
+    );
     frame.render_widget(table, parts[0]);
 
     frame.render_widget(
@@ -337,12 +355,26 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
                     lines.push(field("instruction", &path.display().to_string()));
                     lines.push(field(
                         "  on disk",
-                        &if exists {
-                            format!("{bytes} bytes")
-                        } else {
+                        &if !exists {
                             "not there yet — press e to write it".to_owned()
+                        } else if app.instruction_is_only_placeholder() {
+                            "not there yet — press e to write it; the file holds only the guidance line"
+                                .to_owned()
+                        } else {
+                            format!("{bytes} bytes")
                         },
                     ));
+                    // An interrupted editor leaves its unsaved buffer beside the file;
+                    // naming it is the difference between recovery and retyping.
+                    if let Some(backup) = app.instruction_backup() {
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "an earlier edit of this instruction was not saved; the editor kept it in {} — open that file to recover",
+                                backup.display()
+                            ),
+                            Style::new().fg(Color::Yellow),
+                        )));
+                    }
                 }
                 None => lines.push(field("instruction", "the name cannot be used")),
             }
@@ -431,7 +463,21 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     ));
     if let Some(agent) = app.selected_agent() {
         match crate::credentials::recorded_login(&app.credentials_path, &agent.name) {
-            Ok(Some(login)) => lines.push(field("agent identity", &login)),
+            Ok(Some(login)) => {
+                // The mode is shown persistently, beside the login, not only in the
+                // transient status line: which account a clone or a pull request acts
+                // as is exactly the thing a user with several tokens needs to know
+                // before pressing the key, not after.
+                let mode = identity::recorded_mode(&app.credentials_path)
+                    .ok()
+                    .flatten()
+                    .map(|mode| format!(" ({})", mode.as_str()))
+                    .unwrap_or_default();
+                lines.push(field(
+                    "agent identity",
+                    &format!("{login}{mode} — clones and pull requests act as this account"),
+                ));
+            }
             _ => lines.push(field("agent identity", "not settled — press i")),
         }
     }
@@ -516,7 +562,7 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(field("mode", &mode_text(app)));
     // Which secret *names* are present, never a value: a person can confirm a key
     // loaded without the tool reading it back onto a screen.
-    let present = crate::credentials::present_secret_names(&app.credentials_path);
+    let present = app.present_secret_labels();
     if let Some(problem) = crate::credentials::parse_problem(&app.credentials_path) {
         // A file that could not be read is not an empty file. Say which it is.
         lines.push(Line::from(Span::styled(
@@ -566,9 +612,16 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The recent runs, read from the records on disk.
 fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
-    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(9)]).split(area);
+    // The same rule as the agent list: never silently drop a run, and never let the
+    // selection land on a row that is not drawn.
+    let notes_height = area.height.saturating_sub(4).min(9);
+    let parts =
+        Layout::vertical([Constraint::Min(4), Constraint::Length(notes_height)]).split(area);
 
-    let header = Row::new(["agent", "run", "started", "outcome"]).style(
+    let capacity = parts[0].height.saturating_sub(3) as usize;
+    let (first, shown) = visible_window(app.recent.len(), app.run_selected, capacity);
+
+    let header = Row::new(["", "agent", "run", "started", "outcome"]).style(
         Style::new()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -577,6 +630,8 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         .recent
         .iter()
         .enumerate()
+        .skip(first)
+        .take(shown)
         .map(|(at, run)| {
             let style = if at == app.run_selected {
                 Style::new().fg(Color::Black).bg(Color::Cyan)
@@ -586,6 +641,7 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new()
             };
             Row::new(vec![
+                Cell::from(if at == app.run_selected { ">" } else { " " }),
                 Cell::from(run.agent.clone()),
                 Cell::from(run.run_id.clone()),
                 Cell::from(run.started_text()),
@@ -595,14 +651,15 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let widths = [
+        Constraint::Length(2),
         Constraint::Length(12),
         Constraint::Length(24),
         Constraint::Length(24),
         Constraint::Min(18),
     ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::bordered().title(" recent runs "));
+    let table = Table::new(rows, widths).header(header).block(
+        Block::bordered().title(list_title("recent runs", first, shown, app.recent.len())),
+    );
     frame.render_widget(table, parts[0]);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -620,6 +677,15 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             "Press s on the Agents screen (1) to start one.",
         ));
     } else if let Some(run) = app.selected_run() {
+        // The reason leads, because it is what a person who returns to this screen
+        // came for: the page map asks the finished row for the outcome *with its
+        // reason*. The paths follow; if the note area is short, the paths are what
+        // wrap off the bottom, never the reason.
+        if let Some(reason) = run.reason.as_deref() {
+            lines.push(Line::from(format!("outcome: {} — {reason}", run.describe())));
+        } else {
+            lines.push(Line::from(format!("outcome: {}", run.describe())));
+        }
         // The transcript is the run's own record; `T` opens it here, never only from a
         // path the README happens to name.
         lines.push(Line::from(format!(
@@ -630,11 +696,6 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             "o opens the log on show: {}",
             run.log.display()
         )));
-        if let Some(reason) = run.reason.as_deref() {
-            lines.push(Line::from(format!("outcome: {} — {reason}", run.describe())));
-        } else {
-            lines.push(Line::from(format!("outcome: {}", run.describe())));
-        }
         lines.push(Line::from(Span::styled(
             "The outcome is decided by the process, not by what it wrote.",
             Style::new().fg(Color::DarkGray),
@@ -684,10 +745,32 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new(key_legend(area.width as usize))
-            .style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(key_legend(
+            area.width as usize,
+            &running_clause(app),
+        ))
+        .style(Style::new().fg(Color::DarkGray)),
         parts[2],
     );
+}
+
+/// The short clause the footer carries on every screen.
+///
+/// Two answers a person is owed wherever they are: what is running now, and what has
+/// finished since this UI started — the questions a user who leaves a screen and comes
+/// back asks first.
+fn running_clause(app: &App) -> String {
+    let base = format!(
+        "Running: {} of {}   ",
+        app.supervisor.running_count(),
+        app.supervisor.max_concurrent()
+    );
+    let finished = app.runs_finished_since_start();
+    if finished == 0 {
+        base
+    } else {
+        format!("{base}· {finished} finished   ")
+    }
 }
 
 /// The action keys, built to fit the width it is drawn into.
@@ -695,8 +778,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 /// The legend must not stop mid-list with no sign that more exists: it shows as many
 /// keys as fit and, when one does not, ends with a fixed tail naming the full list —
 /// the page map's own rule. On a wide terminal every key fits and the line ends with
-/// `? all keys` too.
-fn key_legend(width: usize) -> String {
+/// `? all keys` too. The `prefix` is the running count, which is rendered here so that
+/// it is on screen wherever the user is, not only on the Agents screen.
+fn key_legend(width: usize, prefix: &str) -> String {
     const KEYS: &[&str] = &[
         "s start",
         "x stop",
@@ -714,10 +798,15 @@ fn key_legend(width: usize) -> String {
         "d remove",
     ];
     let tail = "… more — ? all keys";
+    // If the count would crowd out even the full-list hint, the hint wins: it is the
+    // affordance the page map requires, and the count is repeated on the Agents screen.
     if width <= tail.chars().count() {
         return "? all keys".to_owned();
     }
-    let mut line = String::new();
+    if prefix.chars().count() + tail.chars().count() > width {
+        return tail.to_owned();
+    }
+    let mut line = prefix.to_owned();
     for key in KEYS {
         let candidate = format!("{line}{key}   ");
         if candidate.chars().count() + tail.chars().count() > width {
@@ -757,15 +846,20 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
         },
     );
 
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(
-        "Name an agent and point it at a model. The model key and the Forgejo token are written to the credentials file and are never shown.",
-    ));
-    lines.push(Line::from(Span::styled(
-        "The model key is required. The Forgejo fields are optional; a blank URL keeps the sample's placeholder address.",
-        Style::new().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line> = vec![
+        Line::from(
+            "Name an agent and point it at a model. The model key and the Forgejo token are written to the credentials file and are never shown.",
+        ),
+        Line::from(Span::styled(
+            "The model key is required. The Forgejo fields are optional; a blank URL keeps the sample's placeholder address.",
+            Style::new().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "The Forgejo token here is the role token — the account the role check acts as. An agent's own token is a different secret: supply it later with `v` on the Forgejo screen, where `i` needs it.",
+            Style::new().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
     for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
         let value = &form.fields[at];
         let shown = if *secret {
@@ -880,10 +974,22 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
         .selected_paths()
         .map(|paths| paths.config_dir().display().to_string())
         .unwrap_or_else(|| "its files".to_owned());
-    let lines: Vec<Line> = vec![
-        Line::from(format!(
+    let has_files = app
+        .selected_paths()
+        .map(|paths| paths.config_dir().is_dir())
+        .unwrap_or(false);
+    // The confirmation's job is to say exactly what stays. A sentence that promises
+    // files to a user who never wrote any is a small lie that makes them hunt for a
+    // directory that does not exist.
+    let question = if has_files {
+        format!(
             "Remove `{name}` from the configuration? Its files under {left} are left on disk."
-        )),
+        )
+    } else {
+        format!("Remove `{name}` from the configuration? It has no files under {left} yet.")
+    };
+    let lines: Vec<Line> = vec![
+        Line::from(question),
         Line::from(""),
         Line::from(Span::styled(
             "y remove it        n keep it",
@@ -1064,6 +1170,46 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+/// The rows of a list that fit, and the first one to draw.
+///
+/// A list that silently drops rows — and lets the selection travel onto a row that is
+/// not drawn — is the worst case for a person: they can start, stop or remove
+/// something they cannot see. The window is chosen so the selected row is always
+/// drawn, and the title says how many rows there are.
+fn visible_window(total: usize, selected: usize, capacity: usize) -> (usize, usize) {
+    if capacity == 0 || total == 0 {
+        return (0, 0);
+    }
+    if total <= capacity {
+        return (0, total);
+    }
+    let first = selected
+        .saturating_add(1)
+        .saturating_sub(capacity)
+        .min(total - capacity);
+    (first, capacity)
+}
+
+/// A panel title that names the rows on show when the list is longer than its window.
+///
+/// The product's own rule, applied to lists as it already is to the footer legend and
+/// the window size: nothing is dropped **silently**.
+fn list_title(base: &str, first: usize, shown: usize, total: usize) -> String {
+    if total == 0 || total <= shown {
+        return format!(" {base} ");
+    }
+    let mut extra = format!("{}–{} of {total}", first + 1, first + shown);
+    let more_above = first > 0;
+    let more_below = first + shown < total;
+    match (more_above, more_below) {
+        (true, true) => extra.push_str(" — ↑↓ more"),
+        (false, true) => extra.push_str(" — ↓ more"),
+        (true, false) => extra.push_str(" — ↑ more"),
+        (false, false) => {}
+    }
+    format!(" {base} {extra} ")
 }
 
 /// A centered rectangle inside `area`, never larger than it.

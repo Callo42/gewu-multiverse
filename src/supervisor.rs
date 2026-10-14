@@ -606,6 +606,32 @@ impl Supervisor {
         );
     }
 
+    /// Seed the screens with the newest terminal record of one agent.
+    ///
+    /// A reopened UI has no live process to watch, but the run records are on disk.
+    /// The page map's "Signals and abandoned runs" row says a run left behind is shown
+    /// as `stopped`, **never `idle`**; the same honesty is owed to a run that finished
+    /// before the user quit. Without this, the hub forgets every outcome on every
+    /// start and the reason a run ended is gone from the screen the user lands on.
+    pub fn note_last_outcome(
+        &mut self,
+        name: &str,
+        run_id: &str,
+        outcome: RunOutcome,
+        reason: Option<String>,
+        duration_ms: u64,
+    ) {
+        self.states.insert(
+            name.to_owned(),
+            State::Finished {
+                run_id: run_id.to_owned(),
+                outcome,
+                reason,
+                duration_ms,
+            },
+        );
+    }
+
     /// Ask for one run of one agent.
     ///
     /// Beyond the concurrency limit the start does not fail: it waits its turn, and

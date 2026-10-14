@@ -839,3 +839,260 @@ fn the_selected_repository_is_marked_in_text() {
     assert!(screen.contains("> uxmember/demo-public"), "{screen}");
     assert!(!screen.contains("> uxmember/demo-private"), "{screen}");
 }
+
+const SIX_AGENTS: &str = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+
+[limits]
+run_timeout_secs = 30
+max_concurrent_agents = 10
+
+[[agents]]
+name = "a1"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "a1.md"
+concurrency = 1
+
+[[agents]]
+name = "a2"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "a2.md"
+concurrency = 1
+
+[[agents]]
+name = "a3"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "a3.md"
+concurrency = 1
+
+[[agents]]
+name = "a4"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "a4.md"
+concurrency = 1
+
+[[agents]]
+name = "a5"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "a5.md"
+concurrency = 1
+
+[[agents]]
+name = "a6"
+model = "m"
+endpoint = "https://m.example.org"
+instruction = "a6.md"
+concurrency = 1
+"#;
+
+#[test]
+fn the_agents_list_never_hides_a_row_the_selection_can_reach() {
+    // X-1: more agents than rows must not vanish silently, and the selection must
+    // never travel onto a row that is not drawn.
+    let root = scratch("agents-window");
+    let mut app = app_with_config(&root, SIX_AGENTS);
+    app.show_acknowledgment = false;
+
+    // The size the product calls usable draws at least one agent row; one size below
+    // says the window is too small instead of drawing a header over nothing.
+    let small = render_at(72, 18, &app);
+    assert!(small.contains("a1"), "no agent row at 72x18: {small}");
+    let below = render_at(72, 17, &app);
+    assert!(below.contains("too small"), "{below}");
+
+    // Six agents do not fit; the panel says how many there are.
+    let wide = render_at(80, 24, &app);
+    assert!(wide.contains("of 6"), "the count is missing: {wide}");
+
+    // Walk the selection to the last agent; it must be drawn, and marked.
+    for _ in 0..5 {
+        app.move_agent_selection(1);
+    }
+    assert_eq!(app.selected, 5);
+    let scrolled = render_at(80, 24, &app);
+    assert!(scrolled.contains("a6"), "the selected row is hidden: {scrolled}");
+    assert!(scrolled.contains(">  a6"), "the selected row is not marked: {scrolled}");
+}
+
+#[test]
+fn the_selected_agent_row_is_marked_in_text() {
+    // X-2: the selection must survive a monochrome capture.
+    let root = scratch("agents-marker");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.move_agent_selection(1);
+    let screen = render(&app);
+    assert!(screen.contains(">  checker"), "{screen}");
+    assert!(!screen.contains(">  scribe"), "{screen}");
+}
+
+#[test]
+fn the_running_count_is_in_the_footer_on_every_screen() {
+    // X-4: \"what is running\" must not be a fact only the hub knows.
+    let root = scratch("footer-running");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    for screen in [
+        Screen::AgentConfig,
+        Screen::Instructions,
+        Screen::Forgejo,
+        Screen::Credentials,
+        Screen::Runs,
+    ] {
+        app.show(screen);
+        let text = render(&app);
+        assert!(
+            text.contains("Running: 0 of 2"),
+            "{screen:?} has no running count: {text}"
+        );
+    }
+}
+
+#[test]
+fn the_add_agent_form_says_which_token_the_forgejo_field_is() {
+    // X-3: one form, two tokens; the field must say which one it takes.
+    let root = scratch("form-role-token");
+    let mut app = app_with_config(&root, EMPTY_CONFIG);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('n')));
+    let form = render(&app);
+    assert!(form.contains("Forgejo role token"), "{form}");
+    assert!(form.contains("agent's own token"), "{form}");
+}
+
+#[test]
+fn the_identity_and_its_mode_are_on_the_forgejo_screen_persistently() {
+    // X-3: the mode must not live only in a transient status line.
+    let root = scratch("identity-mode");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    gewu_multiverse::credentials::record_agent_identity(
+        &app.credentials_path,
+        "scribe",
+        None,
+        "gewu-scribe",
+        "gewu-scribe@agents.invalid",
+        "managed",
+    )
+    .expect("the identity is recorded");
+    app.reload();
+    app.show(Screen::Forgejo);
+    let screen = render(&app);
+    assert!(screen.contains("gewu-scribe (managed)"), "{screen}");
+    assert!(screen.contains("act as this account"), "{screen}");
+}
+
+#[test]
+fn the_runs_note_area_shows_the_reason_a_run_ended() {
+    // I-2: the reason is what a person returning to Runs came for.
+    let root = scratch("runs-reason");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_id = new_run_id(1);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 4321, "/w"))
+        .expect("a record is appended");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Stopped,
+            None,
+            3300,
+            Some("the run was stopped on request".to_owned()),
+        ))
+        .expect("a record is appended");
+    app.refresh_recent();
+    app.show(Screen::Runs);
+    let screen = render(&app);
+    assert!(screen.contains("the run was stopped on request"), "{screen}");
+}
+
+#[test]
+fn the_runs_selection_is_marked_in_text_too() {
+    // X-2 on the other list this persona lives in.
+    let root = scratch("runs-marker");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    for (at, agent) in ["scribe", "checker"].iter().enumerate() {
+        let run_id = new_run_id(at as u64 + 1);
+        let run_dir = root.join("state").join(agent).join(&run_id);
+        fs::create_dir_all(&run_dir).expect("the run directory is created");
+        let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+        transcript
+            .append(&Record::run_started(&run_id, agent, 1, "/w"))
+            .expect("a record is appended");
+        transcript
+            .append(&Record::run_finished(&run_id, RunOutcome::Succeeded, Some(0), 1, None))
+            .expect("a record is appended");
+    }
+    app.refresh_recent();
+    app.show(Screen::Runs);
+    app.move_run_selection(1);
+    assert_eq!(app.run_selected, 1);
+    let screen = render(&app);
+    assert!(screen.contains("> "), "{screen}");
+    assert!(screen.contains("checker"), "{screen}");
+}
+
+#[test]
+fn the_instruction_screen_names_an_interrupted_editors_emergency_save() {
+    // I-3: the words survive in the editor's own file; the product must say so.
+    let root = scratch("instruction-backup");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(paths.instruction(), "spoken for\n").expect("the instruction is written");
+    fs::write(paths.instruction().with_extension("md.save"), "half a paragraph\n")
+        .expect("the emergency save is written");
+    app.show(Screen::Instructions);
+    let screen = render(&app);
+    assert!(screen.contains("not saved"), "{screen}");
+    assert!(screen.contains("instruction.md.save"), "{screen}");
+}
+
+#[test]
+fn an_instruction_holding_only_the_placeholder_reads_as_the_empty_state() {
+    // I-4: the template is not an instruction the user wrote.
+    let root = scratch("instruction-placeholder");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(
+        paths.instruction(),
+        format!("{}\n", gewu_multiverse::agent_run::INSTRUCTION_PLACEHOLDER),
+    )
+    .expect("the template is written");
+    app.show(Screen::Instructions);
+    let screen = render(&app);
+    assert!(screen.contains("holds only the guidance line"), "{screen}");
+    assert!(!screen.contains("11 bytes"), "{screen}");
+}
+
+#[test]
+fn the_removal_confirmation_only_promises_files_that_exist() {
+    // I-6: an interrupted first edit leaves no directory; the sentence must say so.
+    let root = scratch("remove-wording");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    let no_files = render(&app);
+    assert!(no_files.contains("has no files"), "{no_files}");
+    assert!(!no_files.contains("are left on disk"), "{no_files}");
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(paths.instruction(), "typed\n").expect("the instruction is written");
+    app.on_key(KeyEvent::from(KeyCode::Char('d')));
+    let with_files = render(&app);
+    assert!(with_files.contains("are left on disk"), "{with_files}");
+}
