@@ -392,6 +392,7 @@ fn the_forgejo_screen_shows_a_role_check_and_an_identity_plainly() {
             email: "gewu-scribe@agents.invalid".to_owned(),
             mode: IdentityMode::Managed,
             created: true,
+            created_at: Some(gewu_multiverse::time::now_unix_ms() / 1000),
         }),
     });
     app.show(Screen::Forgejo);
@@ -983,13 +984,74 @@ fn the_identity_and_its_mode_are_on_the_forgejo_screen_persistently() {
         "gewu-scribe",
         "gewu-scribe@agents.invalid",
         "managed",
+        None,
     )
     .expect("the identity is recorded");
     app.reload();
     app.show(Screen::Forgejo);
     let screen = render(&app);
-    assert!(screen.contains("gewu-scribe (managed)"), "{screen}");
+    // F6: one shape on every surface — login, email, agent and mode — and it names
+    // the agent, not only the account (F1).
+    assert!(
+        screen.contains("gewu-scribe <gewu-scribe@agents.invalid> as `scribe` (managed)"),
+        "{screen}"
+    );
     assert!(screen.contains("act as this account"), "{screen}");
+}
+
+#[test]
+fn the_identity_report_survives_a_restart_and_its_creation_time_ages() {
+    // H-3: the report lived only in the session that settled the identity, and
+    // `(created now)` never aged. It is now rebuilt from the credentials file once the
+    // role check has run, and it says when the account was made.
+    use gewu_multiverse::config::Role;
+    use gewu_multiverse::forgejo::{RoleCheck, Viewer};
+    let root = scratch("identity-persist");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    gewu_multiverse::credentials::record_agent_identity(
+        &app.credentials_path,
+        "scribe",
+        None,
+        "gewu-scribe",
+        "gewu-scribe@agents.invalid",
+        "managed",
+        Some(gewu_multiverse::time::now_unix_ms() / 1000 - 180),
+    )
+    .expect("the identity is recorded");
+    // A fresh session: no session report, and no role check yet.
+    app.reload();
+    app.identity_report = None;
+    app.role_check = None;
+    assert!(
+        app.identity_report_for("scribe").is_none(),
+        "a report before the role check has run"
+    );
+    // After the role check, the recorded identity is reported again.
+    app.role_check = Some(Ok(RoleCheck {
+        url: "https://forgejo.example.org".to_owned(),
+        role: Role::Member,
+        viewer: Viewer {
+            login: "member".to_owned(),
+            email: None,
+            description: None,
+            is_admin: false,
+        },
+        repositories: Vec::new(),
+        private_visible: 0,
+    }));
+    app.show(Screen::Forgejo);
+    let screen = render_at(100, 40, &app);
+    assert!(screen.contains("identity for `scribe`"), "{screen}");
+    assert!(
+        screen.contains("gewu-scribe <gewu-scribe@agents.invalid> as `scribe` (managed)"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("(created 3") && screen.contains("minutes ago)"),
+        "the creation time did not age: {screen}"
+    );
+    assert!(!screen.contains("created now"), "{screen}");
 }
 
 #[test]
@@ -1097,7 +1159,9 @@ fn the_removal_confirmation_only_promises_files_that_exist() {
     fs::write(paths.instruction(), "typed\n").expect("the instruction is written");
     app.on_key(KeyEvent::from(KeyCode::Char('d')));
     let with_files = render(&app);
-    assert!(with_files.contains("are left on disk"), "{with_files}");
+    // A path that may break at `/` can move the phrase to the next row; the promise
+    // itself is what the test is about.
+    assert!(with_files.contains("left on disk"), "{with_files}");
 }
 
 /// One repository, as a role check reports it, for the windowing tests.
@@ -1424,15 +1488,32 @@ fn the_forgejo_screen_never_says_placeholder() {
 }
 
 #[test]
-fn the_identity_line_names_the_account_i_would_create() {
-    // D-4: `i` acts on a remote system; name the account before the keypress.
+fn the_identity_line_names_the_agent_and_the_account_i_would_create() {
+    // D-4 / F1: `i` acts on a remote system. The field names the **agent** whose
+    // identity is on show, and — when the tool would create the account — the account
+    // itself, before the keypress.
     let root = scratch("identity-preview");
     let mut app = app(&root);
     app.show_acknowledgment = false;
     app.show(Screen::Forgejo);
     let screen = render(&app);
     assert!(screen.contains("not settled"), "{screen}");
-    assert!(screen.contains("`gewu-scribe`"), "{screen}");
+    assert!(
+        screen.contains("`scribe`"),
+        "the agent is not named: {screen}"
+    );
+    assert!(screen.contains("v supplies the token"), "{screen}");
+
+    // With an administrator token, the account `i` would create is named too.
+    gewu_multiverse::mode::write_private(
+        root.join("credentials.toml"),
+        b"forgejo_admin_token = \"gw-admin-fixture\"\n",
+    )
+    .expect("the credentials file is written");
+    app.reload();
+    app.show(Screen::Forgejo);
+    let managed = render(&app);
+    assert!(managed.contains("`gewu-scribe`"), "{managed}");
 }
 
 #[test]
@@ -1464,6 +1545,24 @@ fn the_agent_screen_keeps_a_long_paths_file_name_and_says_when_fields_are_below(
     app.show(Screen::AgentConfig);
     let screen = render_at(80, 24, &app);
     assert!(screen.contains("more below"), "{screen}");
+    // H-5: the path must break at a `/`, never inside `run.log`, even at the floor.
+    // Scroll the panel until the newest log is drawn and check the file name is whole.
+    let mut scrolled = String::new();
+    for _ in 0..40 {
+        scrolled = render_at(80, 24, &app);
+        if scrolled.contains("run.log") {
+            break;
+        }
+        app.scroll_panel(1);
+    }
+    assert!(
+        scrolled.contains("newest log"),
+        "the newest log never came into view: {scrolled}"
+    );
+    assert!(
+        scrolled.contains("run.log"),
+        "the file name was split at the floor: {scrolled}"
+    );
     // At a taller window the field and its file name are drawn whole, so the path is
     // not inherently clipped — the short window is what the title now declares.
     let tall = render_at(80, 40, &app);
@@ -2455,17 +2554,53 @@ fn the_runs_list_and_the_footer_count_say_when_they_stop_at_fifty() {
     app.show(Screen::Runs);
     let screen = render_at(100, 30, &app);
     assert!(
-        screen.contains("This list stops at the newest 50 run records of 60 on disk"),
+        screen.contains(
+            "This list stops at the newest 50 of the 60 run records whose agents are configured"
+        ),
         "the cap is not declared: {screen}"
     );
     assert!(
-        screen.contains("10 older records are not listed here"),
+        screen.contains("10 older") && screen.contains("records are not listed here"),
         "the older records are not named: {screen}"
     );
     assert!(
         screen.contains("50+ finished"),
         "the footer count presents the cap as exact: {screen}"
     );
+}
+
+#[test]
+fn one_fact_gets_one_number_on_the_runs_screen() {
+    // F4 / H-4: the footprint said `120 run records on disk` and the cap clause said
+    // `of 110 on disk`, and `60 older records are not listed` omitted the unlisted
+    // agent's records. Every total is now named for what it counts, and the size says
+    // it is file bytes.
+    let root = scratch("one-number");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    // Sixty records of a configured agent and ten of one the configuration dropped.
+    seed_runs(&root, "scribe", 60, 0);
+    seed_runs(&root, "ghost", 10, 0);
+    app.reload();
+    assert_eq!(app.footprint.records, 70, "every record is measured");
+    app.show(Screen::Runs);
+    let screen = render_at(120, 40, &app);
+    assert!(
+        screen.contains("70 run records on disk")
+            && screen.contains("of file bytes in total"),
+        "the footprint is not one named quantity: {screen}"
+    );
+    // The cap clause names its own population and the total on disk separately, and
+    // its `not listed` count is every record left off the list.
+    assert!(
+        screen.contains("whose agents are configured (70 records are on disk in all)"),
+        "the two totals are not told apart: {screen}"
+    );
+    assert!(
+        screen.contains("20 records in all") && screen.contains("are not listed here"),
+        "the unlisted count omits records: {screen}"
+    );
+    assert!(screen.contains("10 records belong"), "{screen}");
 }
 
 #[test]
@@ -2486,7 +2621,7 @@ fn the_run_records_footprint_and_the_cleanup_expectation_are_on_the_runs_screen(
         "the footprint count is missing: {screen}"
     );
     assert!(
-        screen.contains("KB") || screen.contains("B in total"),
+        screen.contains("KB") || screen.contains("B of file bytes"),
         "the footprint has no room figure: {screen}"
     );
     assert!(
@@ -2576,12 +2711,18 @@ fn a_used_configuration_says_when_and_under_which_version_the_risk_was_acknowled
         "the record is not on the screen: {screen}"
     );
     assert!(
-        screen.contains("press R to read the terms again"),
+        screen.contains("press R to") && screen.contains("read the terms again"),
         "there is no way to read the terms again: {screen}"
     );
     assert!(
         screen.contains(env!("CARGO_PKG_VERSION")),
         "the version that wrote the record is not named: {screen}"
+    );
+    // F3: the version now running is named beside the record's own version, so the
+    // comparison a second person came for is on the screen.
+    assert!(
+        screen.contains("this build is"),
+        "the running version is not labelled: {screen}"
     );
 
     // `R` shows the terms without writing anything.
