@@ -300,7 +300,7 @@ pub fn render_unit(spec: &UnitSpec) -> String {
 
 [Unit]
 Description=gewu-multiverse agent `{agent}`
-# A failed run is restarted, but not for ever: at most {burst} start(s) in {interval} s.
+# A failed run is restarted, but not for ever: the start limit below bounds it.
 StartLimitIntervalSec={interval}
 StartLimitBurst={burst}
 
@@ -773,6 +773,12 @@ impl SystemdSupervisor {
     /// The last problem systemd gave, if any.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Remember — or clear — the reason the user's systemd could not be reached when
+    /// it was probed for a record with no unit to read (M-6).
+    pub fn set_manager_error(&mut self, message: Option<String>) {
+        self.last_error = message;
     }
 
     /// Remember the run a record names, so a later session can read its state.

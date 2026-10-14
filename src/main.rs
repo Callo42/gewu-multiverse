@@ -28,6 +28,7 @@ use gewu_multiverse::cli::{Cli, HELP, Invocation, parse_args};
 use gewu_multiverse::editor;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::ui;
+use gewu_multiverse::words;
 use gewu_multiverse::workspace;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -135,7 +136,10 @@ fn run(cli: Cli) -> Result<(), StartupError> {
     let left = screen.leave();
     drawn.and(left)?;
     if stopped > 0 {
-        println!("gewu-multiverse: stopped {stopped} running agent(s) before leaving");
+        println!(
+            "gewu-multiverse: stopped {} before leaving",
+            words::counted(stopped, "running agent", "running agents")
+        );
     }
     Ok(())
 }
@@ -195,7 +199,17 @@ fn hand_to_the_user(
             let _ = io::stdout().flush();
             editor::edit(&action.path)
         }
-        ActionKind::View => editor::view(&action.path),
+        ActionKind::View => {
+            // The pager takes the screen; say on the primary screen which file it is
+            // and that the pager's own key is `q`, because `esc` — this product's way
+            // back — does nothing inside it (M-5).
+            println!(
+                "gewu-multiverse: opening {} in the pager — leave the pager with q",
+                action.label
+            );
+            let _ = io::stdout().flush();
+            editor::view(&action.path)
+        }
     };
     screen.resume()?;
     Ok(result)

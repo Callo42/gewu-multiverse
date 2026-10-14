@@ -36,6 +36,10 @@ const RECENT_RUNS_REFRESH: Duration = Duration::from_secs(1);
 /// How many runs the runs screen lists.
 const RECENT_RUNS_LIMIT: usize = 50;
 
+/// How many rows one page key moves a list, and the help overlay.
+const LIST_PAGE: isize = 5;
+const HELP_PAGE: usize = 5;
+
 /// The screens of the terminal UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -366,11 +370,15 @@ fn clone_failed_status(repo: &str, login: &str, mode: &str, class: &str, detail:
     )
 }
 
-/// Say how an endpoint test ended.
+/// Say how an endpoint test ended, in the product's own words.
 fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String {
     match result {
         Ok(summary) => format!("the endpoint answered: {summary}"),
-        Err(failure) => format!("failed ({}): {}", failure.class, failure.message),
+        Err(failure) => format!(
+            "failed ({}): {}",
+            failure.class,
+            crate::model::in_product_words(&failure.message)
+        ),
     }
 }
 
@@ -382,10 +390,15 @@ fn backticked_agent(label: &str) -> Option<String> {
 }
 
 /// A Forgejo failure, as a screen holds it.
+///
+/// The transport's own words are translated at the point the failure is built, so
+/// every screen that shows it — the role check's status, the panel's refusal, an
+/// identity attempt — reads in the product's vocabulary (O-4). A Forgejo action
+/// leaves no run record to keep the raw sentence in.
 fn failure_of(error: forgejo::ForgejoError) -> ForgejoFailure {
     ForgejoFailure {
         class: error.class().to_owned(),
-        message: error.to_string(),
+        message: crate::model::in_product_words(&error.to_string()),
     }
 }
 
@@ -1224,15 +1237,29 @@ impl App {
 
     /// Ask to leave. If runs are in flight, name what leaving ends and ask again.
     pub fn request_quit(&mut self) {
+        self.ask_to_leave("q");
+    }
+
+    /// Ask to leave, naming the chord that must be pressed again to go through with it.
+    ///
+    /// `^C` is the reflex "cancel the thing that is running" chord, and here it does
+    /// what `q` does — leave and stop the runs this UI started. It therefore asks the
+    /// same one question rather than leaving in silence (C-1).
+    fn ask_to_leave(&mut self, chord: &str) {
         let live = self.supervisor.running_count();
         if live == 0 || self.confirm_quit.is_some() {
             self.should_quit = true;
             return;
         }
         self.confirm_quit = Some(live);
-        let noun = if live == 1 { "run" } else { "runs" };
+        // One run is `it`, not `them` (C-8).
+        let (noun, pronoun) = if live == 1 {
+            ("run", "it")
+        } else {
+            ("runs", "them")
+        };
         self.status = format!(
-            "leaving stops the {live} {noun} this UI started; press q again to quit and stop them, or any other key to stay"
+            "leaving stops the {live} {noun} this UI started; press {chord} again to quit and stop {pronoun}, or any other key to stay"
         );
     }
 
@@ -1249,16 +1276,14 @@ impl App {
     /// The reason is read from the run's own record, so it is there on the screen the
     /// user looks at after a failure, not only in a transient footer line.
     pub fn last_failure(&self, name: &str) -> Option<String> {
-        self.last_run_failure(name)
+        self.newest_failed_run(name)
             .or_else(|| self.last_start_failure(name))
             .or_else(|| self.supervisor.last_error().map(str::to_owned))
     }
 
-    /// Why one agent's most recent *run* did not go well, from the run's own record.
-    ///
-    /// Kept apart from a start that never produced a run, so the hub does not call a
-    /// failed start "the last run" (D-8).
-    pub fn last_run_failure(&self, name: &str) -> Option<String> {
+    /// Why one agent's most recent *failed* run did not go well, for the historical
+    /// `last failure` field on the Agent screen.
+    fn newest_failed_run(&self, name: &str) -> Option<String> {
         if let State::Finished {
             outcome: RunOutcome::Failed,
             reason: Some(reason),
@@ -1271,6 +1296,30 @@ impl App {
             .iter()
             .find(|run| run.agent == name && run.outcome == Some(RunOutcome::Failed))
             .and_then(|run| run.reason.clone())
+    }
+
+    /// Why the agent's **newest** terminal run did not go well, from the run's own
+    /// record.
+    ///
+    /// Kept apart from a start that never produced a run (D-8), and answered from the
+    /// newest record, terminal or not: after a recovery the next run succeeded, and an
+    /// older failure is not "the last run" (O-1). A record that is not terminal yet is
+    /// not a last run either.
+    pub fn last_run_failure(&self, name: &str) -> Option<String> {
+        match self.supervisor.state(name) {
+            State::Finished {
+                outcome: RunOutcome::Failed,
+                reason: Some(reason),
+                ..
+            } => Some(reason),
+            State::Finished { .. } => None,
+            _ => self
+                .recent
+                .iter()
+                .find(|run| run.agent == name)
+                .filter(|run| run.outcome == Some(RunOutcome::Failed))
+                .and_then(|run| run.reason.clone()),
+        }
     }
 
     /// Why one agent's most recent *start* did not go well, when it never became a run.
@@ -1425,11 +1474,11 @@ impl App {
                         // user session does not look ready when it is not.
                         match self.supervisor.systemd_available() {
                             Ok(version) => format!(
-                                "a unit is written and started the next time it is started \
-                                 (s), and it keeps running when this UI exits (systemd {version})"
+                                "a unit is written and started the next time it is started, \
+                                 and it keeps running when this UI exits (systemd {version})"
                             ),
                             Err(reason) => format!(
-                                "a unit will be written at the next start (s), but {reason}: \
+                                "a unit will be written at the next start, but {reason}: \
                                  starting will be refused until a user session is available"
                             ),
                         }
@@ -1503,7 +1552,10 @@ impl App {
         };
         let short = match &result {
             Ok(_) => "ok".to_owned(),
-            Err(failure) => format!("failed ({})", failure.class),
+            // The class alone is not the reason: the footer grows to hold the same
+            // sentence the Agent screen shows, so a refused connection or a bad name
+            // is read at 80×24, not just the word `transport` (O-2).
+            Err(_) => describe_endpoint_result(&result),
         };
         self.status = format!("endpoint test for `{}`: {short}", agent.name);
         self.endpoint_test = Some(EndpointTest {
@@ -1652,7 +1704,7 @@ impl App {
             identity::resolve(&settings.url, &name, &self.credentials_path).map_err(|error| {
                 ForgejoFailure {
                     class: error.class().to_owned(),
-                    message: error.to_string(),
+                    message: crate::model::in_product_words(&error.to_string()),
                 }
             });
         self.status = match &result {
@@ -2091,7 +2143,9 @@ impl App {
             label: label.clone(),
             before: None,
         });
-        self.status = format!("opening {label}");
+        // Name the way out before the pager takes the screen: `esc` cancels the
+        // product's own overlays but not the user's pager, whose own key is `q` (M-5).
+        self.status = format!("opening {label} — leave it with q");
     }
 
     /// Ask to read the log of the run on show. The terminal loop carries it out.
@@ -2133,7 +2187,9 @@ impl App {
             label: label.clone(),
             before: None,
         });
-        self.status = format!("opening {label}");
+        // Name the way out before the pager takes the screen: `esc` cancels the
+        // product's own overlays but not the user's pager, whose own key is `q` (M-5).
+        self.status = format!("opening {label} — leave it with q");
     }
 
     /// The directory of the newest run of one agent, from the state or from disk.
@@ -2373,6 +2429,36 @@ impl App {
         }
     }
 
+    /// Move the selection to the first or last row of the list on show.
+    ///
+    /// Home/`g` and End/`G` mean the same thing on every list, so a person who reads
+    /// the end by reflex is not sent somewhere else (C-4).
+    pub fn select_edge(&mut self, last: bool) {
+        match self.screen {
+            Screen::Runs => {
+                self.run_selected = if last {
+                    self.recent.len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            Screen::Forgejo => {
+                let count = match &self.role_check {
+                    Some(Ok(check)) => check.repositories.len(),
+                    _ => 0,
+                };
+                self.repo_selected = if last { count.saturating_sub(1) } else { 0 };
+            }
+            _ => {
+                self.selected = if last {
+                    self.agents().len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+        }
+    }
+
     /// Move the repository selection on the Forgejo screen, stopping at the ends.
     pub fn move_repo_selection(&mut self, steps: isize) {
         let count = match &self.role_check {
@@ -2472,11 +2558,12 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         // A control chord is never a plain-letter binding. `^C` is the reflex keystroke
         // for "stop"; here it leaves the UI, and the children it owns are stopped on
-        // the way out. Before this, `^C` fell through to the plain `c` binding and ran
-        // the Forgejo role check, reaching the network while a run kept going.
+        // the way out — the same destructive act `q` performs. So it takes the same
+        // question `q` does and leaves only on a second press (C-1). Before this,
+        // `^C` left the whole tool and killed every run without a word.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if key.code == KeyCode::Char('c') {
-                self.should_quit = true;
+                self.ask_to_leave("ctrl-c");
             }
             return;
         }
@@ -2491,13 +2578,23 @@ impl App {
         if self.show_help {
             match key.code {
                 // The help is a scrollable list, so a short window can still reach
-                // every key instead of clipping the last group (P-6).
+                // every key instead of clipping the last group (P-6). The list keys
+                // a person brings from anywhere work here too, and one the overlay
+                // cannot use says so rather than vanishing into it (C-4).
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.help_offset = self.help_offset.saturating_add(1);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.help_offset = self.help_offset.saturating_sub(1);
                 }
+                KeyCode::PageDown => {
+                    self.help_offset = self.help_offset.saturating_add(HELP_PAGE);
+                }
+                KeyCode::PageUp => {
+                    self.help_offset = self.help_offset.saturating_sub(HELP_PAGE);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.help_offset = 0,
+                KeyCode::End | KeyCode::Char('G') => self.help_offset = usize::MAX,
                 KeyCode::Esc
                 | KeyCode::Char('?')
                 | KeyCode::Char('h')
@@ -2505,7 +2602,11 @@ impl App {
                 | KeyCode::Enter => {
                     self.show_help = false;
                 }
-                _ => {}
+                _ => {
+                    self.status =
+                        "the help scrolls with up/down or a page with PageDown/PageUp; esc closes it"
+                            .to_owned();
+                }
             }
             return;
         }
@@ -2583,6 +2684,15 @@ impl App {
             // prompt for a model key.
             KeyCode::Char('k') if self.screen != Screen::Credentials => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            // Page, home and end motion on every windowed list and on the help overlay:
+            // the conventions a person brings from any other list (C-4). `g` is the
+            // same "top" key everywhere except the Forgejo screen, where it is the
+            // clone key the page map names; it never acts on a repository from another
+            // screen (C-6).
+            KeyCode::PageDown => self.move_selection(LIST_PAGE),
+            KeyCode::PageUp => self.move_selection(-LIST_PAGE),
+            KeyCode::Home => self.select_edge(false),
+            KeyCode::End | KeyCode::Char('G') => self.select_edge(true),
             KeyCode::Enter => self.open_selected_agent(),
             KeyCode::Esc => self.screen = Screen::Agents,
             KeyCode::Char('s') => self.request_agent_start(),
@@ -2591,16 +2701,12 @@ impl App {
             KeyCode::Char('p') => self.request_endpoint_test(),
             KeyCode::Char('c') => self.request_role_check(),
             KeyCode::Char('i') => self.request_identity(),
-            KeyCode::Char('g') => {
-                self.show(Screen::Forgejo);
-                self.request_clone();
-            }
-            KeyCode::Char('P') => {
-                self.show(Screen::Forgejo);
+            KeyCode::Char('g') if self.screen == Screen::Forgejo => self.request_clone(),
+            KeyCode::Char('g') => self.select_edge(false),
+            KeyCode::Char('P') if self.screen == Screen::Forgejo => {
                 self.request_pull_request();
             }
-            KeyCode::Char('U') => {
-                self.show(Screen::Forgejo);
+            KeyCode::Char('U') if self.screen == Screen::Forgejo => {
                 self.request_update_pull_request();
             }
             KeyCode::Char('e') => self.request_edit(EditTarget::Instruction),
@@ -3245,6 +3351,124 @@ role = "member"
     }
 
     #[test]
+    fn the_last_run_is_the_newest_record_not_the_newest_failure() {
+        // O-1: after the network returned, a fresh run succeeded and the hub still
+        // said "the last run ... did not go well", because it searched for the newest
+        // failure rather than reading the newest record. The Agent screen's
+        // `last failure` keeps the history; the hub's sentence is about the last run.
+        let mut app = app_with(GOOD);
+        let failed = RunSummary {
+            agent: "one".to_owned(),
+            run_id: "run-100-0001-1".to_owned(),
+            outcome: Some(RunOutcome::Failed),
+            reason: Some(
+                "the model call failed (transport): io: Connection refused (os error 111)"
+                    .to_owned(),
+            ),
+            duration_ms: Some(0),
+            started_at: None,
+            log: PathBuf::from("/l"),
+            dir: PathBuf::from("/d"),
+        };
+        let succeeded = RunSummary {
+            agent: "one".to_owned(),
+            run_id: "run-200-0001-1".to_owned(),
+            outcome: Some(RunOutcome::Succeeded),
+            reason: Some("the model finished after 1 turn".to_owned()),
+            duration_ms: Some(10),
+            started_at: None,
+            log: PathBuf::from("/l"),
+            dir: PathBuf::from("/d"),
+        };
+        app.recent = vec![succeeded.clone(), failed.clone()];
+        assert!(
+            app.last_run_failure("one").is_none(),
+            "an older failure is not the last run"
+        );
+        assert_eq!(
+            app.last_failure("one").as_deref(),
+            failed.reason.as_deref(),
+            "the historical failure is still named on the Agent screen"
+        );
+        // When the newest record is the failure, it is named.
+        app.recent = vec![failed.clone(), succeeded];
+        assert_eq!(
+            app.last_run_failure("one").as_deref(),
+            failed.reason.as_deref()
+        );
+    }
+
+    #[test]
+    fn page_and_edge_keys_move_the_selection_on_every_list() {
+        // C-4: PageDown/PageUp/Home/End/G are the list conventions a person brings
+        // from anywhere, and an unbound key inside the help overlay speaks instead of
+        // vanishing into it.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.selected, app.agents().len() - 1);
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.selected, 0);
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.selected, app.agents().len() - 1);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.selected, 0);
+
+        app.on_key(key(KeyCode::Char('?')));
+        app.on_key(key(KeyCode::PageDown));
+        assert!(app.help_offset > 0, "PageDown did not page the help");
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.help_offset, 0);
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(app.status.contains("help scrolls"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_clone_key_does_not_fire_from_another_screen() {
+        // C-6: `g` on the Agents list did a Forgejo clone and told the user to run the
+        // role check while they were looking at agents. Off the Forgejo screen it is
+        // the list's own "top" key; the clone stays on the Forgejo screen.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.select_edge(true);
+        assert_ne!(app.selected, 0, "the selection starts at the last row");
+        app.on_key(key(KeyCode::Char('g')));
+        assert_eq!(app.screen, Screen::Agents, "g moved to the Forgejo screen");
+        assert_eq!(app.selected, 0, "g is the top-of-list key here");
+    }
+
+    #[test]
+    fn the_pager_hand_off_names_the_way_out_before_it_opens() {
+        // M-5: `esc` is the product's own way back, but the pager's is `q`; say so
+        // before the pager takes the screen.
+        let root = scratch_root("pager-leave");
+        std::fs::write(root.join("config.toml"), GOOD).expect("the configuration is written");
+        let mut app = App::with_runner(Layout::rooted_at(root.clone()), quiet_runner("pager"));
+        app.show_acknowledgment = false;
+        let run_dir = root.join("state").join("one").join("run-100-0001-1");
+        std::fs::create_dir_all(&run_dir).expect("the run directory is created");
+        std::fs::write(run_dir.join(crate::run::LOG_FILE), "log\n").expect("the log");
+        app.recent = vec![RunSummary {
+            agent: "one".to_owned(),
+            run_id: "run-100-0001-1".to_owned(),
+            outcome: Some(RunOutcome::Succeeded),
+            reason: None,
+            duration_ms: Some(1),
+            started_at: None,
+            log: run_dir.join(crate::run::LOG_FILE),
+            dir: run_dir,
+        }];
+        app.run_selected = 0;
+        app.show(Screen::Runs);
+        app.request_view_log();
+        assert!(
+            app.status.contains("leave it with q"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
     fn an_abandoned_run_is_closed_as_stopped_not_shown_as_idle() {
         // S-1: a `tui` run is a child of the UI. A reopened UI must not call the agent
         // idle while the run's own record says it never ended.
@@ -3471,6 +3695,69 @@ concurrency = 3
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.should_quit, "the second q leaves");
         app.shutdown();
+    }
+
+    #[test]
+    fn ctrl_c_asks_before_it_leaves_with_a_run_in_flight() {
+        // C-1: `^C` left the whole tool and killed every run without a word, while `q`
+        // asked; the reflex "cancel" chord is the same destructive act and now takes
+        // the same question. C-8: one run is `it`, not `them`.
+        let mut app = app_with_sleeping_runner("app-ctrl-c-live", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_c);
+        assert!(!app.should_quit, "the first ^C asks, it does not leave");
+        assert!(
+            app.status.contains("press ctrl-c again"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("stop it"), "{}", app.status);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "the second ^C leaves");
+        app.shutdown();
+    }
+
+    #[test]
+    fn switching_to_systemd_does_not_leave_a_pluralisation_gutter() {
+        // C-3: the confirmation read `... started the next time it is started (s)`,
+        // an `(s)` that is neither a key nor a plural. A stand-in `systemctl` answers
+        // the version query so the success branch is the one driven.
+        let program = scratch_root("app-mode-string").join("ok-systemctl.sh");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncase \"$*\" in *'show -p Version --value'*) echo 255.4 ;; esac\nexit 0\n",
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is runnable");
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.supervisor
+            .set_systemctl(crate::systemd::Systemctl::with_binary(&program));
+        app.on_key(key(KeyCode::Char('m')));
+        assert!(
+            app.status.contains("now supervised"),
+            "the switch did not succeed: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("(s)"),
+            "the confirmation still carries a gutter: {}",
+            app.status
+        );
     }
 
     #[test]

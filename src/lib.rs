@@ -33,6 +33,7 @@
 //! - [`agent_run`] — the agent process itself, one run at a time;
 //! - [`supervisor`] — starting, watching and stopping agent processes;
 //! - [`systemd`] — the opt-in mode in which an agent runs as a user unit;
+//! - [`words`] — the product's plain-text sentences (counts with the right noun);
 //! - [`editor`] — handing a file to the user's own editor or pager;
 //! - [`ui`] — drawing the screens;
 //! - [`app`] — the state behind the screens and the key bindings.
@@ -62,6 +63,7 @@ pub mod time;
 pub mod transcript;
 pub mod ui;
 pub mod workspace;
+pub mod words;
 
 /// A tiny local HTTP server for the tests and demonstrations only; the application
 /// never starts it and never listens on a socket.

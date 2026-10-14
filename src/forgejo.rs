@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Role;
 use crate::credentials::{REDACTED, Secret};
+use crate::words;
 
 /// How long one Forgejo request may take.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -222,14 +223,14 @@ impl RoleCheck {
     /// that says which view this is.
     pub fn summary(&self) -> String {
         let mut text = format!(
-            "as {}, {} sees {} repository(ies), {} of them private",
+            "as {}, {} sees {}, {} of them private",
             if self.administrative() {
                 "an administrator"
             } else {
                 "an ordinary member"
             },
             self.viewer.login,
-            self.repositories.len(),
+            words::counted(self.repositories.len(), "repository", "repositories"),
             self.private_visible,
         );
         // The label comes from the configured role, but the token may belong to an
@@ -274,17 +275,18 @@ impl RepositoryState {
                 .unwrap_or("unknown"),
         )];
         lines.push(format!(
-            "{} branch(es): {}",
-            self.branches.len(),
+            "{}: {}",
+            words::counted(self.branches.len(), "branch", "branches"),
             if self.branches.is_empty() {
                 "none".to_owned()
             } else {
                 self.branches.join(", ")
             }
         ));
-        lines.push(format!(
-            "{} open pull request(s)",
-            self.open_pull_requests.len()
+        lines.push(words::counted(
+            self.open_pull_requests.len(),
+            "open pull request",
+            "open pull requests",
         ));
         for pull in &self.open_pull_requests {
             lines.push(format!("  {}", pull.line()));
@@ -1024,7 +1026,7 @@ mod tests {
         };
         assert_eq!(
             check.summary(),
-            "as an administrator, root sees 0 repository(ies), 3 of them private"
+            "as an administrator, root sees 0 repositories, 3 of them private"
         );
         assert_eq!(check.summary().matches("private").count(), 1);
     }
