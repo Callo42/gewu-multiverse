@@ -55,7 +55,8 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | removing | the same fields, with the removal confirmation over them | `d` removes the agent (after asking); the files left on disk are named, so a mistyped agent is not a dead end |
 | failed | run state `failed`; the failure class and the run's reason | the reason stored, not a transient footer line |
 | systemd, unit start failed | run state; unit; restarts | the `systemctl` reason, recoverable |
-| systemd, ready | supervision `systemd (user unit)`; unit name; restarts | what `systemd` changes *before* `m` is pressed |
+| systemd, ready | supervision `systemd (user unit)`; unit name; restarts; the user manager reachable | what `systemd` changes *before* `m` is pressed |
+| systemd, the user manager is not reachable | supervision stays `tui`; the refusal names what is missing and says nothing was changed; on an existing `systemd` record, a red line naming the manager and `m` | the switch into `systemd` is **refused before the mode record changes**, so `m` is never a one-way door; leaving an existing `systemd` record succeeds without the manager when no unit file is on disk, because there is nothing to stop |
 
 ## Instruction, steps and skills (`3`)
 
