@@ -292,6 +292,18 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                     "restarts",
                     &app.supervisor.restart_count(&agent.name).to_string(),
                 ));
+                // A `systemd` record whose user manager cannot be reached is the T-1
+                // state, and it must be visible where the mode is shown: say what is
+                // missing, and that `m` leaves the mode without needing the manager
+                // when no unit file is on disk.
+                if let Some(reason) = app.supervisor.systemd_last_error() {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "the user's systemd cannot be reached: {reason} — press m to leave systemd mode; leaving needs no unit on disk and no manager"
+                        ),
+                        Style::new().fg(Color::Red),
+                    )));
+                }
             }
             if let Some(paths) = app.selected_paths() {
                 lines.push(field(

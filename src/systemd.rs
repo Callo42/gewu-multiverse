@@ -893,9 +893,18 @@ impl SystemdSupervisor {
     }
 
     /// Remove one agent's unit file, after making sure it is not running.
+    ///
+    /// An agent with no unit file on disk has nothing to stop and nothing systemd
+    /// needs to be asked about, so leaving `systemd` mode for such an agent succeeds
+    /// even when the user manager cannot be reached. That is the way back out of a
+    /// `systemd` record written by an earlier session on a machine that has since
+    /// lost its user session (T-1): the record, not the manager, was the door.
     pub fn remove_unit(&mut self, agent: &str) -> Result<(), String> {
-        self.stop_quietly(agent)?;
         let path = self.unit_dir.join(unit_name(agent));
+        let on_disk = path.is_file();
+        if on_disk {
+            self.stop_quietly(agent)?;
+        }
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -904,9 +913,12 @@ impl SystemdSupervisor {
             }
         }
         self.runs.remove(agent);
-        // A unit the tool no longer manages must not stay reported as failed.
-        let _ = self.systemctl.reset_failed(&unit_name(agent));
-        self.systemctl.daemon_reload()
+        if on_disk {
+            // A unit the tool no longer manages must not stay reported as failed.
+            let _ = self.systemctl.reset_failed(&unit_name(agent));
+            self.systemctl.daemon_reload()?;
+        }
+        Ok(())
     }
 
     /// Read every unit back, at most once per poll interval.

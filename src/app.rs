@@ -1397,7 +1397,8 @@ impl App {
                         }
                     }
                     Mode::Tui => {
-                        "its unit file was removed from your systemd directory".to_owned()
+                        "it runs as a child of this UI again; no unit file of this tool's is left in your systemd directory"
+                            .to_owned()
                     }
                 };
                 self.status = format!(
