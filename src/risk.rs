@@ -115,16 +115,19 @@ impl AckState {
     /// a risk someone else accepted, under a version they did not run. The record is
     /// on disk — this line puts it on the screen, with the key that shows the terms
     /// again, so reading them does not mean finding and deleting a file by hand
-    /// (C-3).
+    /// (C-3). Both versions are named and labelled: the one the record agreed to and
+    /// the one now running, so the comparison a Migrator came for can be made on the
+    /// screen (F3).
     pub fn record_line(&self) -> Option<String> {
         match self {
             AckState::Recorded {
                 acknowledged_at_unix,
                 app_version,
             } => Some(format!(
-                "the risk was acknowledged on {} (version {}); press R to read the terms again — the record is not changed",
+                "the risk was acknowledged on {} (version {}; this build is {}); press R to read the terms again — the record is not changed",
                 crate::time::compact_utc(acknowledged_at_unix.saturating_mul(1000)),
-                version_label(app_version)
+                version_label(app_version),
+                env!("CARGO_PKG_VERSION")
             )),
             _ => None,
         }
@@ -220,6 +223,16 @@ mod tests {
         assert!(line.contains("the risk was acknowledged on"), "{line}");
         assert!(line.contains("0.1.7"), "the version the file carries: {line}");
         assert!(line.contains("press R"), "the way to read the terms again: {line}");
+        // F3: the version now running is named beside the one the record carries, so
+        // the comparison is on the screen instead of only in `--version`.
+        assert!(
+            line.contains(env!("CARGO_PKG_VERSION")),
+            "the running version is not shown: {line}"
+        );
+        assert!(
+            line.contains("this build is"),
+            "the running version is not labelled: {line}"
+        );
         // A missing record has no line to draw.
         assert!(AckState::Missing.record_line().is_none());
     }

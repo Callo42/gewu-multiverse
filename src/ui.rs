@@ -320,7 +320,7 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled(
         format!(
             "The `tui` mode is an ordinary child process of this tool; `m` switches to `systemd`, a user unit that keeps running when this UI exits and needs `loginctl enable-linger` to outlive a logout. Your systemd directory is {}.",
-            app.supervisor.unit_dir().display()
+            breakable_path(&app.supervisor.unit_dir().display().to_string())
         ),
         Style::new().fg(Color::DarkGray),
     )));
@@ -462,12 +462,14 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     }
                 }
             }
-            match crate::credentials::recorded_login(&app.credentials_path, &agent.name) {
-                Ok(Some(login)) => lines.push(field("identity", &login)),
-                _ => lines.push(field("identity", "not settled — press i")),
+            match app.recorded_identity(&agent.name) {
+                Some(identity) => lines.push(field("identity", &identity.line())),
+                None => lines.push(field("identity", "not settled — press i")),
             }
-            if let Some(report) = &app.identity_report {
-                if report.agent == agent.name {
+            // A refusal from this session stays visible here; the success line is
+            // already above, in the same shape every surface uses (F6).
+            if let Some(report) = app.identity_report_for(&agent.name) {
+                if report.result.is_err() {
                     lines.push(field("forgejo account", &report.describe()));
                 }
             }
@@ -549,7 +551,7 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
                         lines.push(Line::from(Span::styled(
                             format!(
                                 "an earlier edit of this instruction was not saved; the editor kept it in {} — open that file to recover",
-                                backup.display()
+                                breakable_path(&backup.display().to_string())
                             ),
                             Style::new().fg(Color::Yellow),
                         )));
@@ -854,35 +856,42 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
         },
     ));
     if let Some(agent) = app.selected_agent() {
-        match crate::credentials::recorded_login(&app.credentials_path, &agent.name) {
-            Ok(Some(login)) => {
-                // The mode is shown persistently, beside the login, not only in the
-                // transient status line: which account a clone or a pull request acts
-                // as is exactly the thing a user with several tokens needs to know
-                // before pressing the key, not after.
-                let mode = identity::recorded_mode(&app.credentials_path)
-                    .ok()
-                    .flatten()
-                    .map(|mode| format!(" ({})", mode.as_str()))
-                    .unwrap_or_default();
+        match app.recorded_identity(&agent.name) {
+            Some(identity) => {
+                // One shape on every surface, and it names the agent: the login, the
+                // email and the mode of the account a clone or a pull request acts as
+                // (F1, F6). A second person with several agents never has to guess
+                // whose identity is on show.
                 head.push(field(
                     "agent identity",
-                    &format!("{login}{mode} — clones and pull requests act as this account"),
+                    &format!(
+                        "{} — clones and pull requests act as this account",
+                        identity.line()
+                    ),
                 ));
             }
-            _ => {
+            None => {
                 // What `i` will do, before it does it: with an administrator token the
                 // tool creates and manages the account `gewu-<agent>`; without one, it
-                // checks the token the user supplies with `v` (D-4).
+                // checks the token the user supplies with `v` (D-4). The field names
+                // the agent, not only the account it would create (F1).
                 let login = identity::login_for(&agent.name)
                     .unwrap_or_else(|_| format!("gewu-{}", agent.name));
                 let (_, admin) = app.forgejo_tokens_present();
+                // The field names the **agent** the identity would belong to, so a
+                // second person with several agents never has to guess whose
+                // selection the screen is showing (F1). The supplied path keeps the
+                // page map's `v supplies the token` clause whole at 80×24.
                 let sentence = if admin {
                     format!(
-                        "not settled — press i for `{login}`; the account is created and managed"
+                        "not settled for `{}` — press i for `{login}`; the account is created and managed",
+                        agent.name
                     )
                 } else {
-                    format!("not settled — press i for `{login}`; v supplies the token")
+                    format!(
+                        "not settled for `{}` — press i; v supplies the token",
+                        agent.name
+                    )
                 };
                 head.push(field("agent identity", &sentence));
             }
@@ -952,7 +961,14 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
 /// panel at 80×24 (Y-8).
 fn forgejo_frame(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut tail: Vec<Line> = Vec::new();
-    if let Some(report) = &app.identity_report {
+    // The report is drawn from the state that owns it: this session's result when
+    // there is one, otherwise the identity recorded in the credentials file once the
+    // role check has run, so a second person who restarts the product can still read
+    // it (H-3).
+    if let Some(report) = app
+        .selected_agent()
+        .and_then(|agent| app.identity_report_for(&agent.name))
+    {
         tail.push(Line::from(""));
         tail.push(Line::from(format!(
             "identity for `{}`: {}",
@@ -1179,7 +1195,7 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(format!(
         "Run records are read from {}.",
-        app.state_root().display()
+        breakable_path(&app.state_root().display().to_string())
     )));
     // L-2: records accumulate for ever, and nothing on any screen said where they live
     // as a footprint or what a person is expected to do about them. The count, the
@@ -1194,7 +1210,7 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             "records"
         };
         lines.push(Line::from(format!(
-            "{} run {noun} on disk, {} in total.",
+            "{} run {noun} on disk, {} of file bytes in total.",
             footprint.records,
             crate::app::filesize_text(footprint.bytes)
         )));
@@ -1215,20 +1231,39 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         )));
     }
     // L-1, L-5: the list is capped at the newest fifty records. Say so at the point of
-    // the cap, rather than presenting fifty as the whole history.
+    // the cap, rather than presenting fifty as the whole history. Every total here is
+    // named for what it counts: the configured agents' records are the list's own
+    // population, `on disk` is every record, and nothing is left out of "not listed"
+    // (F4, H-4).
     if app.recent_total > app.recent.len() {
-        let older = app.recent_total - app.recent.len();
-        let tail = if older == 1 {
-            "1 older record is not listed here, but it is still on disk.".to_owned()
+        let listed = app.recent.len();
+        let configured = app.recent_total;
+        let unconfigured = app.footprint.unconfigured_records;
+        let configured_older = configured - listed;
+        let not_listed = configured_older + unconfigured;
+        let text = if unconfigured == 0 {
+            format!(
+                "This list stops at the newest {listed} of the {configured} run records whose agents are configured: {configured_older} older records are not listed here, but they are still on disk."
+            )
         } else {
-            format!("{older} older records are not listed here, but they are still on disk.")
+            let older_noun = if configured_older == 1 {
+                "older record"
+            } else {
+                "older records"
+            };
+            let unlisted_noun = if unconfigured == 1 {
+                "record"
+            } else {
+                "records"
+            };
+            let all_noun = if not_listed == 1 { "record" } else { "records" };
+            format!(
+                "This list stops at the newest {listed} of the {configured} run records whose agents are configured ({} records are on disk in all): {configured_older} {older_noun} of configured agents and {unconfigured} {unlisted_noun} of agents the configuration no longer lists — {not_listed} {all_noun} in all — are not listed here, but they are still on disk.",
+                app.footprint.records
+            )
         };
         lines.push(Line::from(Span::styled(
-            format!(
-                "This list stops at the newest {} run records of {} on disk: {tail}",
-                app.recent.len(),
-                app.recent_total
-            ),
+            text,
             Style::new().fg(Color::Yellow),
         )));
     }
@@ -1275,8 +1310,8 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             App::file_size_text(&run.log).unwrap_or_else(|| "size unknown".to_owned());
         lines.push(Line::from(format!(
             "the transcript is at {} ({transcript_size}) and the log at {} ({log_size})",
-            transcript.display(),
-            run.log.display()
+            breakable_path(&transcript.display().to_string()),
+            breakable_path(&run.log.display().to_string())
         )));
         lines.push(Line::from(Span::styled(
             "The outcome is decided by the process, not by what it wrote.",
@@ -1944,9 +1979,9 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     let width = (screen.width.saturating_sub(2)).min(76);
     let config_dir = app
         .selected_paths()
-        .map(|paths| paths.config_dir().display().to_string())
+        .map(|paths| breakable_path(&paths.config_dir().display().to_string()))
         .unwrap_or_else(|| "its files".to_owned());
-    let state_dir = app.state_root().join(name).display().to_string();
+    let state_dir = breakable_path(&app.state_root().join(name).display().to_string());
     let config_exists = app
         .selected_paths()
         .map(|paths| paths.config_dir().is_dir())
@@ -1969,7 +2004,7 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
         Line::from(question),
         Line::from(format!(
             "Its secret in {} is left too, marked on the Credentials screen; press D there to delete a secret whose agent is gone.",
-            app.credentials_path.display()
+            breakable_path(&app.credentials_path.display().to_string())
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -2022,7 +2057,7 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
     let lines: Vec<Line> = vec![
         Line::from(format!(
             "Delete the leftover secrets for {names} from {}?",
-            app.credentials_path.display()
+            breakable_path(&app.credentials_path.display().to_string())
         )),
         Line::from("Their agents are not configured any more. The values are never shown."),
         Line::from(""),
@@ -2245,7 +2280,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         ));
         lines.push(Line::from(format!(
             "  The record will be written to {}",
-            app.ack_path.display()
+            breakable_path(&app.ack_path.display().to_string())
         )));
     }
 
@@ -2338,14 +2373,27 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// A line naming a field and its value.
+///
+/// A path among the values gets break opportunities at its `/` separators, so a panel
+/// too narrow for the whole path breaks between directories instead of splitting a
+/// file name in half (H-5).
 fn field(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{label:<LABEL_WIDTH$}"),
             Style::new().fg(Color::DarkGray),
         ),
-        Span::raw(value.to_owned()),
+        Span::raw(breakable_path(value)),
     ])
+}
+
+/// A string whose `/` separators may break when a panel is too narrow.
+///
+/// Ratatui treats `U+200B` as a break opportunity and gives it no width, so the text
+/// reads whole when it fits and, when it does not, breaks at a separator — never
+/// inside a file name (H-5).
+fn breakable_path(text: &str) -> String {
+    text.replace('/', "/\u{200b}")
 }
 
 /// A line that says plainly that something is not there yet.

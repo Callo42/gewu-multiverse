@@ -151,11 +151,27 @@ pub fn clone_destination(workspace: &Path, full_name: &str) -> PathBuf {
     workspace.join(name)
 }
 
+/// What `prepare` did at the destination.
+///
+/// A clone into an empty destination and the reuse of a directory that already holds
+/// a git repository are two different acts, and the status must say which one
+/// happened (F2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prepared {
+    /// The repository was cloned into the destination.
+    Cloned,
+    /// A git repository was already at the destination; it was kept as it was, and
+    /// nothing was cloned or fetched. Only its local git identity was set.
+    AlreadyPresent,
+}
+
 /// Clone a repository into the workspace, or open the clone that is already there.
 ///
 /// This is the "clone or open" of the design: if the destination already holds a git
 /// repository it is opened and its identity is (re)applied; otherwise it is cloned.
-/// Either way the agent's git identity is configured before the call returns.
+/// Either way the agent's git identity is configured before the call returns, and the
+/// returned [`Prepared`] says which act happened so no surface calls a reuse a clone
+/// (F2).
 pub fn prepare(
     base: &str,
     full_name: &str,
@@ -163,10 +179,12 @@ pub fn prepare(
     destination: &Path,
     identity: &GitIdentity,
     credential: Option<&GitCredential<'_>>,
-) -> Result<PathBuf, WorkspaceError> {
+) -> Result<(PathBuf, Prepared), WorkspaceError> {
     if destination.join(".git").is_dir() {
+        // The directory is a repository already; keep it. Nothing is cloned or
+        // fetched, and the caller reports what was found rather than a clone.
         set_identity(destination, identity)?;
-        return Ok(destination.to_path_buf());
+        return Ok((destination.to_path_buf(), Prepared::AlreadyPresent));
     }
     if destination.exists() {
         let empty = std::fs::read_dir(destination)
@@ -192,7 +210,7 @@ pub fn prepare(
     let destination_text = destination.display().to_string();
     run_git(&["clone", &url, &destination_text], workspace, credential)?;
     set_identity(destination, identity)?;
-    Ok(destination.to_path_buf())
+    Ok((destination.to_path_buf(), Prepared::Cloned))
 }
 
 /// Set the repository's local git identity, so a commit is authored by the agent.
@@ -371,6 +389,88 @@ mod tests {
         // exit code says so.
         let code = askpass_main("Password for 'https://example.org':");
         assert_eq!(code, 1);
+    }
+
+    /// Run one git command in `dir`, failing the test if git refuses.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn a_destination_that_already_holds_a_repository_is_reported_as_kept_not_cloned() {
+        // F2: `g` on a directory that already held a git repository reported `is
+        // ready` without cloning, fetching, or saying it had kept what was there. The
+        // outcome now says which act happened, so no surface calls a reuse a clone.
+        let root = crate::test_support::scratch_root("workspace-reuse");
+        let workspace = root.join("workspace");
+        let destination = workspace.join("demo");
+        std::fs::create_dir_all(&destination).expect("the destination is made");
+        git(&destination, &["init", "-q"]);
+        std::fs::write(destination.join("README"), "mine\n").expect("a file");
+        git(&destination, &["add", "."]);
+        git(
+            &destination,
+            &[
+                "-c",
+                "user.name=me",
+                "-c",
+                "user.email=me@example.org",
+                "commit",
+                "-q",
+                "-m",
+                "mine",
+            ],
+        );
+        let identity = GitIdentity {
+            login: "gewu-scribe".to_owned(),
+            email: "gewu-scribe@agents.invalid".to_owned(),
+        };
+        let (path, outcome) = prepare(
+            "https://forgejo.example.org",
+            "migrator/gewu-multiverse",
+            &workspace,
+            &destination,
+            &identity,
+            None,
+        )
+        .expect("the existing repository is kept");
+        assert_eq!(path, destination);
+        assert_eq!(outcome, Prepared::AlreadyPresent);
+        // Nothing was cloned or fetched, and the tool's identity was applied locally.
+        let remotes = Command::new("git")
+            .args(["remote", "-v"])
+            .current_dir(&destination)
+            .output()
+            .expect("git runs");
+        assert!(
+            String::from_utf8_lossy(&remotes.stdout).trim().is_empty(),
+            "a remote was added"
+        );
+        let name = Command::new("git")
+            .args(["config", "user.name"])
+            .current_dir(&destination)
+            .output()
+            .expect("git runs");
+        assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "gewu-scribe");
+        // A non-empty directory that is *not* a repository is still refused.
+        let plain = workspace.join("plain");
+        std::fs::create_dir_all(&plain).expect("the plain directory");
+        std::fs::write(plain.join("file"), "x").expect("a file");
+        let error = prepare(
+            "https://forgejo.example.org",
+            "migrator/plain",
+            &workspace,
+            &plain,
+            &identity,
+            None,
+        )
+        .expect_err("a non-git directory is refused");
+        assert_eq!(error.class(), "destination_in_the_way");
     }
 }
 
