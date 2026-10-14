@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use directories::BaseDirs;
 
-use crate::mode::{PRIVATE_DIR_MODE, set_mode};
+use crate::mode::{PRIVATE_DIR_MODE, hold_dir_private_below, set_mode};
 use crate::naming::agent_name_problem;
 
 /// Every path this program uses, derived from two root directories.
@@ -140,9 +140,16 @@ impl Layout {
         ensure_private_dir(&self.root)
     }
 
+    /// Create the directory holding one directory per agent, and hold it to 0700.
+    pub fn ensure_agents_dir(&self) -> Result<(), PathError> {
+        ensure_private_dir_below(&self.root, &self.agents_dir())
+    }
+
     /// Create whatever a run of one agent needs before it starts: the agent's own
     /// configuration directory, its skills directory and its workspace.
     pub fn ensure_agent(&self, name: &str) -> Result<AgentPaths, PathError> {
+        self.ensure_root()?;
+        self.ensure_agents_dir()?;
         let agent = self.agent(name)?;
         agent.ensure()?;
         Ok(agent)
@@ -153,6 +160,8 @@ impl Layout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPaths {
     name: String,
+    root: PathBuf,
+    state_root: PathBuf,
     config_dir: PathBuf,
     instruction: PathBuf,
     skills_dir: PathBuf,
@@ -176,6 +185,8 @@ impl AgentPaths {
         let config_dir = layout.agents_dir().join(name);
         Ok(Self {
             name: name.to_owned(),
+            root: layout.root().to_path_buf(),
+            state_root: layout.state_root().to_path_buf(),
             instruction: config_dir.join("instruction.md"),
             skills_dir: config_dir.join("skills"),
             steps_file: config_dir.join("steps.txt"),
@@ -201,6 +212,16 @@ impl AgentPaths {
     /// The agent's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The configuration root this agent lives under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The state root this agent's run records live under.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
     }
 
     /// The agent's configuration directory: its instruction, skills and workspace.
@@ -243,15 +264,30 @@ impl AgentPaths {
     /// A configured instruction may live in a directory of its own (for example
     /// `instructions/scribe.md`), so the instruction's parent is created too: the
     /// editor writes the file there, and `e` must not fail because the directory the
-    /// configuration named does not exist yet.
+    /// configuration named does not exist yet. Every directory on the way, from the
+    /// configuration root down, is held to 0700 (F-1).
     pub fn ensure(&self) -> Result<(), PathError> {
-        ensure_private_dir(&self.config_dir)?;
-        ensure_private_dir(&self.skills_dir)?;
-        ensure_private_dir(&self.workspace)?;
+        ensure_private_dir_below(&self.root, &self.config_dir)?;
+        ensure_private_dir_below(&self.root, &self.skills_dir)?;
+        ensure_private_dir_below(&self.root, &self.workspace)?;
         if let Some(parent) = self.instruction.parent() {
-            ensure_private_dir(parent)?;
+            ensure_private_dir_below(&self.root, parent)?;
         }
         Ok(())
+    }
+
+    /// Create this agent's run-record directory, holding every directory from the
+    /// state root down to it to 0700 (F-1).
+    pub fn ensure_state_dir(&self) -> Result<(), PathError> {
+        ensure_private_dir_below(&self.state_root, &self.state_dir)
+    }
+
+    /// Create one run's record directory, holding every directory from the state
+    /// root down to it to 0700 (F-1).
+    pub fn ensure_run_dir(&self, run_id: &str) -> Result<PathBuf, PathError> {
+        let run_dir = self.run_dir(run_id);
+        ensure_private_dir_below(&self.state_root, &run_dir)?;
+        Ok(run_dir)
     }
 }
 
@@ -262,6 +298,19 @@ fn ensure_private_dir(path: &Path) -> Result<(), PathError> {
         source,
     })?;
     set_mode(path, PRIVATE_DIR_MODE).map_err(|source| PathError::RootMode {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Create a directory if it is not there yet, and hold it, and every directory
+/// between `stop` and it, to mode 0700.
+fn ensure_private_dir_below(stop: &Path, path: &Path) -> Result<(), PathError> {
+    fs::create_dir_all(path).map_err(|source| PathError::Root {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    hold_dir_private_below(stop, path).map_err(|source| PathError::RootMode {
         path: path.to_path_buf(),
         source,
     })
@@ -379,9 +428,16 @@ mod tests {
         let agent = layout
             .ensure_agent("scribe")
             .expect("the agent is prepared");
-        for dir in [agent.config_dir(), agent.skills_dir(), agent.workspace()] {
+        // F-1: the intermediate `agents/` directory is the product's too, and must
+        // carry the same 0700 as the directories inside it.
+        for dir in [
+            layout.agents_dir(),
+            agent.config_dir().to_path_buf(),
+            agent.skills_dir().to_path_buf(),
+            agent.workspace().to_path_buf(),
+        ] {
             assert!(dir.is_dir(), "{dir:?} must exist");
-            let mode = fs::metadata(dir)
+            let mode = fs::metadata(&dir)
                 .expect("the directory can be described")
                 .permissions()
                 .mode();
@@ -389,5 +445,33 @@ mod tests {
         }
         assert!(!agent.instruction().exists(), "no instruction is invented");
         assert!(!agent.state_dir().exists(), "no run record is created yet");
+    }
+
+    #[test]
+    fn every_state_directory_the_product_makes_is_private() {
+        // F-1: the state root, the per-agent state directory and the per-run record
+        // directory were left at the umask default while the agent's configuration
+        // directory was 0700.
+        let root = scratch_root("ensure-state");
+        let layout = Layout::rooted_at(root.clone());
+        let agent = layout
+            .ensure_agent("scribe")
+            .expect("the agent is prepared");
+        agent.ensure_state_dir().expect("the state directory is made");
+        let run_dir = agent
+            .ensure_run_dir("run-1")
+            .expect("the run directory is made");
+        for dir in [
+            layout.state_root(),
+            agent.state_dir(),
+            run_dir.as_path(),
+        ] {
+            assert!(dir.is_dir(), "{dir:?} must exist");
+            let mode = fs::metadata(dir)
+                .expect("the directory can be described")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, PRIVATE_DIR_MODE, "{dir:?}");
+        }
     }
 }

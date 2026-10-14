@@ -200,6 +200,13 @@ pub fn prepare(
         path: workspace.to_path_buf(),
         source,
     })?;
+    // F-1: the workspace is one of the product's directories.
+    crate::mode::set_mode(workspace, crate::mode::PRIVATE_DIR_MODE).map_err(|source| {
+        WorkspaceError::Workspace {
+            path: workspace.to_path_buf(),
+            source,
+        }
+    })?;
 
     let login = credential.map(|credential| credential.login).unwrap_or("");
     let url = if login.is_empty() {

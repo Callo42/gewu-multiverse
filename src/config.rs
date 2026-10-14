@@ -277,7 +277,10 @@ impl Config {
                 source,
             })?;
         }
-        fs::write(path, SAMPLE).map_err(|source| ConfigError::Write {
+        // F-2: the configuration file is written 0600 like the credentials file. A
+        // configuration names endpoints and agent names, and one custody for both
+        // files is what the screen beside them states.
+        crate::mode::write_private(path, SAMPLE.as_bytes()).map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
         })?;
@@ -785,6 +788,11 @@ token = "abcdef"
         assert!(file.is_file());
         // The sample it wrote is itself a valid configuration.
         Config::load(&file).expect("the written sample is valid");
+        // F-2: the configuration file is 0600, the same custody as the credentials
+        // file written beside it.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&file).expect("described").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the sample is not private: {mode:04o}");
     }
 
     #[test]
