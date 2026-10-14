@@ -775,6 +775,12 @@ impl SystemdSupervisor {
         self.last_error.as_deref()
     }
 
+    /// Remember — or clear — the reason the user's systemd could not be reached when
+    /// it was probed for a record with no unit to read (M-6).
+    pub fn set_manager_error(&mut self, message: Option<String>) {
+        self.last_error = message;
+    }
+
     /// Remember the run a record names, so a later session can read its state.
     pub fn note_run(&mut self, agent: &str, run_dir: Option<PathBuf>, restarts_recorded: u32) {
         let Some(run_dir) = run_dir else {

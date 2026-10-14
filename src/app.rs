@@ -36,6 +36,10 @@ const RECENT_RUNS_REFRESH: Duration = Duration::from_secs(1);
 /// How many runs the runs screen lists.
 const RECENT_RUNS_LIMIT: usize = 50;
 
+/// How many rows one page key moves a list, and the help overlay.
+const LIST_PAGE: isize = 5;
+const HELP_PAGE: usize = 5;
+
 /// The screens of the terminal UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -2134,7 +2138,9 @@ impl App {
             label: label.clone(),
             before: None,
         });
-        self.status = format!("opening {label}");
+        // Name the way out before the pager takes the screen: `esc` cancels the
+        // product's own overlays but not the user's pager, whose own key is `q` (M-5).
+        self.status = format!("opening {label} — leave it with q");
     }
 
     /// Ask to read the log of the run on show. The terminal loop carries it out.
@@ -2176,7 +2182,9 @@ impl App {
             label: label.clone(),
             before: None,
         });
-        self.status = format!("opening {label}");
+        // Name the way out before the pager takes the screen: `esc` cancels the
+        // product's own overlays but not the user's pager, whose own key is `q` (M-5).
+        self.status = format!("opening {label} — leave it with q");
     }
 
     /// The directory of the newest run of one agent, from the state or from disk.
@@ -2416,6 +2424,36 @@ impl App {
         }
     }
 
+    /// Move the selection to the first or last row of the list on show.
+    ///
+    /// Home/`g` and End/`G` mean the same thing on every list, so a person who reads
+    /// the end by reflex is not sent somewhere else (C-4).
+    pub fn select_edge(&mut self, last: bool) {
+        match self.screen {
+            Screen::Runs => {
+                self.run_selected = if last {
+                    self.recent.len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            Screen::Forgejo => {
+                let count = match &self.role_check {
+                    Some(Ok(check)) => check.repositories.len(),
+                    _ => 0,
+                };
+                self.repo_selected = if last { count.saturating_sub(1) } else { 0 };
+            }
+            _ => {
+                self.selected = if last {
+                    self.agents().len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+        }
+    }
+
     /// Move the repository selection on the Forgejo screen, stopping at the ends.
     pub fn move_repo_selection(&mut self, steps: isize) {
         let count = match &self.role_check {
@@ -2535,13 +2573,23 @@ impl App {
         if self.show_help {
             match key.code {
                 // The help is a scrollable list, so a short window can still reach
-                // every key instead of clipping the last group (P-6).
+                // every key instead of clipping the last group (P-6). The list keys
+                // a person brings from anywhere work here too, and one the overlay
+                // cannot use says so rather than vanishing into it (C-4).
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.help_offset = self.help_offset.saturating_add(1);
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.help_offset = self.help_offset.saturating_sub(1);
                 }
+                KeyCode::PageDown => {
+                    self.help_offset = self.help_offset.saturating_add(HELP_PAGE);
+                }
+                KeyCode::PageUp => {
+                    self.help_offset = self.help_offset.saturating_sub(HELP_PAGE);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.help_offset = 0,
+                KeyCode::End | KeyCode::Char('G') => self.help_offset = usize::MAX,
                 KeyCode::Esc
                 | KeyCode::Char('?')
                 | KeyCode::Char('h')
@@ -2549,7 +2597,11 @@ impl App {
                 | KeyCode::Enter => {
                     self.show_help = false;
                 }
-                _ => {}
+                _ => {
+                    self.status =
+                        "the help scrolls with up/down or a page with PageDown/PageUp; esc closes it"
+                            .to_owned();
+                }
             }
             return;
         }
@@ -2627,6 +2679,15 @@ impl App {
             // prompt for a model key.
             KeyCode::Char('k') if self.screen != Screen::Credentials => self.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            // Page, home and end motion on every windowed list and on the help overlay:
+            // the conventions a person brings from any other list (C-4). `g` is the
+            // same "top" key everywhere except the Forgejo screen, where it is the
+            // clone key the page map names; it never acts on a repository from another
+            // screen (C-6).
+            KeyCode::PageDown => self.move_selection(LIST_PAGE),
+            KeyCode::PageUp => self.move_selection(-LIST_PAGE),
+            KeyCode::Home => self.select_edge(false),
+            KeyCode::End | KeyCode::Char('G') => self.select_edge(true),
             KeyCode::Enter => self.open_selected_agent(),
             KeyCode::Esc => self.screen = Screen::Agents,
             KeyCode::Char('s') => self.request_agent_start(),
@@ -2635,16 +2696,12 @@ impl App {
             KeyCode::Char('p') => self.request_endpoint_test(),
             KeyCode::Char('c') => self.request_role_check(),
             KeyCode::Char('i') => self.request_identity(),
-            KeyCode::Char('g') => {
-                self.show(Screen::Forgejo);
-                self.request_clone();
-            }
-            KeyCode::Char('P') => {
-                self.show(Screen::Forgejo);
+            KeyCode::Char('g') if self.screen == Screen::Forgejo => self.request_clone(),
+            KeyCode::Char('g') => self.select_edge(false),
+            KeyCode::Char('P') if self.screen == Screen::Forgejo => {
                 self.request_pull_request();
             }
-            KeyCode::Char('U') => {
-                self.show(Screen::Forgejo);
+            KeyCode::Char('U') if self.screen == Screen::Forgejo => {
                 self.request_update_pull_request();
             }
             KeyCode::Char('e') => self.request_edit(EditTarget::Instruction),
@@ -3333,6 +3390,76 @@ role = "member"
         assert_eq!(
             app.last_run_failure("one").as_deref(),
             failed.reason.as_deref()
+        );
+    }
+
+    #[test]
+    fn page_and_edge_keys_move_the_selection_on_every_list() {
+        // C-4: PageDown/PageUp/Home/End/G are the list conventions a person brings
+        // from anywhere, and an unbound key inside the help overlay speaks instead of
+        // vanishing into it.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.selected, app.agents().len() - 1);
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.selected, 0);
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.selected, app.agents().len() - 1);
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.selected, 0);
+
+        app.on_key(key(KeyCode::Char('?')));
+        app.on_key(key(KeyCode::PageDown));
+        assert!(app.help_offset > 0, "PageDown did not page the help");
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.help_offset, 0);
+        app.on_key(key(KeyCode::Char('z')));
+        assert!(app.status.contains("help scrolls"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_clone_key_does_not_fire_from_another_screen() {
+        // C-6: `g` on the Agents list did a Forgejo clone and told the user to run the
+        // role check while they were looking at agents. Off the Forgejo screen it is
+        // the list's own "top" key; the clone stays on the Forgejo screen.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.select_edge(true);
+        assert_ne!(app.selected, 0, "the selection starts at the last row");
+        app.on_key(key(KeyCode::Char('g')));
+        assert_eq!(app.screen, Screen::Agents, "g moved to the Forgejo screen");
+        assert_eq!(app.selected, 0, "g is the top-of-list key here");
+    }
+
+    #[test]
+    fn the_pager_hand_off_names_the_way_out_before_it_opens() {
+        // M-5: `esc` is the product's own way back, but the pager's is `q`; say so
+        // before the pager takes the screen.
+        let root = scratch_root("pager-leave");
+        std::fs::write(root.join("config.toml"), GOOD).expect("the configuration is written");
+        let mut app = App::with_runner(Layout::rooted_at(root.clone()), quiet_runner("pager"));
+        app.show_acknowledgment = false;
+        let run_dir = root.join("state").join("one").join("run-100-0001-1");
+        std::fs::create_dir_all(&run_dir).expect("the run directory is created");
+        std::fs::write(run_dir.join(crate::run::LOG_FILE), "log\n").expect("the log");
+        app.recent = vec![RunSummary {
+            agent: "one".to_owned(),
+            run_id: "run-100-0001-1".to_owned(),
+            outcome: Some(RunOutcome::Succeeded),
+            reason: None,
+            duration_ms: Some(1),
+            started_at: None,
+            log: run_dir.join(crate::run::LOG_FILE),
+            dir: run_dir,
+        }];
+        app.run_selected = 0;
+        app.show(Screen::Runs);
+        app.request_view_log();
+        assert!(
+            app.status.contains("leave it with q"),
+            "{}",
+            app.status
         );
     }
 

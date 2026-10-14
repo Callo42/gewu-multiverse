@@ -72,7 +72,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | removing | the same fields, with the removal confirmation over them | `d` removes the agent (after asking); the files left on disk are named, so a mistyped agent is not a dead end |
 | failed | run state `failed`; the failure class and the run's reason | the reason stored, not a transient footer line |
 | systemd, unit start failed | run state; unit; restarts | the `systemctl` reason, recoverable |
-| systemd, ready | supervision `systemd (user unit)`; unit name; restarts; the user manager reachable | what `systemd` changes *before* `m` is pressed; the confirmation that follows reads as a sentence (`... started the next time it is started`), with no `(s)` gutter |
+| systemd, ready | supervision `systemd (user unit)`; unit name; restarts; the user manager reachable | what `systemd` changes *before* `m` is pressed; the confirmation that follows reads as a sentence (`... started the next time it is started`), with no `(s)` gutter; a `systemd` record the product itself wrote (which names no run) still says when the manager cannot be reached, so `systemd` + `idle` is never shown as if a start would work |
 | systemd, the user manager is not reachable | supervision stays `tui`; the refusal names what is missing and says nothing was changed; on an existing `systemd` record, a red line naming the manager and `m` | the switch into `systemd` is **refused before the mode record changes**, so `m` is never a one-way door; leaving an existing `systemd` record succeeds without the manager when no unit file is on disk, because there is nothing to stop |
 
 ## Instruction, steps and skills (`3`)
@@ -94,7 +94,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | a check was refused | `role check failed (<class>) at <configured url>: <reason>`; a token that is an administrator's but is checked as `member` says so and names `C` | the URL the user configured, led before the reason, and the account's real standing, not a bare class |
 | configured, unread | the URL and role | a sentence that says *not read yet*, not “could not be read” |
 | checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel, each `[private]`/`[public]`, what the caller may do; the definition of a role shortens once the check has run, so the list gets the panel (more than one row at 80×24) | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
-| checked rows then `g` | the clone acts as the agent's identity, while the list came from the role token | a failed clone names the account it acted as and says the list came from the role token, so two different tokens are not confused |
+| checked rows then `g` | the clone acts as the agent's identity, while the list came from the role token | a failed clone names the account it acted as and says the list came from the role token, so two different tokens are not confused; `g`, `P` and `U` act **only** on this screen — off it, `g` is the list's own top-of-list key, never a Forgejo action |
 | both tokens present | one view at a time, or both | a way to compare the two roles **inside the app** (`c` / `C`); a failed `C` keeps the last good view and shows the failure beside it |
 | a token is missing | `role token absent` / `admin token absent` / `failed (no_agent_token)` | a one-field, masked prompt (`v` for the agent's own token, `A` for the administrator token) that writes the credentials file, never an editor |
 | `not_admin` | the exact refusal | keep it; it is the model |
@@ -128,7 +128,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | add-agent form (`n`/`a`) | opened from the Agents screen | name, endpoint, model, key, Forgejo URL, **role** token — every field drawn at 80×24, with the body windowed so the cursor's own row is always drawn; writes the two files; the model key is **required**, so the agent the form creates can run; the form says the agent's own token is separate and is supplied later with `v`; the keys never echoed; **the `enter writes it / esc cancels` action line is in the panel at every size** (including 80×24); a masked field shows how many characters it holds; a bracketed paste keeps the first line, names the rest as unused, and **replaces** the field instead of appending |
 | secret prompt (`k`/`f`/`v`/`A`) | Credentials (`k`, `f`, `A`) and Forgejo (`v`, `A`) | one field, masked, showing how many characters it holds (`1 character` in the singular); writes the named secret to the credentials file, naming the agent it belongs to when the secret is per-agent; never a value on screen; a bracketed paste keeps the first line and replaces |
 | removal confirmation (`d`) | any configured agent | `y` or `enter` removes it from the configuration, `n` or `esc` keeps it — the destructive key is named in the box; the files left on disk are named **only when they exist** |
-| key help (`?`/`h`/`F1`) | any screen | every key, in groups, with one line of what it does; a **scrollable window** whose title reads `keys a–b of N — ↓/↑ more` when the window is short, so every key survives 80×24 |
+| key help (`?`/`h`/`F1`) | any screen | every key, in groups, with one line of what it does; a **scrollable window** whose title reads `keys a–b of N — ↓/↑ more` when the window is short, so every key survives 80×24; it scrolls with up/down (and `j`/`k`), a page with PageDown/PageUp, and Home/`g` or End/`G` to either end; a key it cannot use says so instead of being swallowed |
 
 ## Hand-offs (editor, pager)
 
@@ -138,7 +138,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | editor, `$EDITOR` unset | `vi` (or `nano` when present) | the program named, and how to leave it — the overlay gives `vi`'s `:wq`/`:q!` and `nano`'s `^X`; an honest “not changed” when nothing was saved |
 | editor on skills (`K`) | a scratch `SKILL.md`, not a directory | what a skill is and the file name |
 | editor on an instruction | a file whose only guidance is one marked placeholder line | **the product's own first placeholder line** is dropped before a run sends the document (a line equal to it later in the user's own document is kept), so guidance is never sent as instruction but the user's text is not deleted; an emergency save left by an interrupted editor is named before the hand-off |
-| pager (`o`, `T`) | the user's own `$PAGER` | the path shown before it opens |
+| pager (`o`, `T`) | the user's own `$PAGER` | the path shown before it opens, and how to leave it (the pager's own `q`), because `esc` is this product's way back but not the pager's |
 
 ## Signals and abandoned runs
 
