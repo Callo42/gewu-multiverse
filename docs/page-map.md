@@ -12,19 +12,27 @@ A zero-knowledge user has started the product and nothing else. They have not re
 repository, the README or any page. The product carries them: each state says what it
 is, what is missing, and the key or the form that moves them on.
 
-**Nothing truncates in silence.** A panel or a note area whose wrapped content does not
-fit its window says so where the user is looking: a bordered panel puts `more below;
-enlarge the window` in its title (always drawn), and the two borderless note areas
-(Agents, Runs) reserve their last drawn row for the same sentence. The declaration is
-the part that must survive: when a panel's title carries more than its name (the
-Forgejo panel carries its repository range) and both cannot fit, the screen name is
-shortened and then the declaration is shortened, and only if neither can hold both
-does the range move to a line above the list. **The below-fold content is reachable
-too**: `[`/`]` scroll the panel or note area on every screen, on the screens whose
-content is not a list (Agent, Instruction, Credentials) the arrows and page keys move
-the panel, and a press that cannot move it says `the panel is at its top` / `at its
-end` rather than being swallowed. A screen's own
-must-offer sentence is drawn at the advertised minimum size (80×24) by putting the
+**Nothing truncates in silence — in both directions.** A panel or a note area whose
+wrapped content does not fit its window says so where the user is looking: a bordered
+panel puts `more below; enlarge the window` in its title (always drawn), and the two
+borderless note areas (Agents, Runs) reserve their last drawn row for the same
+sentence. A surface scrolled away from its own top carries the sibling marker —
+`↑ more above` in a bordered title, `↑ more above — press [ to go back` as the first
+drawn row of a note area — so a scrolled panel never hides its own heading in silence.
+The declaration is the part that must survive: when a panel's title carries more than
+its name (the Forgejo panel carries its repository range) and both cannot fit, the
+screen name is shortened and then the declaration is shortened, and only if neither
+can hold both does the range move to a line above the list. **The scroll offset belongs
+to the screen it was made on**: every way of changing screens (`1`–`6`, tab and
+left/right, `esc`, `enter` into an agent) returns the new screen to its own top, so a
+screen the user never scrolled never opens at another screen's offset. **The below-fold
+content is reachable too**: `[`/`]` scroll the panel or note area on **every** screen —
+Forgejo included, where the list, the summary, the identity report and the key legend
+are the one panel, so below 80×24 the same discipline reaches them instead of only
+declaring them; on the screens whose content is not a list (Agent, Instruction,
+Credentials) the arrows and page keys move the panel, and a press that cannot move it
+says `the panel is at its top` / `at its end` rather than being swallowed. A screen's
+own must-offer sentence is drawn at the advertised minimum size (80×24) by putting the
 offer above the prose that can wait, not by making the window taller; only what is
 below that line needs the declaration.
 
@@ -43,7 +51,9 @@ gutter; the JSONL transcript keeps its numbers.
 
 Screens: **Agents** (`1`) · **Agent** (`2`) · **Instruction** (`3`) · **Forgejo**
 (`4`) · **Credentials** (`5`) · **Runs** (`6`); the tab bar carries each number beside
-its name. Overlays: **first-run
+its name, and every name survives whole at the advertised floor (72×18) — the bar
+sheds its side padding rather than clipping the last name to a fragment. Overlays:
+**first-run
 acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pager**.
 
 ---
@@ -102,9 +112,10 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | a check was refused | `role check failed (<class>) at <configured url>: <reason>`; a token that is an administrator's but is checked as `member` says so and names `C` | the URL the user configured, led before the reason, and the account's real standing, not a bare class |
 | configured, unread | the URL and role | a sentence that says *not read yet*, not “could not be read” |
 | checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel (or, when that cannot share the title with the overflow declaration, a `repositories a–b of N` line above the list), each `[private]`/`[public]`, what the caller may do; the definition of a role shortens once the check has run, so the list gets the panel (more than one row at 80×24); the key legend is two compact rows, each phrase keeping its object (`v agent token`), and the rows after the list are reserved so the legend is never what the list pushes off | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
+| checked, too short for the windowed form (below 80×24) | the same panel drawn whole — summary, `repositories 1–N of N`, every repository with its `>` marker, the identity report, the clone note and the two-row key legend — with `more below; enlarge the window` (or `↑ more above` once scrolled) in the title | the same discipline as every other panel: `[`/`]` scroll the Forgejo panel too, so the whole repository list and the key legend are **reachable** below 80×24 and at the 72×18 floor, not merely declared; `up/down` still chooses a repository. The refusal never names a panel that is not on this screen |
 | checked rows then `g` | the clone acts as the agent's identity, while the list came from the role token | a failed clone names the account it acted as and says the list came from the role token, so two different tokens are not confused; `g`, `P` and `U` act **only** on this screen — off it, `g` is the list's own top-of-list key, never a Forgejo action |
 | both tokens present | one view at a time, or both | a way to compare the two roles **inside the app** (`c` / `C`); a failed `C` keeps the last good view and shows the failure beside it |
-| a token is missing | `role token absent` / `admin token absent` / `failed (no_agent_token)` | a one-field, masked prompt (`v` for the agent's own token, `A` for the administrator token) that writes the credentials file, never an editor |
+| a token is missing | `role token absent` / `admin token absent` / `failed (no_agent_token)`, and a refusal a user acts on names the product's own keys (`press v on the Forgejo screen`, `press A on the Credentials screen`), never a file and a TOML section | a one-field, masked prompt (`v` for the agent's own token, `A` for the administrator token) that writes the credentials file, never an editor |
 | `not_admin` | the exact refusal | keep it; it is the model |
 | identity not settled | `identity not settled — press i` | what `i` will change, before it creates an account, and the `v` prompt that supplies the token `i` needs |
 | identity settled | `identity gewu-<agent> (managed|supplied) — clones and pull requests act as this account` | the login **and** the mode persistently, not only in a transient status line |
@@ -114,8 +125,8 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | ready | file path, the mode the file **actually has now** (`0600` when it is right; a widened file shows its real mode and the refusal below), the redaction promise | which secret **names** are present (`model key for…`, `Forgejo role token`), never a value; `k` sets a model key and `f` the role token, masked — the key line is drawn at 80×24, above the prose that may fall below the fold |
-| after a removal | the removed agent's key, marked `(no agent with that name is configured)` | know that a listed secret belongs to no configured agent, and delete it: `D` opens a confirmation naming the agents and removes exactly those entries, never showing a value |
-| a secret is missing | `present  nothing yet — no model key and no Forgejo token` | a key on this screen to supply it (`k`, `f`, `A`), never a file to edit |
+| after a removal | the removed agent's key, marked `(no agent with that name is configured)`, and `D delete the leftover secrets of agents no longer configured` on this screen's own legend beside `k`/`f`/`A` | know that a listed secret belongs to no configured agent, and delete it: `D` opens a confirmation naming the agents and removes exactly those entries, never showing a value; the key is offered where the leftover is shown, not only on a help page |
+| a secret is missing | `present  nothing yet — no model key and no Forgejo token`; a refusal elsewhere names this screen's own keys (`press 5 and then k on the Credentials screen`), never a file and a TOML section | a key on this screen to supply it (`k`, `f`, `A`), never a file to edit |
 | not ready | `the credentials file is not ready: <reason>` | the reason, and that no value is ever printed. A file that cannot be read is **not** reported as empty |
 
 ## Runs (`6`) — recent runs
@@ -171,4 +182,4 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | 80×24 | the status line and the legend | the legend must not silently drop keys: it clips at a key boundary and ends with `? all keys`, and the way back (`esc agents`) is among the shown keys |
 | any status longer than the width | the status line, grown past its usual rows when it must be | the footer takes the body's spare rows for the status (never below the body's minimum), so a reason, a path or git's own `fatal:` line is read whole at 80×24, never clipped |
 | a window smaller than 72×18 | one line: “this window is too small to show the product; make it at least 72×18” | that line, instead of clipped panels, a clipped modal or a clipped help overlay |
-| exactly 72×18 (the advertised minimum) | the product, with at least one agent row drawn and the count in the title when more exist | a minimum the product calls usable must show a real row, not a header over nothing |
+| exactly 72×18 (the advertised minimum) | the product, with at least one agent row drawn and the count in the title when more exist, and the tab bar with all six names whole (`6 Runs`, not `6 Ru`) | a minimum the product calls usable must show a real row, not a header over nothing, and must name every screen it offers |

@@ -1704,19 +1704,31 @@ fn the_forgejo_title_never_clips_its_overflow_declaration_at_eighty_columns() {
     app.show(Screen::Forgejo);
 
     // A short window (18 rows, the advertised floor's height) forces the panel to
-    // declare, with the repository range still present.
+    // declare. The declaration is never the part that is clipped; with the panel now
+    // scrollable (A-3) the range moves to a line above the list rather than sharing a
+    // title that would have to clip one of them.
     let short = render_at(80, 18, &app);
     let title_line = short
         .lines()
         .find(|line| line.contains("┌ Forgejo"))
         .unwrap_or_default();
     assert!(
-        title_line.contains("repositories 1–1 of 7"),
-        "the repository range left the title: {title_line:?}"
-    );
-    assert!(
         title_line.contains("more below; enlarge the window"),
         "the declaration is clipped or missing: {title_line:?}"
+    );
+    assert!(
+        !title_line.contains("more bel ") && !title_line.ends_with("more bel"),
+        "the declaration is clipped: {title_line:?}"
+    );
+    // The range is not lost: a few `]` presses bring the line that names it, above
+    // the list, into the window.
+    for _ in 0..3 {
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    }
+    let scrolled = render_at(80, 18, &app);
+    assert!(
+        scrolled.contains("repositories 1–7 of 7"),
+        "the repository range is not reachable: {scrolled}"
     );
 }
 
@@ -1966,4 +1978,169 @@ fn a_newest_log_that_is_gone_is_marked() {
     let screen = render_at(80, 40, &app);
     assert!(screen.contains("newest log"), "{screen}");
     assert!(screen.contains("gone, the record has no log"), "{screen}");
+}
+
+#[test]
+fn a_screen_never_opens_at_another_screens_scroll_offset_and_a_scrolled_panel_says_so() {
+    // A-1: the scroll offset was shared between screens — the number-key path never
+    // reset it — so Instruction opened at the Agents note area's offset with its own
+    // heading gone and no marker. Every screen change resets it, and a panel the user
+    // *does* scroll says there is content above.
+    let root = scratch("scroll-reset");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+
+    app.show(Screen::Agents);
+    for _ in 0..6 {
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    }
+    assert!(app.panel_scroll > 0, "the Agents note area did not scroll");
+
+    // The digit path: the offset must not follow the user to another screen.
+    app.on_key(KeyEvent::from(KeyCode::Char('3')));
+    assert_eq!(
+        app.panel_scroll, 0,
+        "the digit path carried the offset to Instruction"
+    );
+    let instruction = render_at(80, 24, &app);
+    assert!(
+        instruction.contains("on disk"),
+        "Instruction did not open at its own top: {instruction}"
+    );
+    assert!(
+        !instruction.contains("↑ more above"),
+        "an unscrolled panel claims content above: {instruction}"
+    );
+
+    // A panel the user scrolls on this screen says so rather than hiding its heading.
+    for _ in 0..4 {
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    }
+    let scrolled = render_at(80, 24, &app);
+    assert!(
+        scrolled.contains("↑ more above"),
+        "a scrolled panel hides its top in silence: {scrolled}"
+    );
+
+    // `enter` into an agent, and `esc` back, reset it too.
+    app.show(Screen::Agents);
+    for _ in 0..6 {
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.panel_scroll, 0, "`enter` carried the offset");
+    for _ in 0..4 {
+        app.on_key(KeyEvent::from(KeyCode::Char(']')));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    assert_eq!(app.panel_scroll, 0, "`esc` carried the offset");
+}
+
+#[test]
+fn the_forgejo_panel_scrolls_to_its_repository_list_and_legend_below_eighty_by_twenty_four() {
+    // A-3: below 80x24 the Forgejo panel declared `more below` and `[`/`]` refused, so
+    // the repository list and the key legend were unreachable and the selection moved
+    // through rows that were never drawn. The panel now scrolls like every other one.
+    let root = scratch("forgejo-scroll-small");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let mut check = three_repository_check();
+    for index in 0..4 {
+        check
+            .repositories
+            .push(repository(&format!("uxmember/extra-{index}"), false));
+    }
+    app.role_check = Some(Ok(check));
+    app.show(Screen::Forgejo);
+
+    for (width, height) in [(80u16, 18u16), (72, 18)] {
+        app.panel_scroll = 0;
+        let top = render_at(width, height, &app);
+        assert!(
+            top.contains("more below"),
+            "{width}x{height}: the overflowing panel does not declare: {top}"
+        );
+        for _ in 0..12 {
+            app.on_key(KeyEvent::from(KeyCode::Char(']')));
+        }
+        let reached = render_at(width, height, &app);
+        assert!(
+            reached.contains("uxmember/") || reached.contains("uxadmin/"),
+            "{width}x{height}: no repository row is reachable: {reached}"
+        );
+        assert!(
+            reached.contains("up/down choose one"),
+            "{width}x{height}: the key legend is not reachable: {reached}"
+        );
+        assert!(
+            !app.status.contains("the panel below is declared"),
+            "{width}x{height}: the refusal still names a panel that is not there: {}",
+            app.status
+        );
+    }
+}
+
+#[test]
+fn every_screen_name_survives_the_advertised_floor() {
+    // A-4: at 72 columns the tab bar clipped the last name to `6 Ru`.
+    let root = scratch("tab-names-72");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let screen = render_at(72, 18, &app);
+    let tabs: Vec<&str> = screen.lines().take(3).collect();
+    let bar = tabs.join("\n");
+    for name in [
+        "1 Agents",
+        "2 Agent",
+        "3 Instruction",
+        "4 Forgejo",
+        "5 Credentials",
+        "6 Runs",
+    ] {
+        assert!(
+            bar.contains(name),
+            "the tab bar lost `{name}` at 72 columns: {bar}"
+        );
+    }
+    assert!(
+        !bar.contains("6 Ru ") && !bar.contains("6 Ru│") && !bar.contains("6 Ru\n"),
+        "the last tab name is clipped: {bar}"
+    );
+}
+
+#[test]
+fn the_credentials_legend_offers_the_leftover_delete_when_one_is_shown() {
+    // A-5: the screen that shows a leftover secret did not offer `D`; it lived only on
+    // a help page.
+    let root = scratch("credentials-leftover-legend");
+    let mut leftover = app(&root);
+    leftover.show_acknowledgment = false;
+    let path = root.join("credentials.toml");
+    fs::write(
+        &path,
+        "forgejo_token = \"\"\n\n[model_keys]\n\"ghost\" = \"gw-throwaway\"\n",
+    )
+    .expect("the credentials file is written");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
+    leftover.show(Screen::Credentials);
+    let screen = render_at(80, 24, &leftover);
+    assert!(
+        screen.contains("no agent with that name is configured"),
+        "the leftover is not marked: {screen}"
+    );
+    assert!(
+        screen.contains("D delete the leftover secrets"),
+        "the legend does not offer the delete: {screen}"
+    );
+
+    // With no leftover, the legend stays as it was.
+    let empty = scratch("credentials-no-leftover-legend");
+    let mut plain = app(&empty);
+    plain.show_acknowledgment = false;
+    plain.show(Screen::Credentials);
+    let no_leftover = render_at(80, 24, &plain);
+    assert!(
+        !no_leftover.contains("D delete the leftover secrets"),
+        "the legend offers a delete with nothing to delete: {no_leftover}"
+    );
 }
