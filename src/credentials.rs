@@ -517,6 +517,22 @@ pub fn recorded_email(path: &Path, agent: &str) -> Result<Option<String>, Creden
     Ok(text_at(&value, "forgejo_emails", agent))
 }
 
+/// When the tool created an agent's Forgejo account, in unix seconds, when it did.
+///
+/// The time is stored so the identity report can say **when** the account was made
+/// instead of forever saying `created now` (H-3).
+pub fn recorded_identity_created(
+    path: &Path,
+    agent: &str,
+) -> Result<Option<u64>, CredentialsError> {
+    let value = read_value(path)?;
+    Ok(value
+        .get("forgejo_identity_created")
+        .and_then(|table| table.get(agent))
+        .and_then(toml::Value::as_integer)
+        .and_then(|seconds| u64::try_from(seconds).ok()))
+}
+
 /// Which identity path the credentials file records, when it records one.
 pub fn recorded_identity_mode(path: &Path) -> Result<Option<String>, CredentialsError> {
     let value = read_value(path)?;
@@ -535,6 +551,7 @@ pub fn record_agent_identity(
     login: &str,
     email: &str,
     mode: &str,
+    created_at: Option<u64>,
 ) -> Result<(), CredentialsError> {
     let mut value = read_value(path)?;
     let table = value
@@ -570,6 +587,20 @@ pub fn record_agent_identity(
         "forgejo_identity_mode".to_owned(),
         toml::Value::String(mode.to_owned()),
     );
+    // The creation time is written when the tool made the account; a later resolve
+    // that only reused it leaves the first time in place, so the report ages from when
+    // the account was actually created (H-3).
+    if let Some(seconds) = created_at {
+        let created = table
+            .entry("forgejo_identity_created".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let Some(created) = created.as_table_mut() {
+            created.insert(
+                agent.to_owned(),
+                toml::Value::Integer(seconds as i64),
+            );
+        }
+    }
     let text = toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
         path: path.to_path_buf(),
         source: io::Error::other(error),
@@ -1065,6 +1096,7 @@ mod tests {
             "gewu-scribe",
             "gewu-scribe@agents.invalid",
             "managed",
+            Some(1_700_000_000),
         )
         .expect("the identity is recorded");
 
@@ -1111,6 +1143,27 @@ mod tests {
             mode_of(&path).expect("the mode is readable"),
             SECRET_FILE_MODE
         );
+        // H-3: the creation time is written down, and a later resolve that reuses the
+        // account leaves the first time in place instead of overwriting it.
+        assert_eq!(
+            recorded_identity_created(&path, "scribe").expect("the file reads"),
+            Some(1_700_000_000)
+        );
+        record_agent_identity(
+            &path,
+            "scribe",
+            None,
+            "gewu-scribe",
+            "gewu-scribe@agents.invalid",
+            "managed",
+            None,
+        )
+        .expect("the reuse is recorded");
+        assert_eq!(
+            recorded_identity_created(&path, "scribe").expect("the file reads"),
+            Some(1_700_000_000),
+            "a reuse must not lose the account's creation time"
+        );
     }
 
     #[test]
@@ -1126,6 +1179,7 @@ mod tests {
             "author",
             "author@example.org",
             "supplied",
+            None,
         )
         .expect("the identity is recorded");
         assert_eq!(
