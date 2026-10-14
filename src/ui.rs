@@ -23,12 +23,31 @@ use crate::systemd::Mode;
 /// The space between the field name and its value on the detail screens.
 const LABEL_WIDTH: usize = 16;
 
+/// The smallest window the product will draw its panels into.
+///
+/// Below this, panels and the modal clip silently — an action line or a reason simply
+/// disappears. One honest line is better than a clipped screen, and it says exactly
+/// what to do.
+const MIN_WIDTH: u16 = 72;
+const MIN_HEIGHT: u16 = 18;
+
 /// Paint the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let full = frame.area();
+    if full.width < MIN_WIDTH || full.height < MIN_HEIGHT {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "this window is too small to show the product; make it at least {MIN_WIDTH}×{MIN_HEIGHT}"
+            ))
+            .wrap(Wrap { trim: true }),
+            full,
+        );
+        return;
+    }
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
-        Constraint::Length(4),
+        Constraint::Length(5),
     ])
     .split(frame.area());
 
@@ -40,6 +59,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_add_agent_form(frame, app);
     } else if app.editor_confirm.is_some() {
         draw_editor_confirm(frame, app);
+    } else if app.secret_prompt.is_some() {
+        draw_secret_prompt(frame, app);
+    } else if app.confirm_remove.is_some() {
+        draw_remove_confirm(frame, app);
     } else if app.show_help {
         draw_help(frame, app);
     }
@@ -82,7 +105,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The list of agents and their state.
 fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
-    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
+    // The note area carries the words the list uses, the failure reason and the
+    // supervision explanation; give it the rows to say all of it without clipping.
+    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(area);
 
     let header = Row::new(["agent", "model", "concurrency", "supervision", "state"]).style(
         Style::new()
@@ -177,6 +202,12 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Red),
         )));
     }
+    // The two numbers the list and the Agent screen show are defined where they first
+    // appear, so a zero-knowledge user is not left with an undefined word.
+    lines.push(Line::from(Span::styled(
+        "concurrency is how many model requests one agent may keep in flight at once; max turns is the most model turns one run may take.",
+        Style::new().fg(Color::DarkGray),
+    )));
     // Explain what `systemd` will change *before* `m` is pressed, not only in
     // the receipt afterwards: whether any agent is in systemd mode or not.
     let uses_systemd = app
@@ -440,8 +471,15 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::new()
                 };
+                // The selected row is marked in text as well as colour: a monochrome
+                // capture, or a person who cannot tell the colours apart, still sees
+                // which repository `g` and `P` will act on.
                 lines.push(Line::from(Span::styled(
-                    format!("  {}", repository.line()),
+                    format!(
+                        "{} {}",
+                        if at == app.repo_selected { '>' } else { ' ' },
+                        repository.line()
+                    ),
                     style,
                 )));
             }
@@ -460,7 +498,7 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "c check the role   C check it as the administrator token   i settle the agent's identity   up/down choose a repository   g clone it into the agent's workspace   P open a pull request as the agent   U update the newest one",
+        "c check the role   C check it as the administrator token   v set the agent's own token   A set the administrator token   i settle the agent's identity   up/down choose a repository   g clone it into the agent's workspace   P open a pull request as the agent   U update the newest one",
         Style::new().fg(Color::DarkGray),
     )));
     frame.render_widget(
@@ -479,7 +517,13 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     // Which secret *names* are present, never a value: a person can confirm a key
     // loaded without the tool reading it back onto a screen.
     let present = crate::credentials::present_secret_names(&app.credentials_path);
-    if present.is_empty() {
+    if let Some(problem) = crate::credentials::parse_problem(&app.credentials_path) {
+        // A file that could not be read is not an empty file. Say which it is.
+        lines.push(Line::from(Span::styled(
+            format!("the credentials file is not ready: {problem}"),
+            Style::new().fg(Color::Red),
+        )));
+    } else if present.is_empty() {
         lines.push(field(
             "present",
             "nothing yet — no model key and no Forgejo token",
@@ -506,6 +550,10 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lines.push(Line::from(Span::styled(
         "The model key for an agent is read from this file at the point of a model call, and is redacted from every transcript, log and error the tool writes.",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "k set the model key   f set the Forgejo role token   A set the administrator token",
         Style::new().fg(Color::DarkGray),
     )));
     frame.render_widget(
@@ -566,6 +614,11 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(
             "No run has been recorded yet, so there is nothing to list.",
         ));
+        // A person who came here to see whether anything ran needs the step that makes
+        // a run, not only where the records would appear.
+        lines.push(Line::from(
+            "Press s on the Agents screen (1) to start one.",
+        ));
     } else if let Some(run) = app.selected_run() {
         // The transcript is the run's own record; `T` opens it here, never only from a
         // path the README happens to name.
@@ -601,8 +654,10 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
 /// line leads with `? all keys`, so at 80 columns nothing is hidden *silently*;
 /// the full list is one key away.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // The status gets three rows so a long reason or path wraps instead of being cut;
+    // the legend gets its own row and is built to fit it, tail and all.
     let parts = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -629,13 +684,55 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new(
-            "? all keys   s start   x stop   p test endpoint   m supervision   c role   C admin role   i identity   e instruction   t steps   K skill   o log   T transcript   n new agent",
-        )
-        .style(Style::new().fg(Color::DarkGray))
-        .wrap(Wrap { trim: true }),
+        Paragraph::new(key_legend(area.width as usize))
+            .style(Style::new().fg(Color::DarkGray)),
         parts[2],
     );
+}
+
+/// The action keys, built to fit the width it is drawn into.
+///
+/// The legend must not stop mid-list with no sign that more exists: it shows as many
+/// keys as fit and, when one does not, ends with a fixed tail naming the full list —
+/// the page map's own rule. On a wide terminal every key fits and the line ends with
+/// `? all keys` too.
+fn key_legend(width: usize) -> String {
+    const KEYS: &[&str] = &[
+        "s start",
+        "x stop",
+        "p endpoint",
+        "m supervision",
+        "c role",
+        "C admin role",
+        "i identity",
+        "e instruction",
+        "t steps",
+        "K skill",
+        "o log",
+        "T transcript",
+        "n new agent",
+        "d remove",
+    ];
+    let tail = "… more — ? all keys";
+    if width <= tail.chars().count() {
+        return "? all keys".to_owned();
+    }
+    let mut line = String::new();
+    for key in KEYS {
+        let candidate = format!("{line}{key}   ");
+        if candidate.chars().count() + tail.chars().count() > width {
+            line.push_str(tail);
+            return line;
+        }
+        line = candidate;
+    }
+    let candidate = format!("{line}? all keys");
+    if candidate.chars().count() <= width {
+        candidate
+    } else {
+        line.push_str(tail);
+        line
+    }
 }
 
 /// The add-agent form, over the Agents screen.
@@ -648,7 +745,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     };
     let screen = frame.area();
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = (NewAgentForm::FIELDS.len() as u16 + 8).min(screen.height.saturating_sub(2));
+    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height.saturating_sub(2));
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -664,6 +761,10 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     lines.push(Line::from(
         "Name an agent and point it at a model. The model key and the Forgejo token are written to the credentials file and are never shown.",
     ));
+    lines.push(Line::from(Span::styled(
+        "The model key is required. The Forgejo fields are optional; a blank URL keeps the sample's placeholder address.",
+        Style::new().fg(Color::DarkGray),
+    )));
     lines.push(Line::from(""));
     for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
         let value = &form.fields[at];
@@ -697,6 +798,104 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     let block = Block::bordered()
         .title(" add an agent ")
         .border_style(Style::new().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// The one-field, masked prompt for a secret that goes into the credentials file.
+fn draw_secret_prompt(frame: &mut Frame, app: &App) {
+    let Some(prompt) = &app.secret_prompt else {
+        return;
+    };
+    let screen = frame.area();
+    let width = (screen.width.saturating_sub(2)).min(76);
+    let height = 8.min(screen.height.saturating_sub(2));
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+    let shown = "*".repeat(prompt.value.chars().count());
+    let mut lines: Vec<Line> = vec![
+        Line::from(format!(
+            "The {} is written to the credentials file and never shown.",
+            prompt.target.describe()
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("> {shown}"),
+            Style::new().fg(Color::Black).bg(Color::Cyan),
+        )),
+        Line::from(""),
+    ];
+    match &prompt.error {
+        Some(error) => lines.push(Line::from(Span::styled(
+            format!("  {error}"),
+            Style::new().fg(Color::Red),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "  enter writes it   esc cancels",
+            Style::new().fg(Color::DarkGray),
+        ))),
+    }
+    let block = Block::bordered()
+        .title(format!(" set the {} ", prompt.target.describe()))
+        .border_style(Style::new().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// The "remove this agent?" confirmation, so a destructive key is never silent.
+fn draw_remove_confirm(frame: &mut Frame, app: &App) {
+    let Some(name) = &app.confirm_remove else {
+        return;
+    };
+    let screen = frame.area();
+    let width = (screen.width.saturating_sub(2)).min(76);
+    let height = 7.min(screen.height.saturating_sub(2));
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+    let left = app
+        .selected_paths()
+        .map(|paths| paths.config_dir().display().to_string())
+        .unwrap_or_else(|| "its files".to_owned());
+    let lines: Vec<Line> = vec![
+        Line::from(format!(
+            "Remove `{name}` from the configuration? Its files under {left} are left on disk."
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y remove it        n keep it",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let block = Block::bordered()
+        .title(" remove an agent ")
+        .border_style(Style::new().fg(Color::Red));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -798,23 +997,32 @@ const HELP_LINES: &[&str] = &[
     "Moving:    up / down choose   enter open the chosen agent (or add one when none)",
     "An agent:  s start   x stop   p test its endpoint   m switch tui/systemd supervision",
     "           e edit its instruction   t edit its declared steps   K start a new skill",
-    "           o open its newest log   T open its newest transcript",
+    "           o open its newest log   T open its newest transcript   d remove it",
     "A new one: n or a open the add-agent form (also enter on an empty list)",
     "Forgejo:   c check the configured role   C check the administrator token",
     "           i settle the agent's identity   up/down choose a repository",
     "           g clone it   P open a pull request   U update the newest one",
-    "Files:     r re-read config.toml and credentials.toml   q quit",
+    "Secrets:   k set the model key (Credentials)   f set the role token (Credentials)",
+    "           v set the agent's own Forgejo token (Forgejo)   A set the administrator token",
+    "Files:     r re-read config.toml and credentials.toml   q quit   ^C quit and stop runs",
     "Help:      ? or h or F1 show this list   esc or enter close it",
 ];
 
 /// The first-run risk acknowledgment, over everything else.
 fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let screen = frame.area();
-    // At least one cell of margin on every side, so the modal never shares an edge
-    // with the panel behind it even on a narrow terminal.
-    let width = (screen.width.saturating_sub(2)).min(78);
-    let height = (risk::LINES.len() as u16 + 9).min(screen.height.saturating_sub(2));
-    let popup = centered(screen, width, height);
+    // The modal sits over the body, above the footer, so the status line that says
+    // what answers the screen stays visible while the modal is up. At least one cell
+    // of margin on every side keeps it off the panel edge even on a narrow terminal.
+    let available = Rect {
+        x: screen.x,
+        y: screen.y.saturating_add(3),
+        width: screen.width,
+        height: screen.height.saturating_sub(8),
+    };
+    let width = (available.width.saturating_sub(2)).min(78);
+    let height = (risk::LINES.len() as u16 + 9).min(available.height.saturating_sub(2));
+    let popup = centered(available, width, height);
 
     let mut lines: Vec<Line> = Vec::new();
     for text in risk::LINES {
@@ -846,7 +1054,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let owned = Rect {
         x: 0,
         y: popup.y,
-        width: screen.width,
+        width: available.width,
         height: popup.height,
     };
     frame.render_widget(Clear, owned);

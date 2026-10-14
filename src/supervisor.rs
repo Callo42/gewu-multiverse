@@ -577,6 +577,35 @@ impl Supervisor {
         self.last_error.as_deref()
     }
 
+    /// Close the record of a run the UI that started it can no longer be watching.
+    ///
+    /// A default-mode run is a child of the UI. When that UI is gone, nothing is left
+    /// to reap the child or write its ending; a reopened UI reads the run's own
+    /// opening record, sees the process is dead, and closes it here as `stopped` with
+    /// a reason, rather than calling the agent `idle` while the run's record says it
+    /// never ended. The caller has already checked that the process is not alive; this
+    /// only writes the ending and puts the state on the screens.
+    pub fn note_abandoned(&mut self, name: &str, run_dir: &Path, run_id: &str) {
+        let reason = "the UI that started this run is not running any more, so the run is not either"
+            .to_owned();
+        let (outcome, reason, duration_ms) = record_outcome_if_missing(
+            run_dir,
+            run_id,
+            RunOutcome::Stopped,
+            Some(reason),
+            0,
+        );
+        self.states.insert(
+            name.to_owned(),
+            State::Finished {
+                run_id: run_id.to_owned(),
+                outcome,
+                reason,
+                duration_ms,
+            },
+        );
+    }
+
     /// Ask for one run of one agent.
     ///
     /// Beyond the concurrency limit the start does not fail: it waits its turn, and
@@ -1255,6 +1284,19 @@ fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
 /// error: the thing this function exists for has already happened.
 fn signal_group(pid: u32, signal: Signal) {
     let _ = killpg(Pid::from_raw(pid as i32), signal);
+}
+
+/// Whether a process with this id is still alive.
+///
+/// A process owned by another user is still alive; only a process that is gone counts
+/// as dead. This is what lets a reopened UI tell a run still in progress from one left
+/// behind by a UI that is no longer there.
+pub fn process_alive(pid: u32) -> bool {
+    match nix::sys::signal::kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
+    }
 }
 
 /// Whether any process on this machine is still in the process group `pgid`.
