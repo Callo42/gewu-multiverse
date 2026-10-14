@@ -365,13 +365,23 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
         "e edit the instruction   K start a new skill   t edit the declared steps   p test the endpoint   s start   x stop   m switch supervision mode   o open the log",
         Style::new().fg(Color::DarkGray),
     )));
+    // A short window does not silently drop the fields below the fold: the panel says
+    // so in its title, which is always drawn (D-7).
+    let inner = area.width.saturating_sub(2) as usize;
+    let overflows = pushed_rows(&lines, inner) > area.height.saturating_sub(2) as usize;
+    let title = if overflows {
+        " agent configuration — more fields below; enlarge the window "
+    } else {
+        " agent configuration "
+    };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" agent configuration "))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
+
 
 /// An agent's instruction, its declared steps and its skills, as they are on disk.
 fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
@@ -548,10 +558,15 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
-    lines.push(Line::from(Span::styled(
-        ROLE_EXPLANATION,
-        Style::new().fg(Color::DarkGray),
-    )));
+    // The definition of a role is what the screen owes *before* `c` is pressed; once
+    // the check has run, the repositories are what the panel is for, and the list
+    // gets the rows (T-12).
+    if !matches!(app.role_check, Some(Ok(_))) {
+        lines.push(Line::from(Span::styled(
+            ROLE_EXPLANATION,
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     lines.push(Line::from(""));
 
     let mut repo_window: Option<(usize, usize, usize)> = None;
