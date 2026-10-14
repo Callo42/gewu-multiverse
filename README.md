@@ -1,5 +1,15 @@
 # gewu-multiverse
 
+**One line, no Rust:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
+```
+
+It fetches the latest prebuilt release, verifies its checksum and installs `gewu-multiverse` into
+`~/.local/bin` (x86_64 Linux, glibc 2.39+ — details and other options under [Install](#install)).
+Then run `gewu-multiverse`.
+
 A **local, single-Universe Matrixverse**: one small terminal application that turns a Linux machine into a place where
 you run **agents against your own Forgejo** — no server, no accounts, no cloud.
 
@@ -202,7 +212,14 @@ without a compiler. It needs a 64-bit x86_64 Linux machine with **glibc 2.39 or 
 (for example Ubuntu 24.04 or newer, Debian 13 or newer, Fedora 40 or newer) and a
 terminal. Nothing else: no Rust toolchain, no build step, no service.
 
-The tarball holds the binary (`gewu-multiverse`), this README and both licences. Its
+**One line** — this repository's [`install.sh`](install.sh) does the three steps below for you, looking up the
+latest release and installing into `~/.local/bin` (override with `INSTALL_DIR`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
+```
+
+**Or by hand** — the tarball holds the binary (`gewu-multiverse`), this README and both licences. Its
 name records the revision it was built from:
 
 ```sh
