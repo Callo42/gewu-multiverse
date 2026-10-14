@@ -26,7 +26,10 @@ file**, **configuration file**, **supervision**, **concurrency**, **max turns**.
 screen may use a word only after the screen, or a screen before it, has shown what it
 means. `concurrency` (how many model requests one agent may keep in flight at once)
 and `max turns` (the most model turns one run may take) are defined in the Agents note
-area where they first appear.
+area where they first appear. A transport failure is shown on screen in the product's
+own words (`the endpoint refused the connection`, `the connection dropped`, `the
+address could not be resolved`); the run's log and transcript keep the transport's
+exact sentence, so the failure is still auditable afterwards.
 
 Screens: **Agents** (`1`) · **Agent** (`2`) · **Instruction** (`3`) · **Forgejo**
 (`4`) · **Credentials** (`5`) · **Runs** (`6`); the tab bar carries each number beside
@@ -48,7 +51,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 |---|---|---|
 | first run, acknowledgment not recorded | the risk overlay (see below) over the Agents screen | one legible overlay; `y`/`n` both act; `n` leaves the list visible |
 | nothing configured | empty list; no agent; a note naming the configuration file | a form, by name: “press `n` to add an agent”. `n`/`a` must answer |
-| partially configured | one or more rows: name, model, concurrency, supervision, state; the selected row carries `>` | each row readable **and present**; the last failure named, not only the word `failed`; `concurrency` and `max turns` defined in the note area |
+| partially configured | one or more rows: name, model, concurrency, supervision, state; the selected row carries `>` | each row readable **and present**; the newest run's outcome, with a failure named only when it is the newest terminal record — an older failure is not called “the last run”, and it still stands as `last failure` on the Agent screen; `concurrency` and `max turns` defined in the note area |
 | ready (idle) | rows with `idle`; the concurrency count and the note about `tui` | the keys that matter (`p`, `s`, `c`, `e`, `d`) visible or one `?` away |
 | many agents (more than fit) | a window of rows whose title reads `agents a–b of N — ↓/↑ more`; the selected row is always drawn and marked `>` | no agent is hidden **silently**, and the selection never moves onto a row that is not drawn |
 | removing | a confirmation over the list | `y` removes the agent from `config.toml`; `n` keeps it; the files left on disk are named, or the confirmation says it had none yet. An agent with a run in flight is **refused** with its run named and the stop key (`x`) offered, so removing it can never orphan the run |
@@ -63,7 +66,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | no agent | `no agent to show: …` | the same in-app path as the empty Agents screen |
-| configured | name, model, endpoint, max turns, instruction, **concurrency**, run state, supervision, unit/restarts, agent files, workspace, newest log, endpoint test, identity | every word the user needs defined here or on the screen that introduced it; no `identitynot`; when the window is too short for every field, the panel **title** says more is below, so a field is never dropped silently (the paths wrap whole words) |
+| configured | name, model, endpoint, max turns, instruction, **concurrency**, run state, supervision, unit/restarts, agent files, workspace, newest log, endpoint test, identity | every word the user needs defined here or on the screen that introduced it; no `identitynot`; when the window is too short for every field, the panel **title** says more is below, so a field is never dropped silently (the paths wrap whole words); the endpoint test's **class and cause**, in the product's words, wherever the result is shown (the status line carries both, so a short window cannot reduce it to the class) |
 | removing | the same fields, with the removal confirmation over them | `d` removes the agent (after asking); the files left on disk are named, so a mistyped agent is not a dead end |
 | failed | run state `failed`; the failure class and the run's reason | the reason stored, not a transient footer line |
 | systemd, unit start failed | run state; unit; restarts | the `systemctl` reason, recoverable |

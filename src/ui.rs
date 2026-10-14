@@ -225,7 +225,10 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
     if let Some(name) = app.selected_name() {
         if let Some(reason) = app.last_run_failure(&name) {
             lines.push(Line::from(Span::styled(
-                format!("the last run of `{name}` did not go well: {reason}"),
+                format!(
+                    "the last run of `{name}` did not go well: {}",
+                    crate::model::in_product_words(&reason)
+                ),
                 Style::new().fg(Color::Red),
             )));
         }
@@ -307,7 +310,10 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                 &app.supervisor.state(&agent.name).word_with_reason(),
             ));
             if let Some(reason) = app.last_failure(&agent.name) {
-                lines.push(field("last failure", &reason));
+                lines.push(field(
+                    "last failure",
+                    &crate::model::in_product_words(&reason),
+                ));
             }
             let mode = app.supervisor.mode(&agent.name);
             lines.push(field("supervision", &format!("{} ({})", mode.label(), mode.as_str())));
@@ -878,7 +884,11 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         // came for; the offers follow in the rows the note area grew for them, so a
         // wordy reason cannot hide `o` and `T` (O-3, P-M3).
         if let Some(reason) = run.reason.as_deref() {
-            lines.push(Line::from(format!("outcome: {} — {reason}", run.describe())));
+            lines.push(Line::from(format!(
+                "outcome: {} — {}",
+                run.describe(),
+                crate::model::in_product_words(reason)
+            )));
         } else {
             lines.push(Line::from(format!("outcome: {}", run.describe())));
         }

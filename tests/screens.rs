@@ -1563,7 +1563,11 @@ fn the_runs_note_area_keeps_the_reason_and_both_offers_at_eighty_columns() {
     app.show(Screen::Runs);
     let screen = render_at(80, 24, &app);
     assert!(screen.contains("outcome:"), "{screen}");
-    assert!(screen.contains("Connection refused"), "{screen}");
+    // The record keeps the transport's words; the screen shows the product's (O-4).
+    assert!(
+        screen.contains("the endpoint refused the connection"),
+        "{screen}"
+    );
     assert!(
         screen.contains("o opens the log on show"),
         "the `o` line is not drawn: {screen}"
@@ -1597,4 +1601,80 @@ fn the_add_agent_form_draws_every_field_and_the_cursor_at_eighty_columns() {
         "the cursor's own field is not drawn: {last}"
     );
     assert!(last.contains("enlarge the window"), "{last}");
+}
+
+#[test]
+fn the_endpoint_test_failure_names_its_cause_in_the_product_words_at_eighty_columns() {
+    // O-2: the footer repeated only the class, so the cause (and the path the D-3 fix
+    // added) was below the fold. O-4: `io:` and `(os error 111)` are the transport
+    // library's words, not the product's.
+    const CONFIG: &str = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+
+[[agents]]
+name = "scribe"
+model = "example-model"
+endpoint = "http://127.0.0.1:1/v1/chat/completions"
+instruction = "instructions/scribe.md"
+concurrency = 1
+"#;
+    let root = scratch("endpoint-failure-80");
+    let mut app = app_with_config(&root, CONFIG);
+    app.show_acknowledgment = false;
+    app.request_secret(SecretTarget::ModelKey);
+    app.on_paste("sk-not-a-real-credential");
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    app.request_endpoint_test();
+    assert!(
+        app.status.contains("the endpoint refused the connection"),
+        "the footer does not carry the cause: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("os error"),
+        "the transport's errno is still on the status line: {}",
+        app.status
+    );
+    app.show(Screen::AgentConfig);
+    let screen = render_at(80, 24, &app);
+    // The footer carries it at the minimum (the sentence wraps, so the whole phrase is
+    // not contiguous); the transport's errno is nowhere on the screen.
+    assert!(screen.contains("endpoint test for `scribe`"), "{screen}");
+    assert!(!screen.contains("os error"), "{screen}");
+}
+
+#[test]
+fn a_stored_transport_reason_is_shown_in_the_product_words() {
+    // O-4: the record keeps the transport's sentence, but every screen that shows it
+    // translates it; the errno gutter is not the product's vocabulary.
+    let root = scratch("product-words-80");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_dir = root.join("state").join("scribe").join(new_run_id(1));
+    app.recent = vec![RunSummary {
+        agent: "scribe".to_owned(),
+        run_id: new_run_id(1),
+        outcome: Some(RunOutcome::Failed),
+        reason: Some(
+            "the model call failed (transport): io: Connection refused (os error 111)"
+                .to_owned(),
+        ),
+        duration_ms: Some(0),
+        started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        log: run_dir.join("run.log"),
+        dir: run_dir,
+    }];
+    app.run_selected = 0;
+    app.show(Screen::Agents);
+    let agents = render_at(80, 24, &app);
+    assert!(
+        agents.contains("the endpoint refused the connection"),
+        "{agents}"
+    );
+    assert!(!agents.contains("os error 111"), "{agents}");
+    app.show(Screen::Runs);
+    let runs = render_at(80, 24, &app);
+    assert!(!runs.contains("os error 111"), "{runs}");
 }
