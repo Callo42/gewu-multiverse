@@ -1431,7 +1431,10 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
 
 /// The key-reference overlay: every key, in groups, one line each.
 fn draw_help(frame: &mut Frame, app: &App) {
-    let screen = frame.area();
+    // The overlay may cover the body, but not the footer: a key it cannot use says so
+    // on the status line, and that sentence must be readable while the overlay is up
+    // (C-4). This is the same area the other overlays take.
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(80);
     // The help is a list, so it takes the list rule: a window it can scroll, and a
     // title that says the range. Every logical line is given room for two wrapped
