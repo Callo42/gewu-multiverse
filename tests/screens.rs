@@ -578,14 +578,22 @@ fn the_acknowledgment_owns_its_rows_at_eighty_columns() {
         .iter()
         .position(|line| line.contains("Before the first agent runs"))
         .expect("the modal is on screen");
-    // The modal is 15 rows and centred: every one of those rows must have a blank
-    // one-cell margin on the left, never a surviving panel border.
-    for (row, line) in lines.iter().enumerate().skip(title_row).take(15) {
+    // Every row of the modal, down to its own bottom border, must have a blank
+    // one-cell margin on the left, never a surviving panel border. The modal's height
+    // follows its content, so the loop stops at the modal's own closing border rather
+    // than at a hard-coded row count.
+    let mut checked = 0;
+    for (row, line) in lines.iter().enumerate().skip(title_row) {
         assert!(
             line.starts_with(' '),
             "the panel bled into the modal margin on row {row}: {line:?}"
         );
+        checked += 1;
+        if line.contains('└') {
+            break;
+        }
     }
+    assert!(checked >= 5, "the modal's rows were not all checked");
     assert!(screen.contains("Until it is recorded"), "{screen}");
 }
 
