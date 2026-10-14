@@ -24,6 +24,8 @@ pub const TITLE: &str = "Before the first agent runs";
 /// What the user is asked to understand, in plain language. Each line is short
 /// enough to sit on one row of the acknowledgment screen at its usual width.
 pub const LINES: &[&str] = &[
+    "An agent is a program this tool runs for you.",
+    "You give it an instruction and point it at a model.",
     "An agent runs as you: the same user, this machine, your rights.",
     "Its workspace is a directory. That is a layout, not a sandbox.",
     "An agent can read anything you can read — the credentials file too.",

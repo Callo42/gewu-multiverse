@@ -703,3 +703,131 @@ fn the_runs_screen_opens_the_transcript_as_well_as_the_log() {
     let action = app.take_action().expect("a view was asked for");
     assert_eq!(action.path, run_dir.join("transcript.jsonl"));
 }
+
+#[test]
+fn the_key_legend_never_stops_without_naming_the_full_list() {
+    // C-1 / N-1: at 80 columns the legend must end with an explicit tail, not mid-key.
+    let root = scratch("legend-tail");
+    let app = app(&root);
+    let screen = render_at(80, 24, &app);
+    let legend = screen
+        .lines()
+        .find(|line| line.contains("s start"))
+        .expect("the action legend is on screen");
+    assert!(legend.contains("? all keys"), "{legend:?}");
+    assert!(
+        legend.trim_end().ends_with("? all keys"),
+        "the legend must end with the affordance: {legend:?}"
+    );
+}
+
+#[test]
+fn an_unmapped_key_says_so_rather_than_staying_silent() {
+    // S-12: a press that cannot act must not read as a freeze.
+    let root = scratch("unmapped-key");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.on_key(KeyEvent::from(KeyCode::Char('z')));
+    assert!(app.status.contains("press ?"), "{}", app.status);
+}
+
+#[test]
+fn the_first_run_modal_says_what_answers_it() {
+    // S-11: swallowed keys while the modal is up must not be silent.
+    let root = scratch("modal-swallow");
+    let mut app = app(&root);
+    assert!(app.show_acknowledgment);
+    app.on_key(KeyEvent::from(KeyCode::Char('s')));
+    assert!(app.status.contains("answer this screen"), "{}", app.status);
+}
+
+#[test]
+fn a_credentials_file_that_cannot_be_read_is_not_reported_as_empty() {
+    // S-9: a parse failure shown as "nothing yet" is a lie a person acts on.
+    let root = scratch("broken-credentials");
+    let mut app = app(&root);
+    fs::write(root.join("credentials.toml"), "this is not toml =\n")
+        .expect("the broken file is written");
+    app.reload();
+    app.show_acknowledgment = false;
+    app.show(Screen::Credentials);
+    let screen = render(&app);
+    assert!(screen.contains("not ready"), "{screen}");
+    assert!(!screen.contains("nothing yet"), "{screen}");
+}
+
+#[test]
+fn the_empty_runs_screen_names_how_a_run_starts() {
+    // C-8: a literal user comes to Runs and needs the step that makes a run.
+    let root = scratch("runs-empty-hint");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Runs);
+    let screen = render(&app);
+    assert!(screen.contains("Press s on the Agents screen"), "{screen}");
+}
+
+#[test]
+fn the_agents_screen_defines_the_words_the_list_uses() {
+    // C-7: `concurrency` and `max turns` are used and must be defined.
+    let root = scratch("agents-definitions");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let screen = render(&app);
+    assert!(screen.contains("concurrency is how many"), "{screen}");
+}
+
+#[test]
+fn the_first_screen_defines_an_agent() {
+    // C-9: the whole product hangs on a word the first screen never defines.
+    let root = scratch("first-screen-definition");
+    let app = app(&root);
+    let screen = render(&app);
+    assert!(screen.contains("An agent is a program"), "{screen}");
+}
+
+#[test]
+fn the_selected_repository_is_marked_in_text() {
+    // S-8 / C-10: selection must survive a monochrome capture.
+    use gewu_multiverse::config::Role;
+    use gewu_multiverse::forgejo::{Permissions, Repository, RoleCheck, Viewer};
+    let root = scratch("repo-marker");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.role_check = Some(Ok(RoleCheck {
+        url: "https://forgejo.example.org".to_owned(),
+        role: Role::Member,
+        viewer: Viewer {
+            login: "uxmember".to_owned(),
+            email: None,
+            description: None,
+            is_admin: false,
+        },
+        repositories: vec![
+            Repository {
+                full_name: "uxmember/demo-private".to_owned(),
+                namespace: "uxmember".to_owned(),
+                name: "demo-private".to_owned(),
+                private: true,
+                default_branch: None,
+                html_url: None,
+                permissions: Permissions::default(),
+            },
+            Repository {
+                full_name: "uxmember/demo-public".to_owned(),
+                namespace: "uxmember".to_owned(),
+                name: "demo-public".to_owned(),
+                private: false,
+                default_branch: None,
+                html_url: None,
+                permissions: Permissions::default(),
+            },
+        ],
+        private_visible: 1,
+    }));
+    app.show(Screen::Forgejo);
+    app.move_repo_selection(1);
+    let screen = render(&app);
+    assert!(screen.contains("> uxmember/demo-public"), "{screen}");
+    assert!(!screen.contains("> uxmember/demo-private"), "{screen}");
+}

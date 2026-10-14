@@ -491,6 +491,15 @@ pub fn present_secret_names(path: &Path) -> Vec<String> {
     names
 }
 
+/// Why the credentials file could not be read, when it could not.
+///
+/// The Credentials screen uses this to tell a file that was read and is empty from one
+/// that could not be read at all: a parse failure shown as "nothing yet" is a lie a
+/// person acts on.
+pub fn parse_problem(path: &Path) -> Option<String> {
+    read_value(path).err().map(|error| error.to_string())
+}
+
 /// Whether a value is a non-empty string.
 fn non_empty(text: Option<&str>) -> bool {
     text.map(str::trim).is_some_and(|text| !text.is_empty())
@@ -614,6 +623,54 @@ pub fn record_form_secrets(
             path: path.to_path_buf(),
             source,
         }
+    })
+}
+
+/// Write one named secret into the credentials file, preserving everything else.
+///
+/// This is how a secret needed after the agent exists — a rotated model key, the
+/// administrator token, or an agent's own Forgejo token — reaches the file without an
+/// editor. `table` is the TOML table the key goes under (`model_keys`,
+/// `forgejo_agent_tokens`), or `None` for a top-level key (`forgejo_token`,
+/// `forgejo_admin_token`). The value is written and never returned.
+pub fn record_secret(
+    path: &Path,
+    table: Option<&str>,
+    key: &str,
+    value: &str,
+) -> Result<(), CredentialsError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let mut root = read_value(path)?;
+    let root = root
+        .as_table_mut()
+        .ok_or_else(|| CredentialsError::MissingToken {
+            path: path.to_path_buf(),
+            key: "the credentials file".to_owned(),
+        })?;
+    match table {
+        Some(name) => {
+            let entry = root
+                .entry(name.to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            if let Some(table) = entry.as_table_mut() {
+                table.insert(key.to_owned(), toml::Value::String(value.to_owned()));
+            }
+        }
+        None => {
+            root.insert(key.to_owned(), toml::Value::String(value.to_owned()));
+        }
+    }
+    let text = toml::to_string_pretty(root).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
