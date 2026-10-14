@@ -1141,24 +1141,37 @@ fn the_repository_list_never_hides_a_row_the_selection_can_reach() {
     let root = scratch("repo-window");
     let mut app = app(&root);
     app.show_acknowledgment = false;
-    app.role_check = Some(Ok(three_repository_check()));
+    // Seven repositories, so the list is longer than the panel at the minimum and
+    // the window (not the whole list) is what is exercised.
+    let mut check = three_repository_check();
+    for index in 0..4 {
+        check
+            .repositories
+            .push(repository(&format!("uxmember/extra-{index}"), false));
+    }
+    app.role_check = Some(Ok(check));
     app.show(Screen::Forgejo);
 
-    let wide = render(&app);
-    assert!(wide.contains("uxmember/demo-public"), "{wide}");
+    let narrow = render_at(80, 24, &app);
+    assert!(
+        narrow.contains("of 7"),
+        "the title does not say how many repositories there are: {narrow}"
+    );
+    // T-12: the checked list gets the panel, so more than one row is drawn even at
+    // 80x24 and the explanation never takes the whole panel.
+    assert!(
+        narrow.matches("uxmember/").count() + narrow.matches("uxadmin/").count() >= 2,
+        "only one repository row is drawn: {narrow}"
+    );
 
     for _ in 0..2 {
         app.move_repo_selection(1);
     }
     assert_eq!(app.repo_selected, 2);
-    let narrow = render_at(80, 24, &app);
+    let selected = render_at(80, 24, &app);
     assert!(
-        narrow.contains("> uxmember/demo-public"),
-        "the selected repository is not drawn or not marked: {narrow}"
-    );
-    assert!(
-        narrow.contains("of 3"),
-        "the title does not say how many repositories there are: {narrow}"
+        selected.contains("> uxmember/demo-public"),
+        "the selected repository is not drawn or not marked: {selected}"
     );
 }
 
@@ -1417,4 +1430,39 @@ fn the_identity_line_names_the_account_i_would_create() {
     let screen = render(&app);
     assert!(screen.contains("not settled"), "{screen}");
     assert!(screen.contains("`gewu-scribe`"), "{screen}");
+}
+
+#[test]
+fn the_agent_screen_keeps_a_long_paths_file_name_and_says_when_fields_are_below() {
+    // D-7: at 80x24 the panel clipped `newest log` mid-filename and silently dropped
+    // fields; the file name must survive and the panel must say more is below.
+    let root = scratch("agent-overflow");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.ensure_agent("scribe").expect("the agent is prepared");
+    let run_id = new_run_id(1);
+    let run_dir = app.state_root().join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 1, "/w"))
+        .expect("a record");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            10,
+            None,
+        ))
+        .expect("a record");
+    fs::write(run_dir.join(gewu_multiverse::run::LOG_FILE), "log\n").expect("a log");
+    app.refresh_recent();
+    app.show(Screen::AgentConfig);
+    let screen = render_at(80, 24, &app);
+    assert!(screen.contains("more fields below"), "{screen}");
+    // At a taller window the field and its file name are drawn whole, so the path is
+    // not inherently clipped — the short window is what the title now declares.
+    let tall = render_at(80, 40, &app);
+    assert!(tall.contains("run.log"), "{tall}");
 }

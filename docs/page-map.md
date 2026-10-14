@@ -3,7 +3,10 @@
 Every screen the product can show, and every state a user can be in on it: what the
 screen shows, and **what it must offer a zero-knowledge user at that moment**. The map
 is the standard the screens are built and fixed against; a screen that hides the next
-step, or shows a word the user has not been given, is a defect against its row.
+step, or shows a word the user has not been given, is a defect against its row. This
+map governs the tree it is committed in; a release carries the map as of its own tag,
+so a reader can tell "the product fails its map" from "the map is ahead of the
+product".
 
 A zero-knowledge user has started the product and nothing else. They have not read this
 repository, the README or any page. The product carries them: each state says what it
@@ -51,7 +54,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | no agent | `no agent to show: …` | the same in-app path as the empty Agents screen |
-| configured | name, model, endpoint, max turns, instruction, **concurrency**, run state, supervision, unit/restarts, agent files, workspace, newest log, endpoint test, identity | every word the user needs defined here or on the screen that introduced it; no `identitynot` |
+| configured | name, model, endpoint, max turns, instruction, **concurrency**, run state, supervision, unit/restarts, agent files, workspace, newest log, endpoint test, identity | every word the user needs defined here or on the screen that introduced it; no `identitynot`; when the window is too short for every field, the panel **title** says more is below, so a field is never dropped silently (the paths wrap whole words) |
 | removing | the same fields, with the removal confirmation over them | `d` removes the agent (after asking); the files left on disk are named, so a mistyped agent is not a dead end |
 | failed | run state `failed`; the failure class and the run's reason | the reason stored, not a transient footer line |
 | systemd, unit start failed | run state; unit; restarts | the `systemctl` reason, recoverable |
@@ -76,7 +79,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | no token | `role token absent`; `admin token absent (identities are supplied)`; “no role check has been run yet — press c” | what a *role* is, in one line, before `c` is pressed |
 | a check was refused | `role check failed (<class>) at <configured url>: <reason>`; a token that is an administrator's but is checked as `member` says so and names `C` | the URL the user configured, led before the reason, and the account's real standing, not a bare class |
 | configured, unread | the URL and role | a sentence that says *not read yet*, not “could not be read” |
-| checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel, each `[private]`/`[public]`, what the caller may do | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
+| checked (one token) | the view, a window of repositories whose title reads `repositories a–b of N — ↓/↑ more` when the list is longer than the panel, each `[private]`/`[public]`, what the caller may do; the definition of a role shortens once the check has run, so the list gets the panel (more than one row at 80×24) | which repository is selected, in text (a `>` marker), not only in colour; the selected repository is always drawn and no repository is hidden **silently** |
 | checked rows then `g` | the clone acts as the agent's identity, while the list came from the role token | a failed clone names the account it acted as and says the list came from the role token, so two different tokens are not confused |
 | both tokens present | one view at a time, or both | a way to compare the two roles **inside the app** (`c` / `C`); a failed `C` keeps the last good view and shows the failure beside it |
 | a token is missing | `role token absent` / `admin token absent` / `failed (no_agent_token)` | a one-field, masked prompt (`v` for the agent's own token, `A` for the administrator token) that writes the credentials file, never an editor |
