@@ -1576,6 +1576,8 @@ fn the_runs_note_area_keeps_the_reason_and_both_offers_at_eighty_columns() {
         screen.contains("T opens the transcript on show"),
         "the `T` line is not drawn: {screen}"
     );
+    // M-5: the pager's own way out is named on the screen, before `o`/`T` is pressed.
+    assert!(screen.contains("leave the pager with q"), "{screen}");
 }
 
 #[test]
