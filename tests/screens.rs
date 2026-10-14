@@ -1394,3 +1394,27 @@ fn the_model_key_prompt_names_the_agent_it_writes_for() {
         "{screen}"
     );
 }
+
+#[test]
+fn the_forgejo_screen_never_says_placeholder() {
+    // D-5: `Placeholder` is a word from inside the product, not a word for the user.
+    let root = scratch("no-placeholder");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Forgejo);
+    let screen = render(&app);
+    assert!(!screen.contains("Placeholder"), "{screen}");
+    assert!(screen.contains("no role check has been run yet"), "{screen}");
+}
+
+#[test]
+fn the_identity_line_names_the_account_i_would_create() {
+    // D-4: `i` acts on a remote system; name the account before the keypress.
+    let root = scratch("identity-preview");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Forgejo);
+    let screen = render(&app);
+    assert!(screen.contains("not settled"), "{screen}");
+    assert!(screen.contains("`gewu-scribe`"), "{screen}");
+}
