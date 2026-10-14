@@ -3233,6 +3233,31 @@ impl App {
             self.status = note.to_owned();
             return;
         }
+        // The remaining overlays own the keys, so the generic `press n … or k/f/v/A`
+        // advice would be false under them. Each names what answers it instead.
+        if self.editor_confirm.is_some() {
+            self.status =
+                "the editor confirmation is open — enter opens it, esc cancels"
+                    .to_owned();
+            return;
+        }
+        if self.confirm_remove.is_some() {
+            self.status =
+                "answer the removal confirmation first: y or enter removes, n, esc or q keeps"
+                    .to_owned();
+            return;
+        }
+        if self.confirm_forget.is_some() {
+            self.status =
+                "answer the delete confirmation first: y or enter deletes, n, esc or q keeps"
+                    .to_owned();
+            return;
+        }
+        if self.confirm_quit.is_some() {
+            self.status =
+                "the leave question is open — q again quits, any other key stays".to_owned();
+            return;
+        }
         // A paste is never dropped in silence; say where it can land.
         self.status =
             "there is no one-line field here to take a paste; press n for the form, or k/f/v/A for a secret"
@@ -4955,6 +4980,32 @@ concurrency = 3
         assert!(app.show_help, "the key list is open");
         app.on_paste("token");
         assert!(app.status.contains("key list is open"), "{}", app.status);
+    }
+
+    #[test]
+    fn every_overlay_answers_a_paste_with_what_owns_the_screen() {
+        // F4's sweep: the generic `press n … or k/f/v/A` advice is false under a
+        // confirmation that owns the keys, so each overlay names its own answer.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.confirm_remove = Some("one".to_owned());
+        app.on_paste("token");
+        assert!(app.status.contains("removal confirmation"), "{}", app.status);
+        app.confirm_remove = None;
+        app.confirm_forget = Some(vec!["ghost".to_owned()]);
+        app.on_paste("token");
+        assert!(app.status.contains("delete confirmation"), "{}", app.status);
+        app.confirm_forget = None;
+        app.confirm_quit = Some(1);
+        app.on_paste("token");
+        assert!(app.status.contains("leave question"), "{}", app.status);
+        app.confirm_quit = None;
+        app.editor_configured = false;
+        app.show(Screen::Instructions);
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.editor_confirm.is_some(), "the editor confirmation is up");
+        app.on_paste("token");
+        assert!(app.status.contains("editor confirmation"), "{}", app.status);
     }
 
     #[test]
