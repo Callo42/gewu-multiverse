@@ -442,8 +442,8 @@ max_concurrent_agents = 10
 # endpoint = "https://model.example.org/v1/chat/completions"
 # How many model turns one run may take before the declared bound stops it (1 to 256).
 # max_turns = 24
-# The instruction path shown on the agent's screen. The run reads the derived
-# agents/<name>/instruction.md, which `e` writes; this field does not move it.
+# The instruction document, relative to the configuration directory. The run reads
+# this file; `e` writes it, and the Agent and Instruction screens show it.
 # instruction = "agents/example-agent/instruction.md"
 # How many model requests this agent may keep in flight at once (1 to 16).
 # concurrency = 2

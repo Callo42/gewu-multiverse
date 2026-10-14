@@ -14,7 +14,12 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use signal_hook::SigId;
+use signal_hook::consts::SIGINT;
 
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
@@ -171,19 +176,35 @@ fn event_loop(screen: &mut Screen, app: &mut App) -> io::Result<()> {
         // Editing a file or reading a log means leaving the UI for a moment and
         // coming back; only this loop can do that.
         if let Some(action) = app.take_action() {
-            let result = hand_to_the_user(screen, &action)?;
-            app.note_action(&action, result);
+            let handoff = hand_to_the_user(screen, &action)?;
+            app.note_action(&action, handoff.status);
+            // A `^C` pressed while the hand-off owned the terminal is the same chord
+            // the TUI answers: on return, go through `ask_to_leave`, which warns when
+            // runs are in flight and leaves at once when none are (E-3).
+            if handoff.interrupted {
+                app.request_leave_after_handoff();
+            }
         }
     }
 }
 
+/// What came back from a hand-off: whether the product caught a `^C` while the
+/// hand-off owned the terminal, and how the user's program ended.
+struct Handoff {
+    interrupted: bool,
+    status: io::Result<std::process::ExitStatus>,
+}
+
 /// Step out of the UI, hand a path to the user's editor or pager, and step back in.
-fn hand_to_the_user(
-    screen: &mut Screen,
-    action: &PendingAction,
-) -> io::Result<io::Result<std::process::ExitStatus>> {
+fn hand_to_the_user(screen: &mut Screen, action: &PendingAction) -> io::Result<Handoff> {
     screen.suspend()?;
-    let result = match action.kind {
+    // The UI is not in raw mode while the user's program has the terminal, so `^C`
+    // arrives as `SIGINT` for the whole foreground process group. Catch it for the
+    // product so the hand-off's exit returns to the product instead of killing it and
+    // stopping every run it started (E-3). A handler, not `SIG_IGN`: the child gets
+    // the default disposition across `exec`, so its own `^C` still works.
+    let guard = SigintGuard::install();
+    let status = match action.kind {
         ActionKind::Edit => {
             // Say on the primary screen which program is taking over, where it can be
             // read even though the editor's own screen covers the alternate one.
@@ -204,15 +225,50 @@ fn hand_to_the_user(
             // and that the pager's own key is `q`, because `esc` — this product's way
             // back — does nothing inside it (M-5).
             println!(
-                "gewu-multiverse: opening {} in the pager — leave the pager with q",
+                "gewu-multiverse: opening {} in the pager — leave the pager with q; esc is not the pager's key and can swallow the next key",
                 action.label
             );
             let _ = io::stdout().flush();
             editor::view(&action.path)
         }
     };
+    let interrupted = guard.as_ref().map(|guard| guard.interrupted()).unwrap_or(false);
+    drop(guard);
     screen.resume()?;
-    Ok(result)
+    Ok(Handoff {
+        interrupted,
+        status,
+    })
+}
+
+/// Keep the product alive while a hand-off owns the terminal.
+///
+/// The handler is installed only for the hand-off's lifetime. `signal_hook`'s
+/// registration is a real handler, so it is reset to the default across `exec` and
+/// the child inherits nothing surprising; the flag records whether the product should
+/// ask to leave when it regains the terminal.
+struct SigintGuard {
+    flag: Arc<AtomicBool>,
+    id: SigId,
+}
+
+impl SigintGuard {
+    fn install() -> io::Result<Self> {
+        let flag = Arc::new(AtomicBool::new(false));
+        let id = signal_hook::flag::register(SIGINT, Arc::clone(&flag))?;
+        Ok(Self { flag, id })
+    }
+
+    /// Whether a `^C` arrived while the guard was installed.
+    fn interrupted(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SigintGuard {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.id);
+    }
 }
 
 /// The terminal while the UI is on it, or while it is stepped out of the way.
@@ -291,5 +347,33 @@ impl Drop for Screen {
     fn drop(&mut self) {
         // A panic must not leave the terminal in raw mode.
         let _ = self.leave();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard the E-3 rule rests on: a `^C` that arrives while the hand-off owns
+    /// the terminal is caught by the product, not left to kill it. A child sends the
+    /// signal to this process exactly as the terminal would (the hand-off runs in the
+    /// same foreground process group), and the process keeps running and records it.
+    #[test]
+    fn a_ctrl_c_during_a_handoff_is_caught_instead_of_killing_the_product() {
+        let guard = SigintGuard::install().expect("the signal handler is installed");
+        assert!(!guard.interrupted(), "nothing has been signalled yet");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("kill -INT $PPID; exit 0")
+            .status()
+            .expect("the hand-off child runs");
+        assert!(
+            status.success(),
+            "the child finished; if this line ran, the product survived the SIGINT"
+        );
+        assert!(
+            guard.interrupted(),
+            "the product caught the SIGINT the hand-off's `^C` delivered"
+        );
     }
 }

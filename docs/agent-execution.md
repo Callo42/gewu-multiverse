@@ -71,7 +71,8 @@ The child then, in sequence:
 2. installs the agent's skills into the run directory, byte for byte — a skill is one
    directory with a `SKILL.md`; an unsafe skill name, a skill without a manifest, or a
    link inside a skill refuses the whole run, so nothing is half-installed;
-3. reads `instruction.md` and records its size and a digest of its bytes;
+3. reads the instruction document the configuration names (the plan carries its
+   resolved path) and records its size and a digest of its bytes;
 4. reads its model key out of the credentials file — before anything runs, so that any
    output can be redacted with it — and records the bounds it will be held to;
 5. runs the declared steps, one shell command at a time, in the workspace, through

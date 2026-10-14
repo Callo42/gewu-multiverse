@@ -344,9 +344,9 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
    concurrency = 1
    ```
 
-   `instruction` is the path shown on the agent's screen. The run itself reads the
-   derived `agents/<name>/instruction.md`, which is the file `e` writes and the file the
-   tool checks before a start; point the field at that path to keep the two in step. See
+   `instruction` is the instruction document, relative to the configuration directory.
+   The run reads exactly this file — the form writes `agents/<name>/instruction.md`, and
+   the Agent screen, the Instruction screen and every run agree on it. See
    [How an agent runs](docs/agent-execution.md). Edit that file by hand and press `r` to
    re-read it.
 
