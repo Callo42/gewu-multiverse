@@ -386,10 +386,17 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
                             // guidance line is dropped, and the two numbers differ
                             // (P-4).
                             match app.instruction_payload() {
-                                Some((on_disk, sent)) if on_disk != sent => format!(
+                                Some((on_disk, sent, dropped)) if on_disk != sent && dropped => format!(
                                     "{on_disk} bytes on disk; a run sends {sent} — the guidance line is dropped"
                                 ),
-                                Some((on_disk, _)) => format!("{on_disk} bytes"),
+                                // No guidance line to drop: the only difference a run
+                                // can make on its own is the document's trailing
+                                // newline, and naming it for what it is (T-3, D-1) is
+                                // the difference between a fact and a false reason.
+                                Some((on_disk, sent, _)) if on_disk != sent => format!(
+                                    "{on_disk} bytes on disk; a run sends {sent} — the trailing newline is not sent"
+                                ),
+                                Some((on_disk, _, _)) => format!("{on_disk} bytes"),
                                 None => format!("{bytes} bytes"),
                             }
                         },

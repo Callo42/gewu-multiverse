@@ -2192,15 +2192,22 @@ impl App {
         }
     }
 
-    /// The instruction's size on disk and the size a run sends.
+    /// The instruction's size on disk, the size a run sends, and whether the difference
+    /// is the product's guidance line.
     ///
     /// A run drops the product's guidance line; the screen shows both numbers and the
-    /// reason for the difference (P-4).
-    pub fn instruction_payload(&self) -> Option<(u64, u64)> {
+    /// *real* reason for the difference (P-4, T-3, D-1): a document with no guidance
+    /// line but a trailing newline differs by that byte, and saying a line was dropped
+    /// would send the user looking for a line they never wrote.
+    pub fn instruction_payload(&self) -> Option<(u64, u64, bool)> {
         let paths = self.selected_paths()?;
         let bytes = std::fs::read(paths.instruction()).ok()?;
         let (on_disk, sent) = crate::agent_run::instruction_payload(&bytes);
-        Some((on_disk as u64, sent as u64))
+        Some((
+            on_disk as u64,
+            sent as u64,
+            crate::agent_run::guidance_dropped(&bytes),
+        ))
     }
 
     /// Whether the instruction document holds nothing but the guidance placeholder.
