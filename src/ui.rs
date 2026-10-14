@@ -23,8 +23,27 @@ use crate::systemd::Mode;
 /// The space between the field name and its value on the detail screens.
 const LABEL_WIDTH: usize = 16;
 
+/// The smallest window the product will draw its panels into.
+///
+/// Below this, panels and the modal clip silently — an action line or a reason simply
+/// disappears. One honest line is better than a clipped screen, and it says exactly
+/// what to do.
+const MIN_WIDTH: u16 = 72;
+const MIN_HEIGHT: u16 = 18;
+
 /// Paint the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let full = frame.area();
+    if full.width < MIN_WIDTH || full.height < MIN_HEIGHT {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "this window is too small to show the product; make it at least {MIN_WIDTH}×{MIN_HEIGHT}"
+            ))
+            .wrap(Wrap { trim: true }),
+            full,
+        );
+        return;
+    }
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
@@ -726,7 +745,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     };
     let screen = frame.area();
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = (NewAgentForm::FIELDS.len() as u16 + 8).min(screen.height.saturating_sub(2));
+    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height.saturating_sub(2));
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -742,6 +761,10 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     lines.push(Line::from(
         "Name an agent and point it at a model. The model key and the Forgejo token are written to the credentials file and are never shown.",
     ));
+    lines.push(Line::from(Span::styled(
+        "The model key is required. The Forgejo fields are optional; a blank URL keeps the sample's placeholder address.",
+        Style::new().fg(Color::DarkGray),
+    )));
     lines.push(Line::from(""));
     for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
         let value = &form.fields[at];
@@ -988,11 +1011,18 @@ const HELP_LINES: &[&str] = &[
 /// The first-run risk acknowledgment, over everything else.
 fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let screen = frame.area();
-    // At least one cell of margin on every side, so the modal never shares an edge
-    // with the panel behind it even on a narrow terminal.
-    let width = (screen.width.saturating_sub(2)).min(78);
-    let height = (risk::LINES.len() as u16 + 9).min(screen.height.saturating_sub(2));
-    let popup = centered(screen, width, height);
+    // The modal sits over the body, above the footer, so the status line that says
+    // what answers the screen stays visible while the modal is up. At least one cell
+    // of margin on every side keeps it off the panel edge even on a narrow terminal.
+    let available = Rect {
+        x: screen.x,
+        y: screen.y.saturating_add(3),
+        width: screen.width,
+        height: screen.height.saturating_sub(8),
+    };
+    let width = (available.width.saturating_sub(2)).min(78);
+    let height = (risk::LINES.len() as u16 + 9).min(available.height.saturating_sub(2));
+    let popup = centered(available, width, height);
 
     let mut lines: Vec<Line> = Vec::new();
     for text in risk::LINES {
@@ -1024,7 +1054,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let owned = Rect {
         x: 0,
         y: popup.y,
-        width: screen.width,
+        width: available.width,
         height: popup.height,
     };
     frame.render_widget(Clear, owned);

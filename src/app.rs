@@ -2909,4 +2909,47 @@ role = "member"
         app.note_action(&action, Ok(success()));
         assert!(app.status.contains("were not changed"), "{}", app.status);
     }
+
+    #[test]
+    fn a_failed_administrator_check_keeps_the_last_good_role_view() {
+        // S-10: `C` without an administrator token must not wipe the member view.
+        use crate::config::Role;
+        use crate::forgejo::{Permissions, Repository, RoleCheck, Viewer};
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let repository = Repository {
+            full_name: "uxmember/demo-public".to_owned(),
+            namespace: "uxmember".to_owned(),
+            name: "demo-public".to_owned(),
+            private: false,
+            default_branch: None,
+            html_url: None,
+            permissions: Permissions::default(),
+        };
+        app.role_check = Some(Ok(RoleCheck {
+            url: "https://forgejo.example.org".to_owned(),
+            role: Role::Member,
+            viewer: Viewer {
+                login: "uxmember".to_owned(),
+                email: None,
+                description: None,
+                is_admin: false,
+            },
+            repositories: vec![repository],
+            private_visible: 0,
+        }));
+        app.request_admin_role_check();
+        assert!(app.status.contains("administrator token"), "{}", app.status);
+        assert!(
+            matches!(app.role_check, Some(Ok(_))),
+            "the good member view was wiped: {:?}",
+            app.role_check
+        );
+        assert!(
+            app.forgejo_note
+                .as_deref()
+                .is_some_and(|note| note.contains("administrator token")),
+            "the failure is not shown beside the view"
+        );
+    }
 }

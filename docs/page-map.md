@@ -131,3 +131,4 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | wide terminal | the status line and the key legend | the legend may be long |
 | 80×24 | the status line and the legend | the legend must not silently drop keys: it clips at a key boundary and ends with `? all keys` |
 | any status longer than the width | the status line | wrap it onto the footer's spare lines, never clip a reason or a path |
+| a window smaller than 72×18 | one line: “this window is too small to show the product; make it at least 72×18” | that line, instead of clipped panels, a clipped modal or a clipped help overlay |
