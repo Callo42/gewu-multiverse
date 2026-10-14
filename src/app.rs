@@ -1410,7 +1410,7 @@ impl App {
         };
         let text = render_config(&existing, &url, &name, &endpoint, &model);
         Config::from_text(&self.config_path(), &text).map_err(|error| error.to_string())?;
-        std::fs::write(self.config_path(), text).map_err(|error| {
+        crate::mode::write_private(self.config_path(), text.as_bytes()).map_err(|error| {
             format!("{} cannot be written: {error}", self.config_path().display())
         })?;
         credentials::record_form_secrets(
@@ -1473,7 +1473,7 @@ impl App {
             self.status = error.to_string();
             return;
         }
-        if let Err(error) = std::fs::write(self.config_path(), text) {
+        if let Err(error) = crate::mode::write_private(self.config_path(), text.as_bytes()) {
             self.status = format!(
                 "{} cannot be written: {error}",
                 self.config_path().display()
@@ -3666,6 +3666,9 @@ fn foreign_path(text: &str, live: &str) -> Option<String> {
 fn write_template(path: &std::path::Path, template: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        // F-1: the directory this hand-off makes (a new skill's directory) is the
+        // product's, and carries the product's custody.
+        crate::mode::set_mode(parent, crate::mode::PRIVATE_DIR_MODE)?;
     }
     crate::mode::write_private(path, template)
 }
