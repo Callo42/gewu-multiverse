@@ -141,6 +141,6 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | wide terminal | the status line and the key legend | the legend may be long |
 | every screen, every state | a footer clause `Running: N of M`, and `· K finished` once a run has ended since this UI started | the running count and what has finished, wherever the user is, not only on the hub |
 | 80×24 | the status line and the legend | the legend must not silently drop keys: it clips at a key boundary and ends with `? all keys` |
-| any status longer than the width | the status line | wrap it onto the footer's spare lines, never clip a reason or a path |
+| any status longer than the width | the status line, grown past its usual rows when it must be | the footer takes the body's spare rows for the status (never below the body's minimum), so a reason, a path or git's own `fatal:` line is read whole at 80×24, never clipped |
 | a window smaller than 72×18 | one line: “this window is too small to show the product; make it at least 72×18” | that line, instead of clipped panels, a clipped modal or a clipped help overlay |
 | exactly 72×18 (the advertised minimum) | the product, with at least one agent row drawn and the count in the title when more exist | a minimum the product calls usable must show a real row, not a header over nothing |
