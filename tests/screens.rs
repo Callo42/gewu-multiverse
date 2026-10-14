@@ -266,7 +266,10 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
     // The runs screen has nothing to list yet, and says so rather than claiming a run.
     app.show(Screen::Runs);
     let runs = render(&app);
-    assert!(runs.contains("No run has been recorded yet"), "{runs}");
+    assert!(
+        runs.contains("No run of a configured agent has been recorded yet"),
+        "{runs}"
+    );
 }
 
 #[test]
@@ -1254,7 +1257,7 @@ fn the_key_reference_scrolls_so_every_key_survives_a_short_window() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('?')));
     let first = render_at(80, 24, &app);
-    assert!(first.contains("of 16"), "the range is missing: {first}");
+    assert!(first.contains("of 17"), "the range is missing: {first}");
     // Scroll to the end; the last line must be reachable.
     for _ in 0..20 {
         app.on_key(KeyEvent::from(KeyCode::Down));
@@ -1532,9 +1535,12 @@ fn every_panel_and_note_area_that_truncates_declares_it_at_eighty_columns() {
     assert!(forgejo.contains("up/down choose one"), "{forgejo}");
     assert!(forgejo.contains("c role"), "{forgejo}");
 
-    // The Agents note area has no border to carry a title, so its own last row says so.
+    // The Agents note area has no border to carry a title, so its own last row says so
+    // when there is more below. With the acknowledgment record (C-3) the note now fits
+    // at 80×24, so the declaration is exercised at the advertised floor, where the
+    // same content does not fit.
     app.show(Screen::Agents);
-    let agents = render_at(80, 24, &app);
+    let agents = render_at(72, 18, &app);
     assert!(
         agents.contains("… more below; enlarge the window"),
         "{agents}"
@@ -1632,6 +1638,10 @@ concurrency = 1
     app.request_secret(SecretTarget::ModelKey);
     app.on_paste("sk-not-a-real-credential");
     app.on_key(KeyEvent::from(KeyCode::Enter));
+    // C-1: a status sentence belongs to the screen that made it, so the test asks for
+    // the test on the Agent screen, where a person pressing `p` is standing — the way
+    // a user drives it — rather than carrying a stale sentence across a screen change.
+    app.show(Screen::AgentConfig);
     app.request_endpoint_test();
     assert!(
         app.status.contains("the endpoint refused the connection"),
@@ -1643,7 +1653,6 @@ concurrency = 1
         "the transport's errno is still on the status line: {}",
         app.status
     );
-    app.show(Screen::AgentConfig);
     let screen = render_at(80, 24, &app);
     // The footer carries it at the minimum (the sentence wraps, so the whole phrase is
     // not contiguous); the transport's errno is nowhere on the screen.
@@ -2405,5 +2414,217 @@ fn the_credentials_legend_offers_the_leftover_delete_when_one_is_shown() {
     assert!(
         !no_leftover.contains("D delete the leftover secrets"),
         "the legend offers a delete with nothing to delete: {no_leftover}"
+    );
+}
+
+/// Write `count` finished run records for one agent, so a test can cross the fifty
+/// record cap or make a footprint worth measuring.
+fn seed_runs(root: &Path, agent: &str, count: usize, log_bytes: usize) {
+    for index in 0..count {
+        let run_id = format!("run-{}-{index:04}-1", 1_700_000_000_000u128 + index as u128);
+        let dir = root.join("state").join(agent).join(&run_id);
+        fs::create_dir_all(&dir).expect("the run directory is created");
+        let mut transcript = Transcript::open(&dir).expect("a transcript is opened");
+        transcript
+            .append(&Record::run_started(&run_id, agent, 42, "/w"))
+            .expect("a record");
+        transcript
+            .append(&Record::run_finished(&run_id, RunOutcome::Succeeded, Some(0), 120, None))
+            .expect("a record");
+        if log_bytes > 0 {
+            fs::write(dir.join("run.log"), vec![b'x'; log_bytes]).expect("the log is written");
+        }
+    }
+}
+
+#[test]
+fn the_runs_list_and_the_footer_count_say_when_they_stop_at_fifty() {
+    // L-1 / L-5: the record list and the footer count both stopped at fifty with no
+    // word, presenting fifty as the whole history. The list now declares the older
+    // records, and the footer says `+` when it cannot count them all.
+    let root = scratch("cap-declared");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    seed_runs(&root, "scribe", 60, 0);
+    app.reload();
+
+    assert_eq!(app.recent.len(), 50, "the list is capped at fifty");
+    assert_eq!(app.recent_total, 60, "all sixty records are measured");
+    assert!(app.finished_count_is_capped(), "the count cannot see them all");
+
+    app.show(Screen::Runs);
+    let screen = render_at(100, 30, &app);
+    assert!(
+        screen.contains("This list stops at the newest 50 run records of 60 on disk"),
+        "the cap is not declared: {screen}"
+    );
+    assert!(
+        screen.contains("10 older records are not listed here"),
+        "the older records are not named: {screen}"
+    );
+    assert!(
+        screen.contains("50+ finished"),
+        "the footer count presents the cap as exact: {screen}"
+    );
+}
+
+#[test]
+fn the_run_records_footprint_and_the_cleanup_expectation_are_on_the_runs_screen() {
+    // L-2: records accumulated with no footprint and no statement of what a person is
+    // expected to do about them. The Runs screen now shows the count, the room and the
+    // expectation (the product never deletes a record; the person removes a run's
+    // directory to free its space).
+    let root = scratch("footprint");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    seed_runs(&root, "scribe", 3, 2048);
+    app.reload();
+    app.show(Screen::Runs);
+    let screen = render_at(100, 30, &app);
+    assert!(
+        screen.contains("3 run records on disk"),
+        "the footprint count is missing: {screen}"
+    );
+    assert!(
+        screen.contains("KB") || screen.contains("B in total"),
+        "the footprint has no room figure: {screen}"
+    );
+    assert!(
+        screen.contains("it never deletes one by itself"),
+        "the cleanup expectation is not stated: {screen}"
+    );
+}
+
+#[test]
+fn a_removed_agents_records_are_counted_though_they_are_not_listed() {
+    // L-4: removing an agent dropped all its records from the screen while they stayed
+    // on disk. The footprint counts every record, and names the ones whose agent the
+    // configuration no longer lists.
+    let root = scratch("removed-records");
+    let mut app = app_with_config(&root, EMPTY_CONFIG);
+    app.show_acknowledgment = false;
+    seed_runs(&root, "ghost", 4, 0);
+    app.reload();
+    assert_eq!(app.footprint.records, 4, "every record is measured");
+    assert_eq!(
+        app.footprint.unconfigured_records, 4,
+        "the records of the removed agent are the unconfigured ones"
+    );
+    app.show(Screen::Runs);
+    let screen = render_at(100, 30, &app);
+    assert!(
+        screen.contains("4 run records on disk"),
+        "the records are not counted: {screen}"
+    );
+    assert!(
+        screen.contains("no longer lists"),
+        "the unconfigured records are not named: {screen}"
+    );
+}
+
+#[test]
+fn the_agent_screen_names_the_size_of_the_log_and_the_transcript() {
+    // L-3: the files that grow with every run had no size anywhere; only the
+    // instruction had the byte arithmetic. The Agent screen names both, with the size.
+    let root = scratch("growing-files");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    seed_runs(&root, "scribe", 1, 4096);
+    app.reload();
+    app.show(Screen::AgentConfig);
+    let screen = render_at(100, 50, &app);
+    assert!(screen.contains("newest log"), "the log field is gone: {screen}");
+    assert!(screen.contains("4.0 KB"), "the log's size is not shown: {screen}");
+    assert!(
+        screen.contains("transcript"),
+        "the transcript field is not drawn: {screen}"
+    );
+}
+
+#[test]
+fn the_forgejo_identity_sentence_does_not_stop_mid_thought() {
+    // C-2: the one line that answers "whose identity?" ended at `the token is from v`,
+    // at every width. It is a finished sentence now, and it names the key that does it.
+    let root = scratch("identity-sentence");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Forgejo);
+    let screen = render_at(200, 30, &app);
+    assert!(
+        screen.contains("v supplies the token"),
+        "the identity sentence is not complete: {screen}"
+    );
+    assert!(
+        !screen.contains("from v"),
+        "the broken clause is still there: {screen}"
+    );
+}
+
+#[test]
+fn a_used_configuration_says_when_and_under_which_version_the_risk_was_acknowledged() {
+    // C-3: a second person on a directory someone else acknowledged had no record of
+    // it anywhere on screen, and no way to read the terms. The Agents note area names
+    // the record, the date and the version, and `R` shows the terms read-only.
+    let root = scratch("ack-visible");
+    let mut app = app(&root);
+    // The record a predecessor wrote.
+    app.on_key(KeyEvent::from(KeyCode::Char('y')));
+    app.show(Screen::Agents);
+    let screen = render(&app);
+    assert!(
+        screen.contains("the risk was acknowledged on"),
+        "the record is not on the screen: {screen}"
+    );
+    assert!(
+        screen.contains("press R to read the terms again"),
+        "there is no way to read the terms again: {screen}"
+    );
+    assert!(
+        screen.contains(env!("CARGO_PKG_VERSION")),
+        "the version that wrote the record is not named: {screen}"
+    );
+
+    // `R` shows the terms without writing anything.
+    let record_before = fs::read(root.join("risk-acknowledgment.toml")).expect("the record");
+    app.on_key(KeyEvent::from(KeyCode::Char('R')));
+    assert!(app.show_acknowledgment, "the terms are not shown");
+    assert!(app.ack_review, "the review is not read-only");
+    let review = render(&app);
+    assert!(
+        review.contains("the record is unchanged"),
+        "the review does not say it writes nothing: {review}"
+    );
+    app.on_key(KeyEvent::from(KeyCode::Esc));
+    let record_after = fs::read(root.join("risk-acknowledgment.toml")).expect("the record");
+    assert_eq!(record_before, record_after, "the review changed the record");
+}
+
+#[test]
+fn a_leftover_secret_names_the_age_of_the_credentials_file() {
+    // C-4: the Credentials screen marked the leftover but gave no age, so a person
+    // could not tell a tidy-up from a loss. The file's own modification time is named.
+    let root = scratch("leftover-age");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let credentials = root.join("credentials.toml");
+    fs::write(
+        &credentials,
+        "[model_keys]\n\"ghost\" = \"gw-fixture-key\"\n",
+    )
+    .expect("the credentials file is written");
+    // Three days old, so the sentence has an age to name.
+    let three_days_ago = SystemTime::now() - std::time::Duration::from_secs(3 * 86_400 + 120);
+    let file = fs::File::options()
+        .write(true)
+        .open(&credentials)
+        .expect("the credentials file opens");
+    file.set_modified(three_days_ago)
+        .expect("the modification time is set");
+    app.reload();
+    app.show(Screen::Credentials);
+    let screen = render_at(100, 30, &app);
+    assert!(
+        screen.contains("last written 3 days ago"),
+        "the leftover has no age: {screen}"
     );
 }

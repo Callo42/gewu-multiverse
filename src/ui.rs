@@ -142,7 +142,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     // needs for its border, its header and **at least one agent**, even at the
     // smallest size the product calls usable, so a configured agent is never
     // invisible.
-    let notes_height = area.height.saturating_sub(4).min(8);
+    let notes_height = area.height.saturating_sub(4).min(10);
     let parts =
         Layout::vertical([Constraint::Min(4), Constraint::Length(notes_height)]).split(area);
 
@@ -241,6 +241,19 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             Style::new().fg(Color::Yellow),
         )));
     }
+    // C-3: the acknowledgment record is a fact a second person needs before anything
+    // else on this screen, so it is drawn near the top, where a short note area cannot
+    // hide it below the fold. A first user who answered the overlay never thinks about
+    // it again; the person who inherits the directory must be able to read what was
+    // agreed, when and under which version.
+    if !app.ack_confirmed() {
+        lines.push(Line::from(Span::styled(
+            "The risk of running an agent is not acknowledged: starting one is refused.",
+            Style::new().fg(Color::Yellow),
+        )));
+    } else if let Some(record) = app.ack_state.record_line() {
+        lines.push(Line::from(Span::styled(record, Style::new().fg(Color::DarkGray))));
+    }
     let waiting = app.supervisor.waiting_count();
     let waiting_noun = if waiting == 1 { "start" } else { "starts" };
     lines.push(Line::from(format!(
@@ -321,12 +334,6 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
         "Either way its workspace is a directory: a layout, not a sandbox.",
         Style::new().fg(Color::DarkGray),
     )));
-    if !app.ack_confirmed() {
-        lines.push(Line::from(Span::styled(
-            "The risk of running an agent is not acknowledged: starting one is refused.",
-            Style::new().fg(Color::Yellow),
-        )));
-    }
     lines
 }
 
@@ -399,7 +406,14 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             }
             match app.latest_run_log(&agent.name) {
                 Some(log) if log.is_file() => {
-                    lines.push(field("newest log", &log.display().to_string()));
+                    // L-3: the log is the file that grows with every run, so its size
+                    // is shown beside its path rather than left to the filesystem.
+                    let size = App::file_size_text(&log)
+                        .unwrap_or_else(|| "size unknown".to_owned());
+                    lines.push(field(
+                        "newest log",
+                        &format!("{} ({size})", log.display()),
+                    ));
                 }
                 // Y-7: a path to a file that is no longer there is not a thing. Mark it
                 // gone, rather than presenting it as if `o` would open it.
@@ -411,6 +425,22 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     ),
                 )),
                 None => lines.push(field("newest log", "no run yet")),
+            }
+            // L-3: the transcript grows too, and was named nowhere with a size.
+            match app.latest_run_transcript(&agent.name) {
+                Some(path) if path.is_file() => {
+                    let size = App::file_size_text(&path)
+                        .unwrap_or_else(|| "size unknown".to_owned());
+                    lines.push(field(
+                        "transcript",
+                        &format!("{} ({size})", path.display()),
+                    ));
+                }
+                Some(path) => lines.push(field(
+                    "transcript",
+                    &format!("{} — gone, the record has no transcript", path.display()),
+                )),
+                None => {}
             }
             if let Some(run_id) = app.supervisor.state(&agent.name).run_id() {
                 lines.push(field("run", run_id));
@@ -852,7 +882,7 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                         "not settled — press i for `{login}`; the account is created and managed"
                     )
                 } else {
-                    format!("not settled — press i for `{login}`; the token is from v")
+                    format!("not settled — press i for `{login}`; v supplies the token")
                 };
                 head.push(field("agent identity", &sentence));
             }
@@ -1151,9 +1181,60 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         "Run records are read from {}.",
         app.state_root().display()
     )));
+    // L-2: records accumulate for ever, and nothing on any screen said where they live
+    // as a footprint or what a person is expected to do about them. The count, the
+    // room and the cleanup expectation are now on the screen that lists them; the
+    // count includes records of agents the configuration no longer lists, so a
+    // removed agent's history does not vanish (L-4).
+    let footprint = &app.footprint;
+    if footprint.records > 0 {
+        let noun = if footprint.records == 1 {
+            "record"
+        } else {
+            "records"
+        };
+        lines.push(Line::from(format!(
+            "{} run {noun} on disk, {} in total.",
+            footprint.records,
+            crate::app::filesize_text(footprint.bytes)
+        )));
+        if footprint.unconfigured_records > 0 {
+            let noun = if footprint.unconfigured_records == 1 {
+                "record belongs"
+            } else {
+                "records belong"
+            };
+            lines.push(Line::from(format!(
+                "{} {noun} to an agent the configuration no longer lists; they stay on disk until they are deleted.",
+                footprint.unconfigured_records
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "To free their space, remove a run's directory under that path. The product only reads run records; it never deletes one by itself.",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    // L-1, L-5: the list is capped at the newest fifty records. Say so at the point of
+    // the cap, rather than presenting fifty as the whole history.
+    if app.recent_total > app.recent.len() {
+        let older = app.recent_total - app.recent.len();
+        let tail = if older == 1 {
+            "1 older record is not listed here, but it is still on disk.".to_owned()
+        } else {
+            format!("{older} older records are not listed here, but they are still on disk.")
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "This list stops at the newest {} run records of {} on disk: {tail}",
+                app.recent.len(),
+                app.recent_total
+            ),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
     if app.recent.is_empty() {
         lines.push(Line::from(
-            "No run has been recorded yet, so there is nothing to list.",
+            "No run of a configured agent has been recorded yet, so there is nothing to list.",
         ));
         // A person who came here to see whether anything ran needs the step that makes
         // a run, not only where the records would appear.
@@ -1184,10 +1265,17 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             Style::new().fg(Color::DarkGray),
         )));
         // The paths are the detail: named here, below the offers, so a short note area
-        // drops them rather than the offers (they stay reachable with `[`/`]`).
+        // drops them rather than the offers (they stay reachable with `[`/`]`). Each
+        // file's size is beside it, so the growth a Long-hauler watches is readable
+        // without leaving the product (L-3).
+        let transcript = run.dir.join(crate::transcript::TRANSCRIPT_FILE);
+        let transcript_size = App::file_size_text(&transcript)
+            .unwrap_or_else(|| "size unknown".to_owned());
+        let log_size =
+            App::file_size_text(&run.log).unwrap_or_else(|| "size unknown".to_owned());
         lines.push(Line::from(format!(
-            "the transcript is at {} and the log at {}",
-            run.dir.join(crate::transcript::TRANSCRIPT_FILE).display(),
+            "the transcript is at {} ({transcript_size}) and the log at {} ({log_size})",
+            transcript.display(),
             run.log.display()
         )));
         lines.push(Line::from(Span::styled(
@@ -1614,7 +1702,10 @@ fn running_clause(app: &App) -> String {
     if finished == 0 {
         base
     } else {
-        format!("{base}· {finished} finished   ")
+        // A `+` when the newest fifty records all finished since this UI started and
+        // older records are on disk: the count may be larger than it can see (L-5).
+        let plus = if app.finished_count_is_capped() { "+" } else { "" };
+        format!("{base}· {finished}{plus} finished   ")
     }
 }
 
@@ -2096,6 +2187,7 @@ const HELP_LINES: &[&str] = &[
     "Secrets:   k set the model key (Credentials)   f set the role token (Credentials)",
     "           v set the agent's own Forgejo token (Forgejo)   A set the administrator token",
     "           D delete the leftover secrets of agents no longer configured (Credentials)",
+    "Risk:      R read the acknowledged terms again; the record is not changed",
     "Files:     r re-read config.toml and credentials.toml   q quit   ^C quit and stop runs",
     "Help:      ? or h or F1 show this list   esc or enter close it",
 ];
@@ -2124,20 +2216,38 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         lines.push(Line::from(vec![Span::raw("  * "), Span::raw(*text)]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  y — I understand, record it once        n — not now",
-        Style::new()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(
-        "  Until it is recorded, starting an agent stays refused.",
-    ));
-    lines.push(Line::from(format!(
-        "  The record will be written to {}",
-        app.ack_path.display()
-    )));
+    if app.ack_review {
+        // Read-only: the record exists and a second person is reading it. Nothing
+        // here writes, so nothing here may look like it does (C-3).
+        lines.push(Line::from(Span::styled(
+            "  esc or any key — close this, the record is unchanged",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if let Some(record) = app.ack_state.record_line() {
+            lines.push(Line::from(Span::styled(
+                format!("  {record}"),
+                Style::new().fg(Color::DarkGray),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  y — I understand, record it once        n — not now",
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(
+            "  Until it is recorded, starting an agent stays refused.",
+        ));
+        lines.push(Line::from(format!(
+            "  The record will be written to {}",
+            app.ack_path.display()
+        )));
+    }
 
     let block = Block::bordered()
         .title(format!(" {} ", risk::TITLE))

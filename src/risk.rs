@@ -43,6 +43,12 @@ pub enum AckState {
     Recorded {
         /// Seconds since the Unix epoch, as written when it was confirmed.
         acknowledged_at_unix: u64,
+        /// The version that wrote the record, as the file itself carries it.
+        ///
+        /// A second person on the same configuration directory inherits terms that
+        /// were accepted under this version (C-3); the value is read from the file,
+        /// never assumed to be the running version.
+        app_version: String,
     },
     /// A record is there but cannot be trusted, so it is not treated as a confirmation.
     Unreadable {
@@ -66,6 +72,7 @@ impl AckState {
         match toml::from_str::<Record>(&text) {
             Ok(record) if record.acknowledged => AckState::Recorded {
                 acknowledged_at_unix: record.acknowledged_at_unix,
+                app_version: record.app_version,
             },
             Ok(_) => AckState::Missing,
             Err(error) => AckState::Unreadable {
@@ -89,10 +96,37 @@ impl AckState {
             }
             AckState::Recorded {
                 acknowledged_at_unix,
-            } => format!("acknowledged at Unix time {acknowledged_at_unix}"),
+                app_version,
+            } => format!(
+                "acknowledged on {} (version {})",
+                crate::time::compact_utc(acknowledged_at_unix.saturating_mul(1000)),
+                version_label(app_version)
+            ),
             AckState::Unreadable { reason } => format!(
                 "a record is there but cannot be read ({reason}); it is not treated as a confirmation"
             ),
+        }
+    }
+
+    /// The line the Agents note area draws when a record exists.
+    ///
+    /// A first user answers the overlay once and never thinks about it again; a
+    /// **second** person on the same configuration directory is running agents under
+    /// a risk someone else accepted, under a version they did not run. The record is
+    /// on disk — this line puts it on the screen, with the key that shows the terms
+    /// again, so reading them does not mean finding and deleting a file by hand
+    /// (C-3).
+    pub fn record_line(&self) -> Option<String> {
+        match self {
+            AckState::Recorded {
+                acknowledged_at_unix,
+                app_version,
+            } => Some(format!(
+                "the risk was acknowledged on {} (version {}); press R to read the terms again — the record is not changed",
+                crate::time::compact_utc(acknowledged_at_unix.saturating_mul(1000)),
+                version_label(app_version)
+            )),
+            _ => None,
         }
     }
 }
@@ -126,6 +160,15 @@ pub fn record(path: &Path) -> Result<AckState, io::Error> {
     Ok(AckState::read(path))
 }
 
+/// The version a record carries, or `unknown` when the file did not say.
+fn version_label(app_version: &str) -> &str {
+    if app_version.trim().is_empty() {
+        "unknown"
+    } else {
+        app_version.trim()
+    }
+}
+
 /// The shape of the record on disk.
 #[derive(Debug, Deserialize)]
 struct Record {
@@ -133,6 +176,8 @@ struct Record {
     acknowledged: bool,
     #[serde(default)]
     acknowledged_at_unix: u64,
+    #[serde(default)]
+    app_version: String,
 }
 
 #[cfg(test)]
@@ -156,6 +201,27 @@ mod tests {
         let state = record(&path).expect("the record is written");
         assert!(state.is_confirmed());
         assert!(AckState::read(&path).is_confirmed());
+    }
+
+    #[test]
+    fn the_record_line_names_the_date_and_the_version_a_predecessor_agreed_to() {
+        // C-3: a second person on a used configuration directory must be able to read
+        // what was agreed, when, and under which version — read from the file itself,
+        // never assumed to be the running version.
+        let root = scratch_root("risk-line");
+        let path = root.join("risk-acknowledgment.toml");
+        fs::write(
+            &path,
+            "acknowledged = true\nacknowledged_at_unix = 1700000000\napp_version = \"0.1.7\"\n",
+        )
+        .expect("the test writes a predecessor's record");
+        let state = AckState::read(&path);
+        let line = state.record_line().expect("a record has a line");
+        assert!(line.contains("the risk was acknowledged on"), "{line}");
+        assert!(line.contains("0.1.7"), "the version the file carries: {line}");
+        assert!(line.contains("press R"), "the way to read the terms again: {line}");
+        // A missing record has no line to draw.
+        assert!(AckState::Missing.record_line().is_none());
     }
 
     #[test]
