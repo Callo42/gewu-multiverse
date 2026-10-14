@@ -64,7 +64,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 |---|---|---|
 | no agent | `no agent to show` + the config path | the in-app path to add one |
 | empty instruction | path, `not there yet — press e to write it`; a file that holds only the guidance placeholder reads the same way, with the reason | `e`, and one line of what a run sends |
-| instruction written | path, **the size on disk and the size a run sends** (with the guidance line named as dropped when they differ), steps, `skills N on disk` | a preview of the instruction, or a key that opens it; what a run will send, not only what is on disk |
+| instruction written | path, **the size on disk and the size a run sends** (the guidance line named as dropped only when it actually was; otherwise the trailing newline named as the difference), steps, `skills N on disk` | a preview of the instruction, or a key that opens it; what a run will send, not only what is on disk |
 | an interrupted edit | `an earlier edit of this instruction was not saved; the editor kept it in <file>` | the emergency-save file named, so the words are recovered, not retyped |
 | steps | path, declared count, or `none — press t` | the template must not doubt the product (“until model calls exist” is false) |
 | skills | `skills N on disk`, one `SKILL.md` per skill | what a *skill* is, and `K` must not hand an editor a directory |

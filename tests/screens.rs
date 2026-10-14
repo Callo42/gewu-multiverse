@@ -1330,3 +1330,17 @@ fn a_broken_configuration_names_the_key_that_reads_it_again() {
     assert!(screen.contains("no agent list"), "{screen}");
     assert!(screen.contains("press r to read it"), "{screen}");
 }
+
+#[test]
+fn a_trailing_newline_is_not_reported_as_a_dropped_guidance_line() {
+    // T-3 / D-1: no guidance line was written, so none was dropped.
+    let root = scratch("instruction-newline");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    fs::write(paths.instruction(), "Do one thing\n").expect("the instruction is written");
+    app.show(Screen::Instructions);
+    let screen = render(&app);
+    assert!(screen.contains("trailing newline is not sent"), "{screen}");
+    assert!(!screen.contains("the guidance line is dropped"), "{screen}");
+}
