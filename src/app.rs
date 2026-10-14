@@ -420,6 +420,20 @@ fn clone_failed_status(repo: &str, login: &str, mode: &str, class: &str, detail:
     )
 }
 
+/// The status when an agent's own Forgejo token cannot be read.
+///
+/// A-2's class: a refusal the user acts on names the product's own keys for the fix
+/// (`v` supplies the token, `i` settles the identity), never the credentials file and
+/// its TOML table. Any other read failure keeps its own sentence.
+fn missing_agent_token_status(name: &str, error: &credentials::CredentialsError) -> String {
+    match error {
+        credentials::CredentialsError::MissingToken { .. } => format!(
+            "no Forgejo token for `{name}` — press v on the Forgejo screen to supply it, or i to settle the identity"
+        ),
+        _ => format!("no Forgejo token for `{name}`: {error}"),
+    }
+}
+
 /// Say how an endpoint test ended, in the product's own words.
 fn describe_endpoint_result(result: &Result<String, EndpointFailure>) -> String {
     match result {
@@ -1497,10 +1511,12 @@ impl App {
         // Refuse before a run is wasted, with the same sentence the run's own log
         // would carry: `p` already knows the key is missing, so `s` must know too.
         if credentials::model_key(&self.credentials_path, &name).is_err() {
-            // Lead with the fix; the full sentence is on the Credentials screen and in
-            // the run's own log. A long path here would clip in a narrow footer.
+            // Lead with the fix, and name the product's own key for it: the screen
+            // that sets a model key is one keypress away, so the refusal must not send
+            // the user to a file and a TOML section instead (A-2). The run's own log
+            // still carries the file's full sentence.
             self.status = format!(
-                "not started: no model key for `{name}` — add one under [model_keys] in credentials.toml"
+                "not started: no model key for `{name}` — press 5 and then k on the Credentials screen to add one"
             );
             return;
         }
@@ -1871,7 +1887,7 @@ impl App {
             _ => Err(ForgejoFailure {
                 class: "no_identity".to_owned(),
                 message: format!(
-                    "no Forgejo identity is recorded for `{agent}`; press i to settle one, or supply its token under [forgejo_agent_tokens]"
+                    "no Forgejo identity is recorded for `{agent}`; press i to settle one, or press v on this screen to supply its token"
                 ),
             }),
         }
@@ -2028,7 +2044,7 @@ impl App {
         let token = match credentials::forgejo_agent_token(&self.credentials_path, &name) {
             Ok(token) => token,
             Err(error) => {
-                self.status = format!("no Forgejo token for `{name}`: {error}");
+                self.status = missing_agent_token_status(&name, &error);
                 return;
             }
         };
@@ -2085,7 +2101,7 @@ impl App {
         let token = match credentials::forgejo_agent_token(&self.credentials_path, &name) {
             Ok(token) => token,
             Err(error) => {
-                self.status = format!("no Forgejo token for `{name}`: {error}");
+                self.status = missing_agent_token_status(&name, &error);
                 return;
             }
         };
@@ -2699,7 +2715,7 @@ impl App {
     /// list is empty: `enter` must never be a silent dead end either.
     fn open_selected_agent(&mut self) {
         if self.selected_agent().is_some() {
-            self.screen = Screen::AgentConfig;
+            self.show(Screen::AgentConfig);
         } else if self.agents().is_empty() {
             self.request_new_agent();
         } else {
@@ -2945,7 +2961,7 @@ impl App {
             KeyCode::Char('[') => self.scroll_panel(-1),
             KeyCode::Char(']') => self.scroll_panel(1),
             KeyCode::Enter => self.open_selected_agent(),
-            KeyCode::Esc => self.screen = Screen::Agents,
+            KeyCode::Esc => self.show(Screen::Agents),
             KeyCode::Char('s') => self.request_agent_start(),
             KeyCode::Char('x') => self.request_agent_stop(),
             KeyCode::Char('m') => self.request_mode_switch(),
@@ -2998,7 +3014,9 @@ impl App {
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char(digit) if ('1'..='6').contains(&digit) => {
                 let at = digit as usize - '1' as usize;
-                self.screen = Screen::ALL[at];
+                // `show` resets the panel's scroll offset: a screen the user never
+                // scrolled must not open at another screen's offset (A-1).
+                self.show(Screen::ALL[at]);
             }
             // A press that cannot act must not be silent: say so, and name the way to
             // the full list. Silence reads as a frozen program.
@@ -3522,8 +3540,36 @@ role = "member"
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.status.contains("model key"), "{}", app.status);
-        assert!(app.status.contains("model_keys"), "{}", app.status);
+        // A-2: the refusal names the product's own key for the fix, not a file and a
+        // TOML section.
+        assert!(!app.status.contains("[model_keys]"), "{}", app.status);
+        assert!(
+            app.status.contains("k on the Credentials screen"),
+            "{}",
+            app.status
+        );
         assert_eq!(app.supervisor.running_count(), 0);
+    }
+
+    #[test]
+    fn a_missing_forgejo_token_refusal_names_the_products_own_keys() {
+        // A-2's class: the sibling refusal (`i`, with no administrator token and no
+        // agent token) names `v`/`A`, not `[forgejo_agent_tokens]`. No network is
+        // touched: the token is read before any request.
+        let mut app = app_with(GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(key(KeyCode::Char('i')));
+        assert!(app.status.contains("no Forgejo token"), "{}", app.status);
+        assert!(
+            !app.status.contains("[forgejo_agent_tokens]"),
+            "{}",
+            app.status
+        );
+        assert!(
+            app.status.contains("v on the Forgejo screen"),
+            "{}",
+            app.status
+        );
     }
 
     #[test]
