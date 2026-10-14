@@ -85,24 +85,60 @@ pub fn pager() -> String {
 }
 
 /// Hand a path to the editing program and wait for it.
+///
+/// When the program is `nano` its search history is switched off (`-N`): the
+/// hand-off must not leave its own droppings in the person's `HOME`, and nano
+/// otherwise writes `~/.local/share/nano` (H-6's sibling).
 pub fn edit(path: &Path) -> io::Result<ExitStatus> {
-    run(editor(), path)
+    let mut program = editor();
+    if program.trim() == "nano" {
+        program.push_str(" -N");
+    }
+    run(program, path, Handoff::Edit)
 }
 
 /// Hand a path to the reading program and wait for it.
 pub fn view(path: &Path) -> io::Result<ExitStatus> {
-    run(pager(), path)
+    run(pager(), path, Handoff::View)
+}
+
+/// Which kind of hand-off is running, so its own scratch files can be suppressed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handoff {
+    Edit,
+    View,
 }
 
 /// Run `program` with the path as its one argument, through a shell so that a
 /// program named with its own options (`code --wait`, `less -R`) still works.
-fn run(program: String, path: &Path) -> io::Result<ExitStatus> {
-    Command::new("/bin/sh")
+fn run(program: String, path: &Path, handoff: Handoff) -> io::Result<ExitStatus> {
+    let mut command = Command::new("/bin/sh");
+    command
         .arg("-c")
         .arg(format!("exec {program} \"$1\""))
         .arg("sh")
-        .arg(path)
-        .status()
+        .arg(path);
+    if handoff == Handoff::View {
+        // `less` writes `~/.lesshst` unless it is told not to. The product hands the
+        // terminal back as it found it, so a person's `HOME` gains no file from
+        // reading a log (H-6).
+        for (key, value) in handoff_env(handoff) {
+            command.env(key, value);
+        }
+    }
+    command.status()
+}
+
+/// The environment an editor or pager child gets for its own scratch files.
+///
+/// A pager is told its history file is `/dev/null`, so reading a log leaves the
+/// person's `HOME` exactly as it was (H-6). An editor keeps its own settings; the
+/// `nano` history is suppressed by `-N` in [`edit`].
+fn handoff_env(handoff: Handoff) -> Vec<(&'static str, &'static str)> {
+    match handoff {
+        Handoff::Edit => Vec::new(),
+        Handoff::View => vec![("LESSHISTFILE", "/dev/null")],
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +177,15 @@ mod tests {
         assert_eq!(choose_editor(Some("emacs".to_owned()), None), "emacs");
     }
 
+
+    #[test]
+    fn a_pager_hand_off_writes_no_history_into_the_users_home() {
+        // H-6: `less` wrote `~/.lesshst` when `o`/`T` handed it the log or transcript.
+        let env: std::collections::HashMap<_, _> = handoff_env(Handoff::View).into_iter().collect();
+        assert_eq!(env["LESSHISTFILE"], "/dev/null");
+        // An editor gets no pager variable; nano's history is off through `-N`.
+        assert!(handoff_env(Handoff::Edit).is_empty());
+    }
 
     #[test]
     fn a_pager_is_chosen_with_a_sensible_last_resort() {

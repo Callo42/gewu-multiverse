@@ -86,6 +86,11 @@ pub struct AgentIdentity {
     pub mode: IdentityMode,
     /// Whether this call created the account (as opposed to finding it).
     pub created: bool,
+    /// When the tool created the account, in unix seconds, when it knows.
+    ///
+    /// Recorded so a report read minutes or days later says when the account was
+    /// made instead of forever claiming `created now` (H-3).
+    pub created_at: Option<u64>,
 }
 
 impl AgentIdentity {
@@ -271,13 +276,17 @@ pub fn manage(
                             &login,
                             &email,
                             IdentityMode::Managed.as_str(),
+                            None,
                         )?;
+                        let created_at =
+                            credentials::recorded_identity_created(credentials_path, agent)?;
                         return Ok(AgentIdentity {
                             agent: agent.to_owned(),
                             login,
                             email,
                             mode: IdentityMode::Managed,
                             created: false,
+                            created_at,
                         });
                     }
                 }
@@ -298,6 +307,13 @@ pub fn manage(
     // The password was only ever needed to make the account; it is dropped here, and
     // only the token is written down.
     password.clear();
+    // The account's creation time is written down the moment it is made, so the
+    // report can age instead of repeating `now` (H-3).
+    let created_at = if created {
+        Some(crate::time::now_unix_ms() / 1000)
+    } else {
+        credentials::recorded_identity_created(credentials_path, agent)?
+    };
     credentials::record_agent_identity(
         credentials_path,
         agent,
@@ -305,6 +321,7 @@ pub fn manage(
         &login,
         &email,
         IdentityMode::Managed.as_str(),
+        created_at,
     )?;
     Ok(AgentIdentity {
         agent: agent.to_owned(),
@@ -312,6 +329,7 @@ pub fn manage(
         email,
         mode: IdentityMode::Managed,
         created,
+        created_at,
     })
 }
 
@@ -347,6 +365,7 @@ pub fn supplied(
         &login,
         &email,
         IdentityMode::Supplied.as_str(),
+        None,
     )?;
     Ok(AgentIdentity {
         agent: agent.to_owned(),
@@ -354,6 +373,7 @@ pub fn supplied(
         email,
         mode: IdentityMode::Supplied,
         created: false,
+        created_at: None,
     })
 }
 
@@ -429,6 +449,7 @@ mod tests {
             email: "gewu-scribe@agents.invalid".to_owned(),
             mode: IdentityMode::Managed,
             created: true,
+            created_at: Some(1_700_000_000),
         };
         let line = identity.line();
         assert!(line.contains("gewu-scribe"), "{line}");

@@ -252,7 +252,7 @@ impl Config {
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
-        find_secret_key(&value, "the top level", path)?;
+        find_secret_key(&value, "", path)?;
         // The generic parse above already proved the text is TOML, so a failure here
         // is about the *shape* of the configuration, not its syntax (T-11).
         let config: Config = toml::from_str(text).map_err(|error| ConfigError::Shape {
@@ -485,6 +485,10 @@ fn instruction_problem(path: &Path) -> Option<&'static str> {
 }
 
 /// Walk the parsed file and refuse the first secret-like key.
+///
+/// `section` is the bare TOML path (`forgejo`, `agents[0]`, empty at the root), so
+/// the refusal can name the section the way the person's own file writes it
+/// (`[forgejo]`, `[[agents]]`) instead of a dotted path they never typed (F5).
 fn find_secret_key(value: &toml::Value, section: &str, path: &Path) -> Result<(), ConfigError> {
     match value {
         toml::Value::Table(table) => {
@@ -492,23 +496,46 @@ fn find_secret_key(value: &toml::Value, section: &str, path: &Path) -> Result<()
                 if SECRET_KEY_NAMES.contains(&key.to_ascii_lowercase().as_str()) {
                     return Err(ConfigError::SecretInConfig {
                         path: path.to_path_buf(),
-                        section: section.to_owned(),
+                        section: section_words(section),
                         key: key.clone(),
                     });
                 }
-                let child_section = format!("{section}.{key}");
+                let child_section = if section.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{section}.{key}")
+                };
                 find_secret_key(child, &child_section, path)?;
             }
         }
         toml::Value::Array(items) => {
             for (index, child) in items.iter().enumerate() {
-                let child_section = format!("{section}[{index}]");
+                let child_section = if section.is_empty() {
+                    format!("[{index}]")
+                } else {
+                    format!("{section}[{index}]")
+                };
                 find_secret_key(child, &child_section, path)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// The section of the person's file, in the words the file itself uses.
+///
+/// The empty path is the document's top; a table is `[name]`; an array element is
+/// `[[name]]`. A person who wrote `[forgejo]` is not made to translate a dotted
+/// `the top level.forgejo` back to their own file (F5).
+fn section_words(section: &str) -> String {
+    if section.is_empty() {
+        return "the top level".to_owned();
+    }
+    match section.split_once('[') {
+        Some((name, _)) => format!("[[{name}]]"),
+        None => format!("[{section}]"),
+    }
 }
 
 /// Build the "a value is outside what is accepted" error.
@@ -586,7 +613,7 @@ concurrency = 2
     #[test]
     fn the_sample_holds_no_secret_like_key() {
         let value: toml::Value = toml::from_str(SAMPLE).expect("the sample parses");
-        find_secret_key(&value, "the top level", path()).expect("no secret-like key in the sample");
+        find_secret_key(&value, "", path()).expect("no secret-like key in the sample");
     }
 
     #[test]
@@ -611,6 +638,16 @@ token = "abcdef"
         let message = message(text);
         assert!(message.contains("credentials file"), "{message}");
         assert!(message.contains("token"), "{message}");
+        // F5: the refusal names the section the way the file writes it, not a dotted
+        // path the person never typed.
+        assert!(message.contains("`[forgejo]`"), "{message}");
+        assert!(!message.contains("top level.forgejo"), "{message}");
+    }
+
+    #[test]
+    fn a_secret_like_key_at_the_top_level_still_reads_as_the_top_level() {
+        let message = message("token = \"abcdef\"\n");
+        assert!(message.contains("the top level"), "{message}");
     }
 
     #[test]

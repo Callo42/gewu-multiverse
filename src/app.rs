@@ -282,6 +282,13 @@ pub struct PendingAction {
     /// The file's fingerprint before the hand-off, so an unchanged file can be told
     /// from an edited one. `None` for a view, or when the file did not exist.
     pub before: Option<FileStamp>,
+    /// Which of an agent's files an edit opens. `None` for a view.
+    pub target: Option<EditTarget>,
+    /// Whether the hand-off itself created the file it opened (H-1, H-2).
+    pub created: bool,
+    /// The template written when the path does not exist yet, so nothing is created
+    /// until the hand-off actually begins. `None` for a view.
+    pub template: Option<Vec<u8>>,
 }
 
 /// Whether a pending action edits a file or reads one.
@@ -424,17 +431,23 @@ pub struct IdentityReport {
 
 impl IdentityReport {
     /// One line for a screen.
+    ///
+    /// The shape is one shape on every surface: `<login> <email> as `<agent>`
+    /// (<mode>)`, with the creation time appended when the tool made the account
+    /// (F6). The time is derived from the stored second, so the report ages instead
+    /// of forever saying `created now` (H-3).
     pub fn describe(&self) -> String {
         match &self.result {
-            Ok(identity) => format!(
-                "{}{}",
-                identity.line(),
-                if identity.created {
-                    " (created now)"
-                } else {
-                    ""
+            Ok(identity) => {
+                let line = identity.line();
+                match identity.created_at {
+                    Some(at) => {
+                        format!("{line} (created {})", tested_age(at.saturating_mul(1000)))
+                    }
+                    None if identity.created => format!("{line} (created now)"),
+                    None => line,
                 }
-            ),
+            }
             Err(failure) => format!("failed ({}): {}", failure.class, failure.message),
         }
     }
@@ -2017,13 +2030,12 @@ impl App {
             });
         self.status = match &result {
             Ok(identity) => format!(
-                "identity for `{name}`: {}{}",
-                identity.line(),
-                if identity.created {
-                    " (created now)"
-                } else {
-                    ""
+                "identity for `{name}`: {}",
+                IdentityReport {
+                    agent: name.clone(),
+                    result: Ok(identity.clone()),
                 }
+                .describe()
             ),
             Err(failure) => format!(
                 "identity for `{name}` failed ({}): {}",
@@ -2034,6 +2046,57 @@ impl App {
             agent: name,
             result,
         });
+    }
+
+    /// The identity recorded for an agent, in the one shape every surface uses.
+    ///
+    /// Read from the credentials file rather than from a session's transient report,
+    /// so a second person who restarts the product still sees whose identity is
+    /// settled (F1, F6, H-3).
+    pub fn recorded_identity(&self, agent: &str) -> Option<crate::identity::AgentIdentity> {
+        let login = credentials::recorded_login(&self.credentials_path, agent)
+            .ok()
+            .flatten()?;
+        let email = credentials::recorded_email(&self.credentials_path, agent)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mode = identity::recorded_mode(&self.credentials_path)
+            .ok()
+            .flatten();
+        let created_at = credentials::recorded_identity_created(&self.credentials_path, agent)
+            .ok()
+            .flatten();
+        Some(crate::identity::AgentIdentity {
+            agent: agent.to_owned(),
+            login,
+            email,
+            mode: mode.unwrap_or(identity::IdentityMode::Supplied),
+            created: created_at.is_some(),
+            created_at,
+        })
+    }
+
+    /// The identity report a surface should draw for one agent.
+    ///
+    /// The session's own report wins when it is about this agent (it may carry a
+    /// refusal). Otherwise, once the role check has run and an identity is recorded,
+    /// the report is rebuilt from the credentials file, so it survives a restart the
+    /// way the page map's `checked` row requires (H-3).
+    pub fn identity_report_for(&self, agent: &str) -> Option<IdentityReport> {
+        if let Some(report) = &self.identity_report {
+            if report.agent == agent {
+                return Some(report.clone());
+            }
+        }
+        if !matches!(self.role_check, Some(Ok(_))) {
+            return None;
+        }
+        let identity = self.recorded_identity(agent)?;
+        Some(IdentityReport {
+            agent: agent.to_owned(),
+            result: Ok(identity),
+        })
     }
 
     /// The git identity recorded for an agent, or why there is none yet.
@@ -2105,13 +2168,25 @@ impl App {
             &identity,
             Some(&credential),
         ) {
-            Ok(path) => {
-                let note = format!(
-                    "{} is ready in {} as {}",
-                    repository.full_name,
-                    path.display(),
-                    identity.line()
-                );
+            Ok((path, outcome)) => {
+                // Say what actually happened: a real clone and the reuse of a
+                // repository already on the ground are different acts, and calling
+                // both "is ready" hides the second — including the fact that its
+                // local git identity was just written (F2).
+                let note = match outcome {
+                    workspace::Prepared::Cloned => format!(
+                        "{} was cloned into {} as {}",
+                        repository.full_name,
+                        path.display(),
+                        identity.line()
+                    ),
+                    workspace::Prepared::AlreadyPresent => format!(
+                        "{} was already a git repository at {} — kept, not cloned or fetched; its local git identity was set to {}",
+                        repository.full_name,
+                        path.display(),
+                        identity.line()
+                    ),
+                };
                 self.status = note.clone();
                 self.forgejo_note = Some(note);
             }
@@ -2362,13 +2437,11 @@ impl App {
             EditTarget::Skills => paths.skills_dir().join("new-skill").join("SKILL.md"),
             EditTarget::Steps => paths.steps_file().to_path_buf(),
         };
-        if let Err(error) = ensure_editable(target, &path, &name) {
-            self.status = format!(
-                "the {} of `{name}` cannot be prepared: {error}",
-                target.label()
-            );
-            return;
-        }
+        // The file is **not** created here: a person who backs out of the
+        // confirmation, or whose editor fails to start, must not be left with a file
+        // the product made for them. It is written at the hand-off, and the status
+        // then says so instead of claiming nothing happened (H-1, H-2).
+        let template = editable_template(target, &name);
         // An interrupted editor can leave its unsaved buffer beside the file. Saying
         // so before the hand-off, and naming the file, is the difference between a
         // person recovering their words and retyping them.
@@ -2382,12 +2455,14 @@ impl App {
         } else {
             None
         };
-        let before = stamp(&path);
         let action = PendingAction {
             kind: ActionKind::Edit,
             path,
             label: format!("the {} of `{name}`", target.label()),
-            before,
+            before: None,
+            target: Some(target),
+            created: false,
+            template: Some(template.into_bytes()),
         };
         // A person who set no `$EDITOR` is exactly the person who does not know which
         // editor this is, or how to leave it. Name the program on screen first, and
@@ -2450,6 +2525,9 @@ impl App {
             path,
             label: label.clone(),
             before: None,
+            target: None,
+            created: false,
+            template: None,
         });
         // Name the way out before the pager takes the screen: `esc` cancels the
         // product's own overlays but not the user's pager, whose own key is `q` (M-5).
@@ -2494,6 +2572,9 @@ impl App {
             path,
             label: label.clone(),
             before: None,
+            target: None,
+            created: false,
+            template: None,
         });
         // Name the way out before the pager takes the screen: `esc` cancels the
         // product's own overlays but not the user's pager, whose own key is `q` (M-5).
@@ -2527,8 +2608,28 @@ impl App {
     }
 
     /// Take any work the terminal loop has to do, leaving none behind.
+    ///
+    /// A file an edit will open is written **here**, at the moment of the hand-off,
+    /// not when the key was pressed: a person who cancels the confirmation is left
+    /// with nothing, and a hand-off that does create a file can say so truthfully
+    /// (H-1, H-2).
     pub fn take_action(&mut self) -> Option<PendingAction> {
-        self.pending.take()
+        let mut action = self.pending.take()?;
+        if action.kind == ActionKind::Edit {
+            if let Some(template) = action.template.take() {
+                if !action.path.exists() {
+                    if let Err(error) = write_template(&action.path, &template) {
+                        self.status = format!("{} cannot be prepared: {error}", action.label);
+                        return None;
+                    }
+                    action.created = true;
+                }
+            }
+            // Fingerprint the file as the editor will first see it, *after* any
+            // template was written, so an untouched template is told from an edit.
+            action.before = stamp(&action.path);
+        }
+        Some(action)
     }
 
     /// Say how an edit or a view ended.
@@ -2545,8 +2646,16 @@ impl App {
                 let program = crate::editor::editor();
                 self.reload();
                 if !status.success() {
+                    // The editor may have failed before saving; if the hand-off itself
+                    // created the file, say so too, so the count on the screen beside
+                    // it is never unexplained (H-1, H-2).
+                    let created = if action.created {
+                        "; the template was created and left as it was"
+                    } else {
+                        ""
+                    };
                     self.status = format!(
-                        "{program} left with code {:?} for {}; it may not have been saved",
+                        "{program} left with code {:?} for {}; it may not have been saved{created}",
                         status.code(),
                         action.label
                     );
@@ -2563,6 +2672,11 @@ impl App {
                             "{} {verb} edited in {program}; the files were read again",
                             action.label
                         );
+                    } else if action.created {
+                        // The hand-off itself made the file; the screen beside it now
+                        // counts it. Saying `not changed` here is the lie H-1 and H-2
+                        // found: report the creation instead.
+                        self.status = created_status(action, &program);
                     } else {
                         self.status =
                             format!("{} {verb} not changed ({program})", action.label);
@@ -2570,7 +2684,13 @@ impl App {
                 }
             }
             (ActionKind::Edit, Err(error)) => {
-                self.status = format!("your editor could not be started: {error}");
+                let created = if action.created {
+                    "; the template was created and is unchanged"
+                } else {
+                    ""
+                };
+                self.status =
+                    format!("your editor could not be started: {error}{created}");
             }
             (ActionKind::View, Ok(_)) => {
                 self.status = format!("{} was shown", action.label);
@@ -3305,17 +3425,12 @@ fn quote(text: &str) -> String {
     toml::Value::String(text.to_owned()).to_string()
 }
 
-/// Create a file that must exist before it can be edited, so the editor never opens
-/// on a path that is not there. A skill gets a scratch `SKILL.md`, because a skill is
-/// one directory holding that manifest, never a directory handed to an editor.
-fn ensure_editable(target: EditTarget, path: &std::path::Path, agent: &str) -> std::io::Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let text = match target {
+/// The template text for a file that must exist before it can be edited, so the editor
+/// never opens on a path that is not there. A skill gets a scratch `SKILL.md`, because
+/// a skill is one directory holding that manifest, never a directory handed to an
+/// editor. The text is written only at the hand-off (see `take_action`).
+fn editable_template(target: EditTarget, agent: &str) -> String {
+    match target {
         // The guidance is a single marked placeholder, not prose in the document: the
         // run drops any line that is exactly this text before it sends the document,
         // so a person who types below the guidance never sends the guidance itself.
@@ -3337,8 +3452,39 @@ fn ensure_editable(target: EditTarget, path: &std::path::Path, agent: &str) -> s
              # and installs it into the run's own skills directory.\n\n\
              # name: {agent}\n"
         ),
-    };
-    crate::mode::write_private(path, text.as_bytes())
+    }
+}
+
+/// Write a hand-off's template, creating the directories a skill needs.
+fn write_template(path: &std::path::Path, template: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::mode::write_private(path, template)
+}
+
+/// The status when the hand-off created the file it opened and the editor left the
+/// template untouched.
+///
+/// `not changed` would be false: the Instruction screen now counts the skill, or
+/// shows the steps file, that this hand-off just made, and the next run installs
+/// whatever is under `skills/` (H-1, H-2). The sentence names the creation and what
+/// the screen beside it will now show.
+fn created_status(action: &PendingAction, program: &str) -> String {
+    match action.target {
+        Some(EditTarget::Skills) => format!(
+            "{} was created as a template and left unchanged ({program}); a run installs every skill under `skills/`, so write it or remove the directory",
+            action.label
+        ),
+        Some(EditTarget::Steps) => format!(
+            "{} did not exist; the template was created and left unchanged ({program}) — it declares 0 shell steps, so the screen now shows the file",
+            action.label
+        ),
+        _ => format!(
+            "{} did not exist; the template was created and left unchanged ({program})",
+            action.label
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -3707,10 +3853,14 @@ concurrency = 1
         let paths = app.selected_paths().expect("paths");
         assert!(!paths.instruction().exists());
         app.on_key(key(KeyCode::Char('e')));
-        assert!(paths.instruction().is_file(), "the file is created");
+        // Nothing is written until the hand-off begins; a cancelled confirmation
+        // leaves the directory as it was (H-1, H-2).
+        assert!(!paths.instruction().exists(), "no file before the hand-off");
         let action = app.take_action().expect("an edit was asked for");
         assert_eq!(action.kind, ActionKind::Edit);
         assert_eq!(action.path, paths.instruction());
+        assert!(action.created, "the hand-off created the file");
+        assert!(paths.instruction().is_file(), "the file is created");
         assert!(app.take_action().is_none(), "the action is taken once");
     }
 
@@ -3723,6 +3873,7 @@ concurrency = 1
         app.on_key(key(KeyCode::Char('t')));
         let action = app.take_action().expect("a steps edit");
         assert_eq!(action.path, paths.steps_file());
+        assert!(action.created, "the hand-off created the steps file");
         assert!(paths.steps_file().is_file());
         // N-10: the steps template must not doubt the product by saying model calls
         // do not exist yet; they do, and the template describes when the steps run.
@@ -3733,8 +3884,79 @@ concurrency = 1
         let action = app.take_action().expect("a skills edit");
         // `K` opens a scratch `SKILL.md`, never a directory.
         assert_eq!(action.path, paths.skills_dir().join("new-skill").join("SKILL.md"));
+        assert!(action.created, "the hand-off created the skill");
         assert!(action.path.is_file());
         assert!(paths.skills_dir().is_dir());
+    }
+
+    #[test]
+    fn an_editor_that_fails_still_says_the_template_was_created() {
+        // The H-1/H-2 class has no hole when the editor itself fails: the file the
+        // hand-off made is named in the failure sentence too.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.editor_configured = true;
+        app.on_key(key(KeyCode::Char('K')));
+        let action = app.take_action().expect("an edit");
+        let failure = std::process::Command::new("false")
+            .status()
+            .expect("`false` runs");
+        app.note_action(&action, Ok(failure));
+        assert!(
+            app.status.contains("template was created"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn backing_out_of_an_editor_confirmation_creates_no_file() {
+        // H-1/H-2's sibling: the file used to be made when the key was pressed, so a
+        // person who pressed `esc` on `no $EDITOR … press enter` was left with a
+        // counted skill or a steps file they never opened.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.editor_configured = false;
+        let paths = app.selected_paths().expect("paths");
+        for (keycode, path) in [
+            (KeyCode::Char('K'), paths.skills_dir().join("new-skill").join("SKILL.md")),
+            (KeyCode::Char('t'), paths.steps_file().to_path_buf()),
+            (KeyCode::Char('e'), paths.instruction().to_path_buf()),
+        ] {
+            app.on_key(key(keycode));
+            assert!(app.editor_confirm.is_some(), "the confirmation is up");
+            app.on_key(key(KeyCode::Esc));
+            assert!(app.take_action().is_none(), "nothing is handed off");
+            assert!(!path.exists(), "{} was not created", path.display());
+        }
+    }
+
+    #[test]
+    fn an_untouched_new_file_is_reported_as_created_not_as_not_changed() {
+        // H-1: `K` created a counted skill and said `was not changed`; H-2: `t`
+        // created a steps file and said `was not changed`. One guard per hand-off key:
+        // the status must name the creation the screen beside it can see.
+        let cases = [
+            (KeyCode::Char('K'), "created as a template"),
+            (KeyCode::Char('t'), "the template was created"),
+            (KeyCode::Char('e'), "the template was created"),
+        ];
+        for (keycode, expected) in cases {
+            let mut app = app_with(GOOD);
+            app.show_acknowledgment = false;
+            app.editor_configured = true;
+            app.on_key(key(keycode));
+            let action = app.take_action().expect("an edit");
+            assert!(action.created, "the hand-off created the file");
+            // The editor ran and saved nothing: the fingerprint is unchanged.
+            app.note_action(&action, Ok(success()));
+            assert!(app.status.contains(expected), "{} for {keycode:?}", app.status);
+            assert!(
+                !app.status.contains("not changed"),
+                "a created file was called unchanged: {}",
+                app.status
+            );
+        }
     }
 
     #[test]
@@ -3841,12 +4063,19 @@ role = "member"
 
     #[test]
     fn an_unchanged_edit_is_reported_as_not_changed() {
-        // F-E: never claim an edit that was not written.
+        // F-E: never claim an edit that was not written. The file must already exist:
+        // a hand-off that *creates* one reports the creation instead (H-1, H-2).
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         app.editor_configured = true;
+        let paths = app.selected_paths().expect("paths");
+        std::fs::create_dir_all(paths.instruction().parent().expect("a parent"))
+            .expect("the agent directory exists");
+        std::fs::write(paths.instruction(), "an instruction already written\n")
+            .expect("the instruction exists");
         app.on_key(key(KeyCode::Char('e')));
         let action = app.take_action().expect("an edit was asked for");
+        assert!(!action.created, "the file was already there");
         app.note_action(&action, Ok(success()));
         assert!(app.status.contains("was not changed"), "{}", app.status);
     }
@@ -4604,6 +4833,9 @@ concurrency = 3
             path: paths.steps_file().to_path_buf(),
             label: "the declared steps of `one`".to_owned(),
             before: stamp(paths.steps_file()),
+            target: Some(EditTarget::Steps),
+            created: false,
+            template: None,
         };
         app.note_action(&action, Ok(success()));
         assert!(app.status.contains("were not changed"), "{}", app.status);
