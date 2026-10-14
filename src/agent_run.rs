@@ -47,6 +47,7 @@ use crate::model::{self, Message, ModelConfig, ToolCall};
 use crate::naming::agent_name_problem;
 use crate::run::{RunOutcome, RunPlan};
 use crate::transcript::{self, ModelToolCall, ModelUsage, Record, SkillRef, Transcript};
+use crate::words;
 
 /// The largest instruction document a run will read.
 pub const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
@@ -315,8 +316,11 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
     let secret = secret.with_extra_redactions(credentials::all_secret_values(&plan.credentials));
     log.set_secret(secret.clone());
     log.line(&format!(
-        "model: {} at {} (bound: {} turn(s), {} s)",
-        plan.model, plan.endpoint, plan.max_turns, plan.timeout_secs
+        "model: {} at {} (bound: {}, {} s)",
+        plan.model,
+        plan.endpoint,
+        words::counted(plan.max_turns as usize, "turn", "turns"),
+        plan.timeout_secs
     ));
     // The bound is written into the transcript before the first call, so a run read
     // afterwards shows what it was held to rather than only how it ended.
@@ -429,8 +433,8 @@ fn model_loop(
     loop {
         if turn >= plan.max_turns {
             return RunEnd::failed(format!(
-                "the run reached its declared maximum of {} turn(s) (bound: max_turns) and the model still asked to continue",
-                plan.max_turns
+                "the run reached its declared maximum of {} (bound: max_turns) and the model still asked to continue",
+                words::counted(plan.max_turns as usize, "turn", "turns")
             ));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -530,7 +534,10 @@ fn model_loop(
         ));
 
         if reply.tool_calls.is_empty() {
-            return RunEnd::completed(format!("the model finished after {turn} turn(s)"));
+            return RunEnd::completed(format!(
+                "the model finished after {}",
+                words::counted(turn as usize, "turn", "turns")
+            ));
         }
 
         for call in &reply.tool_calls {
@@ -1358,7 +1365,7 @@ mod tests {
         let end = execute(&dir);
         assert!(!end.is_success());
         let reason = end.reason.expect("a reason");
-        assert!(reason.contains("maximum of 2 turn(s)"), "{reason}");
+        assert!(reason.contains("maximum of 2 turns"), "{reason}");
         assert!(reason.contains("max_turns"), "{reason}");
         assert_eq!(stub.requests().len(), 2, "the bound stopped the third call");
         assert!(matches!(

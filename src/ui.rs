@@ -83,9 +83,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 /// The tab bar across the top.
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    // The number beside each name is the key that opens it, so the mapping the help
+    // lists is on the bar itself (C-5); the name keeps its own word.
     let titles: Vec<Line> = Screen::ALL
         .iter()
-        .map(|screen| Line::from(screen.title()))
+        .enumerate()
+        .map(|(at, screen)| Line::from(format!("{} {}", at + 1, screen.title())))
         .collect();
     let tabs = Tabs::new(titles)
         .select(app.screen.index())
@@ -172,14 +175,21 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(table, parts[0]);
 
+    // A note area that runs out of rows declares its tail instead of dropping it
+    // without a word — the same rule the panels follow in their titles (O-3).
+    let notes = declared_notes(
+        agent_notes(app),
+        area.width as usize,
+        parts[1].height as usize,
+    );
     frame.render_widget(
-        Paragraph::new(agent_notes(app)).wrap(Wrap { trim: true }),
+        Paragraph::new(Text::from(notes)).wrap(Wrap { trim: true }),
         parts[1],
     );
 }
 
 /// The lines under the agent list.
-fn agent_notes(app: &App) -> Text<'static> {
+fn agent_notes(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(error) = &app.config_error {
         // The recovery key belongs with the error, not only in the legend that a short
@@ -215,7 +225,10 @@ fn agent_notes(app: &App) -> Text<'static> {
     if let Some(name) = app.selected_name() {
         if let Some(reason) = app.last_run_failure(&name) {
             lines.push(Line::from(Span::styled(
-                format!("the last run of `{name}` did not go well: {reason}"),
+                format!(
+                    "the last run of `{name}` did not go well: {}",
+                    crate::model::in_product_words(&reason)
+                ),
                 Style::new().fg(Color::Red),
             )));
         }
@@ -273,7 +286,7 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Yellow),
         )));
     }
-    Text::from(lines)
+    lines
 }
 
 /// One agent's configuration, read from the configuration file and the supervisor.
@@ -297,7 +310,10 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                 &app.supervisor.state(&agent.name).word_with_reason(),
             ));
             if let Some(reason) = app.last_failure(&agent.name) {
-                lines.push(field("last failure", &reason));
+                lines.push(field(
+                    "last failure",
+                    &crate::model::in_product_words(&reason),
+                ));
             }
             let mode = app.supervisor.mode(&agent.name);
             lines.push(field("supervision", &format!("{} ({})", mode.label(), mode.as_str())));
@@ -366,14 +382,9 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::DarkGray),
     )));
     // A short window does not silently drop the fields below the fold: the panel says
-    // so in its title, which is always drawn (D-7).
-    let inner = area.width.saturating_sub(2) as usize;
-    let overflows = pushed_rows(&lines, inner) > area.height.saturating_sub(2) as usize;
-    let title = if overflows {
-        " agent configuration — more fields below; enlarge the window "
-    } else {
-        " agent configuration "
-    };
+    // so in its title, which is always drawn (D-7); the same rule is applied to every
+    // sibling panel and note area (O-3).
+    let title = panel_title("agent configuration", panel_overflows(&lines, area));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(title))
@@ -393,33 +404,37 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
             match app.instruction_summary() {
                 Some((path, exists, bytes)) => {
                     lines.push(field("instruction", &path.display().to_string()));
-                    lines.push(field(
-                        "  on disk",
-                        &if !exists {
-                            "not there yet — press e to write it".to_owned()
-                        } else if app.instruction_is_only_placeholder() {
-                            "not there yet — press e to write it; the file holds only the guidance line"
-                                .to_owned()
-                        } else {
-                            // What a run sends, not only what is on disk: the
-                            // guidance line is dropped, and the two numbers differ
-                            // (P-4).
-                            match app.instruction_payload() {
-                                Some((on_disk, sent, dropped)) if on_disk != sent && dropped => format!(
-                                    "{on_disk} bytes on disk; a run sends {sent} — the guidance line is dropped"
-                                ),
-                                // No guidance line to drop: the only difference a run
-                                // can make on its own is the document's trailing
-                                // newline, and naming it for what it is (T-3, D-1) is
-                                // the difference between a fact and a false reason.
-                                Some((on_disk, sent, _)) if on_disk != sent => format!(
-                                    "{on_disk} bytes on disk; a run sends {sent} — the trailing newline is not sent"
-                                ),
-                                Some((on_disk, _, _)) => format!("{on_disk} bytes"),
-                                None => format!("{bytes} bytes"),
+                    if !exists {
+                        lines.push(field("  on disk", "not there yet — press e to write it"));
+                    } else if app.instruction_is_only_placeholder() {
+                        lines.push(field(
+                            "  on disk",
+                            "not there yet — press e to write it; the file holds only the guidance line",
+                        ));
+                    } else {
+                        lines.push(field("  on disk", &format!("{bytes} bytes")));
+                        // What a run sends, not only what is on disk (P-4): the two
+                        // numbers and the reason for the difference. It is a line of
+                        // its own, before the prose that can wait, so the sentence is
+                        // not broken across rows after its own negation (C-7).
+                        match app.instruction_payload() {
+                            Some((on_disk, sent, dropped)) if dropped && on_disk != sent => {
+                                lines.push(Line::from(format!(
+                                    "a run sends {sent} of {on_disk} bytes — the guidance line is dropped"
+                                )));
                             }
-                        },
-                    ));
+                            // No guidance line to drop: the only difference a run can
+                            // make on its own is the document's trailing newline, and
+                            // naming it for what it is (T-3, D-1) is the difference
+                            // between a fact and a false reason.
+                            Some((on_disk, sent, _)) if on_disk != sent => {
+                                lines.push(Line::from(format!(
+                                    "a run sends {sent} of {on_disk} bytes — the trailing newline is not sent"
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
                     // An interrupted editor leaves its unsaved buffer beside the file;
                     // naming it is the difference between recovery and retyping.
                     if let Some(backup) = app.instruction_backup() {
@@ -431,6 +446,19 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
                             Style::new().fg(Color::Yellow),
                         )));
                     }
+                    // What a run will send, said before the panel's lower prose: it is
+                    // the row the page map requires at this state, and a short window
+                    // must not be the reason a person never reads it (O-3).
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "A run sends this instruction, the conversation so far and the declared `shell` tool to {} ({}), runs the tool calls it asks for inside the workspace, and stops when the model finishes or after {} {}.",
+                            agent.endpoint,
+                            agent.model,
+                            agent.max_turns,
+                            if agent.max_turns == 1 { "turn" } else { "turns" },
+                        ),
+                        Style::new().fg(Color::DarkGray),
+                    )));
                 }
                 None => lines.push(field("instruction", "the name cannot be used")),
             }
@@ -474,21 +502,10 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
          you can keep or rename. A run installs the skills it finds into the run directory.",
         Style::new().fg(Color::DarkGray),
     )));
-    if let Some(agent) = app.selected_agent() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "A run sends this instruction, the conversation so far and the declared `shell` tool to {} ({}), runs the tool calls it asks for inside the workspace, and stops when the model finishes or after {} {}.",
-                agent.endpoint,
-                agent.model,
-                agent.max_turns,
-                if agent.max_turns == 1 { "turn" } else { "turns" },
-            ),
-            Style::new().fg(Color::DarkGray),
-        )));
-    }
+    let title = panel_title("instruction, steps and skills", panel_overflows(&lines, area));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" instruction, steps and skills "))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -674,6 +691,9 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
     }
+    // The repository window answers for the rows it hides; the panel's own tail (the
+    // key line) answers here, so a short window declares it too (O-3).
+    let title = declare_below(title, panel_overflows(&lines, area));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(Block::bordered().title(title))
@@ -741,6 +761,14 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(field("present", &present.join(", ")));
     }
     lines.push(Line::from(""));
+    // The screen's own keys come first, before the prose: the page map requires this
+    // row at every size ("`k` sets a model key ...") and at 80x24 the tail of the
+    // prose used to be where they were dropped (O-3, P-M1).
+    lines.push(Line::from(Span::styled(
+        "k set the model key   f set the role token   A set the administrator token",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
     match &app.credentials_error {
         None => lines.push(Line::from(
             "The file is created with mode 0600 if it is absent, and held to 0600 if it is wider.",
@@ -761,13 +789,10 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
         "The model key for an agent is read from this file at the point of a model call, and is redacted from every transcript, log and error the tool writes.",
         Style::new().fg(Color::DarkGray),
     )));
-    lines.push(Line::from(Span::styled(
-        "k set the model key   f set the Forgejo role token   A set the administrator token",
-        Style::new().fg(Color::DarkGray),
-    )));
+    let title = panel_title("credentials file", panel_overflows(&lines, area));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" credentials file "))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -776,8 +801,12 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
 /// The recent runs, read from the records on disk.
 fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     // The same rule as the agent list: never silently drop a run, and never let the
-    // selection land on a row that is not drawn.
-    let notes_height = area.height.saturating_sub(4).min(9);
+    // selection land on a row that is not drawn. The note area takes the rows its own
+    // content needs (the reason leads, and `o`/`T` must survive beside it), never
+    // leaving the list with less than its border, its header and one run (O-3, P-M3).
+    let notes = run_notes(app);
+    let needed = pushed_rows(&notes, area.width.saturating_sub(2) as usize) as u16 + 2;
+    let notes_height = needed.clamp(4, area.height.saturating_sub(4).max(4));
     let parts =
         Layout::vertical([Constraint::Min(4), Constraint::Length(notes_height)]).split(area);
 
@@ -808,7 +837,7 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(if at == app.run_selected { ">" } else { " " }),
                 Cell::from(run.agent.clone()),
-                Cell::from(run.run_id.clone()),
+                Cell::from(ellipsise(&run.run_id, 20)),
                 Cell::from(run.started_text()),
                 Cell::from(run.describe()),
             ])
@@ -827,7 +856,18 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(table, parts[0]);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let title = panel_title("run records", panel_overflows(&notes, parts[1]));
+    frame.render_widget(
+        Paragraph::new(Text::from(notes))
+            .block(Block::bordered().title(title))
+            .wrap(Wrap { trim: true }),
+        parts[1],
+    );
+}
+
+/// The lines under the run list, for the run on show.
+fn run_notes(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(format!(
         "Run records are read from {}.",
         app.state_root().display()
@@ -838,16 +878,17 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         ));
         // A person who came here to see whether anything ran needs the step that makes
         // a run, not only where the records would appear.
-        lines.push(Line::from(
-            "Press s on the Agents screen (1) to start one.",
-        ));
+        lines.push(Line::from("Press s on the Agents screen (1) to start one."));
     } else if let Some(run) = app.selected_run() {
         // The reason leads, because it is what a person who returns to this screen
-        // came for: the page map asks the finished row for the outcome *with its
-        // reason*. The paths follow; if the note area is short, the paths are what
-        // wrap off the bottom, never the reason.
+        // came for; the offers follow in the rows the note area grew for them, so a
+        // wordy reason cannot hide `o` and `T` (O-3, P-M3).
         if let Some(reason) = run.reason.as_deref() {
-            lines.push(Line::from(format!("outcome: {} — {reason}", run.describe())));
+            lines.push(Line::from(format!(
+                "outcome: {} — {}",
+                run.describe(),
+                crate::model::in_product_words(reason)
+            )));
         } else {
             lines.push(Line::from(format!("outcome: {}", run.describe())));
         }
@@ -861,17 +902,35 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             "o opens the log on show: {}",
             run.log.display()
         )));
+        // `esc` is this product's way back everywhere, but not the pager's; name the
+        // pager's own key on the screen, before the key is pressed (M-5).
+        lines.push(Line::from(Span::styled(
+            "Both open in your $PAGER; leave the pager with q.",
+            Style::new().fg(Color::DarkGray),
+        )));
         lines.push(Line::from(Span::styled(
             "The outcome is decided by the process, not by what it wrote.",
             Style::new().fg(Color::DarkGray),
         )));
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" run records "))
-            .wrap(Wrap { trim: true }),
-        parts[1],
-    );
+    lines
+}
+
+/// Shorten text to `max` characters, marking the cut with an ellipsis in the middle.
+///
+/// A column that clips a run id mid-token (`run-1791985790094-000`) reads as a
+/// different id rather than as a shortened one (M-7); an explicit ellipsis keeps the
+/// head and the tail, and the whole id is still in the note area's paths.
+fn ellipsise(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max || max < 6 {
+        return text.to_owned();
+    }
+    let head = (max - 1) / 2;
+    let tail = max - 1 - head;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
 }
 
 /// The status line and the key hints.
@@ -904,7 +963,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(
-            "q quit   tab or left/right screen   1-6 screen   up/down select   enter open   esc agents   r re-read",
+            "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open   r re-read",
         )
         .style(Style::new().fg(Color::DarkGray))
         .wrap(Wrap { trim: true }),
@@ -950,6 +1009,55 @@ fn pushed_rows(lines: &[Line], width: usize) -> usize {
             wrapped_rows(&text, width)
         })
         .sum()
+}
+
+/// Whether a bordered panel's wrapped content needs more rows than it can draw.
+///
+/// The Agent panel was the first to answer this in its title (D-7); every sibling
+/// panel asks the same question now, so a short window declares what is below the
+/// fold rather than dropping it without a word (O-3).
+fn panel_overflows(lines: &[Line], area: Rect) -> bool {
+    pushed_rows(lines, area.width.saturating_sub(2) as usize)
+        > area.height.saturating_sub(2) as usize
+}
+
+/// A panel title that declares the content below the fold, when there is any.
+fn panel_title(base: &str, overflows: bool) -> String {
+    if overflows {
+        format!(" {base} — more below; enlarge the window ")
+    } else {
+        format!(" {base} ")
+    }
+}
+
+/// Append the overflow declaration to a title that already carries something else
+/// (the Forgejo panel carries its repository range).
+fn declare_below(title: String, overflows: bool) -> String {
+    if overflows {
+        format!("{} — more below; enlarge the window ", title.trim_end())
+    } else {
+        title
+    }
+}
+
+/// Keep a note area's tail, replacing what does not fit with a line that says so.
+///
+/// The Agents and Runs note areas are plain paragraphs with no title to carry the
+/// declaration, so the last row carries it instead: the tail is dropped from the
+/// bottom and one row is reserved for the sentence, which is never itself clipped
+/// (O-3).
+fn declared_notes(mut lines: Vec<Line<'static>>, width: usize, height: usize) -> Vec<Line<'static>> {
+    if height == 0 || pushed_rows(&lines, width) <= height {
+        return lines;
+    }
+    while !lines.is_empty() && pushed_rows(&lines, width) + 1 > height {
+        lines.pop();
+    }
+    lines.push(Line::from(Span::styled(
+        "… more below; enlarge the window",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines
 }
 
 /// The short clause the footer carries on every screen.
@@ -1058,6 +1166,8 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
         )),
         Line::from(""),
     ];
+    // Where the field block starts, so the window can keep the cursor's own row drawn.
+    let fields_at = lines.len();
     for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
         let value = &form.fields[at];
         // A masked value says how much it holds: the mask alone is the same block of
@@ -1094,14 +1204,33 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::DarkGray),
         ))),
     }
+    // A short window used to draw a `>` on a row it did not draw: the cursor walked
+    // onto the two Forgejo fields invisibly (M-1). The body is windowed so the
+    // cursor's own field is always among the drawn rows, and the title declares that
+    // the form is longer than the window.
+    let inner = popup.width.saturating_sub(2) as usize;
+    let content_height = popup.height.saturating_sub(2) as usize;
+    let cursor_line = fields_at + form.cursor;
+    let cursor_rows = pushed_rows(&lines[cursor_line..=cursor_line], inner);
+    let mut first = 0usize;
+    while first < cursor_line
+        && pushed_rows(&lines[first..cursor_line], inner) + cursor_rows > content_height
+    {
+        first += 1;
+    }
+    let overflows = first > 0 || pushed_rows(&lines[first..], inner) > content_height;
     // The action line lives in the title as well as the body: at 80x24 the intro
     // prose pushes the body's last line off, and the key that submits the form must
     // never be the line that disappears (P-3).
+    let mut title = " add an agent — enter writes it, esc cancels ".to_owned();
+    if overflows {
+        title = format!("{title} — enlarge the window ");
+    }
     let block = Block::bordered()
-        .title(" add an agent — enter writes it, esc cancels ")
+        .title(title)
         .border_style(Style::new().fg(Color::Cyan));
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
+        Paragraph::new(Text::from(lines[first..].to_vec()))
             .block(block)
             .wrap(Wrap { trim: true }),
         popup,
@@ -1216,7 +1345,7 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
         Line::from(question),
         Line::from(""),
         Line::from(Span::styled(
-            "y remove it        n keep it",
+            "y or enter remove it        n or esc keep it",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -1270,6 +1399,13 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
         lines.push(Line::from(
             "  In vi: press i to type, Esc to stop typing, then :wq and enter to save and quit, or :q! to leave without saving.",
         ));
+    } else if program.trim() == "nano" {
+        // The overlay names the program; it must also say how to leave it, or a person
+        // who presses `e` is stranded in an editor whose screen says esc does nothing
+        // (M-4).
+        lines.push(Line::from(
+            "  In nano: ^X leaves; press Y and enter to save, or N to leave without saving.",
+        ));
     }
     lines.push(Line::from(Span::styled(
         "Set `$EDITOR` (for example, export EDITOR=nano) to use another editor.",
@@ -1295,7 +1431,10 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
 
 /// The key-reference overlay: every key, in groups, one line each.
 fn draw_help(frame: &mut Frame, app: &App) {
-    let screen = frame.area();
+    // The overlay may cover the body, but not the footer: a key it cannot use says so
+    // on the status line, and that sentence must be readable while the overlay is up
+    // (C-4). This is the same area the other overlays take.
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(80);
     // The help is a list, so it takes the list rule: a window it can scroll, and a
     // title that says the range. Every logical line is given room for two wrapped

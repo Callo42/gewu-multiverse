@@ -955,6 +955,7 @@ impl Supervisor {
     /// cadence, so a unit's state is fresh without a call to systemd per frame.
     pub fn poll(&mut self, now: Instant) {
         self.systemd.poll(now);
+        self.poll_untracked_systemd();
         self.sweep_groups(now);
 
         let names: Vec<String> = self.live.keys().cloned().collect();
@@ -990,6 +991,39 @@ impl Supervisor {
             }
         }
         self.reindex_queue();
+    }
+
+    /// A `systemd` record with no run has no unit to read, so `poll_now` would never
+    /// ask the manager about it and a machine whose manager has gone would show
+    /// `systemd` + `idle` with nothing warning the user (M-6). Probe the manager for
+    /// exactly that case — only when no unit of this agent is being read anyway, so a
+    /// tracked unit's own error is never overwritten.
+    fn poll_untracked_systemd(&mut self) {
+        let mut systemd_record = false;
+        let mut unit_tracked = false;
+        for (name, mode) in &self.modes {
+            if *mode == Mode::Systemd {
+                systemd_record = true;
+                if self.systemd.state(name).is_some() {
+                    unit_tracked = true;
+                }
+            }
+        }
+        if !systemd_record || unit_tracked {
+            return;
+        }
+        match self.systemd.available() {
+            Ok(_) => self.systemd.set_manager_error(None),
+            Err(message) => {
+                // `available` prefixes its sentence already; the screen adds that
+                // prefix of its own, so keep only the detail here.
+                let detail = message
+                    .strip_prefix("the user's systemd cannot be reached: ")
+                    .unwrap_or(&message)
+                    .to_owned();
+                self.systemd.set_manager_error(Some(detail));
+            }
+        }
     }
 
     /// Read one live process.
@@ -2423,5 +2457,41 @@ esac
             Some("missing_key")
         );
         assert_eq!(failure_class("run run-1 exited with code 1"), None);
+    }
+
+    #[test]
+    fn a_systemd_record_with_no_run_still_reports_a_manager_that_is_gone() {
+        // M-6: the product writes `mode = "systemd", run_dir = None` when switching,
+        // and nothing read that record's manager, so `systemd` + `idle` was shown with
+        // no warning that the first start would fail.
+        let fake = fake_dead_systemctl("sup-untracked-dead");
+        let root = scratch_root("sup-untracked");
+        let layout = crate::paths::Layout::rooted_at(&root);
+        let agent = layout.ensure_agent("scribe").expect("the agent is prepared");
+        let mut supervisor = Supervisor::new(
+            layout.state_root(),
+            PathBuf::from("/usr/local/bin/gewu-multiverse"),
+            10,
+            Duration::from_secs(30),
+        );
+        supervisor.set_unit_dir(root.join("units"));
+        supervisor.set_systemctl(Systemctl::with_binary(&fake.program));
+        // The record the product itself writes on a switch: systemd, no run.
+        crate::systemd::write_record(
+            &agent,
+            &crate::systemd::Supervision {
+                mode: Mode::Systemd,
+                run_dir: None,
+                restarts_recorded: 0,
+            },
+        )
+        .expect("the record is written");
+        supervisor.load_modes(std::slice::from_ref(&agent));
+        assert_eq!(supervisor.mode("scribe"), Mode::Systemd);
+        supervisor.poll(Instant::now());
+        assert!(
+            supervisor.systemd_last_error().is_some(),
+            "a systemd record with no run hid an unreachable manager"
+        );
     }
 }

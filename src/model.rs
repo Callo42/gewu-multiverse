@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::credentials::Secret;
+use crate::words;
 
 /// How long one model exchange may take, unless the run has less time left.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -224,12 +225,18 @@ impl Reply {
                 format!("replied {:?}", excerpt(text, 80))
             }
             _ if !self.tool_calls.is_empty() => {
-                format!("asked for {} tool call(s)", self.tool_calls.len())
+                format!(
+                    "asked for {}",
+                    words::counted(self.tool_calls.len(), "tool call", "tool calls")
+                )
             }
             _ => "answered with an empty message".to_owned(),
         };
         match self.usage {
-            Some(usage) => format!("{text}; {} token(s) used", usage.total_tokens),
+            Some(usage) => format!(
+                "{text}; {} used",
+                words::counted(usage.total_tokens as usize, "token", "tokens")
+            ),
             None => text,
         }
     }
@@ -534,6 +541,26 @@ fn transport_error(config: &ModelConfig, error: ureq::Error) -> ModelError {
     }
 }
 
+/// The transport's own words, in the product's words where the meaning is known.
+///
+/// `io:` is the transport library's prefix and `(os error 111)` its errno; neither is
+/// a word the product taught a zero-knowledge user (O-4). A screen reads a reason
+/// through this; the run log and the transcript keep the transport's exact sentence,
+/// which is what a person auditing the failure afterwards reads.
+pub fn in_product_words(text: &str) -> String {
+    if text.contains("Connection refused") {
+        "the endpoint refused the connection".to_owned()
+    } else if text.contains("Connection reset") || text.contains("Connection aborted") {
+        "the connection dropped".to_owned()
+    } else if text.contains("lookup address information")
+        || text.contains("Name or service not known")
+    {
+        "the address could not be resolved".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
 /// A bounded excerpt of some text, with a marker when it was cut.
 pub fn excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {
@@ -725,6 +752,64 @@ mod tests {
             chat(&config, &[Message::user("hi")], &[], None).expect_err("the empty key is refused");
         assert_eq!(error.class(), "missing_key");
         assert_eq!(stub.requests().len(), 0, "nothing was sent");
+    }
+
+    #[test]
+    fn the_transport_gutter_is_translated_for_the_screens_only() {
+        // O-4: `io:` and `(os error N)` are the transport library's words, not the
+        // product's. A screen reads the sentence through `in_product_words`; the
+        // stored record keeps the transport's own words for an audit afterwards.
+        assert_eq!(
+            in_product_words("io: Connection refused (os error 111)"),
+            "the endpoint refused the connection"
+        );
+        assert_eq!(
+            in_product_words("io: Connection reset by peer (os error 104)"),
+            "the connection dropped"
+        );
+        assert_eq!(
+            in_product_words(
+                "io: failed to lookup address information: Name or service not known"
+            ),
+            "the address could not be resolved"
+        );
+        // Anything the product does not know keeps the transport's sentence.
+        assert_eq!(in_product_words("a frobnicator failed"), "a frobnicator failed");
+    }
+
+    #[test]
+    fn a_reply_summary_counts_with_the_right_noun() {
+        // C-2: the record drew `asked for 1 tool call(s)` and `5 token(s) used`.
+        let one = Reply {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_owned(),
+                kind: "function".to_owned(),
+                function: FunctionCall {
+                    name: "shell".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            }],
+            usage: Some(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+            }),
+            finish_reason: Some("tool_calls".to_owned()),
+            model: None,
+            body: String::new(),
+        };
+        assert_eq!(one.summary(), "asked for 1 tool call; 5 tokens used");
+        let two = Reply {
+            tool_calls: vec![one.tool_calls[0].clone(), one.tool_calls[0].clone()],
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                total_tokens: 1,
+            }),
+            ..one.clone()
+        };
+        assert_eq!(two.summary(), "asked for 2 tool calls; 1 token used");
     }
 
     #[test]
