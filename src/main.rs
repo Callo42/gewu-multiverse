@@ -28,6 +28,7 @@ use gewu_multiverse::cli::{Cli, HELP, Invocation, parse_args};
 use gewu_multiverse::editor;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::ui;
+use gewu_multiverse::words;
 use gewu_multiverse::workspace;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -135,7 +136,10 @@ fn run(cli: Cli) -> Result<(), StartupError> {
     let left = screen.leave();
     drawn.and(left)?;
     if stopped > 0 {
-        println!("gewu-multiverse: stopped {stopped} running agent(s) before leaving");
+        println!(
+            "gewu-multiverse: stopped {} before leaving",
+            words::counted(stopped, "running agent", "running agents")
+        );
     }
     Ok(())
 }

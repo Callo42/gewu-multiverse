@@ -1228,15 +1228,29 @@ impl App {
 
     /// Ask to leave. If runs are in flight, name what leaving ends and ask again.
     pub fn request_quit(&mut self) {
+        self.ask_to_leave("q");
+    }
+
+    /// Ask to leave, naming the chord that must be pressed again to go through with it.
+    ///
+    /// `^C` is the reflex "cancel the thing that is running" chord, and here it does
+    /// what `q` does — leave and stop the runs this UI started. It therefore asks the
+    /// same one question rather than leaving in silence (C-1).
+    fn ask_to_leave(&mut self, chord: &str) {
         let live = self.supervisor.running_count();
         if live == 0 || self.confirm_quit.is_some() {
             self.should_quit = true;
             return;
         }
         self.confirm_quit = Some(live);
-        let noun = if live == 1 { "run" } else { "runs" };
+        // One run is `it`, not `them` (C-8).
+        let (noun, pronoun) = if live == 1 {
+            ("run", "it")
+        } else {
+            ("runs", "them")
+        };
         self.status = format!(
-            "leaving stops the {live} {noun} this UI started; press q again to quit and stop them, or any other key to stay"
+            "leaving stops the {live} {noun} this UI started; press {chord} again to quit and stop {pronoun}, or any other key to stay"
         );
     }
 
@@ -1451,11 +1465,11 @@ impl App {
                         // user session does not look ready when it is not.
                         match self.supervisor.systemd_available() {
                             Ok(version) => format!(
-                                "a unit is written and started the next time it is started \
-                                 (s), and it keeps running when this UI exits (systemd {version})"
+                                "a unit is written and started the next time it is started, \
+                                 and it keeps running when this UI exits (systemd {version})"
                             ),
                             Err(reason) => format!(
-                                "a unit will be written at the next start (s), but {reason}: \
+                                "a unit will be written at the next start, but {reason}: \
                                  starting will be refused until a user session is available"
                             ),
                         }
@@ -2501,11 +2515,12 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         // A control chord is never a plain-letter binding. `^C` is the reflex keystroke
         // for "stop"; here it leaves the UI, and the children it owns are stopped on
-        // the way out. Before this, `^C` fell through to the plain `c` binding and ran
-        // the Forgejo role check, reaching the network while a run kept going.
+        // the way out — the same destructive act `q` performs. So it takes the same
+        // question `q` does and leaves only on a second press (C-1). Before this,
+        // `^C` left the whole tool and killed every run without a word.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if key.code == KeyCode::Char('c') {
-                self.should_quit = true;
+                self.ask_to_leave("ctrl-c");
             }
             return;
         }
@@ -3548,6 +3563,69 @@ concurrency = 3
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.should_quit, "the second q leaves");
         app.shutdown();
+    }
+
+    #[test]
+    fn ctrl_c_asks_before_it_leaves_with_a_run_in_flight() {
+        // C-1: `^C` left the whole tool and killed every run without a word, while `q`
+        // asked; the reflex "cancel" chord is the same destructive act and now takes
+        // the same question. C-8: one run is `it`, not `them`.
+        let mut app = app_with_sleeping_runner("app-ctrl-c-live", GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.supervisor.state("one").is_live() {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_c);
+        assert!(!app.should_quit, "the first ^C asks, it does not leave");
+        assert!(
+            app.status.contains("press ctrl-c again"),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("stop it"), "{}", app.status);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "the second ^C leaves");
+        app.shutdown();
+    }
+
+    #[test]
+    fn switching_to_systemd_does_not_leave_a_pluralisation_gutter() {
+        // C-3: the confirmation read `... started the next time it is started (s)`,
+        // an `(s)` that is neither a key nor a plural. A stand-in `systemctl` answers
+        // the version query so the success branch is the one driven.
+        let program = scratch_root("app-mode-string").join("ok-systemctl.sh");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncase \"$*\" in *'show -p Version --value'*) echo 255.4 ;; esac\nexit 0\n",
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is runnable");
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.supervisor
+            .set_systemctl(crate::systemd::Systemctl::with_binary(&program));
+        app.on_key(key(KeyCode::Char('m')));
+        assert!(
+            app.status.contains("now supervised"),
+            "the switch did not succeed: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("(s)"),
+            "the confirmation still carries a gutter: {}",
+            app.status
+        );
     }
 
     #[test]

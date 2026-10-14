@@ -29,7 +29,9 @@ and `max turns` (the most model turns one run may take) are defined in the Agent
 area where they first appear. A transport failure is shown on screen in the product's
 own words (`the endpoint refused the connection`, `the connection dropped`, `the
 address could not be resolved`); the run's log and transcript keep the transport's
-exact sentence, so the failure is still auditable afterwards.
+exact sentence, so the failure is still auditable afterwards. A count in a plain-text
+line reads as a sentence (`1 turn`, `2 turns`, `0 repositories`), never a `turn(s)`
+gutter; the JSONL transcript keeps its numbers.
 
 Screens: **Agents** (`1`) · **Agent** (`2`) · **Instruction** (`3`) · **Forgejo**
 (`4`) · **Credentials** (`5`) · **Runs** (`6`); the tab bar carries each number beside
@@ -70,7 +72,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | removing | the same fields, with the removal confirmation over them | `d` removes the agent (after asking); the files left on disk are named, so a mistyped agent is not a dead end |
 | failed | run state `failed`; the failure class and the run's reason | the reason stored, not a transient footer line |
 | systemd, unit start failed | run state; unit; restarts | the `systemctl` reason, recoverable |
-| systemd, ready | supervision `systemd (user unit)`; unit name; restarts; the user manager reachable | what `systemd` changes *before* `m` is pressed |
+| systemd, ready | supervision `systemd (user unit)`; unit name; restarts; the user manager reachable | what `systemd` changes *before* `m` is pressed; the confirmation that follows reads as a sentence (`... started the next time it is started`), with no `(s)` gutter |
 | systemd, the user manager is not reachable | supervision stays `tui`; the refusal names what is missing and says nothing was changed; on an existing `systemd` record, a red line naming the manager and `m` | the switch into `systemd` is **refused before the mode record changes**, so `m` is never a one-way door; leaving an existing `systemd` record succeeds without the manager when no unit file is on disk, because there is nothing to stop |
 
 ## Instruction, steps and skills (`3`)
@@ -143,13 +145,13 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | the UI is signalled | — | the runs it started in `tui` mode end with it: the child asks the kernel to end when its parent does |
-| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop (`1 run`, not `1 run(s)`) | press `q` again to leave and stop them, or any other key to stay; staying **replaces the warning** with a plain statement rather than re-asking the question; the record of each ended run names the UI closing, not “on request” |
+| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop (`1 run`, not `1 run(s)`), with the pronoun in the same number (`stop it` / `stop them`) | press `q` again to leave and stop them, or any other key to stay; staying **replaces the warning** with a plain statement rather than re-asking the question; the record of each ended run names the UI closing, not “on request” |
 | the UI is reopened after a run was left behind | the agent as `stopped`, never `idle`; the run's duration is the time it actually ran | the run's own record is closed as `stopped` with a reason, so a second run of the same agent never overlaps an abandoned one, in the same workspace |
 | the UI is reopened after a run finished | the agent's newest terminal outcome, its reason and its elapsed time | the hub seeds each agent from its newest terminal record, so a restart never shows `idle` for an agent whose record says `succeeded`, `stopped` or `failed` |
 | the configuration is re-read (`r`) after an agent was removed by hand | the removed agent's run is stopped, and the note names it once, in the note area | the run does not stay counted but invisible; what the footer counts is what a screen can show; the run's own record names the re-read, never “on request” |
 | the configuration is re-read (`r`) after the run records were deleted | the hub drops an outcome whose record is gone; the hub and the ledger agree | a cached outcome never outlives the record it came from |
 | a start fails before a run ever runs (systemd refuses, the process cannot spawn) | the run state is `failed` with the start's reason, not `unknown start / no terminal record` | the record opened for the start is closed as `failed`, so the next `s` is not blocked by a run that never was |
-| `^C` | — | a control chord is never a plain-letter binding: `^C` leaves the UI and stops the runs it started |
+| `^C` | — | a control chord is never a plain-letter binding: `^C` asks the same question `q` asks when runs are in flight (naming the runs and the way to stay), and a second `^C` leaves and stops them; with nothing running it leaves at once |
 
 ## Every screen — footer
 
