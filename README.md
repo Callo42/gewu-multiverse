@@ -266,19 +266,28 @@ gewu-multiverse
 ```
 
 On the first start it writes a commented `config.toml` and a `credentials.toml` with mode 0600 under
-your own configuration directory (`~/.config/gewu-multiverse` on Linux), shows the risk
-acknowledgment once, and asks you to confirm it. Edit the configuration file, then press `r` to
-re-read it. `gewu-multiverse --config-dir <dir>` keeps the files somewhere else instead.
+your own configuration directory (`~/.config/gewu-multiverse` on Linux), and shows the risk
+acknowledgment once. Press `y` to record it.
 
-Keys: `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch screens, `up`/`down` choose
-an agent (or a run on the runs screen, or a repository on the Forgejo screen), `enter`
-opens the chosen agent, `esc` goes back
-to the list, `s` starts the chosen agent, `x` stops it, `m` moves it between the two
+**You do not have to edit a file to begin.** On the Agents screen press `n` (or `a`, or `enter` on
+the empty list) and fill in the form: an agent name, its model endpoint and model id, the model key,
+and, if you have one, your Forgejo URL and token. The product writes both files for you and lists the
+agent. Press `e` to write its instruction with your own `$EDITOR`, then `s` to start it. Both files
+are still plain, commented TOML, and `r` re-reads them if you prefer to edit by hand.
+`gewu-multiverse --config-dir <dir>` keeps the files somewhere else instead.
+
+Keys: `?` (or `h`, or `F1`) shows every key; `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch
+screens, `up`/`down` choose an agent (or a run on the runs screen, or a repository on the Forgejo
+screen), `enter` opens the chosen agent, `esc` goes back
+to the list, `n`/`a` open the add-agent form, `s` starts the chosen agent, `x` stops it, `m` moves it
+between the two
 supervision modes (`tui` and `systemd`), `p` tests its model endpoint,
-`c` checks the Forgejo role, `i` settles the chosen agent's Forgejo identity, `g`
+`c` checks the Forgejo role and `C` checks the same instance with the administrator token,
+`i` settles the chosen agent's Forgejo identity, `g`
 clones the chosen repository into its workspace, `P` opens a pull request as the agent,
 `U` updates the newest open one, `e` edits its instruction, `K`
-opens its skills directory, `t` edits its declared run steps, `o` opens its newest log,
+starts a new skill, `t` edits its declared run steps, `o` opens its newest log,
+`T` opens its newest transcript,
 and `r` re-reads the files. Each agent's own files live under
 `<config dir>/agents/<name>/`; its runs are recorded under
 `~/.local/state/gewu-multiverse/<name>/`. `--state-dir <dir>` moves the run records.
@@ -308,8 +317,14 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
    acknowledgment over the Agents screen. Press `y` to record it; it is asked once per
    configuration directory. Quit with `q`.
 
-3. **Edit `~/.config/gewu-multiverse/config.toml`** so it names your Forgejo and one
-   agent, for example:
+3. **Add your first agent in the product.** On the Agents screen press `n` (or `a`, or
+   `enter` on the empty list). A short form collects an agent name, the model endpoint
+   and id, the model key, and — if you have one — the Forgejo URL and token. Press
+   `enter` and the product writes both files for you and lists the agent. This is the
+   path the product offers first; nothing here needs a text editor.
+
+   If you would rather edit by hand, the form writes exactly this to
+   `~/.config/gewu-multiverse/config.toml`:
 
    ```toml
    [forgejo]
@@ -317,14 +332,14 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
    role = "member"
 
    [limits]
-   run_timeout_secs = 300
-   max_concurrent_agents = 2
+   run_timeout_secs = 900
+   max_concurrent_agents = 10
 
    [[agents]]
    name = "scribe"
    model = "the-model-id"
    endpoint = "http://127.0.0.1:8000/v1/chat/completions"
-   max_turns = 8
+   max_turns = 24
    instruction = "agents/scribe/instruction.md"
    concurrency = 1
    ```
@@ -332,10 +347,11 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
    `instruction` is the path shown on the agent's screen. The run itself reads the
    derived `agents/<name>/instruction.md`, which is the file `e` writes and the file the
    tool checks before a start; point the field at that path to keep the two in step. See
-   [How an agent runs](docs/agent-execution.md).
+   [How an agent runs](docs/agent-execution.md). Edit that file by hand and press `r` to
+   re-read it.
 
-4. **Edit `~/.config/gewu-multiverse/credentials.toml`** (mode 0600) and put the Forgejo
-   token or tokens and the model key there. The file holds secrets only:
+4. **The credentials file** (mode 0600) holds secrets only. The form wrote the model key
+   and, if you gave them, the Forgejo token or tokens. The file looks like this:
 
    ```toml
    forgejo_token = "…"          # the token the role check uses
@@ -345,8 +361,10 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
    "scribe" = "…"               # the bearer key for this agent's endpoint
    ```
 
-5. **Start again** and press `r` to re-read the files. The agent is now listed. Press
-   `e` to write its `agents/scribe/instruction.md` through your own `$EDITOR`.
+5. **Write its instruction**: press `e` to write
+   `agents/scribe/instruction.md` through your own `$EDITOR`. The status line names the
+   editor; set `$EDITOR` to choose another, or `~/.config/gewu-multiverse/config.toml`
+   still works by hand.
 
 6. **Check the Forgejo** with `c`, settle the agent's identity with `i`, and clone a
    repository with `g` (choose it with `up`/`down` on the Forgejo screen). With an
@@ -356,10 +374,10 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
 7. **Run it**: choose the agent and press `s`, or press `p` first to test the model
    endpoint on its own. The Agents screen moves the agent from `running` to `exited`.
 
-8. **Read the result**: press `o` to open the newest `run.log` in your own `$PAGER`.
-   The append-only transcript is beside it, at
-   `~/.local/state/gewu-multiverse/<name>/<run-id>/transcript.jsonl`; the Runs screen
-   (`6`) lists recent runs with their outcome.
+8. **Read the result**: press `o` to open the newest `run.log` in your own `$PAGER`, or
+   `T` for the append-only transcript beside it, at
+   `~/.local/state/gewu-multiverse/<name>/<run-id>/transcript.jsonl`. The Runs screen
+   (`6`) lists recent runs with their outcome and the failure reason.
 
 One already-prepared run can be executed without the UI, which is also how the UI starts
 an agent — as a child process of itself:

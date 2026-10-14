@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
-use crate::app::{App, Screen};
+use crate::app::{App, NewAgentForm, Screen};
 use crate::risk;
 use crate::run::RunOutcome;
 use crate::systemd::Mode;
@@ -36,6 +36,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_body(frame, app, areas[1]);
     draw_footer(frame, app, areas[2]);
 
+    if app.adding_agent() {
+        draw_add_agent_form(frame, app);
+    } else if app.editor_confirm.is_some() {
+        draw_editor_confirm(frame, app);
+    } else if app.show_help {
+        draw_help(frame, app);
+    }
+    // The first-run acknowledgment is the topmost overlay: nothing starts behind it.
     if app.show_acknowledgment {
         draw_acknowledgment(frame, app);
     }
@@ -76,7 +84,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
 
-    let header = Row::new(["agent", "model", "requests", "supervision", "state"]).style(
+    let header = Row::new(["agent", "model", "concurrency", "supervision", "state"]).style(
         Style::new()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -96,7 +104,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(agent.model.clone()),
                 Cell::from(agent.concurrency.to_string()),
                 Cell::from(app.supervisor.mode(&agent.name).as_str()),
-                Cell::from(app.supervisor.state(&agent.name).word()),
+                Cell::from(app.supervisor.state(&agent.name).word_with_reason()),
             ])
             .style(style)
         })
@@ -104,7 +112,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     let widths = [
         Constraint::Length(14),
         Constraint::Length(16),
-        Constraint::Length(9),
+        Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Min(18),
     ];
@@ -128,12 +136,35 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Red),
         )));
     }
+    if let Some(note) = &app.config_note {
+        lines.push(Line::from(Span::styled(
+            note.clone(),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    // Nothing configured: the product itself offers the way forward, by name.
+    if app.agents().is_empty() && app.config_error.is_none() {
+        lines.push(Line::from(Span::styled(
+            "No agent is configured yet — press n to name one, give it an endpoint and a model, \
+             and the product writes both files for you.",
+            Style::new().fg(Color::Yellow),
+        )));
+    }
     lines.push(Line::from(format!(
         "Running: {} of {} allowed by the configuration; {} start(s) waiting for a slot.",
         app.supervisor.running_count(),
         app.supervisor.max_concurrent(),
         app.supervisor.waiting_count(),
     )));
+    // Why the selected agent's last run failed, on the screen the user looks at.
+    if let Some(name) = app.selected_name() {
+        if let Some(reason) = app.last_failure(&name) {
+            lines.push(Line::from(Span::styled(
+                format!("the last run of `{name}` did not go well: {reason}"),
+                Style::new().fg(Color::Red),
+            )));
+        }
+    }
     if let Some(error) = app.supervisor.last_error() {
         lines.push(Line::from(Span::styled(
             format!("the last start did not go well: {error}"),
@@ -146,21 +177,27 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Red),
         )));
     }
-    if app
+    // Explain what `systemd` will change *before* `m` is pressed, not only in
+    // the receipt afterwards: whether any agent is in systemd mode or not.
+    let uses_systemd = app
         .agents()
         .iter()
-        .any(|agent| app.supervisor.mode(&agent.name) == Mode::Systemd)
-    {
+        .any(|agent| app.supervisor.mode(&agent.name) == Mode::Systemd);
+    lines.push(Line::from(Span::styled(
+        format!(
+            "The `tui` mode is an ordinary child process of this tool; `m` switches to `systemd`, a user unit that keeps running when this UI exits and needs `loginctl enable-linger` to outlive a logout. Your systemd directory is {}.",
+            app.supervisor.unit_dir().display()
+        ),
+        Style::new().fg(Color::DarkGray),
+    )));
+    if uses_systemd {
         lines.push(Line::from(Span::styled(
-            format!(
-                "A `systemd` agent runs as a user unit: it keeps running when this UI exits. Your systemd directory is {}. It needs a user session, and `loginctl enable-linger` to outlive a logout. It is a convenience, not a security boundary.",
-                app.supervisor.unit_dir().display()
-            ),
+            "A `systemd` agent is supervised by your own systemd. It is a convenience, not a security boundary.",
             Style::new().fg(Color::DarkGray),
         )));
     }
     lines.push(Line::from(Span::styled(
-        "An agent in `tui` mode is an ordinary child process of this tool, run as you. Either way its workspace is a directory: a layout, not a sandbox.",
+        "Either way its workspace is a directory: a layout, not a sandbox.",
         Style::new().fg(Color::DarkGray),
     )));
     if !app.ack_confirmed() {
@@ -186,12 +223,15 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                 "instruction",
                 &agent.instruction.display().to_string(),
             ));
-            lines.push(field("requests", &agent.concurrency.to_string()));
+            lines.push(field("concurrency", &agent.concurrency.to_string()));
             lines.push(Line::from(""));
             lines.push(field(
                 "run state",
-                &app.supervisor.state(&agent.name).word(),
+                &app.supervisor.state(&agent.name).word_with_reason(),
             ));
+            if let Some(reason) = app.last_failure(&agent.name) {
+                lines.push(field("last failure", &reason));
+            }
             let mode = app.supervisor.mode(&agent.name);
             lines.push(field("supervision", &format!("{} ({})", mode.label(), mode.as_str())));
             if mode == Mode::Systemd {
@@ -230,8 +270,8 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
             match crate::credentials::recorded_login(&app.credentials_path, &agent.name) {
-                Ok(Some(login)) => lines.push(field("forgejo identity", &login)),
-                _ => lines.push(field("forgejo identity", "not settled — press i")),
+                Ok(Some(login)) => lines.push(field("identity", &login)),
+                _ => lines.push(field("identity", "not settled — press i")),
             }
             if let Some(report) = &app.identity_report {
                 if report.agent == agent.name {
@@ -243,7 +283,7 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(field("read from", &app.config_path().display().to_string()));
     lines.push(Line::from(Span::styled(
-        "e edit the instruction   K open the skills directory   t edit the declared steps   p test the endpoint   s start   x stop   m switch supervision mode   o open the log",
+        "e edit the instruction   K start a new skill   t edit the declared steps   p test the endpoint   s start   x stop   m switch supervision mode   o open the log",
         Style::new().fg(Color::DarkGray),
     )));
     frame.render_widget(
@@ -306,7 +346,12 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "e edit the instruction   K open the skills directory   t edit the declared steps",
+        "e edit the instruction   K start a new skill   t edit the declared steps",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "A skill is one directory under skills/, each holding a SKILL.md; `K` opens a scratch one \
+         you can keep or rename. A run installs the skills it finds into the run directory.",
         Style::new().fg(Color::DarkGray),
     )));
     if let Some(agent) = app.selected_agent() {
@@ -359,6 +404,10 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
             _ => lines.push(field("agent identity", "not settled — press i")),
         }
     }
+    lines.push(Line::from(Span::styled(
+        "A role is which Forgejo account the check acts as: `c` checks the configured role, `C` checks the administrator token when one is present. An identity is the account an agent's own commits are authored by; `i` creates or records it.",
+        Style::new().fg(Color::DarkGray),
+    )));
     lines.push(Line::from(""));
 
     match &app.role_check {
@@ -371,14 +420,13 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
         ))),
         Some(Ok(check)) => {
             lines.push(Line::from(format!(
-                "{} — {} ({} of these private)",
+                "{} — {}",
                 if check.administrative() {
                     "administrative view"
                 } else {
                     "ordinary view"
                 },
-                check.summary(),
-                check.private_visible
+                check.summary()
             )));
             lines.push(Line::from(""));
             if check.repositories.is_empty() {
@@ -412,7 +460,7 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "c check the role   i settle the agent's identity   up/down choose a repository   g clone it into the agent's workspace   P open a pull request as the agent   U update the newest one",
+        "c check the role   C check it as the administrator token   i settle the agent's identity   up/down choose a repository   g clone it into the agent's workspace   P open a pull request as the agent   U update the newest one",
         Style::new().fg(Color::DarkGray),
     )));
     frame.render_widget(
@@ -428,6 +476,17 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(field("file", &app.credentials_path.display().to_string()));
     lines.push(field("mode", &mode_text(app)));
+    // Which secret *names* are present, never a value: a person can confirm a key
+    // loaded without the tool reading it back onto a screen.
+    let present = crate::credentials::present_secret_names(&app.credentials_path);
+    if present.is_empty() {
+        lines.push(field(
+            "present",
+            "nothing yet — no model key and no Forgejo token",
+        ));
+    } else {
+        lines.push(field("present", &present.join(", ")));
+    }
     lines.push(Line::from(""));
     match &app.credentials_error {
         None => lines.push(Line::from(
@@ -459,7 +518,7 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The recent runs, read from the records on disk.
 fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
-    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
+    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(9)]).split(area);
 
     let header = Row::new(["agent", "run", "started", "outcome"]).style(
         Style::new()
@@ -508,10 +567,21 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             "No run has been recorded yet, so there is nothing to list.",
         ));
     } else if let Some(run) = app.selected_run() {
+        // The transcript is the run's own record; `T` opens it here, never only from a
+        // path the README happens to name.
+        lines.push(Line::from(format!(
+            "T opens the transcript on show: {}",
+            run.dir.join(crate::transcript::TRANSCRIPT_FILE).display()
+        )));
         lines.push(Line::from(format!(
             "o opens the log on show: {}",
             run.log.display()
         )));
+        if let Some(reason) = run.reason.as_deref() {
+            lines.push(Line::from(format!("outcome: {} — {reason}", run.describe())));
+        } else {
+            lines.push(Line::from(format!("outcome: {}", run.describe())));
+        }
         lines.push(Line::from(Span::styled(
             "The outcome is decided by the process, not by what it wrote.",
             Style::new().fg(Color::DarkGray),
@@ -526,10 +596,13 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The status line and the key hints.
+///
+/// The status gets two rows so a path or a reason is not clipped. The action
+/// line leads with `? all keys`, so at 80 columns nothing is hidden *silently*;
+/// the full list is one key away.
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let parts = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -557,7 +630,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(
-            "s start the agent   x stop it   m switch supervision mode (tui / systemd)   p test its endpoint   c check the Forgejo role   i settle its Forgejo identity   e edit its instruction   K open its skills directory   t edit its declared steps   o open its newest log",
+            "? all keys   s start   x stop   p test endpoint   m supervision   c role   C admin role   i identity   e instruction   t steps   K skill   o log   T transcript   n new agent",
         )
         .style(Style::new().fg(Color::DarkGray))
         .wrap(Wrap { trim: true }),
@@ -565,11 +638,182 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The add-agent form, over the Agents screen.
+///
+/// The two secret fields are drawn masked: a credential value is never put on a
+/// screen, and the form exists so the user never has to open a text editor.
+fn draw_add_agent_form(frame: &mut Frame, app: &App) {
+    let Some(form) = &app.add_agent else {
+        return;
+    };
+    let screen = frame.area();
+    let width = (screen.width.saturating_sub(2)).min(76);
+    let height = (NewAgentForm::FIELDS.len() as u16 + 8).min(screen.height.saturating_sub(2));
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(
+        "Name an agent and point it at a model. The model key and the Forgejo token are written to the credentials file and are never shown.",
+    ));
+    lines.push(Line::from(""));
+    for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
+        let value = &form.fields[at];
+        let shown = if *secret {
+            "*".repeat(value.chars().count())
+        } else {
+            value.clone()
+        };
+        let marker = if at == form.cursor { ">" } else { " " };
+        let style = if at == form.cursor {
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker} {label:<16} {shown}"),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    match &form.error {
+        Some(error) => lines.push(Line::from(Span::styled(
+            format!("  {error}"),
+            Style::new().fg(Color::Red),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "  tab/up/down between fields   enter writes config.toml and credentials.toml   esc cancels",
+            Style::new().fg(Color::DarkGray),
+        ))),
+    }
+    let block = Block::bordered()
+        .title(" add an agent ")
+        .border_style(Style::new().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// The no-`$EDITOR` confirmation, over the screen, before the editor takes over.
+///
+/// A status line would be erased the instant the UI steps aside for the editor, so the
+/// program is named here and the user says when to go.
+fn draw_editor_confirm(frame: &mut Frame, app: &App) {
+    let Some(action) = &app.editor_confirm else {
+        return;
+    };
+    let screen = frame.area();
+    let program = crate::editor::editor();
+    let width = (screen.width.saturating_sub(2)).min(74);
+    let height = 7.min(screen.height.saturating_sub(2));
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+    let mut lines: Vec<Line> = vec![
+        Line::from(format!(
+            "No `$EDITOR` is set, so {} opens in:",
+            action.label
+        )),
+        Line::from(Span::styled(
+            format!("  {program}"),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if program.trim() == "vi" {
+        lines.push(Line::from(
+            "  In vi: press i to type, Esc to stop typing, then :wq and enter to save and quit, or :q! to leave without saving.",
+        ));
+    }
+    lines.push(Line::from(Span::styled(
+        "Set `$EDITOR` (for example, export EDITOR=nano) to use another editor.",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "enter open it        esc cancel",
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let block = Block::bordered()
+        .title(" open an editor ")
+        .border_style(Style::new().fg(Color::Yellow));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// The key-reference overlay: every key, in groups, one line each.
+fn draw_help(frame: &mut Frame, app: &App) {
+    let _ = app;
+    let screen = frame.area();
+    let width = (screen.width.saturating_sub(2)).min(80);
+    let height = (HELP_LINES.len() as u16 + 3).min(screen.height.saturating_sub(2));
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+    let lines: Vec<Line> = HELP_LINES.iter().map(|line| Line::from(*line)).collect();
+    let block = Block::bordered()
+        .title(" keys ")
+        .border_style(Style::new().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// Every key the product binds, with one line of what it does.
+const HELP_LINES: &[&str] = &[
+    "Screens:   1-6 open a screen   tab / left / right move   esc back to Agents",
+    "Moving:    up / down choose   enter open the chosen agent (or add one when none)",
+    "An agent:  s start   x stop   p test its endpoint   m switch tui/systemd supervision",
+    "           e edit its instruction   t edit its declared steps   K start a new skill",
+    "           o open its newest log   T open its newest transcript",
+    "A new one: n or a open the add-agent form (also enter on an empty list)",
+    "Forgejo:   c check the configured role   C check the administrator token",
+    "           i settle the agent's identity   up/down choose a repository",
+    "           g clone it   P open a pull request   U update the newest one",
+    "Files:     r re-read config.toml and credentials.toml   q quit",
+    "Help:      ? or h or F1 show this list   esc or enter close it",
+];
+
 /// The first-run risk acknowledgment, over everything else.
 fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let screen = frame.area();
-    let width = 78.min(screen.width);
-    let height = (risk::LINES.len() as u16 + 9).min(screen.height);
+    // At least one cell of margin on every side, so the modal never shares an edge
+    // with the panel behind it even on a narrow terminal.
+    let width = (screen.width.saturating_sub(2)).min(78);
+    let height = (risk::LINES.len() as u16 + 9).min(screen.height.saturating_sub(2));
     let popup = centered(screen, width, height);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -595,7 +839,17 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let block = Block::bordered()
         .title(format!(" {} ", risk::TITLE))
         .border_style(Style::new().fg(Color::Yellow));
-    frame.render_widget(Clear, popup);
+    // The modal owns every row it covers: clear the full terminal width for those
+    // rows before drawing it, so the panel's border and wrapped notes cannot survive
+    // beside it and collide with its own edges. The modal is drawn with at least one
+    // cell of margin from the panel edge.
+    let owned = Rect {
+        x: 0,
+        y: popup.y,
+        width: screen.width,
+        height: popup.height,
+    };
+    frame.render_widget(Clear, owned);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)

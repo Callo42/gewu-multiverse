@@ -12,7 +12,7 @@
 //! for an agent's token: the answer goes straight to git over a pipe, so the token is
 //! never an argument, a URL, a log line or a screen.
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -171,7 +171,21 @@ fn hand_to_the_user(
 ) -> io::Result<io::Result<std::process::ExitStatus>> {
     screen.suspend()?;
     let result = match action.kind {
-        ActionKind::Edit => editor::edit(&action.path),
+        ActionKind::Edit => {
+            // Say on the primary screen which program is taking over, where it can be
+            // read even though the editor's own screen covers the alternate one.
+            let program = editor::editor();
+            if program.trim() == "vi" {
+                println!(
+                    "gewu-multiverse: opening {} in vi — press i to type, Esc then :wq to save and quit",
+                    action.label
+                );
+            } else {
+                println!("gewu-multiverse: opening {} in {program}", action.label);
+            }
+            let _ = io::stdout().flush();
+            editor::edit(&action.path)
+        }
         ActionKind::View => editor::view(&action.path),
     };
     screen.resume()?;
