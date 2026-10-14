@@ -390,10 +390,15 @@ fn backticked_agent(label: &str) -> Option<String> {
 }
 
 /// A Forgejo failure, as a screen holds it.
+///
+/// The transport's own words are translated at the point the failure is built, so
+/// every screen that shows it — the role check's status, the panel's refusal, an
+/// identity attempt — reads in the product's vocabulary (O-4). A Forgejo action
+/// leaves no run record to keep the raw sentence in.
 fn failure_of(error: forgejo::ForgejoError) -> ForgejoFailure {
     ForgejoFailure {
         class: error.class().to_owned(),
-        message: error.to_string(),
+        message: crate::model::in_product_words(&error.to_string()),
     }
 }
 
@@ -1699,7 +1704,7 @@ impl App {
             identity::resolve(&settings.url, &name, &self.credentials_path).map_err(|error| {
                 ForgejoFailure {
                     class: error.class().to_owned(),
-                    message: error.to_string(),
+                    message: crate::model::in_product_words(&error.to_string()),
                 }
             });
         self.status = match &result {
