@@ -290,7 +290,14 @@ endpoint that speaks the OpenAI-compatible chat-completions shape you can name; 
 be local. No secret is ever a command-line argument: the tokens and the model key go in
 `credentials.toml`, whose mode is 0600.
 
-1. **Install** (once), with Rust 1.85 or newer:
+1. **Install** (once) with the one line from the top of this README — it needs no Rust:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
+   ```
+
+   The prebuilt release is x86_64 Linux with glibc 2.39 or newer. On anything else — or to build
+   it yourself — install from source instead, with Rust 1.85 or newer:
 
    ```sh
    cargo install --git https://github.com/Callo42/gewu-multiverse
@@ -376,7 +383,8 @@ with your rights on this machine. The tool shows you where the credentials file 
 first start. A tool is started with the workspace as its working directory, and nothing more: the tool asks
 the operating system for no isolation at all. Because an agent can read the credentials file,
 every string the run writes down — a tool's output, a model reply, an error — is passed
-through the key's redaction before it reaches the transcript or the log.
+through the redaction of the agent's own key and of every other secret in the credentials
+file before it reaches the transcript or the log.
 
 ## Licence
 

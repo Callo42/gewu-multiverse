@@ -10,8 +10,8 @@
 //! 1. reads its plan and opens its transcript;
 //! 2. installs the agent's skill set into the run directory, byte for byte;
 //! 3. reads the agent's instruction document;
-//! 4. reads the agent's model key out of the credentials file — before anything runs,
-//!    so that any output can be redacted with it;
+//! 4. reads the agent's model key out of the credentials file, and the other secrets
+//!    beside it, before anything runs, so that any output can be redacted with them;
 //! 5. runs the agent's declared steps, if it declares any, as a fixed prelude: they
 //!    are the agent's own setup, and they run in the workspace like every tool;
 //! 6. **calls the model**, one turn at a time: it sends the instruction, the
@@ -31,8 +31,8 @@
 //! with the key redacted, the reply as received, and every tool call with its result.
 //! The key itself leaves this process in exactly one place — the `Authorization`
 //! header of the request — and every string that is written down is passed through
-//! [`Secret::redact`] first, so a run can be read afterwards without the key ever
-//! being recoverable.
+//! [`Secret::redact`] first — with every other secret the credentials file holds — so a
+//! run can be read afterwards without any secret being recoverable.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -284,6 +284,10 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
             return RunEnd::failed(reason);
         }
     };
+    // Redact every secret the credentials file holds, not only this run's model key: a
+    // tool can print that file, and whatever it prints reaches the log and the
+    // transcript. The model key stays what the request's Authorization header uses.
+    let secret = secret.with_extra_redactions(credentials::all_secret_values(&plan.credentials));
     log.set_secret(secret.clone());
     log.line(&format!(
         "model: {} at {} (bound: {} turn(s), {} s)",

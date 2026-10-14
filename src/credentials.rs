@@ -15,7 +15,10 @@
 //! is [`Secret::expose`], which is called in exactly one place (the request header).
 //! Every string that is written to a transcript, a log or an error is passed through
 //! [`Secret::redact`], so the key cannot be recovered from anything the tool leaves
-//! behind.
+//! behind. A run wraps its model key in [`Secret::with_extra_redactions`] carrying
+//! [`all_secret_values`] — every token and every other agent's key in the file — so
+//! not even a tool that printed the credentials file can carry a secret into a log or
+//! a transcript.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -262,22 +265,36 @@ impl CredentialsFile {
 /// The value is only reachable through [`Secret::expose`]. Everything else about a
 /// `Secret` — formatting it, cloning it, comparing it — is safe.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Secret(String);
+pub struct Secret {
+    value: String,
+    /// Other secrets redacted alongside `value`, without being `value` itself.
+    ///
+    /// A run redacts its own model key and, with it, every other secret the
+    /// credentials file holds, so a tool that printed that file cannot carry any of
+    /// them into a log or a transcript.
+    also: Vec<String>,
+}
 
 impl Secret {
     /// A secret with the given value.
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self {
+            value: value.into(),
+            also: Vec::new(),
+        }
     }
 
     /// No secret at all, for a place that has not read one yet.
     pub fn empty() -> Self {
-        Self(String::new())
+        Self {
+            value: String::new(),
+            also: Vec::new(),
+        }
     }
 
     /// Whether there is no value.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.value.is_empty()
     }
 
     /// The value itself.
@@ -286,20 +303,38 @@ impl Secret {
     /// the `Authorization` header of a model request is built. It is never opened for
     /// a log line, a transcript record, a screen or an error message.
     pub fn expose(&self) -> &str {
-        &self.0
+        &self.value
     }
 
-    /// Replace every occurrence of the value in `text` with `<redacted>`.
+    /// Redact these extra secrets alongside the value.
     ///
-    /// This is what every string that leaves the process is passed through, so the
-    /// key cannot survive in a transcript, a log or an error even if a tool printed
-    /// the credentials file.
+    /// The value stays what [`Secret::expose`] returns; the extra secrets are only
+    /// ever used by [`Secret::redact`]. An empty extra, or one equal to the value, is
+    /// ignored.
+    pub fn with_extra_redactions(mut self, extras: impl IntoIterator<Item = Secret>) -> Self {
+        for extra in extras {
+            if !extra.value.is_empty() && extra.value != self.value {
+                self.also.push(extra.value);
+            }
+        }
+        self
+    }
+
+    /// Replace every occurrence of every held secret in `text` with `<redacted>`.
+    ///
+    /// This is what every string that leaves the process is passed through, so no
+    /// secret the run holds can survive in a transcript, a log or an error even if a
+    /// tool printed the credentials file.
     pub fn redact(&self, text: &str) -> String {
-        if self.0.is_empty() {
+        let mut redacted = if self.value.is_empty() {
             text.to_owned()
         } else {
-            text.replace(&self.0, REDACTED)
+            text.replace(&self.value, REDACTED)
+        };
+        for extra in &self.also {
+            redacted = redacted.replace(extra.as_str(), REDACTED);
         }
+        redacted
     }
 }
 
@@ -385,6 +420,39 @@ pub fn forgejo_agent_token_optional(
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(|text| Secret::new(text.to_owned())))
+}
+
+/// Every secret value the credentials file holds, for redacting a run's output.
+///
+/// A run always redacts its own model key; this returns that key and every other
+/// secret beside it — the `forgejo_token`, the `forgejo_admin_token`, the per-agent
+/// tokens under `[forgejo_agent_tokens]` and every key under `[model_keys]` — so that
+/// a tool which printed the credentials file cannot carry any of them into a log or a
+/// transcript. A file that cannot be read yields nothing: the model key the run
+/// already holds is still redacted.
+pub fn all_secret_values(path: &Path) -> Vec<Secret> {
+    let Ok(value) = read_value(path) else {
+        return Vec::new();
+    };
+    let mut secrets: Vec<Secret> = Vec::new();
+    for key in ["forgejo_token", "forgejo_admin_token", "model_key"] {
+        push_secret(value.get(key).and_then(toml::Value::as_str), &mut secrets);
+    }
+    for table in ["forgejo_agent_tokens", "model_keys"] {
+        if let Some(entries) = value.get(table).and_then(toml::Value::as_table) {
+            for text in entries.values().filter_map(toml::Value::as_str) {
+                push_secret(Some(text), &mut secrets);
+            }
+        }
+    }
+    secrets
+}
+
+/// Push one non-empty secret onto a list.
+fn push_secret(text: Option<&str>, secrets: &mut Vec<Secret>) {
+    if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+        secrets.push(Secret::new(text.to_owned()));
+    }
 }
 
 /// The Forgejo login recorded for an agent, when one was recorded.
@@ -634,6 +702,47 @@ mod tests {
         assert!(!redacted.contains("sk-abc"));
         // An empty secret changes nothing.
         assert_eq!(Secret::empty().redact(text), text);
+    }
+
+    #[test]
+    fn every_secret_in_the_file_redacts_beside_the_model_key() {
+        let path = credentials_with(
+            "credentials-all-secrets",
+            "forgejo_token = \"forgejo-member-token\"\n\
+             forgejo_admin_token = \"forgejo-admin-token\"\n\n\
+             [forgejo_agent_tokens]\n\"scribe\" = \"agent-token\"\n\n\
+             [model_keys]\n\"scribe\" = \"sk-scribe\"\n\"other\" = \"sk-other\"\n",
+        );
+        let secret = Secret::new("sk-scribe").with_extra_redactions(all_secret_values(&path));
+        // The model key is still the one exposed for the request header.
+        assert_eq!(secret.expose(), "sk-scribe");
+        let text = "member forgejo-member-token, admin forgejo-admin-token, agent agent-token, \
+                    own sk-scribe, other sk-other, plain text";
+        let redacted = secret.redact(text);
+        for value in [
+            "forgejo-member-token",
+            "forgejo-admin-token",
+            "agent-token",
+            "sk-scribe",
+            "sk-other",
+        ] {
+            assert!(
+                !redacted.contains(value),
+                "{value} survived redaction: {redacted}"
+            );
+        }
+        assert!(redacted.contains("plain text"));
+    }
+
+    #[test]
+    fn an_empty_or_repeated_extra_secret_is_ignored() {
+        let secret = Secret::new("sk-own").with_extra_redactions([
+            Secret::empty(),
+            Secret::new("sk-own"),
+            Secret::new("sk-extra"),
+        ]);
+        assert_eq!(secret.expose(), "sk-own");
+        assert_eq!(secret.redact("sk-own sk-extra"), "<redacted> <redacted>");
     }
 
     #[test]

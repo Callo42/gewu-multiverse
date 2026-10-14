@@ -105,7 +105,8 @@ Each turn:
 4. if the reply holds no tool call, the model has finished and the loop ends.
 
 Everything the model is given and everything it is told back is redacted with the
-run's key before it is written down, so a run's records never hold the key even if a
+credentials file's secrets — the run's own key, the Forgejo tokens, and the other agents'
+keys — before it is written down, so a run's records never hold a secret even if a
 tool printed the credentials file.
 
 ### The bounds
