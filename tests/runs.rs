@@ -158,6 +158,7 @@ fn a_real_run_leaves_a_plan_a_log_a_transcript_and_its_effects() {
             "run_limits",
             "tool_call",
             "tool_result",
+            "model_request_sent",
             "model_request",
             "model_reply",
             "child_exit",
@@ -204,6 +205,55 @@ fn a_real_run_leaves_a_plan_a_log_a_transcript_and_its_effects() {
         requests[0].header("authorization").as_deref(),
         Some(format!("Bearer {TEST_KEY}").as_str())
     );
+}
+
+#[test]
+fn a_run_in_flight_records_the_model_call_it_is_waiting_for() {
+    // W-5: mid-run, the log and the transcript must name the call in flight, so a
+    // slow model is not indistinguishable from a wedged run.
+    let root = scratch("waiting-for-model");
+    let paths = agent(&root, "scribe", "do nothing\n");
+    fs::write(paths.steps_file(), "").expect("no declared steps");
+    let mut reply = StubReply::json(completion("done"));
+    reply.delay = Duration::from_secs(10);
+    let stub = Stub::start(vec![reply]);
+    let mut supervisor = supervisor(&root, Duration::from_secs(30), 10);
+    let steps = RunPlan::read_steps(paths.steps_file()).expect("steps");
+    let disposition = supervisor
+        .start(&paths, &model(&stub.url()), steps)
+        .expect("started");
+    let run_id = match disposition {
+        StartDisposition::Started { run_id, .. } => run_id,
+        other => panic!("unexpected {other:?}"),
+    };
+    let run_dir = supervisor.run_dir("scribe", &run_id);
+
+    // The send record is there while the stub is still waiting to answer.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut sent = false;
+    while Instant::now() < deadline && !sent {
+        sent = transcript::read(&run_dir)
+            .map(|file| {
+                file.records
+                    .iter()
+                    .any(|record| matches!(record, Record::ModelRequestSent { .. }))
+            })
+            .unwrap_or(false);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(sent, "the in-flight call is not in the transcript");
+    let log = fs::read_to_string(run_dir.join("run.log")).expect("the log is readable");
+    assert!(log.contains("waiting for the model"), "{log}");
+    // The reply has not arrived yet, so the record written on return is absent.
+    let file = transcript::read(&run_dir).expect("the transcript reads back");
+    assert!(
+        !file
+            .records
+            .iter()
+            .any(|record| matches!(record, Record::ModelRequest { .. })),
+        "the reply arrived before the check"
+    );
+    supervisor.stop_all(Duration::from_secs(3));
 }
 
 #[test]

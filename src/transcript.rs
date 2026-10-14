@@ -161,7 +161,24 @@ pub enum Record {
         /// The model id the run will ask for.
         model: String,
     },
-    /// A model request is about to be sent.
+    /// The model call is in flight.
+    ///
+    /// Written **before** the request goes out, so a run that is waiting on a slow
+    /// endpoint is not indistinguishable from a run that has hung: the send time is
+    /// on the record while the wait is still happening (W-5).
+    ModelRequestSent {
+        /// When the request was sent.
+        ts: String,
+        /// The run's identity.
+        run_id: String,
+        /// Which turn this is, starting at one.
+        turn: u32,
+        /// The endpoint called.
+        endpoint: String,
+        /// The model asked for.
+        model: String,
+    },
+    /// A model request that has been sent, written when the reply arrives.
     ModelRequest {
         /// When.
         ts: String,
@@ -345,6 +362,17 @@ impl Record {
         }
     }
 
+    /// The record that a model call is in flight, written before it is sent.
+    pub fn model_request_sent(run_id: &str, turn: u32, endpoint: &str, model: &str) -> Self {
+        Record::ModelRequestSent {
+            ts: stamp(),
+            run_id: run_id.to_owned(),
+            turn,
+            endpoint: endpoint.to_owned(),
+            model: model.to_owned(),
+        }
+    }
+
     /// The record of a model reply that arrived.
     #[allow(clippy::too_many_arguments)]
     pub fn model_reply(
@@ -409,6 +437,7 @@ impl Record {
             Record::ToolResult { .. } => "tool_result",
             Record::ChildExit { .. } => "child_exit",
             Record::RunLimits { .. } => "run_limits",
+            Record::ModelRequestSent { .. } => "model_request_sent",
             Record::ModelRequest { .. } => "model_request",
             Record::ModelReply { .. } => "model_reply",
             Record::ModelCallFailed { .. } => "model_call_failed",
@@ -426,6 +455,7 @@ impl Record {
             | Record::ToolResult { ts, .. }
             | Record::ChildExit { ts, .. }
             | Record::RunLimits { ts, .. }
+            | Record::ModelRequestSent { ts, .. }
             | Record::ModelRequest { ts, .. }
             | Record::ModelReply { ts, .. }
             | Record::ModelCallFailed { ts, .. }

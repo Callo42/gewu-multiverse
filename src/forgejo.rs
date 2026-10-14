@@ -221,7 +221,7 @@ impl RoleCheck {
     /// The role comes first, so a narrow footer clips the counts rather than the word
     /// that says which view this is.
     pub fn summary(&self) -> String {
-        format!(
+        let mut text = format!(
             "as {}, {} sees {} repository(ies), {} of them private",
             if self.administrative() {
                 "an administrator"
@@ -231,7 +231,18 @@ impl RoleCheck {
             self.viewer.login,
             self.repositories.len(),
             self.private_visible,
-        )
+        );
+        // The label comes from the configured role, but the token may belong to an
+        // administrator. Saying only "ordinary member" beside an administrator's name
+        // is a contradiction the user cannot resolve; say what the token actually is
+        // and name the key that shows the other view (W-8).
+        if self.viewer.is_admin && !self.administrative() {
+            text.push_str(&format!(
+                "; the token belongs to `{}`, an administrator — press C for the administrative view",
+                self.viewer.login
+            ));
+        }
+        text
     }
 }
 
@@ -870,6 +881,28 @@ struct WireToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_administrators_token_checked_as_a_member_is_not_called_a_member() {
+        // W-8: the label comes from the configured role, but the token may be an
+        // administrator's; the summary must not call the administrator an ordinary
+        // member without a word about the contradiction.
+        let check = RoleCheck {
+            url: "https://forgejo.example.org".to_owned(),
+            role: crate::config::Role::Member,
+            viewer: Viewer {
+                login: "uxadmin".to_owned(),
+                email: None,
+                description: None,
+                is_admin: true,
+            },
+            repositories: Vec::new(),
+            private_visible: 0,
+        };
+        let summary = check.summary();
+        assert!(summary.contains("administrator"), "{summary}");
+        assert!(summary.contains("press C"), "{summary}");
+    }
 
     #[test]
     fn a_url_without_a_scheme_is_refused() {
