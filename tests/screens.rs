@@ -235,7 +235,7 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
         instructions.contains("declared `shell` tool"),
         "{instructions}"
     );
-    assert!(instructions.contains("turn(s)"), "{instructions}");
+    assert!(instructions.contains("turns"), "{instructions}");
 
     // The credentials screen says the key is redacted from everything written.
     app.show(Screen::Credentials);

@@ -203,17 +203,25 @@ fn agent_notes(app: &App) -> Text<'static> {
             Style::new().fg(Color::Yellow),
         )));
     }
+    let waiting = app.supervisor.waiting_count();
+    let waiting_noun = if waiting == 1 { "start" } else { "starts" };
     lines.push(Line::from(format!(
-        "Running: {} of {} allowed by the configuration; {} start(s) waiting for a slot.",
+        "Running: {} of {} allowed by the configuration; {waiting} {waiting_noun} waiting for a slot.",
         app.supervisor.running_count(),
         app.supervisor.max_concurrent(),
-        app.supervisor.waiting_count(),
     )));
-    // Why the selected agent's last run failed, on the screen the user looks at.
+    // Why the selected agent's last run failed, on the screen the user looks at. A
+    // start that never became a run is named as a start, not as a run (D-8).
     if let Some(name) = app.selected_name() {
-        if let Some(reason) = app.last_failure(&name) {
+        if let Some(reason) = app.last_run_failure(&name) {
             lines.push(Line::from(Span::styled(
                 format!("the last run of `{name}` did not go well: {reason}"),
+                Style::new().fg(Color::Red),
+            )));
+        }
+        if let Some(reason) = app.last_start_failure(&name) {
+            lines.push(Line::from(Span::styled(
+                format!("the last start of `{name}` did not go well: {reason}"),
                 Style::new().fg(Color::Red),
             )));
         }
@@ -422,7 +430,8 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
                     lines.push(field(
                         "  declared",
                         &if exists {
-                            format!("{count} shell step(s), run in the workspace")
+                            let noun = if count == 1 { "step" } else { "steps" };
+                            format!("{count} shell {noun}, run in the workspace")
                         } else {
                             "none — press t to declare some".to_owned()
                         },
@@ -458,8 +467,11 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(agent) = app.selected_agent() {
         lines.push(Line::from(Span::styled(
             format!(
-                "A run sends this instruction, the conversation so far and the declared `shell` tool to {} ({}), runs the tool calls it asks for inside the workspace, and stops when the model finishes or after {} turn(s).",
-                agent.endpoint, agent.model, agent.max_turns
+                "A run sends this instruction, the conversation so far and the declared `shell` tool to {} ({}), runs the tool calls it asks for inside the workspace, and stops when the model finishes or after {} {}.",
+                agent.endpoint,
+                agent.model,
+                agent.max_turns,
+                if agent.max_turns == 1 { "turn" } else { "turns" },
             ),
             Style::new().fg(Color::DarkGray),
         )));

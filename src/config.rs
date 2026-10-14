@@ -174,6 +174,16 @@ pub enum ConfigError {
         /// What the parser said, with the line it stopped at.
         message: String,
     },
+    /// The file is valid TOML but not a configuration the program accepts (an
+    /// unknown field, a wrong type). Calling that "not valid TOML" sends the user
+    /// looking for a quote they did not miss (T-11).
+    #[error("{path} is not a valid configuration: {message}")]
+    Shape {
+        /// The file that failed.
+        path: PathBuf,
+        /// What the typed parser said.
+        message: String,
+    },
     /// The file carries a secret-like key, which belongs in the credentials file.
     #[error(
         "{path} holds the secret-like key `{key}` under `{section}`; secrets belong in the credentials file, never in the configuration file"
@@ -243,7 +253,9 @@ impl Config {
             message: error.to_string(),
         })?;
         find_secret_key(&value, "the top level", path)?;
-        let config: Config = toml::from_str(text).map_err(|error| ConfigError::Syntax {
+        // The generic parse above already proved the text is TOML, so a failure here
+        // is about the *shape* of the configuration, not its syntax (T-11).
+        let config: Config = toml::from_str(text).map_err(|error| ConfigError::Shape {
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
@@ -552,6 +564,16 @@ concurrency = 2
         // The sample's agent block is commented out, so "commented sample" is true and
         // a fresh installation never lists an agent the user did not make.
         assert!(config.agents.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_field_is_not_called_invalid_toml() {
+        // T-11: the TOML was valid; only the word was wrong.
+        let text = format!("{GOOD}\nnonsense = 1\n");
+        let message = message(&text);
+        assert!(message.contains("is not a valid configuration"), "{message}");
+        assert!(!message.contains("not valid TOML"), "{message}");
+        assert!(message.contains("nonsense"), "{message}");
     }
 
     #[test]

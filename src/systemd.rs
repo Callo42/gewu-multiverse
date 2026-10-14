@@ -850,6 +850,13 @@ impl SystemdSupervisor {
     /// Returns whether there was something alive to stop. A unit that was not active
     /// is left alone: there is nothing to signal, and saying otherwise would be a lie.
     pub fn stop(&mut self, agent: &str) -> Result<bool, String> {
+        self.stop_with_reason(agent, "the user unit was stopped on request")
+    }
+
+    /// Stop one agent's unit and record the run with a caller-chosen reason, so a
+    /// stop the user never asked for — a configuration re-read that no longer lists
+    /// the agent — is not recorded as "on request" (T-6).
+    pub fn stop_with_reason(&mut self, agent: &str, reason_text: &str) -> Result<bool, String> {
         let unit = unit_name(agent);
         let status = self.systemctl.show(&unit)?;
         if !status.is_live() {
@@ -864,7 +871,7 @@ impl SystemdSupervisor {
                 &run_dir,
                 &run_id,
                 RunOutcome::Stopped,
-                Some("the user unit was stopped on request".to_owned()),
+                Some(reason_text.to_owned()),
                 0,
             );
             if let Some(record) = self.runs.get_mut(agent) {

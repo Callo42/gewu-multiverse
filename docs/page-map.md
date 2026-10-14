@@ -44,7 +44,7 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | waiting for a slot | `waiting (1 in line)`; “is waiting its turn: …” | the slot count and the line position; no error |
 | stopped by `x` | `stopped`; “its process group was signalled and is proven gone” once the record is closed | the stop is confirmed, in the past tense, so the status and the row agree; the agent can be started again |
 | failed | `failed (class)`; the last reason in the note area | **why**, on this screen: the class and the run's own reason |
-| error (config unreadable) | `no agent list: <reason>` | the reason in the product's words and a way back (`r`, or the form) |
+| error (config unreadable) | `no agent list: <reason>` | the reason in the product's words, the **real** class (a syntax error is "not valid TOML"; an unknown field is "not a valid configuration"), and a way back named with the error (`press r to read it again`, or the form) |
 
 ## Agent (`2`) — one agent's configuration
 
@@ -128,10 +128,12 @@ acknowledgment**, **add-agent form**, **key help**. Hand-offs: **editor**, **pag
 | State | Shows | Must offer |
 |---|---|---|
 | the UI is signalled | — | the runs it started in `tui` mode end with it: the child asks the kernel to end when its parent does |
-| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop | press `q` again to leave and stop them, or any other key to stay; the record of each ended run names the UI closing, not “on request” |
+| the UI is left with `q` while a run is in flight | one warning naming how many runs will stop (`1 run`, not `1 run(s)`) | press `q` again to leave and stop them, or any other key to stay; staying **replaces the warning** with a plain statement rather than re-asking the question; the record of each ended run names the UI closing, not “on request” |
 | the UI is reopened after a run was left behind | the agent as `stopped`, never `idle`; the run's duration is the time it actually ran | the run's own record is closed as `stopped` with a reason, so a second run of the same agent never overlaps an abandoned one, in the same workspace |
 | the UI is reopened after a run finished | the agent's newest terminal outcome, its reason and its elapsed time | the hub seeds each agent from its newest terminal record, so a restart never shows `idle` for an agent whose record says `succeeded`, `stopped` or `failed` |
-| the configuration is re-read (`r`) after an agent was removed by hand | the removed agent's run is stopped, and the note names it | the run does not stay counted but invisible; what the footer counts is what a screen can show |
+| the configuration is re-read (`r`) after an agent was removed by hand | the removed agent's run is stopped, and the note names it once, in the note area | the run does not stay counted but invisible; what the footer counts is what a screen can show; the run's own record names the re-read, never “on request” |
+| the configuration is re-read (`r`) after the run records were deleted | the hub drops an outcome whose record is gone; the hub and the ledger agree | a cached outcome never outlives the record it came from |
+| a start fails before a run ever runs (systemd refuses, the process cannot spawn) | the run state is `failed` with the start's reason, not `unknown start / no terminal record` | the record opened for the start is closed as `failed`, so the next `s` is not blocked by a run that never was |
 | `^C` | — | a control chord is never a plain-letter binding: `^C` leaves the UI and stops the runs it started |
 
 ## Every screen — footer

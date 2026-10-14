@@ -298,6 +298,9 @@ enum StopKind {
     Left,
     /// The run reached its timeout.
     TimedOut,
+    /// The configuration was re-read and no longer lists this agent, so its run was
+    /// stopped. This is not a stop the user asked for with `x` (T-6).
+    Unlisted,
 }
 
 /// A start that is waiting for a free slot.
@@ -625,7 +628,7 @@ impl Supervisor {
             }
         }
         for name in &names {
-            self.stop(name);
+            self.stop_with(name, StopKind::Unlisted);
         }
         names
     }
@@ -695,6 +698,15 @@ impl Supervisor {
                 duration_ms,
             },
         );
+    }
+
+    /// Forget one agent's remembered terminal outcome.
+    ///
+    /// The records on disk are the truth; an outcome cached from a record that is no
+    /// longer there must not outlive it on the hub, or the hub and the ledger disagree
+    /// about what was recorded (T-5). The caller has already checked the record list.
+    pub fn forget_state(&mut self, name: &str) {
+        self.states.remove(name);
     }
 
     /// Seed the screens with the newest terminal record of one agent.
@@ -802,17 +814,30 @@ impl Supervisor {
     /// asks the user's own `systemctl --user` to stop the unit, and records that the
     /// run was stopped.
     pub fn stop(&mut self, name: &str) -> StopDisposition {
+        self.stop_with(name, StopKind::Requested)
+    }
+
+    /// Stop one agent, recording *why* in the run's own log: a stop asked for with
+    /// `x`, a configuration re-read that no longer lists the agent, or the UI leaving.
+    fn stop_with(&mut self, name: &str, kind: StopKind) -> StopDisposition {
         if let Some(queued_at) = self.queue.iter().position(|queued| queued.name == name) {
             let queued = self
                 .queue
                 .remove(queued_at)
                 .expect("the position was just found");
+            let reason = match kind {
+                StopKind::Unlisted => {
+                    "the configuration no longer lists this agent, so its start was called off"
+                        .to_owned()
+                }
+                _ => "the start was called off before a slot was free".to_owned(),
+            };
             self.states.insert(
                 name.to_owned(),
                 State::Finished {
                     run_id: queued.run_id,
                     outcome: RunOutcome::Stopped,
-                    reason: Some("the start was called off before a slot was free".to_owned()),
+                    reason: Some(reason),
                     duration_ms: 0,
                 },
             );
@@ -820,7 +845,11 @@ impl Supervisor {
             return StopDisposition::Cancelled;
         }
         if self.mode(name) == Mode::Systemd {
-            return match self.systemd.stop(name) {
+            let reason = match kind {
+                StopKind::Unlisted => "the user unit was stopped because the configuration no longer lists this agent",
+                _ => "the user unit was stopped on request",
+            };
+            return match self.systemd.stop_with_reason(name, reason) {
                 Ok(true) => StopDisposition::Signalled,
                 Ok(false) => StopDisposition::Nothing,
                 Err(reason) => StopDisposition::Failed { reason },
@@ -829,7 +858,7 @@ impl Supervisor {
         let Some(live) = self.live.get_mut(name) else {
             return StopDisposition::Nothing;
         };
-        live.stopping = Some(StopKind::Requested);
+        live.stopping = Some(kind);
         live.signalled_at = Some(Instant::now());
         let (pid, run_id) = (live.pid, live.run_id.clone());
         signal_group(pid, Signal::SIGTERM);
@@ -1079,6 +1108,13 @@ impl Supervisor {
                     self.timeout.as_secs()
                 )),
             ),
+            Some(StopKind::Unlisted) => (
+                RunOutcome::Stopped,
+                Some(
+                    "the configuration no longer lists this agent, so its run was stopped"
+                        .to_owned(),
+                ),
+            ),
             None => {
                 if status.success() {
                     (RunOutcome::Succeeded, None)
@@ -1222,10 +1258,25 @@ impl Supervisor {
             // A new process group, so one signal reaches the agent and everything it
             // started. The child becomes the leader, so its group id is its own id.
             .process_group(0);
-        let child = command.spawn().map_err(|source| StartError::Spawn {
-            agent: name.clone(),
-            source,
-        })?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => {
+                // The run directory and plan were opened before the process was; a
+                // start that never happened must not be left as a run with no ending
+                // (T-8). Close it as failed, with the reason the caller will show.
+                record_outcome_if_missing(
+                    &run_dir,
+                    &run_id,
+                    RunOutcome::Failed,
+                    Some(format!("the run could not be started: {source}")),
+                    0,
+                );
+                return Err(StartError::Spawn {
+                    agent: name.clone(),
+                    source,
+                });
+            }
+        };
         let pid = child.id();
         self.live.insert(
             name.clone(),
@@ -1268,13 +1319,25 @@ impl Supervisor {
             &run_dir.join(LOG_FILE),
             RestartPolicy::default(),
         );
-        let pid = self
-            .systemd
-            .start(&spec, run_id, run_dir.clone())
-            .map_err(|message| StartError::Systemd {
-                agent: name.clone(),
-                message,
-            })?;
+        let pid = match self.systemd.start(&spec, run_id.clone(), run_dir.clone()) {
+            Ok(pid) => pid,
+            Err(message) => {
+                // systemd refused the start, so no run ever ran. The directory opened
+                // for it is closed as failed here, with the reason, rather than left
+                // for ever as `unknown start / no terminal record` (T-8).
+                record_outcome_if_missing(
+                    &run_dir,
+                    &run_id,
+                    RunOutcome::Failed,
+                    Some(format!("the start failed: {message}")),
+                    0,
+                );
+                return Err(StartError::Systemd {
+                    agent: name.clone(),
+                    message,
+                });
+            }
+        };
         // Record which run the unit points at, so a later session reads the unit's
         // state rather than the tool's memory. A failure to write the record after the
         // unit has started is reported, but it is not a reason to claim the start did
@@ -1899,6 +1962,33 @@ esac
         }
     }
 
+    /// A `systemctl` that reports fine but refuses to start a unit, so the path where a
+    /// run directory was opened and the start then failed can be driven (T-8).
+    fn fake_systemctl_start_fails(tag: &str) -> FakeSystemd {
+        let root = scratch_root(tag);
+        let state = root.join("unit-state");
+        let restarts = root.join("unit-restarts");
+        let commands = root.join("systemctl-commands.log");
+        let program = root.join("fake-systemctl.sh");
+        let body = FAKE_SYSTEMCTL
+            .replace(
+                "start) printf '%s' active > \"$STATE\"; exit 0 ;;",
+                "start) printf '%s\\n' 'Job for the unit failed' >&2; exit 1 ;;",
+            )
+            .replace("__STATE__", &state.display().to_string())
+            .replace("__RESTARTS__", &restarts.display().to_string())
+            .replace("__LOG__", &commands.display().to_string());
+        fs::write(&program, body).expect("the stand-in is written");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is runnable");
+        FakeSystemd {
+            program,
+            state,
+            restarts,
+            commands,
+        }
+    }
+
     /// A `systemctl` that is present but cannot reach the user manager, which is what
     /// a machine with no user session looks like. Every verb fails with systemd's own
     /// sentence, so the paths that must refuse — or must not need the manager at all —
@@ -2211,6 +2301,35 @@ esac
                 .exists(),
             "a refused switch writes no unit"
         );
+    }
+
+    #[test]
+    fn a_systemd_start_that_fails_closes_the_run_it_opened_as_failed() {
+        // T-8: a start that never ran must not be left for ever as a run with no
+        // terminal record; its own record is closed with the reason.
+        let fake = fake_systemctl_start_fails("sup-start-fail");
+        let (layout, agent, mut supervisor) =
+            systemd_supervisor("sup-start-fail", &fake, Mode::Systemd);
+        let error = supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect_err("the start is refused");
+        eprintln!("failed systemd start: {error}");
+
+        let runs = layout.state_root().join("scribe");
+        let mut checked = false;
+        for entry in fs::read_dir(&runs).expect("the run directory is there") {
+            let dir = entry.expect("an entry").path();
+            if let Some(Record::RunFinished { outcome, reason, .. }) = transcript::terminal_record(&dir)
+            {
+                checked = true;
+                assert_eq!(outcome, "failed", "{outcome}");
+                assert!(
+                    reason.unwrap_or_default().contains("the start failed"),
+                    "the record names the start"
+                );
+            }
+        }
+        assert!(checked, "the opened run has a terminal record");
     }
 
     #[test]

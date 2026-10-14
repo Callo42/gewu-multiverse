@@ -645,6 +645,18 @@ impl App {
             .map(|agent| agent.name.clone())
             .collect();
         for name in names {
+            // An outcome whose record is gone is dropped before seeding, so `r` after
+            // deleting the run records puts the hub back in step with the ledger
+            // instead of leaving it claiming an outcome no record holds (T-5).
+            if let State::Finished { run_id, .. } = self.supervisor.state(&name) {
+                // The run's own record is the truth, on disk and now: the in-memory
+                // list may predate a terminal record written by the reconciliation
+                // just above. A record that is gone takes its cached outcome with it.
+                let dir = self.layout.state_root().join(&name).join(&run_id);
+                if crate::transcript::terminal_record(&dir).is_none() {
+                    self.supervisor.forget_state(&name);
+                }
+            }
             if self.supervisor.state(&name) != State::Idle {
                 continue;
             }
@@ -1218,8 +1230,9 @@ impl App {
             return;
         }
         self.confirm_quit = Some(live);
+        let noun = if live == 1 { "run" } else { "runs" };
         self.status = format!(
-            "leaving stops the {live} run(s) this UI started; press q again to quit and stop them, or any other key to stay"
+            "leaving stops the {live} {noun} this UI started; press q again to quit and stop them, or any other key to stay"
         );
     }
 
@@ -1236,6 +1249,16 @@ impl App {
     /// The reason is read from the run's own record, so it is there on the screen the
     /// user looks at after a failure, not only in a transient footer line.
     pub fn last_failure(&self, name: &str) -> Option<String> {
+        self.last_run_failure(name)
+            .or_else(|| self.last_start_failure(name))
+            .or_else(|| self.supervisor.last_error().map(str::to_owned))
+    }
+
+    /// Why one agent's most recent *run* did not go well, from the run's own record.
+    ///
+    /// Kept apart from a start that never produced a run, so the hub does not call a
+    /// failed start "the last run" (D-8).
+    pub fn last_run_failure(&self, name: &str) -> Option<String> {
         if let State::Finished {
             outcome: RunOutcome::Failed,
             reason: Some(reason),
@@ -1244,21 +1267,18 @@ impl App {
         {
             return Some(reason);
         }
-        if let Some(run) = self
-            .recent
+        self.recent
             .iter()
             .find(|run| run.agent == name && run.outcome == Some(RunOutcome::Failed))
-        {
-            if let Some(reason) = &run.reason {
-                return Some(reason.clone());
-            }
-        }
-        if let Some((agent, message)) = &self.start_failure {
-            if agent == name {
-                return Some(message.clone());
-            }
-        }
-        self.supervisor.last_error().map(str::to_owned)
+            .and_then(|run| run.reason.clone())
+    }
+
+    /// Why one agent's most recent *start* did not go well, when it never became a run.
+    pub fn last_start_failure(&self, name: &str) -> Option<String> {
+        self.start_failure
+            .as_ref()
+            .filter(|(agent, _)| agent == name)
+            .map(|(_, message)| message.clone())
     }
 
     /// Ask to start the selected agent.
@@ -2460,9 +2480,13 @@ impl App {
             }
             return;
         }
-        // A pending "leave and stop the runs?" is cancelled by any key but `q`.
+        // A pending "leave and stop the runs?" is cancelled by any key but `q`, and
+        // the standing status is replaced: a warning that keeps asking a question
+        // already answered reads as a question the product did not hear (D-6).
         if self.confirm_quit.is_some() && key.code != KeyCode::Char('q') {
             self.confirm_quit = None;
+            self.status =
+                "the run continues and this UI stays; q will ask again before leaving".to_owned();
         }
         if self.show_help {
             match key.code {
@@ -3170,6 +3194,57 @@ role = "member"
 "#;
 
     #[test]
+    fn a_reload_forgets_an_outcome_whose_record_is_gone() {
+        // T-5: deleting the run records and pressing `r` must put the hub back in step
+        // with the ledger, not leave it claiming an outcome no record holds.
+        let mut app = app_with(GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+        give_key(&app, "one");
+        app.on_key(key(KeyCode::Char('s')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            app.tick();
+            if matches!(app.supervisor.state("one"), State::Finished { .. }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            matches!(app.supervisor.state("one"), State::Finished { .. }),
+            "the run finished"
+        );
+        let runs = app.layout.state_root().join("one");
+        if runs.exists() {
+            std::fs::remove_dir_all(&runs).expect("the records are removed");
+        }
+        app.reload();
+        assert_eq!(
+            app.supervisor.state("one"),
+            State::Idle,
+            "the hub is in step with the ledger"
+        );
+        assert!(
+            app.recent.iter().all(|run| run.agent != "one"),
+            "the ledger holds no record"
+        );
+        app.shutdown();
+    }
+
+    #[test]
+    fn a_failed_start_is_not_called_a_failed_run() {
+        // D-8: the unit could not be started, so there was no run to speak of.
+        let mut app = app_with(GOOD);
+        app.start_failure = Some(("one".to_owned(), "systemd could not start it".to_owned()));
+        assert!(app.last_run_failure("one").is_none());
+        assert_eq!(
+            app.last_start_failure("one").as_deref(),
+            Some("systemd could not start it")
+        );
+    }
+
+    #[test]
     fn an_abandoned_run_is_closed_as_stopped_not_shown_as_idle() {
         // S-1: a `tui` run is a child of the UI. A reopened UI must not call the agent
         // idle while the run's own record says it never ended.
@@ -3321,6 +3396,17 @@ concurrency = 3
             "the reload note is drawn twice: {}",
             app.status
         );
+        // T-6: the run's own record must name the configuration re-read, never
+        // "on request" — the user did not press `x`.
+        let runs = app.layout.state_root().join("one");
+        let log = std::fs::read_dir(&runs)
+            .expect("the run directory is there")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join(crate::run::LOG_FILE))
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .expect("a run log");
+        assert!(log.contains("no longer lists"), "{log}");
+        assert!(!log.contains("on request"), "{log}");
         app.shutdown();
     }
 
@@ -3366,10 +3452,20 @@ concurrency = 3
         assert!(app.status.contains("stops"), "{}", app.status);
         assert!(app.status.contains("press q again"), "{}", app.status);
 
-        // Any other key cancels the pending quit.
-        app.on_key(key(KeyCode::Char('z')));
+        // Any other key cancels the pending quit. Tab switches screens without setting
+        // a status of its own, which is exactly the case D-6 was about.
+        app.on_key(key(KeyCode::Tab));
         assert!(!app.should_quit);
         assert!(app.confirm_quit.is_none());
+        // D-6: the status no longer re-asks the question the user answered; T-9: the
+        // product's own voice does not carry a pluralisation gutter.
+        assert!(
+            !app.status.contains("press q again"),
+            "the answered warning stays: {}",
+            app.status
+        );
+        assert!(app.status.contains("continues"), "{}", app.status);
+        assert!(!app.status.contains("run(s)"), "{}", app.status);
 
         app.on_key(key(KeyCode::Char('q')));
         app.on_key(key(KeyCode::Char('q')));
