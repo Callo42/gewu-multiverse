@@ -308,6 +308,10 @@ pub struct App {
     pub show_acknowledgment: bool,
     /// The in-TUI add-agent form, when it is open.
     pub add_agent: Option<NewAgentForm>,
+    /// An edit waiting on the no-editor confirmation, when `$EDITOR` is unset.
+    pub editor_confirm: Option<PendingAction>,
+    /// Whether the user set `$EDITOR`/`$VISUAL`. Read once, so tests can vary it.
+    pub editor_configured: bool,
     /// Whether the key-reference overlay is on screen now.
     pub show_help: bool,
     /// A line about the freshly written sample configuration, when one was written.
@@ -378,6 +382,8 @@ impl App {
             ack_state: AckState::Missing,
             show_acknowledgment: false,
             add_agent: None,
+            editor_confirm: None,
+            editor_configured: crate::editor::editor_is_configured(),
             show_help: false,
             config_note: None,
             screen: Screen::Agents,
@@ -831,8 +837,12 @@ impl App {
         }
         // Refuse before a run is wasted, with the same sentence the run's own log
         // would carry: `p` already knows the key is missing, so `s` must know too.
-        if let Err(error) = credentials::model_key(&self.credentials_path, &name) {
-            self.status = format!("not started: `{name}` cannot read its model key: {error}");
+        if credentials::model_key(&self.credentials_path, &name).is_err() {
+            // Lead with the fix; the full sentence is on the Credentials screen and in
+            // the run's own log. A long path here would clip in a narrow footer.
+            self.status = format!(
+                "not started: no model key for `{name}` — add one under [model_keys] in credentials.toml"
+            );
             return;
         }
         let steps = match crate::run::RunPlan::read_steps(paths.steps_file()) {
@@ -1466,19 +1476,27 @@ impl App {
             return;
         }
         let before = stamp(&path);
-        self.pending = Some(PendingAction {
+        let action = PendingAction {
             kind: ActionKind::Edit,
             path,
             label: format!("the {} of `{name}`", target.label()),
             before,
-        });
-        // Name the program before the terminal is handed over: a person who set no
-        // `$EDITOR` is exactly the person who needs to be told which editor this is.
+        };
+        // A person who set no `$EDITOR` is exactly the person who does not know which
+        // editor this is, or how to leave it. Name the program on screen first, and
+        // wait for `enter`, because a status line would be erased the moment the UI
+        // steps aside for the editor.
         let program = crate::editor::editor();
-        self.status = format!(
-            "opening the {} of `{name}` in {program} — set $EDITOR to choose another editor",
-            target.label()
-        );
+        if self.editor_configured {
+            self.pending = Some(action);
+            self.status = format!("opening the {} of `{name}` in {program}", target.label());
+        } else {
+            self.editor_confirm = Some(action);
+            self.status = format!(
+                "no $EDITOR is set: press enter to open the {} of `{name}` in {program}",
+                target.label()
+            );
+        }
     }
 
     /// Ask to read the transcript of the run on show, or the newest run of the agent.
@@ -1602,17 +1620,21 @@ impl App {
                 // Compare the file before and after: never claim an edit that was not
                 // written. A person who quit the editor without saving must be told so.
                 let changed = action.before != stamp(&action.path);
+                let program = crate::editor::editor();
                 self.reload();
                 if !status.success() {
                     self.status = format!(
-                        "the editor left with code {:?} for {}; it may not have been saved",
+                        "{program} left with code {:?} for {}; it may not have been saved",
                         status.code(),
                         action.label
                     );
                 } else if changed {
-                    self.status = format!("{} was edited; the files were read again", action.label);
+                    self.status = format!(
+                        "{} was edited in {program}; the files were read again",
+                        action.label
+                    );
                 } else {
-                    self.status = format!("{} was not changed", action.label);
+                    self.status = format!("{} was not changed ({program})", action.label);
                 }
             }
             (ActionKind::Edit, Err(error)) => {
@@ -1786,6 +1808,22 @@ impl App {
         }
         if self.add_agent.is_some() {
             self.on_form_key(key);
+            return;
+        }
+        if self.editor_confirm.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    self.pending = self.editor_confirm.take();
+                    if let Some(action) = &self.pending {
+                        self.status = format!("opening {}", action.label);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.editor_confirm = None;
+                    self.status = "the file was not opened".to_owned();
+                }
+                _ => {}
+            }
             return;
         }
         if self.show_acknowledgment {
@@ -2161,6 +2199,7 @@ concurrency = 3
     fn editing_the_instruction_creates_it_and_asks_the_loop_to_open_it() {
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
+        app.editor_configured = true;
         let paths = app.selected_paths().expect("paths");
         assert!(!paths.instruction().exists());
         app.on_key(key(KeyCode::Char('e')));
@@ -2175,6 +2214,7 @@ concurrency = 3
     fn editing_the_steps_creates_the_file_and_the_skills_directory() {
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
+        app.editor_configured = true;
         let paths = app.selected_paths().expect("paths");
         app.on_key(key(KeyCode::Char('t')));
         let action = app.take_action().expect("a steps edit");
@@ -2295,6 +2335,7 @@ role = "member"
         // F-E: never claim an edit that was not written.
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
+        app.editor_configured = true;
         app.on_key(key(KeyCode::Char('e')));
         let action = app.take_action().expect("an edit was asked for");
         app.note_action(&action, Ok(success()));
@@ -2305,11 +2346,31 @@ role = "member"
     fn an_edit_that_changed_the_file_is_reported_as_edited() {
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
+        app.editor_configured = true;
         app.on_key(key(KeyCode::Char('e')));
         let action = app.take_action().expect("an edit was asked for");
         std::fs::write(&action.path, "a changed instruction\n").expect("the file is changed");
         app.note_action(&action, Ok(success()));
         assert!(app.status.contains("was edited"), "{}", app.status);
+    }
+
+    #[test]
+    fn an_unset_editor_asks_before_it_takes_the_screen() {
+        // F-D: with no `$EDITOR`, name the program and wait, rather than dropping the
+        // user into the editor's own screen with no hint.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.editor_configured = false;
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.editor_confirm.is_some());
+        assert!(app.take_action().is_none(), "the editor waits for enter");
+        // Esc cancels, leaving the edit unopened.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.editor_confirm.is_none());
+        // A second attempt, confirmed with enter, becomes a real pending action.
+        app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.take_action().is_some(), "enter opens the editor");
     }
 
     #[test]

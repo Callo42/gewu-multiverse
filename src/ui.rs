@@ -38,6 +38,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if app.adding_agent() {
         draw_add_agent_form(frame, app);
+    } else if app.editor_confirm.is_some() {
+        draw_editor_confirm(frame, app);
     } else if app.show_help {
         draw_help(frame, app);
     }
@@ -110,7 +112,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     let widths = [
         Constraint::Length(14),
         Constraint::Length(16),
-        Constraint::Length(9),
+        Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Min(18),
     ];
@@ -695,6 +697,65 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     let block = Block::bordered()
         .title(" add an agent ")
         .border_style(Style::new().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// The no-`$EDITOR` confirmation, over the screen, before the editor takes over.
+///
+/// A status line would be erased the instant the UI steps aside for the editor, so the
+/// program is named here and the user says when to go.
+fn draw_editor_confirm(frame: &mut Frame, app: &App) {
+    let Some(action) = &app.editor_confirm else {
+        return;
+    };
+    let screen = frame.area();
+    let program = crate::editor::editor();
+    let width = (screen.width.saturating_sub(2)).min(74);
+    let height = 7.min(screen.height.saturating_sub(2));
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+    let mut lines: Vec<Line> = vec![
+        Line::from(format!(
+            "No `$EDITOR` is set, so {} opens in:",
+            action.label
+        )),
+        Line::from(Span::styled(
+            format!("  {program}"),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if program.trim() == "vi" {
+        lines.push(Line::from(
+            "  In vi: press i to type, Esc to stop typing, then :wq and enter to save and quit, or :q! to leave without saving.",
+        ));
+    }
+    lines.push(Line::from(Span::styled(
+        "Set `$EDITOR` (for example, export EDITOR=nano) to use another editor.",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "enter open it        esc cancel",
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let block = Block::bordered()
+        .title(" open an editor ")
+        .border_style(Style::new().fg(Color::Yellow));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
