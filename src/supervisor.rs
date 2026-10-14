@@ -117,7 +117,9 @@ impl State {
                 format!("stopping ({}s)", elapsed_ms / 1000)
             }
             State::Finished { outcome, .. } => match outcome {
-                RunOutcome::Succeeded => "exited 0".to_owned(),
+                // One word for one outcome, on every screen: the Runs screen says
+                // `succeeded`, so the hub must not say `exited 0` for the same event.
+                RunOutcome::Succeeded => "succeeded".to_owned(),
                 RunOutcome::Failed => "failed".to_owned(),
                 RunOutcome::Stopped => "stopped".to_owned(),
                 RunOutcome::TimedOut => "timed out".to_owned(),
@@ -290,8 +292,10 @@ struct Live {
 /// Why a run is being stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopKind {
-    /// Someone asked for it.
+    /// Someone asked for it, with `x`.
     Requested,
+    /// The UI is leaving, so the runs it started end with it.
+    Left,
     /// The run reached its timeout.
     TimedOut,
 }
@@ -577,6 +581,70 @@ impl Supervisor {
         self.last_error.as_deref()
     }
 
+    /// Stop every unfinished run whose agent is not in `configured`, and return their
+    /// names.
+    ///
+    /// The configuration file is hand-editable and `r` re-reads it. An agent removed
+    /// from the file while its run is in flight would otherwise leave the run counted
+    /// by the footer but invisible on the hub and unreachable by `x` — the same
+    /// orphaned-run class as W-2, reached through a different door. The run is stopped
+    /// here, so what the screens count is what the screens can show.
+    pub fn stop_unlisted(&mut self, configured: &[String]) -> Vec<String> {
+        let listed = |name: &str| configured.iter().any(|configured| configured == name);
+        let mut names: Vec<String> = Vec::new();
+        for name in self.live.keys().cloned().collect::<Vec<_>>() {
+            if !listed(&name) {
+                names.push(name);
+            }
+        }
+        for name in self.queue.iter().map(|queued| queued.name.clone()).collect::<Vec<_>>() {
+            if !listed(&name) && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for (name, mode) in self.modes.clone() {
+            if mode == Mode::Systemd && !listed(&name) && !names.contains(&name) {
+                self.systemd.poll_now();
+                if self.systemd.is_live(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        for name in &names {
+            self.stop(name);
+        }
+        names
+    }
+
+    /// A run of this agent that has not finished: live, stopping, or waiting for a
+    /// slot.
+    ///
+    /// This is what removal and mode-switch guard against. `State::is_live` is not
+    /// enough: a start waiting in the queue is still a run whose record was opened,
+    /// and removing its agent would leave that record behind with nothing to run it.
+    pub fn unfinished_run(&mut self, name: &str) -> Option<String> {
+        if let Some(queued) = self.queue.iter().find(|queued| queued.name == name) {
+            return Some(queued.run_id.clone());
+        }
+        if self.mode(name) == Mode::Systemd {
+            self.systemd.poll_now();
+            if self.systemd.is_live(name) {
+                return self.systemd.run_of(name).map(|run| run.run_id);
+            }
+            return None;
+        }
+        self.states
+            .get(name)
+            .filter(|state| state.is_live())
+            .and_then(|state| state.run_id())
+            .map(str::to_owned)
+            .or_else(|| {
+                self.live
+                    .get(name)
+                    .map(|live| live.run_id.clone())
+            })
+    }
+
     /// Close the record of a run the UI that started it can no longer be watching.
     ///
     /// A default-mode run is a child of the UI. When that UI is gone, nothing is left
@@ -588,12 +656,21 @@ impl Supervisor {
     pub fn note_abandoned(&mut self, name: &str, run_dir: &Path, run_id: &str) {
         let reason = "the UI that started this run is not running any more, so the run is not either"
             .to_owned();
+        // The abandoned run was already going when its UI died, and the reopening UI
+        // is what closes it. A duration of `0.0s` would be a lie about a run the user
+        // watched for twenty-one seconds; derive it from the record's own start to
+        // now, and fall back to zero only when the record carries no start at all.
+        let duration_ms = transcript::first_started_at(run_dir)
+            .as_deref()
+            .and_then(crate::time::parse_rfc3339)
+            .map(|started| crate::time::now_unix_ms().saturating_sub(started))
+            .unwrap_or(0);
         let (outcome, reason, duration_ms) = record_outcome_if_missing(
             run_dir,
             run_id,
             RunOutcome::Stopped,
             Some(reason),
-            0,
+            duration_ms,
         );
         self.states.insert(
             name.to_owned(),
@@ -770,7 +847,7 @@ impl Supervisor {
         let names: Vec<String> = self.live.keys().cloned().collect();
         for name in &names {
             if let Some(live) = self.live.get_mut(name) {
-                live.stopping = Some(StopKind::Requested);
+                live.stopping = Some(StopKind::Left);
                 live.signalled_at = Some(Instant::now());
                 signal_group(live.pid, Signal::SIGTERM);
                 let (pid, run_id, elapsed_ms) = (
@@ -976,6 +1053,10 @@ impl Supervisor {
             Some(StopKind::Requested) => (
                 RunOutcome::Stopped,
                 Some("the run was stopped on request".to_owned()),
+            ),
+            Some(StopKind::Left) => (
+                RunOutcome::Stopped,
+                Some("the UI was closed, so the run it started was stopped".to_owned()),
             ),
             Some(StopKind::TimedOut) => (
                 RunOutcome::TimedOut,
@@ -1366,6 +1447,61 @@ mod tests {
     use crate::run::PLAN_FILE;
     use crate::test_support::scratch_root;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn the_hub_and_the_runs_screen_use_one_word_for_success() {
+        // W-12: one event, one word. The Runs screen says `succeeded`; the hub used
+        // to say `exited 0` for the same ending.
+        let state = State::Finished {
+            run_id: "run-1".to_owned(),
+            outcome: RunOutcome::Succeeded,
+            reason: None,
+            duration_ms: 25_000,
+        };
+        assert_eq!(state.word(), "succeeded");
+        assert_eq!(state.word_with_reason(), "succeeded");
+    }
+
+    #[test]
+    fn a_run_ended_by_leaving_names_the_ui_closing() {
+        // W-10: the record of a run stopped by `q` must not read "on request", as if
+        // the user had pressed `x`.
+        let binary = fake_agent("sup-left", "sleep 30");
+        let (layout, agent) = layout("sup-left");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("the run starts");
+        wait_for("the run to be live", || {
+            supervisor.state("scribe").is_live()
+        });
+        supervisor.stop_all(Duration::from_secs(3));
+        match supervisor.state("scribe") {
+            State::Finished { reason, .. } => {
+                let reason = reason.expect("a reason is recorded");
+                assert!(reason.contains("UI was closed"), "{reason}");
+            }
+            other => panic!("expected a finished state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unfinished_run_is_reported_for_removal_and_switch_guards() {
+        // W-2's guard reads this: a waiting start is unfinished too, so removing its
+        // agent could not leave the record behind.
+        let binary = fake_agent("sup-unfinished", "sleep 30");
+        let (layout, agent) = layout("sup-unfinished");
+        let mut supervisor = supervisor(&layout, binary, 10, Duration::from_secs(30));
+        let first = supervisor
+            .start(&agent, &RunModel::default(), Vec::new())
+            .expect("the first start");
+        assert!(matches!(first, StartDisposition::Started { .. }));
+        wait_for("the run to be known", || {
+            supervisor.unfinished_run("scribe").is_some()
+        });
+        supervisor.stop_all(Duration::from_secs(2));
+        assert!(supervisor.unfinished_run("scribe").is_none());
+    }
 
     /// Write a fake agent process and return its path.
     ///

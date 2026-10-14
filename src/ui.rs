@@ -361,7 +361,16 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
                             "not there yet — press e to write it; the file holds only the guidance line"
                                 .to_owned()
                         } else {
-                            format!("{bytes} bytes")
+                            // What a run sends, not only what is on disk: the
+                            // guidance line is dropped, and the two numbers differ
+                            // (P-4).
+                            match app.instruction_payload() {
+                                Some((on_disk, sent)) if on_disk != sent => format!(
+                                    "{on_disk} bytes on disk; a run sends {sent} — the guidance line is dropped"
+                                ),
+                                Some((on_disk, _)) => format!("{on_disk} bytes"),
+                                None => format!("{bytes} bytes"),
+                            }
                         },
                     ));
                     // An interrupted editor leaves its unsaved buffer beside the file;
@@ -482,21 +491,34 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     lines.push(Line::from(Span::styled(
-        "A role is which Forgejo account the check acts as: `c` checks the configured role, `C` checks the administrator token when one is present. An identity is the account an agent's own commits are authored by; `i` creates or records it.",
+        ROLE_EXPLANATION,
         Style::new().fg(Color::DarkGray),
     )));
     lines.push(Line::from(""));
 
+    let mut repo_window: Option<(usize, usize, usize)> = None;
     match &app.role_check {
         None => lines.push(placeholder(
             "no role check has been run yet — press c to list what the configured token can see",
         )),
-        Some(Err(failure)) => lines.push(Line::from(Span::styled(
-            format!("role check failed ({}): {}", failure.class, failure.message),
-            Style::new().fg(Color::Red),
-        ))),
+        Some(Err(failure)) => {
+            // P-7: a refusal names the URL the user configured, not only the API path,
+            // so a mistyped path connects to what was typed.
+            let at = app
+                .config
+                .as_ref()
+                .map(|config| config.forgejo.url.clone())
+                .unwrap_or_else(|| "the configured address".to_owned());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "role check failed ({}) at {at}: {}",
+                    failure.class, failure.message
+                ),
+                Style::new().fg(Color::Red),
+            )))
+        }
         Some(Ok(check)) => {
-            lines.push(Line::from(format!(
+            let summary = format!(
                 "{} — {}",
                 if check.administrative() {
                     "administrative view"
@@ -504,30 +526,52 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                     "ordinary view"
                 },
                 check.summary()
-            )));
+            );
+            lines.push(Line::from(summary.clone()));
             lines.push(Line::from(""));
             if check.repositories.is_empty() {
                 lines.push(Line::from(
                     "the token can see no repository on this instance",
                 ));
-            }
-            for (at, repository) in check.repositories.iter().enumerate() {
-                let style = if at == app.repo_selected {
-                    Style::new().fg(Color::Black).bg(Color::Cyan)
-                } else {
-                    Style::new()
-                };
-                // The selected row is marked in text as well as colour: a monochrome
-                // capture, or a person who cannot tell the colours apart, still sees
-                // which repository `g` and `P` will act on.
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "{} {}",
-                        if at == app.repo_selected { '>' } else { ' ' },
-                        repository.line()
-                    ),
-                    style,
-                )));
+            } else {
+                // The repository list takes the Agents/Runs rule, not a rule of its
+                // own: the window is chosen so the selected repository is always
+                // drawn, and the panel title says which rows are on show. Before
+                // this, at 80x24 a repository was dropped with no range and no
+                // `more`, and the selection walked onto the undrawn row (W-1).
+                let inner = area.width.saturating_sub(2) as usize;
+                let content_height = area.height.saturating_sub(2) as usize;
+                let used_before = lines.len()
+                    + wrapped_rows(ROLE_EXPLANATION, inner).saturating_sub(1)
+                    + wrapped_rows(&summary, inner).saturating_sub(1);
+                let capacity = content_height.saturating_sub(used_before).max(1);
+                let total = check.repositories.len();
+                let (first, shown) = visible_window(total, app.repo_selected, capacity);
+                for (at, repository) in check
+                    .repositories
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(shown)
+                {
+                    let style = if at == app.repo_selected {
+                        Style::new().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::new()
+                    };
+                    // The selected row is marked in text as well as colour: a
+                    // monochrome capture, or a person who cannot tell the colours
+                    // apart, still sees which repository `g` and `P` will act on.
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} {}",
+                            if at == app.repo_selected { '>' } else { ' ' },
+                            repository.line()
+                        ),
+                        style,
+                    )));
+                }
+                repo_window = Some((first, shown, total));
             }
         }
     }
@@ -547,12 +591,57 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
         "c check the role   C check it as the administrator token   v set the agent's own token   A set the administrator token   i settle the agent's identity   up/down choose a repository   g clone it into the agent's workspace   P open a pull request as the agent   U update the newest one",
         Style::new().fg(Color::DarkGray),
     )));
+    let mut title = " Forgejo connection and role check ".to_owned();
+    if let Some((first, shown, total)) = repo_window {
+        if total > shown {
+            title = format!(
+                " Forgejo connection and role check —{}",
+                list_title("repositories", first, shown, total)
+            );
+        }
+    }
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(" Forgejo connection and role check "))
+            .block(Block::bordered().title(title))
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// The one sentence that explains what a role is and what an identity is.
+///
+/// It is a constant because the repository window has to measure it: the rows this
+/// sentence wraps onto are rows the repository list cannot use (W-1).
+const ROLE_EXPLANATION: &str = "A role is which Forgejo account the check acts as: `c` checks the configured role, `C` checks the administrator token when one is present. An identity is the account an agent's own commits are authored by; `i` creates or records it.";
+
+/// How many rows a single plain string needs when a panel wraps at `width`.
+///
+/// The repository window needs to know how much of the panel the text above it
+/// takes. This is the same greedy, word-boundary wrapping the panel uses; it is used
+/// only to *reserve* rows, so a small underestimate costs a list row, never a
+/// silent one — the window and the title still agree.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut current = 0usize;
+    for word in text.split(' ') {
+        let len = word.chars().count();
+        if current == 0 {
+            current = len;
+        } else if current + 1 + len <= width {
+            current += 1 + len;
+        } else {
+            rows += 1;
+            current = len;
+        }
+        while current > width {
+            rows += 1;
+            current -= width;
+        }
+    }
+    rows
 }
 
 /// Where the credentials file is, and the mode it has.
@@ -621,7 +710,9 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     let capacity = parts[0].height.saturating_sub(3) as usize;
     let (first, shown) = visible_window(app.recent.len(), app.run_selected, capacity);
 
-    let header = Row::new(["", "agent", "run", "started", "outcome"]).style(
+    // The start time is written in RFC 3339 UTC on disk; saying so in the header is
+    // what stops it reading as a wrongly-set wall clock (W-4).
+    let header = Row::new(["", "agent", "run", "started (UTC)", "outcome"]).style(
         Style::new()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -832,9 +923,9 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     let Some(form) = &app.add_agent else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height.saturating_sub(2));
+    let height = (NewAgentForm::FIELDS.len() as u16 + 10).min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -862,8 +953,15 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     ];
     for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
         let value = &form.fields[at];
+        // A masked value says how much it holds: the mask alone is the same block of
+        // stars whether a paste landed once or twice (P-2).
         let shown = if *secret {
-            "*".repeat(value.chars().count())
+            let count = value.chars().count();
+            if count == 0 {
+                String::new()
+            } else {
+                format!("{} ({count} characters, hidden)", "*".repeat(count.min(12)))
+            }
         } else {
             value.clone()
         };
@@ -889,8 +987,11 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::DarkGray),
         ))),
     }
+    // The action line lives in the title as well as the body: at 80x24 the intro
+    // prose pushes the body's last line off, and the key that submits the form must
+    // never be the line that disappears (P-3).
     let block = Block::bordered()
-        .title(" add an agent ")
+        .title(" add an agent — enter writes it, esc cancels ")
         .border_style(Style::new().fg(Color::Cyan));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -905,9 +1006,9 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     let Some(prompt) = &app.secret_prompt else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = 8.min(screen.height.saturating_sub(2));
+    let height = 8.min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -918,7 +1019,17 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
-    let shown = "*".repeat(prompt.value.chars().count());
+    let count = prompt.value.chars().count();
+    // The count, not the value: a person pasting a long token can see how much was
+    // kept without the product ever printing the secret (P-2).
+    let shown = if count == 0 {
+        String::new()
+    } else {
+        format!(
+            "{} ({count} characters, hidden)",
+            "*".repeat(count.min(12))
+        )
+    };
     let mut lines: Vec<Line> = vec![
         Line::from(format!(
             "The {} is written to the credentials file and never shown.",
@@ -957,9 +1068,9 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     let Some(name) = &app.confirm_remove else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = 7.min(screen.height.saturating_sub(2));
+    let height = 7.min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1018,10 +1129,10 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     let Some(action) = &app.editor_confirm else {
         return;
     };
-    let screen = frame.area();
+    let screen = overlay_area(frame.area());
     let program = crate::editor::editor();
     let width = (screen.width.saturating_sub(2)).min(74);
-    let height = 7.min(screen.height.saturating_sub(2));
+    let height = 7.min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1071,10 +1182,19 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
 
 /// The key-reference overlay: every key, in groups, one line each.
 fn draw_help(frame: &mut Frame, app: &App) {
-    let _ = app;
     let screen = frame.area();
     let width = (screen.width.saturating_sub(2)).min(80);
-    let height = (HELP_LINES.len() as u16 + 3).min(screen.height.saturating_sub(2));
+    // The help is a list, so it takes the list rule: a window it can scroll, and a
+    // title that says the range. Every logical line is given room for two wrapped
+    // rows, so a windowed line is never the line that clips (P-6).
+    let capacity = (screen.height.saturating_sub(4) as usize / 2)
+        .max(1)
+        .min(HELP_LINES.len());
+    let total = HELP_LINES.len();
+    let max_first = total.saturating_sub(capacity);
+    let first = app.help_offset.min(max_first);
+    let shown = capacity.min(total - first);
+    let height = (shown as u16 * 2 + 2).min(screen.height);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -1085,9 +1205,17 @@ fn draw_help(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
-    let lines: Vec<Line> = HELP_LINES.iter().map(|line| Line::from(*line)).collect();
+    let lines: Vec<Line> = HELP_LINES[first..first + shown]
+        .iter()
+        .map(|line| Line::from(*line))
+        .collect();
+    let title = if total > shown {
+        format!(" keys {} ", list_title("", first, shown, total).trim())
+    } else {
+        " keys ".to_owned()
+    };
     let block = Block::bordered()
-        .title(" keys ")
+        .title(title)
         .border_style(Style::new().fg(Color::Cyan));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1127,7 +1255,10 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         height: screen.height.saturating_sub(8),
     };
     let width = (available.width.saturating_sub(2)).min(78);
-    let height = (risk::LINES.len() as u16 + 9).min(available.height.saturating_sub(2));
+    // Size to the content, not to a fixed guess: the record path is a wrapped line,
+    // and a modal that clips it ends the sentence without its object (W-7). The
+    // available area is already inset from the panel, so it is the cap.
+    let height = (risk::LINES.len() as u16 + 10).min(available.height);
     let popup = centered(available, width, height);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -1210,6 +1341,20 @@ fn list_title(base: &str, first: usize, shown: usize, total: usize) -> String {
         (false, false) => {}
     }
     format!(" {base} {extra} ")
+}
+
+/// The area an overlay may cover: the body, with the footer's status rows left free.
+///
+/// A modal that clears the status row silently hides the sentence that explains what
+/// just happened — a paste that kept only its first line, or why a form was refused.
+/// The footer is the product's voice; overlays do not cover it.
+fn overlay_area(screen: Rect) -> Rect {
+    Rect {
+        x: screen.x,
+        y: screen.y.saturating_add(3),
+        width: screen.width,
+        height: screen.height.saturating_sub(8),
+    }
 }
 
 /// A centered rectangle inside `area`, never larger than it.

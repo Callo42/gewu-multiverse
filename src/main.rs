@@ -16,7 +16,9 @@ use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -148,11 +150,18 @@ fn event_loop(screen: &mut Screen, app: &mut App) -> io::Result<()> {
             return Ok(());
         }
         if event::poll(TICK)? {
-            if let Event::Key(key) = event::read()? {
-                // A press is one press: do not act again when the key is released.
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key);
+            match event::read()? {
+                Event::Key(key) => {
+                    // A press is one press: do not act again when the key is released.
+                    if key.kind == KeyEventKind::Press {
+                        app.on_key(key);
+                    }
                 }
+                // The terminal frames a paste, so a one-line field can keep the first
+                // line without joining it to the next, and a repeated paste replaces
+                // instead of doubling (P-1, P-2).
+                Event::Paste(text) => app.on_paste(&text),
+                _ => {}
             }
         }
         // Editing a file or reading a log means leaving the UI for a moment and
@@ -203,7 +212,7 @@ impl Screen {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut out = io::stdout();
-        if let Err(error) = crossterm::execute!(out, EnterAlternateScreen) {
+        if let Err(error) = crossterm::execute!(out, EnterAlternateScreen, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -224,7 +233,11 @@ impl Screen {
             return Ok(());
         }
         disable_raw_mode()?;
-        crossterm::execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        crossterm::execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste
+        )?;
         self.terminal.show_cursor()?;
         Ok(())
     }
@@ -235,7 +248,11 @@ impl Screen {
             return Ok(());
         }
         enable_raw_mode()?;
-        crossterm::execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        crossterm::execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableBracketedPaste
+        )?;
         self.terminal.clear()
     }
 
@@ -246,7 +263,11 @@ impl Screen {
         }
         self.active = false;
         disable_raw_mode()?;
-        crossterm::execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        crossterm::execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste
+        )?;
         self.terminal.show_cursor()?;
         Ok(())
     }
