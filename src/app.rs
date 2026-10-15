@@ -993,6 +993,9 @@ impl App {
     /// The tests use this to put a small script in place of the real binary, so a
     /// screen test can watch a start without starting the program itself.
     pub fn with_runner(layout: Layout, binary: PathBuf) -> Self {
+        // O2: a hand-off killed with `SIGKILL` cannot remove its own scratch root; the
+        // next start of the product removes what a dead hand-off left.
+        crate::editor::sweep_stale_scratch();
         let credentials_path = layout.credentials_file();
         let ack_path = layout.acknowledgment_file();
         let supervisor = Supervisor::new(
@@ -1220,6 +1223,19 @@ impl App {
             if self.supervisor.state(&name) != State::Idle {
                 continue;
             }
+            let newest = self.recent.iter().find(|run| run.agent == name);
+            // W41-2: a fresh start read a present-but-unreadable transcript as `idle`
+            // — the word for "no run" — while the Runs screen said `unreadable`. The
+            // newest record for the agent is on disk and its error is known; the hub
+            // says the same word Runs does, and the note area gives the reason.
+            if let Some(reason) = newest.and_then(|run| run.read_error.clone()) {
+                let run_id = newest
+                    .map(|run| run.run_id.clone())
+                    .unwrap_or_default();
+                self.unreadable_run = Some((name.clone(), reason.clone()));
+                self.supervisor.note_unreadable(&name, run_id, reason);
+                continue;
+            }
             let Some(run) = self
                 .recent
                 .iter()
@@ -1302,6 +1318,51 @@ impl App {
         if self.run_selected >= self.recent.len() {
             self.run_selected = self.recent.len().saturating_sub(1);
         }
+    }
+
+    /// The supervisor's live state for one run, when this UI is watching it now.
+    ///
+    /// A live run is the only state the two screens can disagree about: the hub reads
+    /// the supervisor every frame, and the Runs list reads the records on a one-second
+    /// timer (Z-1). Matching on the run id keeps a later run of the same agent from
+    /// lending its state to an older row.
+    fn live_state_for(&self, run: &crate::run::RunSummary) -> Option<State> {
+        let state = self.supervisor.state(&run.agent);
+        if state.is_live() && state.run_id() == Some(run.run_id.as_str()) {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    /// The state word for one row of the Runs screen.
+    ///
+    /// A run this UI is watching right now takes the supervisor's own word — the
+    /// same `State::word()` the hub prints — so the two screens cannot say `running`
+    /// and `unknown start` about one run in flight (Z-1). A run the UI is not watching
+    /// (an earlier session's, or one that ended while the UI was away) takes its word
+    /// from its own record on disk.
+    pub fn run_state_word(&self, run: &crate::run::RunSummary) -> String {
+        match self.live_state_for(run) {
+            Some(state) => state.word(),
+            None => run.describe_at(crate::time::now_unix_ms()),
+        }
+    }
+
+    /// The start clock for one row of the Runs screen.
+    ///
+    /// A run in flight may not have written its opening transcript record yet, so the
+    /// record carries no start; its own id does, because the id is made from the
+    /// instant the supervisor made it. Reading it there means the row has a start
+    /// clock from the first frame, instead of `unknown start` beside a hub that
+    /// already counts seconds (Z-1).
+    pub fn run_started_text(&self, run: &crate::run::RunSummary) -> String {
+        if self.live_state_for(run).is_some() {
+            if let Some(ms) = crate::run::started_ms_from_run_id(&run.run_id) {
+                return crate::time::compact_utc(ms);
+            }
+        }
+        run.started_text()
     }
 
     /// Apply a freshly read configuration to the supervisor and the screens.
@@ -1739,7 +1800,7 @@ impl App {
                 self.reload();
                 self.status = match moved_address {
                     Some(previous) => format!(
-                        "created `{name}`: write its instruction with e, then press s to start it — the form also moved the Forgejo address from {previous} for every agent on this machine; u on the Forgejo screen edits it on its own"
+                        "created `{name}`: write its instruction with e, then press s to start it — the form also moved the Forgejo address from {previous} for every agent in this configuration; u on the Forgejo screen edits it on its own"
                     ),
                     None => format!(
                         "created `{name}`: write its instruction with e, then press s to start it"
@@ -2016,7 +2077,7 @@ impl App {
     /// The address was settable only by adding an agent, whose writer silently moved
     /// the **global** `[forgejo] url` for every agent that already existed. It has its
     /// own place now: `u` on the Forgejo screen, prefilled with the address in force,
-    /// and its own sentence saying that every agent on this machine follows it.
+    /// and its own sentence saying that every agent in this configuration follows it.
     pub fn request_url_edit(&mut self) {
         let Some(settings) = self.forgejo_settings() else {
             self.status = "the configuration could not be read, so the address cannot be edited"
@@ -2024,7 +2085,7 @@ impl App {
             return;
         };
         self.status =
-            "type the Forgejo address and press enter; it applies to every agent on this machine"
+            "type the Forgejo address and press enter; it applies to every agent in this configuration"
                 .to_owned();
         self.url_prompt = Some(UrlPrompt {
             value: settings.url,
@@ -2100,7 +2161,7 @@ impl App {
         self.role_check = None;
         self.repo_selected = 0;
         self.status = format!(
-            "the Forgejo address is now {url} — it applies to every agent on this machine; press c to check the role against it"
+            "the Forgejo address is now {url} — it applies to every agent in this configuration; press c to check the role against it"
         );
     }
 
@@ -3770,12 +3831,20 @@ impl App {
     }
 
     /// What the instruction screen needs to know about the instruction document.
-    pub fn instruction_summary(&self) -> Option<(PathBuf, bool, u64)> {
+    ///
+    /// Three cases, three answers (Z-3, W38-1's class): the file is there and
+    /// readable (with its size), it is **not there** (`not there yet`), or it is
+    /// there but cannot be read (a directory where a file was expected, a permission
+    /// denial, bytes that are not UTF-8) — and then the reason is carried so the
+    /// screen says `— the record could not be read: <reason>` instead of calling a
+    /// present file absent.
+    pub fn instruction_summary(&self) -> Option<(PathBuf, bool, u64, Option<String>)> {
         let paths = self.selected_paths()?;
         let path = paths.instruction().to_path_buf();
-        match std::fs::metadata(&path) {
-            Ok(metadata) => Some((path, metadata.is_file(), metadata.len())),
-            Err(_) => Some((path, false, 0)),
+        match read_foreign(&path) {
+            Ok(Some(bytes)) => Some((path, true, bytes.len() as u64, None)),
+            Ok(None) => Some((path, false, 0, None)),
+            Err(source) => Some((path, true, 0, Some(source.to_string()))),
         }
     }
 
@@ -3847,14 +3916,28 @@ impl App {
     }
 
     /// What the instruction screen needs to know about the declared steps file.
-    pub fn steps_summary(&self) -> Option<(PathBuf, bool, usize)> {
+    ///
+    /// The same three cases as the instruction document (Z-3): not there is `none`,
+    /// there but unreadable carries the reason, and a readable file is counted.
+    pub fn steps_summary(&self) -> Option<(PathBuf, bool, usize, Option<String>)> {
         let paths = self.selected_paths()?;
         let path = paths.steps_file().to_path_buf();
-        let exists = path.is_file();
-        let count = crate::run::RunPlan::read_steps(&path)
-            .map(|steps| steps.len())
-            .unwrap_or(0);
-        Some((path, exists, count))
+        match read_foreign(&path) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => {
+                    let count = crate::run::parse_steps(&text).len();
+                    Some((path, true, count, None))
+                }
+                Err(source) => Some((
+                    path,
+                    true,
+                    0,
+                    Some(format!("the file is not valid UTF-8: {source}")),
+                )),
+            },
+            Ok(None) => Some((path, false, 0, None)),
+            Err(source) => Some((path, true, 0, Some(source.to_string()))),
+        }
     }
 
     /// Read every live process and the run records, at most once a second for the
@@ -4604,6 +4687,22 @@ fn foreign_path(text: &str, live: &str) -> Option<String> {
         .map(|token| token.trim_end_matches(['.', ',', ';', ':', ')']))
         .find(|token| token.starts_with('/') && *token != live)
         .map(str::to_owned)
+}
+
+/// Read a file the product did not write, keeping "not there" apart from "there but
+/// unreadable" (Z-3, W38-1's class).
+///
+/// `Ok(None)` means only `ENOENT`: there is no file. A directory where a file was
+/// expected, a permission denial, a broken symlink and any other failure are `Err`,
+/// so a screen can say the file could not be read instead of calling it absent. This
+/// is the single-file sibling of [`crate::transcript::read_checked`], which does the
+/// same for a run's transcript.
+fn read_foreign(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source),
+    }
 }
 
 /// Write a hand-off's template, creating the directories a skill needs.
