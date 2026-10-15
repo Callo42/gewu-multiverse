@@ -85,6 +85,17 @@ pub enum State {
         /// How long it has been running, in milliseconds.
         elapsed_ms: u64,
     },
+    /// The newest run record of this agent is there but could not be read.
+    ///
+    /// This is not `idle`: `idle` is the word for "no run", and pretending a record
+    /// the product cannot read is the same as no record is the class W38-1/W41-2
+    /// names. The word is the Runs row's own [`crate::run::UNREADABLE_WORD`].
+    Unreadable {
+        /// The run's identity.
+        run_id: String,
+        /// Why the record could not be read, for the note area.
+        reason: String,
+    },
     /// The last run of this agent is over.
     Finished {
         /// The run's identity.
@@ -112,10 +123,11 @@ impl State {
             State::Idle => "idle".to_owned(),
             State::Waiting { position, .. } => format!("waiting ({position} in line)"),
             State::Starting { .. } => "starting".to_owned(),
-            State::Running { elapsed_ms, .. } => format!("running ({}s)", elapsed_ms / 1000),
+            State::Running { elapsed_ms, .. } => crate::run::running_word(*elapsed_ms),
             State::Stopping { elapsed_ms, .. } => {
                 format!("stopping ({}s)", elapsed_ms / 1000)
             }
+            State::Unreadable { .. } => crate::run::UNREADABLE_WORD.to_owned(),
             State::Finished { outcome, .. } => {
                 // One word for one outcome, on every screen (W39-2): the hub prints the
                 // outcome's own word, the same string the Runs screen reads from
@@ -173,6 +185,7 @@ impl State {
             | State::Starting { run_id, .. }
             | State::Running { run_id, .. }
             | State::Stopping { run_id, .. }
+            | State::Unreadable { run_id, .. }
             | State::Finished { run_id, .. } => Some(run_id),
         }
     }
@@ -746,6 +759,16 @@ impl Supervisor {
     /// about what was recorded (T-5). The caller has already checked the record list.
     pub fn forget_state(&mut self, name: &str) {
         self.states.remove(name);
+    }
+
+    /// Put a present-but-unreadable record on the hub's state column.
+    ///
+    /// W41-2: a fresh start left the state `idle` (the word for no run) while the
+    /// Runs screen said `unreadable`. The record is on disk; its error is known; the
+    /// hub says the same word Runs does.
+    pub fn note_unreadable(&mut self, name: &str, run_id: String, reason: String) {
+        self.states
+            .insert(name.to_owned(), State::Unreadable { run_id, reason });
     }
 
     /// Seed the screens with the newest terminal record of one agent.
@@ -1817,7 +1840,10 @@ mod tests {
                 State::Starting { .. } | State::Running { .. } => true,
                 State::Finished { .. } => true,
                 State::Waiting { .. } => false,
-                State::Idle | State::Stopping { .. } | State::Unavailable { .. } => false,
+                State::Idle
+                | State::Stopping { .. }
+                | State::Unavailable { .. }
+                | State::Unreadable { .. } => false,
             }
         });
         assert_eq!(supervisor.running_count(), 1);

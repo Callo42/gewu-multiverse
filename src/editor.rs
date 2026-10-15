@@ -12,6 +12,7 @@
 
 use std::env;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -114,22 +115,34 @@ fn program_name(program: &str) -> &str {
 ///
 /// A program told to keep its state under `$XDG_DATA_HOME` writes there instead of
 /// in the person's `HOME`; the directory is removed when the hand-off is over, so
-/// nothing is left behind anywhere (F7).
+/// nothing is left behind anywhere (F7). It is created with the product's one
+/// custody, `0700`, and a hand-off that is `SIGKILL`ed cannot run its own cleanup, so
+/// every hand-off first sweeps the stale roots a dead process left (O2).
 struct Scratch {
     dir: PathBuf,
 }
 
+/// The prefix every hand-off scratch root carries under the system temporary
+/// directory, and the mark that separates the owning process's id from the instant.
+const SCRATCH_PREFIX: &str = "gewu-multiverse-handoff-";
+
 impl Scratch {
     fn make() -> io::Result<Self> {
+        sweep_stale_scratch();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "gewu-multiverse-handoff-{}-{nanos}",
+            "{SCRATCH_PREFIX}{}-{nanos}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir)?;
+        // `create_dir_all` makes the directory with the process umask (`0775` here),
+        // not the `0700` every other directory the product makes is held to. The
+        // scratch holds a program's own state, so it gets the same custody (O2).
+        std::fs::DirBuilder::new()
+            .mode(crate::mode::PRIVATE_DIR_MODE)
+            .create(&dir)?;
         Ok(Self { dir })
     }
 }
@@ -137,6 +150,39 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Remove scratch roots a hand-off that was killed could not remove itself.
+///
+/// The name carries the owning process's id, so a root whose process is no longer
+/// alive is a dead hand-off's and is removed. A root whose process is alive belongs
+/// to a hand-off still running (this one or a sibling UI) and is left alone. A pid
+/// the operating system has since reused makes the sweep skip a dead root until that
+/// process ends; the next hand-off then removes it. Errors are ignored: the sweep is
+/// custody, not a screen.
+pub fn sweep_stale_scratch() {
+    let root = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(SCRATCH_PREFIX) else {
+            continue;
+        };
+        let Some((pid, _instant)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if !crate::supervisor::process_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 
@@ -285,5 +331,37 @@ mod tests {
             .status()
             .expect("the shell runs");
         assert!(status.success());
+    }
+
+    #[test]
+    fn the_hand_off_scratch_root_is_private_and_a_dead_one_is_swept() {
+        // O2: the scratch root the product makes under the system temporary directory
+        // was created with the process umask (`0775` here), not the `0700` every other
+        // directory the product makes is held to, and a hand-off killed with SIGKILL
+        // could not run its `Drop`, so it was left behind.
+        let scratch = Scratch::make().expect("a scratch root");
+        assert_eq!(
+            crate::mode::mode_of(&scratch.dir).expect("the scratch mode"),
+            crate::mode::PRIVATE_DIR_MODE,
+            "the scratch root does not carry the product's custody"
+        );
+
+        // A hand-off whose process is gone: the next hand-off removes it.
+        let mut child = Command::new("true").spawn().expect("a throwaway child");
+        let dead_pid = child.id();
+        let _ = child.wait();
+        let stale = std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{dead_pid}-1"));
+        std::fs::create_dir_all(&stale).expect("a stale scratch root");
+        crate::mode::set_mode(&stale, 0o775).expect("the stale mode is set");
+        sweep_stale_scratch();
+        assert!(
+            !stale.exists(),
+            "a hand-off that cannot run its own cleanup left its root behind"
+        );
+
+        // A root whose process is alive is not swept.
+        let live = Scratch::make().expect("a live scratch root");
+        sweep_stale_scratch();
+        assert!(live.dir.is_dir(), "a live hand-off's root was swept");
     }
 }

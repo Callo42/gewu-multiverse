@@ -151,9 +151,16 @@ impl AckState {
 fn machine_clause(machine: Option<&str>) -> String {
     match machine.map(str::trim).filter(|mark| !mark.is_empty()) {
         Some(mark) => match crate::machine::relation(mark) {
-            crate::machine::Relation::Here => "recorded on this machine".to_owned(),
+            // O3: the record belongs to the configuration directory, and a directory
+            // copied to a second person on this machine carries the first person's
+            // confirmation with it. The clause names the configuration as the thing
+            // that was confirmed, and the machine it was made on beside it, so a
+            // second person can tell the record is not theirs.
+            crate::machine::Relation::Here => {
+                "this configuration's record was made on this machine".to_owned()
+            }
             crate::machine::Relation::Elsewhere => format!(
-                "recorded on another machine ({mark}) — this machine has not recorded a confirmation"
+                "this configuration's record was made on another machine ({mark}) — this machine has not recorded a confirmation"
             ),
             crate::machine::Relation::Unnamed | crate::machine::Relation::Undecidable => {
                 "the record does not name the machine it was made on".to_owned()
@@ -278,6 +285,32 @@ mod tests {
         );
         // A missing record has no line to draw.
         assert!(AckState::Missing.record_line().is_none());
+    }
+
+    #[test]
+    fn the_record_names_the_configuration_it_belongs_to() {
+        // O3: a configuration directory copied to a second person on the same machine
+        // read `recorded on this machine`, so the second person could not tell that a
+        // different person agreed. The clause now names the configuration as the thing
+        // the record belongs to, and the machine it was made on beside it.
+        if let Some(mark) = crate::machine::mark() {
+            let clause = machine_clause(Some(&mark));
+            assert!(
+                clause.contains("this configuration's record was made on this machine"),
+                "{clause}"
+            );
+        }
+        let elsewhere = machine_clause(Some("another-host-abc123"));
+        assert!(
+            elsewhere.contains("this configuration's record was made on another machine"),
+            "{elsewhere}"
+        );
+        assert!(
+            elsewhere.contains("this machine has not recorded a confirmation"),
+            "{elsewhere}"
+        );
+        // A record that names no machine still says so, rather than claiming one.
+        assert!(machine_clause(None).contains("does not name the machine"));
     }
 
     #[test]
