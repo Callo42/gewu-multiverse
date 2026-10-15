@@ -900,15 +900,20 @@ pub struct App {
     /// and on a screen whose content is not a list the arrows and page keys move it
     /// too, so no key is swallowed in silence.
     pub panel_scroll: usize,
-    /// The agent whose cached outcome was dropped on the last reload because its run
-    /// record is gone (Y-4). While set, the hub says so and does not call an older
-    /// record "the last run".
-    pub forgotten_run: Option<String>,
-    /// The agent (and the reason) whose run record is present but cannot be read.
+    /// The agents whose cached outcome was dropped on the last reload because its run
+    /// record is gone (Y-4). While an agent is listed, the hub says so and does not
+    /// call an older record "the last run".
+    ///
+    /// A collection, not a single slot: a reason belongs to the row it names, so the
+    /// hub must be able to name every row whose history changed (w45 F3's one rule).
+    pub forgotten_runs: Vec<String>,
+    /// The agents (and the reason) whose run record is present but cannot be read.
     ///
     /// A record that is not there is `forgotten`; a record that is there but
     /// unreadable is **not** the same fact, and the hub says which one it is (W38-1).
-    pub unreadable_run: Option<(String, String)>,
+    /// One entry per named row, so the unreadable reason shares the one rule with
+    /// every other run reason: it is drawn for its row (w45 F3).
+    pub unreadable_runs: Vec<(String, String)>,
     /// A line about the freshly written sample configuration, when one was written.
     pub config_note: Option<String>,
     /// The screen on show.
@@ -1036,8 +1041,8 @@ impl App {
             confirm_quit: None,
             help_offset: 0,
             panel_scroll: 0,
-            forgotten_run: None,
-            unreadable_run: None,
+            forgotten_runs: Vec::new(),
+            unreadable_runs: Vec::new(),
             config_note: None,
             screen: Screen::Agents,
             selected: 0,
@@ -1207,15 +1212,15 @@ impl App {
             .map(|agent| agent.name.clone())
             .collect();
         // This pass is the one place that can notice a record the hub had is gone.
-        self.forgotten_run = None;
-        self.unreadable_run = None;
+        self.forgotten_runs.clear();
+        self.unreadable_runs.clear();
         for name in names {
             // U2's sibling: a state the supervisor already holds as `Unreadable`
             // (from this session, or from a previous `reload`) must put the reason
-            // back on the screen. Clearing `unreadable_run` at the top of this pass
+            // back on the screen. Clearing `unreadable_runs` at the top of this pass
             // and never re-deriving it left the hub word without its note after `r`.
             if let State::Unreadable { reason, .. } = self.supervisor.state(&name) {
-                self.unreadable_run = Some((name.clone(), reason));
+                self.unreadable_runs.push((name.clone(), reason));
                 continue;
             }
             // An outcome whose record is gone is dropped before seeding, so `r` after
@@ -1234,11 +1239,11 @@ impl App {
                         self.supervisor.forget_state(&name);
                         // Say so once, and never let the next-oldest record pass
                         // silently for "the last run" (Y-4).
-                        self.forgotten_run = Some(name.clone());
+                        self.forgotten_runs.push(name.clone());
                     }
                     Err(source) => {
                         self.supervisor.forget_state(&name);
-                        self.unreadable_run = Some((name.clone(), source.to_string()));
+                        self.unreadable_runs.push((name.clone(), source.to_string()));
                     }
                 }
             }
@@ -1254,7 +1259,7 @@ impl App {
                 let run_id = newest
                     .map(|run| run.run_id.clone())
                     .unwrap_or_default();
-                self.unreadable_run = Some((name.clone(), reason.clone()));
+                self.unreadable_runs.push((name.clone(), reason.clone()));
                 self.supervisor.note_unreadable(&name, run_id, reason);
                 continue;
             }
@@ -1675,6 +1680,12 @@ impl App {
             if crate::version::is_newer(app_version, crate::version::running()) {
                 parts.push("the record was made by a newer version than this build".to_owned());
             }
+        }
+        // w45 F2: after a `HOME` is moved, the Elsewhere clause says what the product
+        // knows and what it does not — and this says what to do about it, so the
+        // sentence does not leave a person unsure whether anything can be done.
+        if let Some(action) = self.ack_state.elsewhere_action(&self.ack_path) {
+            parts.push(action);
         }
         // C-4: the landing screen says what the record is and is not, in one clause.
         // The full limit and the digest check are in the review overlay (`R`), where
@@ -2390,6 +2401,28 @@ impl App {
                     _ => None,
                 }),
         }
+    }
+
+    /// The unreadable reason for one agent's newest record, if the hub holds one.
+    ///
+    /// w45 F3: the hub draws one rule for reasons — a reason is named for the row it
+    /// belongs to, not for whatever is selected. This accessor answers for **any**
+    /// agent, so the note area can loop over the rows; the unreadable reason is not a
+    /// special case any more.
+    pub fn unreadable_reason(&self, name: &str) -> Option<String> {
+        self.unreadable_runs
+            .iter()
+            .find(|(agent, _)| agent == name)
+            .map(|(_, reason)| reason.clone())
+            .or_else(|| match self.supervisor.state(name) {
+                State::Unreadable { reason, .. } => Some(reason),
+                _ => None,
+            })
+    }
+
+    /// Whether the hub knows a record it had for this agent is gone (Y-4).
+    pub fn record_forgotten(&self, name: &str) -> bool {
+        self.forgotten_runs.iter().any(|agent| agent == name)
     }
 
     /// A run record's reason, read against the configuration as it is now.
@@ -4715,10 +4748,59 @@ impl App {
             }
             // A press that cannot act must not be silent: say so, and name the way to
             // the full list. Silence reads as a frozen program.
+            //
+            // w44 F1: a written procedure told a person to press `u` on the Agents
+            // screen, where `u` is not bound; the product answered `no key is bound to
+            // that`, which is true but names no route, while `u` does set the address
+            // on the Forgejo screen. When the key is bound somewhere else, the
+            // sentence names that screen, so the next step is on the screen instead of
+            // in a runbook.
             _ => {
-                self.status = "no key is bound to that — press ? for the list".to_owned();
+                self.status = match key_elsewhere(key.code) {
+                    Some(home) => format!(
+                        "no key is bound to that on this screen — {home}; press ? for the list"
+                    ),
+                    None => "no key is bound to that — press ? for the list".to_owned(),
+                };
             }
         }
+    }
+}
+
+/// Where a key that is unbound on the screen on show does act.
+///
+/// Most keys are global (start, stop, remove, edit, the screen numbers, the panel
+/// keys). A few are deliberately local to one screen, and a person who presses one of
+/// them elsewhere used to be told only that no key is bound — never where it lives
+/// (w44 F1, a runbook step that told them to press `u` on the Agents screen). This
+/// table is the binding table's own shadow: every local binding is listed here with
+/// the sentence the refusal draws, so the sentence cannot name a screen that does not
+/// bind the key. The help overlay carries the same reach in its own headings, and the
+/// footer legend lists only keys that act on every screen.
+fn key_elsewhere(code: KeyCode) -> Option<&'static str> {
+    match code {
+        KeyCode::Char('u') => {
+            Some("`u` sets the Forgejo instance address on the Forgejo screen (4)")
+        }
+        KeyCode::Char('v') => {
+            Some("`v` sets the agent's own Forgejo token on the Forgejo screen (4)")
+        }
+        KeyCode::Char('P') => {
+            Some("`P` opens a pull request on the Forgejo screen (4)")
+        }
+        KeyCode::Char('U') => {
+            Some("`U` updates the newest pull request on the Forgejo screen (4)")
+        }
+        KeyCode::Char('f') => {
+            Some("`f` sets the role token on the Credentials screen (5)")
+        }
+        KeyCode::Char('D') => {
+            Some("`D` deletes the leftover secrets of removed agents on the Credentials screen (5)")
+        }
+        KeyCode::Char('A') => Some(
+            "`A` sets the administrator token on the Credentials screen (5) or the Forgejo screen (4)",
+        ),
+        _ => None,
     }
 }
 
@@ -5958,7 +6040,7 @@ role = "member"
         );
         // Y-4: the hub knows a record it had is gone, so it can say so instead of
         // silently promoting an older record to "the last run".
-        assert_eq!(app.forgotten_run.as_deref(), Some("one"));
+        assert!(app.forgotten_runs.contains(&"one".to_owned()));
         app.shutdown();
     }
 

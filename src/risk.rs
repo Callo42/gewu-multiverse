@@ -20,7 +20,18 @@ use sha2::{Digest, Sha256};
 use crate::mode::{SECRET_FILE_MODE, set_mode};
 
 /// The heading of the acknowledgment screen.
+///
+/// It is also the first line of the terms text the digest covers, so it is never
+/// changed for the review's sake.
 pub const TITLE: &str = "Before the first agent runs";
+
+/// The heading of the **read-only review** (`R`) when a record already exists.
+///
+/// w44 F3: the review kept `Before the first agent runs` while the record was on file
+/// and an agent existed, so the overlay described a state the person was not in. The
+/// review is the terms that were acknowledged, read back; this names that state.
+/// It is the overlay's title only — [`terms_text`] keeps [`TITLE`].
+pub const REVIEW_TITLE: &str = "The terms you acknowledged — read-only";
 
 /// What a record can and cannot prove, stated where the record is read (C-4).
 ///
@@ -229,6 +240,34 @@ impl AckState {
             }
         })
     }
+
+    /// What to do about an acknowledgment record made on another machine (w45 F2).
+    ///
+    /// The [`machine_clause`] sentence says what the product knows (the record names
+    /// another machine) and what it does not (this machine has recorded no
+    /// confirmation), but after moving a `HOME` a person was left unsure whether
+    /// anything could be done. This names the consequence — starting here is still
+    /// allowed under that record — and the one action that makes this machine's own
+    /// record: remove the record file and start again, which shows the acknowledgment
+    /// once more. `None` in every other relation, so the sentence is added only where
+    /// it is true.
+    #[must_use]
+    pub fn elsewhere_action(&self, record_path: &Path) -> Option<String> {
+        let AckState::Recorded { machine, .. } = self else {
+            return None;
+        };
+        let mark = machine
+            .as_deref()
+            .map(str::trim)
+            .filter(|mark| !mark.is_empty())?;
+        if crate::machine::relation(mark) != crate::machine::Relation::Elsewhere {
+            return None;
+        }
+        Some(format!(
+            "starting an agent here is still allowed under that record; to record this machine's own confirmation, remove {} and start again",
+            record_path.display()
+        ))
+    }
 }
 
 /// How the record's machine relates to this one, as a clause for a sentence.
@@ -379,6 +418,53 @@ mod tests {
         );
         // A missing record has no line to draw.
         assert!(AckState::Missing.record_line().is_none());
+    }
+
+    #[test]
+    fn the_review_title_is_the_overlays_not_the_terms_text() {
+        // w44 F3 added a title for the read-only review; the terms text the digest is
+        // computed over must not move with it, or every existing record would read as
+        // "the terms text has changed".
+        assert_ne!(TITLE, REVIEW_TITLE);
+        let text = terms_text();
+        assert!(text.starts_with(TITLE), "{text}");
+        assert!(
+            !text.contains(REVIEW_TITLE),
+            "the review title is inside the digested terms text: {text}"
+        );
+    }
+
+    #[test]
+    fn a_record_from_another_machine_names_the_way_back() {
+        // w45 F2: the Elsewhere clause says what is known and what is not; the action
+        // says what to do about it. No host in this test reads as the foreign mark.
+        let state = AckState::Recorded {
+            acknowledged_at_unix: 1_700_000_000,
+            app_version: "0.1.22".to_owned(),
+            machine: Some("gewu-other-host/0000000000000000000000000000abcd".to_owned()),
+            terms_digest: None,
+        };
+        if crate::machine::mark().is_none() {
+            return;
+        }
+        let action = state
+            .elsewhere_action(Path::new("/somewhere/risk-acknowledgment.toml"))
+            .expect("a foreign record has an action");
+        assert!(action.contains("still allowed"), "{action}");
+        assert!(
+            action.contains("/somewhere/risk-acknowledgment.toml") && action.contains("start again"),
+            "{action}"
+        );
+        // A record with no machine has no move to explain, and says nothing extra.
+        let unnamed = AckState::Recorded {
+            acknowledged_at_unix: 1_700_000_000,
+            app_version: "0.1.22".to_owned(),
+            machine: None,
+            terms_digest: None,
+        };
+        assert!(unnamed
+            .elsewhere_action(Path::new("/x/risk-acknowledgment.toml"))
+            .is_none());
     }
 
     #[test]
