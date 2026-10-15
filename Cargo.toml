@@ -1,6 +1,6 @@
 [package]
 name = "gewu-multiverse"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 rust-version = "1.85"
 description = "A local, single-Universe Matrixverse: one Forgejo, the agents you define, and a terminal UI."
