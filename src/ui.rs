@@ -1073,7 +1073,7 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     match &app.credentials_error {
         None => lines.push(Line::from(
-            "The file is created with mode 0600 if it is absent, and held to 0600 if it is wider.",
+            "The file is created with mode 0600 if it is absent, and held back to 0600 whenever the product re-reads the file; a file widened while the product is running is refused in the meantime.",
         )),
         Some(error) => lines.push(Line::from(Span::styled(
             format!("the credentials file is not ready: {error}"),
