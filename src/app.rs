@@ -871,6 +871,10 @@ pub struct App {
     pub probe: Option<Probe>,
     /// The result of the last role check, if any.
     pub role_check: Option<Result<RoleCheck, ForgejoFailure>>,
+    /// When the last role check ran, in unix milliseconds (S-2's stamp).
+    pub role_checked_at_ms: Option<u64>,
+    /// The machine the last role check ran on, when the mark can be read.
+    pub role_check_machine: Option<String>,
     /// Which repository the Forgejo screen has selected.
     pub repo_selected: usize,
     /// The result of the last identity action, if any.
@@ -963,6 +967,8 @@ impl App {
             persisted_endpoint_tests: Vec::new(),
             probe: None,
             role_check: None,
+            role_checked_at_ms: None,
+            role_check_machine: None,
             repo_selected: 0,
             identity_report: None,
             workspace_note: None,
@@ -2534,8 +2540,23 @@ impl App {
         }
     }
 
+    /// The stamp for the role check's result, so a view cannot read as current forever
+    /// (S-2).
+    pub fn role_check_stamp(&self) -> Option<String> {
+        let at = self.role_checked_at_ms?;
+        Some(match &self.role_check_machine {
+            Some(mark) => format!("checked {} on {mark}", tested_age(at)),
+            None => format!(
+                "checked {}; this machine's own name cannot be read",
+                tested_age(at)
+            ),
+        })
+    }
+
     /// Apply the role check's result, in the sentence the Forgejo screen made before.
     fn apply_role_check(&mut self, url: String, result: Result<RoleCheck, ForgejoFailure>) {
+        self.role_checked_at_ms = Some(crate::time::now_unix_ms());
+        self.role_check_machine = crate::machine::mark();
         self.status = match &result {
             Ok(check) => format!("role check: {}", check.summary()),
             // The configured URL leads the refusal: a mistyped path is the common
@@ -2564,6 +2585,8 @@ impl App {
         match result {
             Ok(check) => {
                 self.role_check = Some(Ok(check));
+                self.role_checked_at_ms = Some(crate::time::now_unix_ms());
+                self.role_check_machine = crate::machine::mark();
                 self.repo_selected = 0;
             }
             Err(failure) => {
@@ -2573,9 +2596,13 @@ impl App {
                     failure.class, failure.message
                 );
                 if keep {
+                    // The kept view keeps its own stamp: the failed check is about the
+                    // administrator token, not the view on screen.
                     self.forgejo_note = Some(message);
                 } else {
                     self.role_check = Some(Err(failure));
+                    self.role_checked_at_ms = Some(crate::time::now_unix_ms());
+                    self.role_check_machine = crate::machine::mark();
                     self.repo_selected = 0;
                 }
             }
