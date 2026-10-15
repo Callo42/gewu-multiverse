@@ -988,22 +988,27 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
         )),
         Some(Err(failure)) => {
             // P-7: a refusal names the URL the user configured, not only the API path,
-            // so a mistyped path connects to what was typed.
+            // so a mistyped path connects to what was typed. S-2: the refusal carries
+            // the stamp of when and where it was made.
             let at = app
                 .config
                 .as_ref()
                 .map(|config| config.forgejo.url.clone())
                 .unwrap_or_else(|| "the configured address".to_owned());
-            head.push(Line::from(Span::styled(
-                format!(
+            let line = match app.role_check_stamp() {
+                Some(stamp) => format!(
+                    "role check failed ({}) at {at}: {} — {stamp}",
+                    failure.class, failure.message
+                ),
+                None => format!(
                     "role check failed ({}) at {at}: {}",
                     failure.class, failure.message
                 ),
-                Style::new().fg(Color::Red),
-            )));
+            };
+            head.push(Line::from(Span::styled(line, Style::new().fg(Color::Red))));
         }
         Some(Ok(check)) => {
-            let summary = format!(
+            let mut summary = format!(
                 "{} — {}",
                 if check.administrative() {
                     "administrative view"
@@ -1012,6 +1017,9 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                 },
                 check.summary()
             );
+            if let Some(stamp) = app.role_check_stamp() {
+                summary = format!("{summary} — {stamp}");
+            }
             head.push(Line::from(summary));
             head.push(Line::from(""));
             if check.repositories.is_empty() {
