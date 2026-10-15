@@ -315,6 +315,41 @@ fn the_runs_screen_lists_a_recorded_run_with_its_outcome() {
 }
 
 #[test]
+fn a_run_outcome_is_not_clipped_at_the_advertised_floor() {
+    // T-3: at 72x18 the Runs outcome cell was cut mid-value (`succeeded, 0`) with no
+    // marker, while the run-id cell in the same row was shortened with an ellipsis.
+    // The outcome keeps its room at the floor, so no cell ends mid-value.
+    let root = scratch("runs-floor");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_id = new_run_id(1);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 4321, "/w"))
+        .expect("a record is appended");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            1234,
+            None,
+        ))
+        .expect("a record is appended");
+    app.refresh_recent();
+    app.show(Screen::Runs);
+    for (width, height) in [(72u16, 18u16), (80u16, 24u16)] {
+        let screen = render_at(width, height, &app);
+        assert!(
+            screen.contains("succeeded, 1.2s"),
+            "the outcome is clipped at {width}x{height}: {screen}"
+        );
+    }
+}
+
+#[test]
 fn the_forgejo_screen_shows_the_configured_url_and_role_and_claims_no_check() {
     let root = scratch("forgejo");
     let mut app = app(&root);

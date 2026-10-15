@@ -112,7 +112,7 @@ pub enum CredentialsError {
     },
     /// The file is still reachable by other users after being restricted.
     #[error(
-        "{path} has mode {found} and could not be held to mode {wanted}; secrets in it are readable by others, so it is refused"
+        "{path} has mode {found}, not the {wanted} a credentials file must have; secrets in it are readable by others, so it is refused until the product holds it back"
     )]
     WiderThanAllowed {
         /// The file with the wrong mode.

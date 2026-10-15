@@ -1073,7 +1073,7 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     match &app.credentials_error {
         None => lines.push(Line::from(
-            "The file is created with mode 0600 if it is absent, and held to 0600 if it is wider.",
+            "The file is created with mode 0600 if it is absent, and held back to 0600 whenever the product re-reads the file; a file widened while the product is running is refused in the meantime.",
         )),
         Some(error) => lines.push(Line::from(Span::styled(
             format!("the credentials file is not ready: {error}"),
@@ -1139,8 +1139,12 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     // The same name column as the hub: a run's agent is a configured name, and it is
     // never clipped into a neighbour without a marker (P-2).
     const RUN_ID: usize = 22;
+    const RUN_ID_MIN: usize = 10;
     const STARTED: usize = 20;
-    const OUTCOME_MIN: usize = 12;
+    // `succeeded, 0.0s` is fifteen columns. The outcome column keeps room for it at
+    // the advertised floor, taking the room from the run-id column (which is already
+    // shortened with a marker) rather than ending mid-value at the box edge (T-3).
+    const OUTCOME_MIN: usize = 16;
     let inner = (area.width as usize).saturating_sub(2);
     let available = inner.saturating_sub(4);
     let names: Vec<&str> = app.recent.iter().map(|run| run.agent.as_str()).collect();
@@ -1148,9 +1152,12 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(2 + RUN_ID + STARTED + OUTCOME_MIN)
         .max(NAME_COLUMN_MIN);
     let name_w = name_column_width(&names, name_budget);
-    let outcome_w = available
-        .saturating_sub(2 + name_w + RUN_ID + STARTED)
-        .max(OUTCOME_MIN.min(available));
+    // The five columns sum to exactly `available`, so the table never overflows its
+    // panel and ratatui never clips the last column without a marker.
+    let run_id_w = RUN_ID
+        .min(available.saturating_sub(2 + name_w + STARTED + OUTCOME_MIN))
+        .max(RUN_ID_MIN.min(available));
+    let outcome_w = available.saturating_sub(2 + name_w + run_id_w + STARTED);
 
     // The start time is written in RFC 3339 UTC on disk; saying so in the header is
     // what stops it reading as a wrongly-set wall clock (W-4).
@@ -1176,9 +1183,9 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(if at == app.run_selected { ">" } else { " " }),
                 Cell::from(ellipsise(&run.agent, name_w)),
-                Cell::from(ellipsise(&run.run_id, 20)),
+                Cell::from(ellipsise(&run.run_id, run_id_w)),
                 Cell::from(run.started_text()),
-                Cell::from(run.describe()),
+                Cell::from(ellipsise(&run.describe(), outcome_w)),
             ])
             .style(style)
         })
@@ -1186,7 +1193,7 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     let widths = [
         Constraint::Length(2),
         Constraint::Length(name_w as u16),
-        Constraint::Length(RUN_ID as u16),
+        Constraint::Length(run_id_w as u16),
         Constraint::Length(STARTED as u16),
         Constraint::Length(outcome_w as u16),
     ];
