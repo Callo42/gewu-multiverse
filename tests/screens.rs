@@ -1812,6 +1812,7 @@ fn the_runs_note_area_keeps_the_reason_and_both_offers_at_eighty_columns() {
         ),
         duration_ms: Some(17_400),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        read_error: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -1932,6 +1933,7 @@ fn a_stored_transport_reason_is_shown_in_the_product_words() {
         ),
         duration_ms: Some(0),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        read_error: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -2072,6 +2074,7 @@ fn the_runs_note_leaves_the_list_more_than_one_row_at_eighty_columns() {
                 reason: Some("the model call failed (transport): the endpoint refused the connection".to_owned()),
                 duration_ms: Some(1_000 + index),
                 started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+                read_error: None,
                 log: run_dir.join("run.log"),
                 dir: run_dir,
             }
@@ -2110,6 +2113,7 @@ fn a_record_the_hub_had_that_is_gone_is_named_and_not_called_the_last_run() {
         reason: Some("the endpoint refused the connection".to_owned()),
         duration_ms: Some(120),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        read_error: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -2148,6 +2152,7 @@ fn a_missing_model_key_reason_reads_as_the_products_own_key_on_every_screen() {
         reason: Some(reason),
         duration_ms: Some(0),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+        read_error: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -2727,8 +2732,152 @@ fn the_runs_list_and_the_footer_count_say_when_they_stop_at_fifty() {
         "the older records are not named: {screen}"
     );
     assert!(
-        screen.contains("50+ finished"),
+        screen.contains("50+ ended"),
         "the footer count presents the cap as exact: {screen}"
+    );
+}
+
+#[test]
+fn the_runs_window_title_names_the_total_the_list_counts() {
+    // W39-1: `recent runs a–b of 50` used the fifty-record cap as if it were the list
+    // total, understating a sixty-record history while every sibling windowed list's
+    // `of N` is the collection total. The title names the on-disk total; the note
+    // carries the cap.
+    let root = scratch("runs-title-total");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    seed_runs(&root, "scribe", 60, 0);
+    app.reload();
+    app.show(Screen::Runs);
+    let screen = render_at(100, 30, &app);
+    assert!(
+        screen.contains("recent runs") && screen.contains("of 60"),
+        "the title does not name the on-disk total:\n{screen}"
+    );
+    assert!(
+        !screen.contains("of 50"),
+        "the title still presents the cap as the total:\n{screen}"
+    );
+}
+
+#[test]
+fn file_fates_get_one_wording_on_both_screens() {
+    // W38-3: a deleted transcript read `(size unknown)` on Runs and `gone` on the
+    // Agent screen — two words for one missing file. W38-1: a transcript present but
+    // unreadable read `no terminal record` while its file was still advertised at a
+    // normal size. Both screens now use the same three-case wording: present (size),
+    // gone, or present but unreadable with the reason.
+    let root = scratch("file-fates");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let run_id = new_run_id(1);
+    let run_dir = root.join("state").join("scribe").join(&run_id);
+    fs::create_dir_all(&run_dir).expect("the run directory is created");
+    let mut transcript = Transcript::open(&run_dir).expect("a transcript is opened");
+    transcript
+        .append(&Record::run_started(&run_id, "scribe", 42, "/w"))
+        .expect("a record");
+    transcript
+        .append(&Record::run_finished(
+            &run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            100,
+            None,
+        ))
+        .expect("a record");
+    fs::write(run_dir.join("run.log"), b"a log\n").expect("the log is written");
+
+    // (1) Present and readable: the note names the transcript; neither `gone` nor an
+    // error is drawn.
+    app.reload();
+    app.show(Screen::Runs);
+    app.run_selected = 0;
+    let runs = render_at(100, 30, &app);
+    assert!(
+        runs.contains("the transcript is at") && runs.contains("transcript.jsonl"),
+        "the present transcript is not named:\n{runs}"
+    );
+    assert!(
+        !runs.contains("gone, the record has no transcript"),
+        "a present transcript is reported as gone:\n{runs}"
+    );
+
+    // (2) Present but unreadable: the Runs row says so, the note gives the reason,
+    // and the Agent screen agrees instead of showing the size as if it were fine.
+    fs::write(run_dir.join("transcript.jsonl"), b"not a record\n")
+        .expect("the transcript is corrupted");
+    app.reload();
+    app.show(Screen::Runs);
+    app.run_selected = 0;
+    let runs = render_at(100, 30, &app);
+    assert!(
+        runs.contains("unreadable"),
+        "the Runs row does not say the record is unreadable:\n{runs}"
+    );
+    assert!(
+        runs.contains("could not be read"),
+        "the Runs note does not give the reason:\n{runs}"
+    );
+    app.show(Screen::AgentConfig);
+    let agent = render_at(100, 40, &app);
+    assert!(
+        agent.contains("could not be read"),
+        "the Agent screen does not say the record is unreadable:\n{agent}"
+    );
+
+    // (3) Gone: deleted, and both screens use the same word for the same fact.
+    fs::remove_file(run_dir.join("transcript.jsonl")).expect("the transcript is deleted");
+    app.reload();
+    app.show(Screen::Runs);
+    app.run_selected = 0;
+    let runs = render_at(100, 30, &app);
+    assert!(
+        runs.contains("gone, the record has no transcript"),
+        "the Runs note does not use the Agent screen's word:\n{runs}"
+    );
+    assert!(
+        !runs.contains("size unknown"),
+        "the Runs note still says `size unknown`:\n{runs}"
+    );
+    app.show(Screen::AgentConfig);
+    let agent = render_at(100, 40, &app);
+    assert!(
+        agent.contains("gone, the record has no transcript"),
+        "the two screens disagree about the deleted transcript:\n{agent}"
+    );
+}
+
+#[test]
+fn a_record_the_hub_had_is_named_before_the_standing_prose() {
+    // W38-2: the sentence about a record the hub had sat below the acknowledgment, the
+    // running line and the standing hazard prose, where a short note area could hide
+    // it. It is now the first note row, above the standing prose.
+    let root = scratch("forgotten-first");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.forgotten_run = Some("scribe".to_owned());
+    // A long configuration note stands in for the standing prose that used to lead.
+    app.config_note = Some(
+        "configuration read from /tmp/example/state: the configuration no longer lists an agent whose run was stopped; ".repeat(20),
+    );
+    app.show(Screen::Agents);
+    let screen = render_at(80, 24, &app);
+    assert!(
+        screen.contains("a run record the hub had for `scribe` is no longer there"),
+        "the sentence about the changed history is below the fold:\n{screen}"
+    );
+    // The sentence is the first note row: the line just above it is the bottom border
+    // of the agent list, so it is drawn before the standing prose that may overflow.
+    let lines: Vec<&str> = screen.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains("a run record the hub had for `scribe`"))
+        .expect("the sentence is on screen");
+    assert!(
+        at > 0 && lines[at - 1].starts_with('└'),
+        "the sentence is not the first note row: {:?}",
+        lines.get(at - 1)
     );
 }
 
@@ -2833,6 +2982,7 @@ fn the_unconfigured_sentence_separates_the_count_from_the_listed_marker() {
         reason: None,
         duration_ms: Some(100),
         started_at: Some("2026-10-15T00:00:00Z".to_owned()),
+        read_error: None,
         log: PathBuf::new(),
         dir: PathBuf::new(),
     };

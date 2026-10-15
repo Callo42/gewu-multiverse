@@ -900,6 +900,11 @@ pub struct App {
     /// record is gone (Y-4). While set, the hub says so and does not call an older
     /// record "the last run".
     pub forgotten_run: Option<String>,
+    /// The agent (and the reason) whose run record is present but cannot be read.
+    ///
+    /// A record that is not there is `forgotten`; a record that is there but
+    /// unreadable is **not** the same fact, and the hub says which one it is (W38-1).
+    pub unreadable_run: Option<(String, String)>,
     /// A line about the freshly written sample configuration, when one was written.
     pub config_note: Option<String>,
     /// The screen on show.
@@ -1024,6 +1029,7 @@ impl App {
             help_offset: 0,
             panel_scroll: 0,
             forgotten_run: None,
+            unreadable_run: None,
             config_note: None,
             screen: Screen::Agents,
             selected: 0,
@@ -1142,6 +1148,11 @@ impl App {
         self.clamp_selection();
         self.refresh_recent();
         self.reconcile_abandoned_runs();
+        // The reconciliation writes terminal records for abandoned runs; read them
+        // back before seeding, so the hub and the Runs list cannot disagree for the
+        // first second after a reopen about whether an abandoned run is still running
+        // (O1).
+        self.refresh_recent();
         self.seed_states_from_records();
         self.status = self.reload_status();
         self.stop_unconfigured_runs();
@@ -1180,6 +1191,7 @@ impl App {
             .collect();
         // This pass is the one place that can notice a record the hub had is gone.
         self.forgotten_run = None;
+        self.unreadable_run = None;
         for name in names {
             // An outcome whose record is gone is dropped before seeding, so `r` after
             // deleting the run records puts the hub back in step with the ledger
@@ -1187,13 +1199,22 @@ impl App {
             if let State::Finished { run_id, .. } = self.supervisor.state(&name) {
                 // The run's own record is the truth, on disk and now: the in-memory
                 // list may predate a terminal record written by the reconciliation
-                // just above. A record that is gone takes its cached outcome with it.
+                // just above. A record that is gone takes its cached outcome with it;
+                // a record that is present but unreadable is a different fact, and the
+                // hub names it instead of pretending the run never ended (W38-1).
                 let dir = self.layout.state_root().join(&name).join(&run_id);
-                if crate::transcript::terminal_record(&dir).is_none() {
-                    self.supervisor.forget_state(&name);
-                    // Say so once, and never let the next-oldest record pass silently
-                    // for "the last run" (Y-4).
-                    self.forgotten_run = Some(name.clone());
+                match crate::transcript::terminal_record_checked(&dir) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        self.supervisor.forget_state(&name);
+                        // Say so once, and never let the next-oldest record pass
+                        // silently for "the last run" (Y-4).
+                        self.forgotten_run = Some(name.clone());
+                    }
+                    Err(source) => {
+                        self.supervisor.forget_state(&name);
+                        self.unreadable_run = Some((name.clone(), source.to_string()));
+                    }
                 }
             }
             if self.supervisor.state(&name) != State::Idle {
@@ -3595,6 +3616,14 @@ impl App {
             .map(|run| run.dir.clone())
     }
 
+    /// The newest run summary for one agent, when the list holds one.
+    ///
+    /// A screen that must say *why* a file cannot be shown — gone, or present but
+    /// unreadable — reads the run summary rather than the path alone (W38-1).
+    pub fn latest_run(&self, name: &str) -> Option<&RunSummary> {
+        self.recent.iter().find(|run| run.agent == name)
+    }
+
     /// The log file of the newest run of one agent, for a screen to name.
     pub fn latest_run_log(&self, name: &str) -> Option<PathBuf> {
         self.latest_run_dir(name)
@@ -5822,6 +5851,7 @@ role = "member"
             ),
             duration_ms: Some(0),
             started_at: None,
+            read_error: None,
             log: PathBuf::from("/l"),
             dir: PathBuf::from("/d"),
         };
@@ -5832,6 +5862,7 @@ role = "member"
             reason: Some("the model finished after 1 turn".to_owned()),
             duration_ms: Some(10),
             started_at: None,
+            read_error: None,
             log: PathBuf::from("/l"),
             dir: PathBuf::from("/d"),
         };
@@ -5910,6 +5941,7 @@ role = "member"
             reason: None,
             duration_ms: Some(1),
             started_at: None,
+            read_error: None,
             log: run_dir.join(crate::run::LOG_FILE),
             dir: run_dir,
         }];
@@ -5948,6 +5980,20 @@ role = "member"
         assert!(!state.is_live());
         assert_eq!(state.word(), "stopped");
         assert!(crate::transcript::terminal_record(&dir).is_some());
+        // O1: the hub seeds `stopped` while the Runs list used to keep reading the
+        // record it held before the reconciliation, so the two screens disagreed for a
+        // moment about whether the abandoned run was still running. Reading the records
+        // back after the reconciliation closes that window.
+        let newest = app
+            .recent
+            .iter()
+            .find(|run| run.agent == "one")
+            .expect("the run is listed");
+        assert_eq!(
+            newest.outcome,
+            Some(crate::run::RunOutcome::Stopped),
+            "the Runs list still says the abandoned run is running"
+        );
     }
 
     #[test]
@@ -6758,6 +6804,7 @@ concurrency = 3
             reason: None,
             duration_ms: None,
             started_at: Some("2026-10-15T00:00:00Z".to_owned()),
+            read_error: None,
             log: std::path::PathBuf::new(),
             dir: std::path::PathBuf::new(),
         }];
