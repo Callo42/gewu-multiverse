@@ -224,8 +224,8 @@ name records the revision it was built from:
 
 ```sh
 # 1. download the tarball and its checksum (replace the tag if you use another release)
-base=https://github.com/Callo42/gewu-multiverse/releases/download/v0.1.15
-name=gewu-multiverse-441b8108d89c-x86_64-linux.tar.gz
+base=https://github.com/Callo42/gewu-multiverse/releases/download/v0.1.16
+name=gewu-multiverse-b8b4651d8ade-x86_64-linux.tar.gz
 curl -LO "$base/$name"
 curl -LO "$base/$name.sha256"
 
