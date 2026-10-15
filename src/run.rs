@@ -211,6 +211,16 @@ impl RunOutcome {
             _ => None,
         }
     }
+
+    /// Whether the run went the way it was meant to.
+    ///
+    /// C-3: `succeeded` is the only outcome that is not something to explain. The
+    /// hub's note area names the reason for **every** other outcome, not only
+    /// `failed`, so `timed_out` and `stopped` are not left without their reason on
+    /// the landing screen.
+    pub fn is_success(self) -> bool {
+        matches!(self, RunOutcome::Succeeded)
+    }
 }
 
 /// One run, as the runs screen shows it: read from the records on disk.
@@ -280,10 +290,20 @@ impl RunSummary {
     /// The full record keeps its milliseconds and its `Z`; the table needs a form
     /// that is not clipped before the `Z`, so the clock on screen is never ambiguous
     /// (W-4).
+    ///
+    /// A run whose opening record cannot be read still has a start: the run id is
+    /// made from the instant the supervisor made it (`run::started_ms_from_run_id`).
+    /// C-2: `unknown start` was printed in the Runs `started (UTC)` column for a
+    /// present-but-unreadable record even though the id carried the instant the live
+    /// path already reads. The id is the last fallback before `unknown start`, which
+    /// is now reserved for an id that carries no clock at all.
     pub fn started_text(&self) -> String {
         match self.started_at.as_deref().and_then(crate::time::parse_rfc3339) {
             Some(start) => crate::time::compact_utc(start),
-            None => "unknown start".to_owned(),
+            None => match started_ms_from_run_id(&self.run_id) {
+                Some(ms) => crate::time::compact_utc(ms),
+                None => "unknown start".to_owned(),
+            },
         }
     }
 }
@@ -421,19 +441,58 @@ pub fn file_sentence(path: &Path, kind: &str, read_error: Option<&str>) -> Strin
     if let Some(reason) = read_error {
         return format!("{} — the record could not be read: {reason}", path.display());
     }
-    match fs::metadata(path) {
-        Ok(meta) => format!(
+    // U1: `fs::metadata` succeeds for a directory, so a `run.log` that is a
+    // directory was drawn as a readable file with a size (`4.0 KiB`) and `o` then
+    // said it "is not there yet". The directory case is answered by reading it (a
+    // directory answers `Is a directory (os error 21)`); a plain file that cannot be
+    // opened answers `Permission denied (os error 13)`; a readable file shows its
+    // size. One order, so no path is called readable before it is opened.
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return format!("{} — gone, the record has no {kind}", path.display());
+        }
+        Err(source) => return could_not_read(path, &source),
+    };
+    if meta.is_dir() {
+        return match fs::read(path) {
+            Err(source) => could_not_read(path, &source),
+            Ok(_) => format!(
+                "{} ({})",
+                path.display(),
+                crate::app::filesize_text(meta.len())
+            ),
+        };
+    }
+    match fs::File::open(path) {
+        Ok(_) => format!(
             "{} ({})",
             path.display(),
             crate::app::filesize_text(meta.len())
         ),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            format!("{} — gone, the record has no {kind}", path.display())
-        }
-        Err(source) => format!(
-            "{} — the record could not be read: {source}",
-            path.display()
-        ),
+        Err(source) => could_not_read(path, &source),
+    }
+}
+
+/// The one sentence for a path that is there but cannot be read, with the reason.
+///
+/// The wording the whole product uses for a present-but-unreadable file (W38-1,
+/// Z-3, U1): `— the record could not be read: <reason>`. Keeping it in one place is
+/// what stops a directory, a permission denial and a broken link being called three
+/// different things on three screens.
+pub fn could_not_read(path: &Path, source: &io::Error) -> String {
+    format!("{} — the record could not be read: {source}", path.display())
+}
+
+/// Whether a path is a regular, readable file — the one case in which the product
+/// can open it in a pager or show its size as content (U1).
+///
+/// `is_file()` alone is not enough: a directory passes `metadata` and a file the
+/// mode forbids reading passes `is_file`. The open decides it.
+pub fn is_readable_file(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => fs::File::open(path).is_ok(),
+        _ => false,
     }
 }
 
