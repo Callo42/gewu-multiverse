@@ -116,14 +116,12 @@ impl State {
             State::Stopping { elapsed_ms, .. } => {
                 format!("stopping ({}s)", elapsed_ms / 1000)
             }
-            State::Finished { outcome, .. } => match outcome {
-                // One word for one outcome, on every screen: the Runs screen says
-                // `succeeded`, so the hub must not say `exited 0` for the same event.
-                RunOutcome::Succeeded => "succeeded".to_owned(),
-                RunOutcome::Failed => "failed".to_owned(),
-                RunOutcome::Stopped => "stopped".to_owned(),
-                RunOutcome::TimedOut => "timed out".to_owned(),
-            },
+            State::Finished { outcome, .. } => {
+                // One word for one outcome, on every screen (W39-2): the hub prints the
+                // outcome's own word, the same string the Runs screen reads from
+                // `RunOutcome::as_str`, so `timed_out` cannot become `timed out` here.
+                outcome.as_str().to_owned()
+            }
             State::Unavailable { .. } => "state unknown".to_owned(),
         }
     }
