@@ -1755,7 +1755,14 @@ fn the_add_agent_form_draws_every_field_and_the_cursor_at_eighty_columns() {
         last.contains("> Forgejo role token"),
         "the cursor's own field is not drawn: {last}"
     );
-    assert!(last.contains("enlarge the window"), "{last}");
+    // LIB-1: the form declares its overflow with the same vocabulary every other
+    // bordered surface uses, fitted to the width. Walking to the last field scrolls
+    // the window, so the title names the direction (`↑ above`) and the short form of
+    // the declaration is what fits at 80 columns.
+    assert!(
+        last.contains("↑ above; more below") || last.contains("more below; enlarge the window"),
+        "the form does not declare its scrolled window: {last}"
+    );
 }
 
 #[test]
@@ -2903,8 +2910,14 @@ fn the_acknowledgment_modal_is_whole_or_declares_itself_at_the_floor() {
         "the review modal drops content in silence at the floor: {review}"
     );
     assert!(
-        review.contains("esc or any key — close this"),
+        review.contains("any key closes this; the record is unchanged"),
         "the review modal has no visible way out at the floor: {review}"
+    );
+    // V-2: the footer agrees with the body — `esc` is not the only key that closes it,
+    // so the surface and the footer no longer make two different claims.
+    assert!(
+        review.contains("any key closes this overlay; the record is unchanged"),
+        "the review modal's footer disagrees with its own close line: {review}"
     );
 }
 

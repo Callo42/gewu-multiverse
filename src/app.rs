@@ -13,7 +13,7 @@
 //!   put in [`App::take_action`] for the terminal loop to carry out, because the
 //!   loop is the part that can step out of the UI and put it back.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -352,6 +352,111 @@ impl EndpointTest {
     }
 }
 
+/// One endpoint test as it is written down, so its stamp survives a restart and ages
+/// (LIB-2).
+///
+/// The record holds no secret: the agent's name, the endpoint and model that were
+/// tested, the result (a one-line summary or a failure class and message) and the
+/// time. It is written beside the acknowledgment record, under the same custody.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct EndpointTestRecord {
+    agent: String,
+    endpoint: String,
+    model: String,
+    tested_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answered: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed_message: Option<String>,
+}
+
+impl EndpointTestRecord {
+    fn of(test: &EndpointTest) -> Self {
+        let (answered, failed_class, failed_message) = match &test.result {
+            Ok(summary) => (Some(summary.clone()), None, None),
+            Err(failure) => (None, Some(failure.class.clone()), Some(failure.message.clone())),
+        };
+        Self {
+            agent: test.agent.clone(),
+            endpoint: test.endpoint.clone(),
+            model: test.model.clone(),
+            tested_at_ms: test.tested_at_ms,
+            answered,
+            failed_class,
+            failed_message,
+        }
+    }
+
+    fn into_test(self) -> EndpointTest {
+        let result = match (self.answered, self.failed_class, self.failed_message) {
+            (Some(summary), _, _) => Ok(summary),
+            (None, Some(class), message) => Err(EndpointFailure {
+                class,
+                message: message.unwrap_or_default(),
+            }),
+            // A record that carries neither a result nor a failure is not a usable
+            // test: it is surfaced as `unknown` and named on the screen, never drawn
+            // as if it were a real success or silently treated as no test at all.
+            (None, None, _) => Err(EndpointFailure {
+                class: "unknown".to_owned(),
+                message: "the stored result is not readable".to_owned(),
+            }),
+        };
+        EndpointTest {
+            agent: self.agent,
+            endpoint: self.endpoint,
+            model: self.model,
+            result,
+            tested_at_ms: self.tested_at_ms,
+        }
+    }
+}
+
+/// The shape of the endpoint-test record on disk.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct EndpointTestFile {
+    #[serde(default, rename = "tests")]
+    tests: Vec<EndpointTestRecord>,
+}
+
+/// Read the endpoint tests written beside the acknowledgment record.
+///
+/// A file that is missing, unreadable or unparsable is simply `no test is known`,
+/// never an error on a screen: the Agent screen says `not tested yet` for an agent
+/// with no record (LIB-2).
+pub fn read_endpoint_tests(path: &Path) -> Vec<EndpointTest> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(file) = toml::from_str::<EndpointTestFile>(&text) else {
+        return Vec::new();
+    };
+    file.tests.into_iter().map(EndpointTestRecord::into_test).collect()
+}
+
+/// Write one test into the record, replacing that agent's previous one.
+///
+/// The file is `0600` like every other file the product writes. A read problem is not
+/// fatal: the new test replaces what could not be read, so the record always holds the
+/// latest test for each agent.
+pub fn write_endpoint_test(path: &Path, test: &EndpointTest) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tests: Vec<EndpointTestRecord> = read_endpoint_tests(path)
+        .iter()
+        .map(EndpointTestRecord::of)
+        .collect();
+    tests.retain(|record| record.agent != test.agent);
+    tests.push(EndpointTestRecord::of(test));
+    tests.sort_by(|left, right| left.agent.cmp(&right.agent));
+    let text = toml::to_string(&EndpointTestFile { tests })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    crate::mode::write_private(path, text.as_bytes())
+}
+
 /// A byte count in the product's own words, so the file that grows with every run has
 /// a size a person can watch (L-3).
 ///
@@ -630,8 +735,14 @@ pub struct App {
     /// What every run record under the state root occupies, and how many belong to
     /// agents the configuration no longer lists (L-2, L-4).
     pub footprint: crate::run::RunFootprint,
-    /// The result of the last "test this endpoint" action, if any.
+    /// The result of the last "test this endpoint" action, if any, for this session.
     pub endpoint_test: Option<EndpointTest>,
+    /// The endpoint tests read back from the record beside the acknowledgment file.
+    ///
+    /// LIB-2: a test's stamp vanished at restart, so the Agent screen drew no field at
+    /// all. The record is what lets the stamp age across restarts; the session's own
+    /// test above wins for the agent it names so a fresh result is shown at once.
+    pub persisted_endpoint_tests: Vec<EndpointTest>,
     /// The result of the last role check, if any.
     pub role_check: Option<Result<RoleCheck, ForgejoFailure>>,
     /// Which repository the Forgejo screen has selected.
@@ -722,6 +833,7 @@ impl App {
             recent_total: 0,
             footprint: crate::run::RunFootprint::default(),
             endpoint_test: None,
+            persisted_endpoint_tests: Vec::new(),
             role_check: None,
             repo_selected: 0,
             identity_report: None,
@@ -799,6 +911,11 @@ impl App {
                     }
                 }
                 self.ack_state = AckState::read(&self.layout.acknowledgment_file());
+                // LIB-2: the endpoint tests are a fact the product learned, not a
+                // session's transient line. Read them back so the Agent screen can
+                // draw the stamp (and its age) after a restart.
+                self.persisted_endpoint_tests =
+                    read_endpoint_tests(&self.layout.endpoint_tests_file());
             }
             Err(error) => {
                 self.root_error = Some(error.to_string());
@@ -1962,13 +2079,46 @@ impl App {
             Err(_) => describe_endpoint_result(&result),
         };
         self.status = format!("endpoint test for `{}`: {short}", agent.name);
-        self.endpoint_test = Some(EndpointTest {
+        let test = EndpointTest {
             agent: agent.name,
             endpoint: agent.endpoint,
             model: agent.model,
             result,
             tested_at_ms: crate::time::now_unix_ms(),
-        });
+        };
+        // LIB-2: write the result down before showing it, so the stamp is a fact the
+        // next start can read (and age) instead of a session's line that vanishes with
+        // no note. A failure to save is said on the same status line rather than
+        // hidden: the person is told the result will not outlive the session.
+        match write_endpoint_test(&self.layout.endpoint_tests_file(), &test) {
+            Ok(()) => {
+                self.persisted_endpoint_tests =
+                    read_endpoint_tests(&self.layout.endpoint_tests_file());
+            }
+            Err(error) => {
+                self.status = format!(
+                    "{} — the result could not be saved for the next start: {error}",
+                    self.status
+                );
+            }
+        }
+        self.endpoint_test = Some(test);
+    }
+
+    /// The endpoint test the Agent screen knows for one agent.
+    ///
+    /// The session's own test wins for the agent it names, so a fresh result is shown
+    /// the moment it is made; otherwise the test read back from the record is used, so
+    /// a stamp survives a restart and ages (LIB-2).
+    pub fn endpoint_test_for(&self, agent: &str) -> Option<&EndpointTest> {
+        if let Some(test) = &self.endpoint_test {
+            if test.agent == agent {
+                return Some(test);
+            }
+        }
+        self.persisted_endpoint_tests
+            .iter()
+            .find(|test| test.agent == agent)
     }
 
     /// The Forgejo the configuration names, when the configuration was read.
@@ -2048,8 +2198,14 @@ impl App {
             }
             Ok(None) => Err(ForgejoFailure {
                 class: "missing_admin_token".to_owned(),
-                message: "the credentials file records no administrator token, so only the \
-                          configured role can be checked"
+                // V-1: the refusal a person acts on names the product's own key for the
+                // fix. The old sentence named the credentials file and no key, so the
+                // worst reading was to edit the file by hand — the class that had
+                // recurred four times. `A` on the Credentials screen is what writes
+                // `forgejo_admin_token`, and it is the same key the sibling
+                // `IdentityError::NoAdminToken` names.
+                message: "no administrator token is configured, so only the configured \
+                          role can be checked — press A on the Credentials screen to add one"
                     .to_owned(),
             }),
             Err(error) => Err(ForgejoFailure {
@@ -4535,6 +4691,101 @@ role = "member"
         assert!(!app.status.contains("credentials.toml"), "{}", app.status);
     }
 
+    /// Whether a refusal names something a person can act on: a product key, an exact
+    /// TOML section the file itself uses, or a concrete path to a file.
+    fn names_a_key_section_or_path(text: &str) -> bool {
+        if text.contains("press ") {
+            return true;
+        }
+        if text.contains('[') && text.contains(']') {
+            return true;
+        }
+        text.contains('/')
+            && (text.contains(".toml")
+                || text.contains(".md")
+                || text.contains(".jsonl")
+                || text.contains(".log"))
+    }
+
+    #[test]
+    fn every_secret_refusal_a_person_acts_on_names_the_key_section_or_path_to_act_on() {
+        // V-1 conformance guard.
+        //
+        // How it enumerates: it drives each refusal path through the built `App`
+        // (the same key a person presses), reads the sentence the product draws, and
+        // checks every one. It then reads the source embedded at compile time
+        // (`include_str!`, so the built binary carries the list) for every refusal
+        // class literal that concerns a secret and fails if one was not among the
+        // driven paths — so a new `missing_*`/`*_token` refusal cannot be added
+        // without a driven row and a sentence that names how to act.
+        let mut produced: Vec<(&str, String)> = Vec::new();
+
+        // `c`: no role token is recorded.
+        {
+            let mut app = app_with(GOOD);
+            app.on_key(key(KeyCode::Char('y')));
+            app.on_key(key(KeyCode::Char('c')));
+            produced.push(("c role token", app.status.clone()));
+        }
+        // `C`: no administrator token is recorded.
+        {
+            let mut app = app_with(GOOD);
+            app.on_key(key(KeyCode::Char('y')));
+            app.on_key(key(KeyCode::Char('C')));
+            produced.push(("C administrator token", app.status.clone()));
+        }
+        // `i`: no agent token and no administrator token.
+        {
+            let mut app = app_with(GOOD);
+            app.on_key(key(KeyCode::Char('y')));
+            app.on_key(key(KeyCode::Char('i')));
+            produced.push(("i agent token", app.status.clone()));
+        }
+        // `s`: no model key, with an instruction so the refusal is reached.
+        {
+            let mut app = app_with(GOOD);
+            app.on_key(key(KeyCode::Char('y')));
+            let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+            std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
+            app.on_key(key(KeyCode::Char('s')));
+            produced.push(("s model key", app.status.clone()));
+        }
+        // `p`: the endpoint test finds no model key.
+        {
+            let mut app = app_with(GOOD);
+            app.on_key(key(KeyCode::Char('y')));
+            app.on_key(key(KeyCode::Char('p')));
+            produced.push(("p endpoint test", app.status.clone()));
+        }
+
+        for (path, status) in &produced {
+            assert!(
+                names_a_key_section_or_path(status),
+                "V-1: the refusal from `{path}` names no key, section or path a person \
+                 can act on: {status}"
+            );
+        }
+
+        let source = include_str!("app.rs");
+        for (at, _) in source.match_indices("class: \"") {
+            let rest = &source[at + "class: \"".len()..];
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            let class = &rest[..end];
+            if !(class.contains("token") || class.starts_with("missing_")) {
+                continue;
+            }
+            assert!(
+                produced
+                    .iter()
+                    .any(|(_, status)| status.contains(&format!("({class})"))),
+                "V-1: the secret-refusal class `{class}` is declared in the source but no \
+                 driven path above produces it; add its path and make it name its key"
+            );
+        }
+    }
+
     #[test]
     fn a_failed_runs_reason_is_readable_from_the_agent() {
         // F-G: the reason lives on the screen, not only in a transient status.
@@ -4639,6 +4890,75 @@ role = "member"
             ..same
         };
         assert!(!test.is_current_for(&changed));
+    }
+
+    #[test]
+    fn an_endpoint_test_is_written_down_and_read_back() {
+        // LIB-2: the stamp was session-only, so after a restart the Agent screen drew
+        // no `endpoint test` field at all. The test is a file beside the
+        // acknowledgment record now, so the stamp survives and ages.
+        let root = scratch_root("endpoint-record");
+        let path = root.join("endpoint-tests.toml");
+        assert!(read_endpoint_tests(&path).is_empty(), "no file is no test");
+        let one = EndpointTest {
+            agent: "one".to_owned(),
+            endpoint: "https://m.example.org".to_owned(),
+            model: "m".to_owned(),
+            result: Ok("the endpoint answered: ok".to_owned()),
+            tested_at_ms: 1_700_000_000_000,
+        };
+        write_endpoint_test(&path, &one).expect("the test is written");
+        let two = EndpointTest {
+            agent: "two".to_owned(),
+            endpoint: "https://m.example.org".to_owned(),
+            model: "m".to_owned(),
+            result: Err(EndpointFailure {
+                class: "transport".to_owned(),
+                message: "the endpoint refused the connection".to_owned(),
+            }),
+            tested_at_ms: 1_700_000_001_000,
+        };
+        write_endpoint_test(&path, &two).expect("the second test is written");
+        let mut back = read_endpoint_tests(&path);
+        back.sort_by(|left, right| left.agent.cmp(&right.agent));
+        assert_eq!(back, vec![one.clone(), two.clone()]);
+        // Re-testing one agent replaces only its own record.
+        let retested = EndpointTest {
+            tested_at_ms: 1_700_000_002_000,
+            result: Ok("a fresh answer".to_owned()),
+            ..one.clone()
+        };
+        write_endpoint_test(&path, &retested).expect("the retest is written");
+        let mut back = read_endpoint_tests(&path);
+        back.sort_by(|left, right| left.agent.cmp(&right.agent));
+        assert_eq!(back, vec![retested, two]);
+        // A file the product writes is held to its one custody.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).expect("the record").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the endpoint record is not private");
+    }
+
+    #[test]
+    fn a_restart_draws_the_persisted_endpoint_test_instead_of_nothing() {
+        // LIB-2 at the screen: a test written in one run is the field the Agent screen
+        // draws in the next, and an agent with no test says `not tested yet`.
+        let root = scratch_root("endpoint-restart");
+        std::fs::write(root.join("config.toml"), GOOD).expect("the configuration");
+        write_endpoint_test(
+            &root.join("endpoint-tests.toml"),
+            &EndpointTest {
+                agent: "one".to_owned(),
+                endpoint: "https://m.example.org".to_owned(),
+                model: "m".to_owned(),
+                result: Ok("the endpoint answered: ok".to_owned()),
+                tested_at_ms: 1_700_000_000_000,
+            },
+        )
+        .expect("the test is written");
+        let app = App::with_runner(Layout::rooted_at(root), quiet_runner("endpoint-restart"));
+        let test = app.endpoint_test_for("one").expect("the record is read back");
+        assert!(test.result.is_ok());
+        assert!(app.endpoint_test_for("two").is_none());
     }
 
     #[test]

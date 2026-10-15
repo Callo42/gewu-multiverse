@@ -125,6 +125,12 @@ impl Layout {
         self.root.join("risk-acknowledgment.toml")
     }
 
+    /// The endpoint tests, one per agent, so a test's stamp survives a restart and
+    /// ages instead of vanishing with the session (LIB-2). It holds no secret.
+    pub fn endpoint_tests_file(&self) -> PathBuf {
+        self.root.join("endpoint-tests.toml")
+    }
+
     /// The directory holding one directory per agent.
     pub fn agents_dir(&self) -> PathBuf {
         self.root.join("agents")

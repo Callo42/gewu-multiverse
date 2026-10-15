@@ -54,7 +54,8 @@ Usage:
 
 Options:
     --config-dir <dir>   Put config.toml, credentials.toml, the first-run
-                         acknowledgment and each agent's agents/<name>/ directory
+                         acknowledgment, the endpoint-test record and each agent's
+                         agents/<name>/ directory
                          in <dir> instead of the user's own configuration
                          directory (~/.config/gewu-multiverse).
     --state-dir <dir>    Put run records in <dir> instead of the user's own state
