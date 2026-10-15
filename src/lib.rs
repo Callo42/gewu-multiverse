@@ -26,6 +26,8 @@
 //! - [`credentials`] — the credentials file, and the secrets it hands out;
 //! - [`risk`] — the first-run risk acknowledgment and its record;
 //! - [`time`] — the clock, and how an instant is written down;
+//! - [`version`] — the newest version that has opened the configuration, and how two
+//!   versions compare (U3);
 //! - [`transcript`] — the append-only record of a run;
 //! - [`run`] — a run's identity, its plan and its outcome;
 //! - [`model`] — the direct model client, and its error taxonomy;
@@ -65,6 +67,7 @@ pub mod systemd;
 pub mod time;
 pub mod transcript;
 pub mod ui;
+pub mod version;
 pub mod workspace;
 pub mod words;
 
