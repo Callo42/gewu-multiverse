@@ -241,24 +241,26 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
     // W38-2: the sentence about a record the hub had is the moment's fact. It is drawn
     // first, above the standing hazard and limits prose, so a short note area cannot
     // push the only explanation of a changed history below the fold.
-    if let Some(name) = app.selected_name() {
-        if let Some((agent, reason)) = app.unreadable_run.as_ref() {
-            if agent == &name {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "the newest run record of `{name}` is there but could not be read: {reason}; what is shown is what the records left on disk say"
-                    ),
-                    Style::new().fg(Color::Yellow),
-                )));
-            }
-        } else if app.forgotten_run.as_deref() == Some(name.as_str()) {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "a run record the hub had for `{name}` is no longer there; what is shown is what the records left on disk say"
-                ),
-                Style::new().fg(Color::Yellow),
-            )));
-        }
+    //
+    // U2: the reason follows the **row**, not the cursor. `unreadable` is on the row
+    // wherever the selection is, and the sentence names the agent, so an unselected
+    // unreadable row is not left with a word and no explanation. The same rule covers
+    // a record the hub had that is gone (W38-2): both are facts about a named agent,
+    // not about what is selected.
+    if let Some((agent, reason)) = app.unreadable_run.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "the newest run record of `{agent}` is there but could not be read: {reason}; what is shown is what the records left on disk say"
+            ),
+            Style::new().fg(Color::Yellow),
+        )));
+    } else if let Some(name) = app.forgotten_run.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "a run record the hub had for `{name}` is no longer there; what is shown is what the records left on disk say"
+            ),
+            Style::new().fg(Color::Yellow),
+        )));
     }
     if let Some(error) = &app.config_error {
         // The recovery key belongs with the error, not only in the legend that a short
@@ -292,8 +294,16 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             "The risk of running an agent is not acknowledged: starting one is refused.",
             Style::new().fg(Color::Yellow),
         )));
-    } else if let Some(record) = app.ack_state.record_line() {
+    } else if let Some(record) = app.ack_record_line() {
         lines.push(Line::from(Span::styled(record, Style::new().fg(Color::DarkGray))));
+    }
+    // U3: a build older than the configuration's own data must say so, not run it
+    // silently. Drawn high in the note area, above the standing prose.
+    if let Some(note) = app.version_mismatch_note() {
+        lines.push(Line::from(Span::styled(
+            note,
+            Style::new().fg(Color::Yellow),
+        )));
     }
     let waiting = app.supervisor.waiting_count();
     let waiting_noun = if waiting == 1 { "start" } else { "starts" };
@@ -400,6 +410,24 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     &app.reason_with_history(&agent.name, &reason),
                 ));
             }
+            // C-3, the same rule as the hub: a run that did not succeed names its
+            // reason where its outcome is shown. `last failure` above keeps the
+            // historical newest *failure* (and a start that never became a run); this
+            // names the newest terminal non-success whose outcome is not `failed`, so
+            // `timed_out` and `stopped` are not left as a word with no reason here
+            // either.
+            if let Some((outcome, reason)) = app.last_non_success_run(&agent.name) {
+                if outcome != RunOutcome::Failed {
+                    lines.push(field(
+                        "last run",
+                        &format!(
+                            "{} — {}",
+                            outcome.as_str(),
+                            app.reason_with_history(&agent.name, &reason)
+                        ),
+                    ));
+                }
+            }
             let mode = app.supervisor.mode(&agent.name);
             lines.push(field("supervision", &format!("{} ({})", mode.label(), mode.as_str())));
             if mode == Mode::Systemd {
@@ -447,7 +475,11 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             let newest_run = app.latest_run(&agent.name);
             let transcript_error = newest_run.and_then(|run| run.read_error.as_deref());
             match app.latest_run_log(&agent.name) {
-                Some(log) if log.is_file() => lines.push(field(
+                // U1: `is_file()` alone called a `run.log` that is a directory
+                // readable; the file must be openable before its size is drawn. A path
+                // that exists but cannot be read now carries the reason, the same
+                // sentence the Runs note uses, and `o` says the same thing.
+                Some(log) if crate::run::is_readable_file(&log) => lines.push(field(
                     "newest log",
                     &crate::run::file_sentence(&log, "log", None),
                 )),
@@ -456,10 +488,7 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                 // word is the same one the Runs note uses for the same missing file.
                 Some(log) => lines.push(field(
                     "newest log",
-                    &format!(
-                        "{}; press o to see what it says",
-                        crate::run::file_sentence(&log, "log", None)
-                    ),
+                    &crate::run::file_sentence(&log, "log", None),
                 )),
                 // W32-3: `no run yet` is a claim about the agent, and a person who
                 // copied the configuration to a second machine is not told that their
@@ -1587,6 +1616,14 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
                 app.run_state_word(run),
                 app.reason_with_history(&run.agent, reason)
             )));
+        } else if let Some(error) = run.read_error.as_deref() {
+            // C-2: the reason for an unreadable record is the read error, and it is
+            // known; it leads the note area here exactly as it does on the hub, so
+            // `outcome: unreadable` is not the whole sentence on this screen.
+            lines.push(Line::from(format!(
+                "outcome: {} — the record could not be read: {error}",
+                app.run_state_word(run)
+            )));
         } else {
             lines.push(Line::from(format!(
                 "outcome: {}",
@@ -2259,7 +2296,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::Red),
         ))),
         None => lines.push(Line::from(Span::styled(
-            "  tab/up/down between fields   ctrl-u clears the field   enter writes config.toml and credentials.toml   esc cancels",
+            "  tab/up/down or enter moves on   ctrl-s writes it from any field (enter writes it on the last)   esc cancels",
             Style::new().fg(Color::DarkGray),
         ))),
     }
@@ -2287,7 +2324,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     // phrase this form used to carry.
     let (title, _) = fit_title(
         popup.width as usize,
-        "add an agent — enter writes it, esc cancels",
+        "add an agent — ctrl-s writes it, esc cancels",
         None,
         None,
         above,
@@ -2780,9 +2817,21 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        if let Some(record) = app.ack_state.record_line() {
+        if let Some(record) = app.ack_record_line() {
             answer.push(Line::from(Span::styled(
                 format!("  {record}"),
+                Style::new().fg(Color::DarkGray),
+            )));
+        }
+        // C-4: the record is read here, so what it can and cannot prove is said here.
+        // The same sentence is in the hub's note area and the page map.
+        answer.push(Line::from(Span::styled(
+            format!("  {}", risk::RECORD_LIMIT),
+            Style::new().fg(Color::DarkGray),
+        )));
+        if let Some(check) = app.ack_state.terms_check() {
+            answer.push(Line::from(Span::styled(
+                format!("  {check}"),
                 Style::new().fg(Color::DarkGray),
             )));
         }

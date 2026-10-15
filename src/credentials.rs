@@ -243,7 +243,7 @@ impl CredentialsFile {
             path: path.to_path_buf(),
             source,
         })?;
-        if mode != SECRET_FILE_MODE {
+        if mode & !SECRET_FILE_MODE != 0 {
             return Err(CredentialsError::WiderThanAllowed {
                 path: path.to_path_buf(),
                 found: render(mode),
@@ -820,7 +820,11 @@ fn read_value(path: &Path) -> Result<toml::Value, CredentialsError> {
         path: path.to_path_buf(),
         source,
     })?;
-    if mode != SECRET_FILE_MODE {
+    // U1's class: only a mode **wider** than 0600 is a leak the sentence can name. A
+    // mode with no group/other bits (0400, 0000) keeps the secret from others; a 000
+    // file then fails the read below with its real reason instead of being told its
+    // secrets are readable when they are not.
+    if mode & !SECRET_FILE_MODE != 0 {
         return Err(CredentialsError::WiderThanAllowed {
             path: path.to_path_buf(),
             found: render(mode),

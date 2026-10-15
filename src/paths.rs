@@ -137,6 +137,13 @@ impl Layout {
         self.root.join("role-checks.toml")
     }
 
+    /// The newest version that has opened this configuration, written on every start
+    /// (U3). A record a newer build left is kept when an older build starts, so the
+    /// reverse of an upgrade says what it is. It holds no secret.
+    pub fn last_seen_file(&self) -> PathBuf {
+        self.root.join("last-seen.toml")
+    }
+
     /// The directory holding one directory per agent.
     pub fn agents_dir(&self) -> PathBuf {
         self.root.join("agents")
