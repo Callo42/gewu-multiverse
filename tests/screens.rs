@@ -119,6 +119,15 @@ fn render_at(width: u16, height: u16, app: &App) -> String {
     text
 }
 
+/// A screen's text with only its alphanumerics kept.
+///
+/// A wrapped logical line is drawn as several rows separated by the box border and a
+/// newline, so a plain substring test would miss it. Removing the separators lets the
+/// rows be read back as the one line they are.
+fn normalised(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
 /// Print a screen with a heading, so `--nocapture` reads as a transcript.
 fn show(label: &str, app: &App) {
     println!("===== {label} =====");
@@ -1696,6 +1705,92 @@ fn every_panel_and_note_area_that_truncates_declares_it_at_eighty_columns() {
         agents.contains("… more below; enlarge the window"),
         "{agents}"
     );
+
+    // W36-1: the drop case. Declaring is not enough — a logical line taller than the
+    // body must be drawn row by row so every row is reachable, not dropped and
+    // declared. This drives every wrapped row of the Agent panel to the top of its
+    // window at 72×18; a row the row window cannot show fails here.
+    app.show(Screen::AgentConfig);
+    render_at(72, 18, &app);
+    let rows = gewu_multiverse::ui::panel_rows_text(&app);
+    for (index, row) in rows.iter().enumerate() {
+        let needle = normalised(row);
+        if needle.is_empty() {
+            continue;
+        }
+        app.panel_scroll = index;
+        let screen = normalised(&render_at(72, 18, &app));
+        assert!(
+            screen.contains(&needle),
+            "a wrapped row is dropped unreachably at 72×18: {row:?}"
+        );
+    }
+}
+
+#[test]
+fn nothing_a_panel_holds_is_dropped_unreachably_at_the_advertised_floor() {
+    // W36-1 (the class): the Credentials `present` list was one joined logical line;
+    // with many secrets it wrapped to more rows than the panel body at 72×18, so
+    // `fit_panel_lines` dropped it from the bottom and no `[`/`]` offset could bring
+    // it back. The floor rule is fits / wraps whole / declares — never silently
+    // drops. This drives every surface at 72×18, scrolls it from its top to its end,
+    // and requires every logical line the surface holds to be drawn at some offset.
+    let root = scratch("floor-drops");
+    let mut config = String::from(
+        "[forgejo]\nurl = \"https://forgejo.example.org\"\nrole = \"member\"\n\n\
+         [limits]\nrun_timeout_secs = 30\nmax_concurrent_agents = 2\n",
+    );
+    for index in 0..12 {
+        config.push_str(&format!(
+            "\n[[agents]]\nname = \"agent-{index:02}\"\nmodel = \"model-{index:02}\"\n\
+             endpoint = \"https://model.example.org/v1\"\n\
+             instruction = \"agents/agent-{index:02}/instruction.md\"\nconcurrency = 1\n"
+        ));
+    }
+    let mut app = app_with_config(&root, &config);
+    app.show_acknowledgment = false;
+    // Many model keys make the `present` list long — the exact state W36-1 found.
+    for index in 0..12 {
+        app.selected = index;
+        app.request_secret(SecretTarget::ModelKey);
+        app.on_paste("throwaway-value");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+    }
+    // A little run history, so the Runs note carries a footprint and rows.
+    seed_runs(&root, "agent-00", 4, 0);
+    app.reload();
+
+    for (screen, name) in [
+        (Screen::Agents, "agents"),
+        (Screen::AgentConfig, "agent"),
+        (Screen::Instructions, "instruction"),
+        (Screen::Forgejo, "forgejo"),
+        (Screen::Credentials, "credentials"),
+        (Screen::Runs, "runs"),
+    ] {
+        app.show(screen);
+        // The first frame fixes the width the row wrapping is measured at.
+        render_at(72, 18, &app);
+        let rows = gewu_multiverse::ui::panel_rows_text(&app);
+        assert_eq!(
+            rows.len(),
+            gewu_multiverse::ui::panel_total_lines(&app),
+            "{name}: the scroll count and the drawn rows disagree"
+        );
+        // Drive every wrapped row to the top of its window; it must be drawn there.
+        for (index, row) in rows.iter().enumerate() {
+            let needle = normalised(row);
+            if needle.is_empty() {
+                continue;
+            }
+            app.panel_scroll = index;
+            let screen = normalised(&render_at(72, 18, &app));
+            assert!(
+                screen.contains(&needle),
+                "{name}: row {index} is dropped unreachably at 72×18: {row:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2399,7 +2494,7 @@ fn a_screen_never_opens_at_another_screens_scroll_offset_and_a_scrolled_panel_sa
     }
     let scrolled = render_at(80, 24, &app);
     assert!(
-        scrolled.contains("↑ more above"),
+        scrolled.contains("↑ more above") || scrolled.contains("↑ above"),
         "a scrolled panel hides its top in silence: {scrolled}"
     );
 
@@ -2493,17 +2588,25 @@ fn the_forgejo_panel_scrolls_to_its_repository_list_and_legend_below_eighty_by_t
             top.contains("more below"),
             "{width}x{height}: the overflowing panel does not declare: {top}"
         );
-        for _ in 0..12 {
+        // Scroll to the end one row at a time; both a repository row and the key
+        // legend must be drawn at some offset (they need not share a window when the
+        // body is only two rows tall).
+        let total = gewu_multiverse::ui::panel_total_lines(&app);
+        let mut saw_repo = false;
+        let mut saw_legend = false;
+        for _ in 0..=total {
+            let reached = render_at(width, height, &app);
+            saw_repo |= reached.contains("uxmember/") || reached.contains("uxadmin/");
+            saw_legend |= reached.contains("up/down choose one");
             app.on_key(KeyEvent::from(KeyCode::Char(']')));
         }
-        let reached = render_at(width, height, &app);
         assert!(
-            reached.contains("uxmember/") || reached.contains("uxadmin/"),
-            "{width}x{height}: no repository row is reachable: {reached}"
+            saw_repo,
+            "{width}x{height}: no repository row is reachable"
         );
         assert!(
-            reached.contains("up/down choose one"),
-            "{width}x{height}: the key legend is not reachable: {reached}"
+            saw_legend,
+            "{width}x{height}: the key legend is not reachable"
         );
         assert!(
             !app.status.contains("the panel below is declared"),
@@ -2661,9 +2764,115 @@ fn one_fact_gets_one_number_on_the_runs_screen() {
         screen.contains("20 older records") && screen.contains("not listed"),
         "the cap difference is not named: {screen}"
     );
+    // W36-3: the ten ghost records are all older than the newest fifty, so the list
+    // carries none of them. The note must not point at `*` rows that are not there;
+    // it says the count and the marker's presence separately.
     assert!(
-        screen.contains("10 records belong") && screen.contains("marked `*` in the list above"),
-        "the unconfigured records are counted but not shown as listed: {screen}"
+        screen.contains("10 records belong")
+            && screen.contains("none is among the newest")
+            && screen.contains("carries the `*` marker here"),
+        "the unconfigured records' marker claim does not match the list: {screen}"
+    );
+}
+
+#[test]
+fn the_credentials_present_list_is_reachable_at_the_floor() {
+    // W36-1, runnable on the unfixed tree too: the joined `present` list was one
+    // logical line; at 72×18 it was taller than the panel body, so `fit_panel_lines`
+    // dropped it and no `[`/`]` offset could bring it back. Every name must be drawn
+    // at some offset.
+    let norm = |text: &str| -> String { text.chars().filter(|c| c.is_alphanumeric()).collect() };
+    let root = scratch("creds-present-floor");
+    let mut config = String::from(
+        "[forgejo]\nurl = \"https://forgejo.example.org\"\nrole = \"member\"\n",
+    );
+    for index in 0..31 {
+        config.push_str(&format!(
+            "[[agents]]\nname = \"agent-{index:02}\"\nmodel = \"m\"\n\
+             endpoint = \"https://e/v1\"\n\
+             instruction = \"agents/agent-{index:02}/instruction.md\"\nconcurrency = 1\n"
+        ));
+    }
+    let mut app = app_with_config(&root, &config);
+    app.show_acknowledgment = false;
+    let mut text = String::from("[model_keys]\n");
+    for index in 0..31 {
+        text.push_str(&format!("\"agent-{index:02}\" = \"gw-fixture-key-{index:02}\"\n"));
+    }
+    gewu_multiverse::mode::write_private(root.join("credentials.toml"), text.as_bytes())
+        .expect("the credentials file is written");
+    app.reload();
+    app.show(Screen::Credentials);
+    let total = gewu_multiverse::ui::panel_total_lines(&app);
+    let mut drawn = String::new();
+    for _ in 0..=total {
+        drawn.push_str(&norm(&render_at(72, 18, &app)));
+        app.scroll_panel(1);
+    }
+    for index in 0..31 {
+        let needle = norm(&format!("model key for `agent-{index:02}`"));
+        assert!(
+            drawn.contains(&needle),
+            "the present name for agent-{index:02} is unreachable at 72×18"
+        );
+    }
+}
+
+#[test]
+fn the_unconfigured_sentence_separates_the_count_from_the_listed_marker() {
+    // W36-3: when only some of the unconfigured records are inside the newest fifty,
+    // the count and the marked subset are stated separately, so the list above never
+    // contradicts the sentence.
+    let root = scratch("unconfigured-partial");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let summary = |agent: &str, index: u64| RunSummary {
+        agent: agent.to_owned(),
+        run_id: new_run_id(index),
+        outcome: Some(RunOutcome::Succeeded),
+        reason: None,
+        duration_ms: Some(100),
+        started_at: Some("2026-10-15T00:00:00Z".to_owned()),
+        log: PathBuf::new(),
+        dir: PathBuf::new(),
+    };
+    app.recent = vec![summary("ghost", 0), summary("scribe", 0), summary("ghost", 1)];
+    app.recent_total = 10;
+    app.footprint.records = 10;
+    app.footprint.unconfigured_records = 5;
+    app.show(Screen::Runs);
+    let screen = render_at(120, 40, &app);
+    assert!(screen.contains("5 records belong"), "{screen}");
+    assert!(
+        normalised(&screen).contains(&normalised(
+            "the 2 among the newest 3 listed above are marked `*`"
+        )),
+        "the marked subset is not named: {screen}"
+    );
+}
+
+#[test]
+fn the_address_prompt_says_what_the_address_is_for() {
+    // W37-3: the second clause ("this machine is the only one it names") was opaque.
+    // The prompt now says the address applies to every agent and what checks against
+    // it, which is what the map asks for.
+    let root = scratch("url-prompt");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Forgejo);
+    app.request_url_edit();
+    let screen = render_at(100, 40, &app);
+    assert!(
+        normalised(&screen).contains(&normalised("every agent on this machine uses")),
+        "{screen}"
+    );
+    assert!(
+        normalised(&screen).contains(&normalised("the role check runs against it")),
+        "the prompt does not say what checks against the address: {screen}"
+    );
+    assert!(
+        !screen.contains("the only one it names"),
+        "the opaque second clause is still there: {screen}"
     );
 }
 
@@ -3001,7 +3210,7 @@ fn an_endpoint_test_from_another_machine_is_not_drawn_as_this_machines_result() 
     let screen = render_at(100, 40, &app);
     assert!(screen.contains("tested just now"), "{screen}");
     assert!(
-        screen.contains("tested on another machine"),
+        normalised(&screen).contains(&normalised("tested on another machine")),
         "a foreign machine's test is drawn as this machine's: {screen}"
     );
 
@@ -3012,7 +3221,7 @@ fn an_endpoint_test_from_another_machine_is_not_drawn_as_this_machines_result() 
     });
     let screen = render_at(100, 40, &app);
     assert!(
-        screen.contains("does not name the machine"),
+        normalised(&screen).contains(&normalised("does not name the machine")),
         "{screen}"
     );
 
