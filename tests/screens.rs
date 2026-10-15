@@ -1365,15 +1365,21 @@ fn the_key_reference_scrolls_so_every_key_survives_a_short_window() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('?')));
     let first = render_at(80, 24, &app);
-    assert!(first.contains("of 17"), "the range is missing: {first}");
-    // Scroll to the end; the last line must be reachable.
+    assert!(first.contains("of 18"), "the range is missing: {first}");
+    // Scroll to the end; the last line must be reachable, and every key with it —
+    // including `u`, the Forgejo address key W32-1 added, so the reference lists it.
+    let mut seen = first.clone();
     for _ in 0..20 {
         app.on_key(KeyEvent::from(KeyCode::Down));
+        seen.push_str(&render_at(80, 24, &app));
     }
-    let last = render_at(80, 24, &app);
     assert!(
-        last.contains("esc or enter close it"),
-        "the last help line is unreachable: {last}"
+        seen.contains("esc or enter close it"),
+        "the last help line is unreachable"
+    );
+    assert!(
+        seen.contains("set the instance address"),
+        "the key help does not list `u`, the Forgejo address key"
     );
 }
 
