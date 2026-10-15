@@ -492,6 +492,67 @@ pub fn write_endpoint_test(path: &Path, test: &EndpointTest) -> std::io::Result<
     crate::mode::write_private(path, text.as_bytes())
 }
 
+/// When and where the role check last ran, as a fact the next start can read.
+///
+/// W37-1: the v0.1.18 release note promises the role check's result carries a
+/// **persisted** stamp (`role_checked_at_ms` + `role_check_machine`). The fields
+/// lived only in `App`, so after a real restart the Forgejo screen claimed no check
+/// had ever run. This is the record that makes the note true, beside the endpoint
+/// test's own record and under the same custody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleCheckStamp {
+    /// When the check ran, in unix milliseconds.
+    pub checked_at_ms: u64,
+    /// The machine that ran it, when the record names one.
+    pub machine: Option<String>,
+}
+
+/// One role-check stamp as it is written down. It holds no secret.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct RoleCheckRecord {
+    checked_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine: Option<String>,
+}
+
+/// The shape of the role-check record on disk.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RoleCheckFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check: Option<RoleCheckRecord>,
+}
+
+/// Read the role-check stamp written beside the endpoint-test record.
+///
+/// A file that is missing, unreadable or unparsable is simply `no stamp is known`,
+/// never an error on a screen: the Forgejo screen falls back to its own sentence.
+pub fn read_role_check_stamp(path: &Path) -> Option<RoleCheckStamp> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let file = toml::from_str::<RoleCheckFile>(&text).ok()?;
+    file.check.map(|record| RoleCheckStamp {
+        checked_at_ms: record.checked_at_ms,
+        machine: record.machine,
+    })
+}
+
+/// Write the role check's stamp down, replacing the previous one.
+///
+/// The file is `0600` like every other file the product writes.
+pub fn write_role_check_stamp(path: &Path, stamp: &RoleCheckStamp) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = RoleCheckFile {
+        check: Some(RoleCheckRecord {
+            checked_at_ms: stamp.checked_at_ms,
+            machine: stamp.machine.clone(),
+        }),
+    };
+    let text = toml::to_string(&file)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    crate::mode::write_private(path, text.as_bytes())
+}
+
 /// A byte count in the product's own words, so the file that grows with every run has
 /// a size a person can watch (L-3).
 ///
@@ -875,6 +936,9 @@ pub struct App {
     pub role_checked_at_ms: Option<u64>,
     /// The machine the last role check ran on, when the mark can be read.
     pub role_check_machine: Option<String>,
+    /// The role-check stamp read back from the record, so the fact that a check ran
+    /// survives a restart (W37-1).
+    pub persisted_role_check_stamp: Option<RoleCheckStamp>,
     /// Which repository the Forgejo screen has selected.
     pub repo_selected: usize,
     /// The result of the last identity action, if any.
@@ -900,6 +964,10 @@ pub struct App {
     pub forgejo_note: Option<String>,
     /// When the recent runs were last read.
     last_scan: Option<Instant>,
+    /// The width the body panels were last drawn into, so the scroll keys can count
+    /// wrapped rows without the terminal size being threaded through every key
+    /// (W36-1). Before the first frame it is the floor's own body width.
+    pub panel_width: std::cell::Cell<usize>,
     /// The one line under the screens.
     pub status: String,
     /// Work the terminal loop has to carry out.
@@ -969,6 +1037,7 @@ impl App {
             role_check: None,
             role_checked_at_ms: None,
             role_check_machine: None,
+            persisted_role_check_stamp: None,
             repo_selected: 0,
             identity_report: None,
             workspace_note: None,
@@ -977,6 +1046,7 @@ impl App {
             started_ms: crate::time::now_unix_ms(),
             forgejo_note: None,
             last_scan: None,
+            panel_width: std::cell::Cell::new(70),
             status: String::new(),
             pending: None,
             should_quit: false,
@@ -1050,6 +1120,11 @@ impl App {
                 // draw the stamp (and its age) after a restart.
                 self.persisted_endpoint_tests =
                     read_endpoint_tests(&self.layout.endpoint_tests_file());
+                // W37-1: the role check's stamp is a fact the next start reads, so the
+                // Forgejo screen can say when the last check ran instead of claiming
+                // none ever did.
+                self.persisted_role_check_stamp =
+                    read_role_check_stamp(&self.layout.role_checks_file());
             }
             Err(error) => {
                 self.root_error = Some(error.to_string());
@@ -1368,14 +1443,15 @@ impl App {
 
     /// Whether the footer's finished count cannot see every record that might count.
     ///
-    /// The count is derived from the newest [`RECENT_RUNS_LIMIT`] records, so when
-    /// every one of them finished since this UI started and there are older records
-    /// on disk, the true count may be larger. The footer then says `K+ finished`
-    /// rather than presenting the cap as the whole of the history (L-5).
+    /// The count is derived from the newest [`RECENT_RUNS_LIMIT`] records, so whenever
+    /// older records exist on disk the true count may be larger. The footer then says
+    /// `K+ finished` rather than presenting the window as exact — including when a run
+    /// is in flight inside the window (W36-2, L-5).
     pub fn finished_count_is_capped(&self) -> bool {
+        // The count is over the newest [`RECENT_RUNS_LIMIT`] records. Whenever any
+        // older record exists on disk, that count is a lower bound, not an exact
+        // total — even with a run in flight inside the window (W36-2).
         self.recent_total > self.recent.len()
-            && !self.recent.is_empty()
-            && self.runs_finished_since_start() == self.recent.len()
     }
 
     /// A file's size, in the product's own words, or `None` when it cannot be read.
@@ -1870,8 +1946,19 @@ impl App {
             }
             return;
         }
-        let agent = prompt.agent.clone().or_else(|| self.selected_name());
-        let subject = agent.clone().unwrap_or_else(|| "the connection".to_owned());
+        // W37-2: the role token and the administrator token are stored globally and
+        // act as the connection, whatever agent happens to be selected. Only a
+        // per-agent secret is attributed to an agent, so the sentence never reports a
+        // global token "for `scribe`".
+        let subject = if prompt.target.needs_agent() {
+            prompt
+                .agent
+                .clone()
+                .or_else(|| self.selected_name())
+                .unwrap_or_else(|| "the connection".to_owned())
+        } else {
+            "the connection".to_owned()
+        };
         let (table, key) = match prompt.target {
             SecretTarget::ModelKey => (Some("model_keys"), subject.clone()),
             SecretTarget::ForgejoAgentToken => (Some("forgejo_agent_tokens"), subject.clone()),
@@ -2543,8 +2630,17 @@ impl App {
     /// The stamp for the role check's result, so a view cannot read as current forever
     /// (S-2).
     pub fn role_check_stamp(&self) -> Option<String> {
-        let at = self.role_checked_at_ms?;
-        Some(match &self.role_check_machine {
+        // W37-1: a session that has run a check uses its own fields; a fresh session
+        // uses the stamp read back from the record, so the age survives a restart and
+        // the note's word `persisted` is true.
+        let (at, machine) = match self.role_checked_at_ms {
+            Some(at) => (at, self.role_check_machine.clone()),
+            None => {
+                let stamp = self.persisted_role_check_stamp.as_ref()?;
+                (stamp.checked_at_ms, stamp.machine.clone())
+            }
+        };
+        Some(match &machine {
             Some(mark) => format!("checked {} on {mark}", tested_age(at)),
             None => format!(
                 "checked {}; this machine's own name cannot be read",
@@ -2553,10 +2649,29 @@ impl App {
         })
     }
 
+    /// Write the role check's stamp down beside the endpoint-test record (W37-1).
+    fn persist_role_check_stamp(&mut self, at: u64, machine: Option<String>) {
+        let stamp = RoleCheckStamp {
+            checked_at_ms: at,
+            machine,
+        };
+        if let Err(error) = write_role_check_stamp(&self.layout.role_checks_file(), &stamp) {
+            // Say the stamp could not be saved on the status line rather than hiding
+            // it: the next start's honesty depends on the file.
+            self.status = format!(
+                "{} — the check's stamp could not be saved for the next start: {error}",
+                self.status
+            );
+        }
+        self.persisted_role_check_stamp = Some(stamp);
+    }
+
     /// Apply the role check's result, in the sentence the Forgejo screen made before.
     fn apply_role_check(&mut self, url: String, result: Result<RoleCheck, ForgejoFailure>) {
-        self.role_checked_at_ms = Some(crate::time::now_unix_ms());
-        self.role_check_machine = crate::machine::mark();
+        let at = crate::time::now_unix_ms();
+        let mark = crate::machine::mark();
+        self.role_checked_at_ms = Some(at);
+        self.role_check_machine = mark.clone();
         self.status = match &result {
             Ok(check) => format!("role check: {}", check.summary()),
             // The configured URL leads the refusal: a mistyped path is the common
@@ -2569,6 +2684,7 @@ impl App {
         };
         self.role_check = Some(result);
         self.repo_selected = 0;
+        self.persist_role_check_stamp(at, mark);
     }
 
     /// Apply the administrator role check's result, keeping the last good view.
@@ -2584,10 +2700,13 @@ impl App {
         // keep the last successful list and show the failure beside it instead.
         match result {
             Ok(check) => {
+                let at = crate::time::now_unix_ms();
+                let mark = crate::machine::mark();
                 self.role_check = Some(Ok(check));
-                self.role_checked_at_ms = Some(crate::time::now_unix_ms());
-                self.role_check_machine = crate::machine::mark();
+                self.role_checked_at_ms = Some(at);
+                self.role_check_machine = mark.clone();
                 self.repo_selected = 0;
+                self.persist_role_check_stamp(at, mark);
             }
             Err(failure) => {
                 let keep = matches!(self.role_check, Some(Ok(_)));
@@ -2600,10 +2719,13 @@ impl App {
                     // administrator token, not the view on screen.
                     self.forgejo_note = Some(message);
                 } else {
+                    let at = crate::time::now_unix_ms();
+                    let mark = crate::machine::mark();
                     self.role_check = Some(Err(failure));
-                    self.role_checked_at_ms = Some(crate::time::now_unix_ms());
-                    self.role_check_machine = crate::machine::mark();
+                    self.role_checked_at_ms = Some(at);
+                    self.role_check_machine = mark.clone();
                     self.repo_selected = 0;
+                    self.persist_role_check_stamp(at, mark);
                 }
             }
         }
@@ -6571,6 +6693,83 @@ concurrency = 3
                 .as_deref()
                 .is_some_and(|note| note.contains("administrator token")),
             "the failure is not shown beside the view"
+        );
+    }
+
+    #[test]
+    fn the_role_check_stamp_survives_a_restart() {
+        // W37-1: the v0.1.18 note promises a persisted stamp. The check writes
+        // `role-checks.toml`; the next start reads it back even though its own view
+        // is gone.
+        let root = scratch_root("role-stamp");
+        std::fs::write(root.join("config.toml"), GOOD).expect("the configuration is written");
+        let mut app =
+            App::with_runner(Layout::rooted_at(root.clone()), quiet_runner("role-stamp-1"));
+        app.show_acknowledgment = false;
+        app.apply_role_check(
+            "https://forgejo.example.org".to_owned(),
+            Err(ForgejoFailure {
+                class: "transport".to_owned(),
+                message: "the connection dropped".to_owned(),
+            }),
+        );
+        assert!(app.role_check_stamp().is_some());
+        let record = root.join("role-checks.toml");
+        assert!(record.is_file(), "the stamp was not written down");
+        let text = std::fs::read_to_string(&record).expect("the record is read");
+        assert!(text.contains("checked_at_ms"), "{text}");
+
+        let reopened =
+            App::with_runner(Layout::rooted_at(root), quiet_runner("role-stamp-2"));
+        assert!(
+            reopened.role_check.is_none(),
+            "a new session has no role view of its own"
+        );
+        let stamp = reopened
+            .role_check_stamp()
+            .expect("the stamp survives the restart");
+        assert!(stamp.contains("checked"), "{stamp}");
+    }
+
+    #[test]
+    fn the_role_token_is_reported_for_the_connection_not_an_agent() {
+        // W37-2: the role token is stored globally and acts as the connection; the
+        // receipt must not attribute it to whichever agent happens to be selected.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.selected = 0;
+        app.request_secret(SecretTarget::ForgejoRoleToken);
+        app.on_paste("throwaway-role-token");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.status.contains("for the connection"), "{}", app.status);
+        assert!(!app.status.contains("for `scribe`"), "{}", app.status);
+    }
+
+    #[test]
+    fn the_finished_count_is_declared_a_window_whenever_older_records_exist() {
+        // W36-2: the count is over the newest fifty records. A run in flight inside
+        // the window used to turn the `+` off and print the window as exact.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.recent = vec![crate::run::RunSummary {
+            agent: "scribe".to_owned(),
+            run_id: "run-1-0001-1".to_owned(),
+            outcome: None,
+            reason: None,
+            duration_ms: None,
+            started_at: Some("2026-10-15T00:00:00Z".to_owned()),
+            log: std::path::PathBuf::new(),
+            dir: std::path::PathBuf::new(),
+        }];
+        app.recent_total = 60;
+        assert_eq!(
+            app.runs_finished_since_start(),
+            0,
+            "the only windowed run is live"
+        );
+        assert!(
+            app.finished_count_is_capped(),
+            "the window was presented as exact"
         );
     }
 

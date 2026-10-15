@@ -49,6 +49,9 @@ const MIN_HEIGHT: u16 = 18;
 /// Paint the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
     let full = frame.area();
+    // W36-1: remember the body width so the scroll keys can count wrapped rows with
+    // the same width the frame is drawn at.
+    app.panel_width.set(full.width.saturating_sub(2) as usize);
     if full.width < MIN_WIDTH || full.height < MIN_HEIGHT {
         frame.render_widget(
             Paragraph::new(format!(
@@ -220,7 +223,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         note_window(
             agent_notes(app),
-            area.width as usize,
+            area.width.saturating_sub(2) as usize,
             parts[1].height as usize,
             app.panel_scroll,
             true,
@@ -556,7 +559,7 @@ fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
         above,
         below,
     );
-    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
+    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
 }
 
 
@@ -684,7 +687,7 @@ fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
         above,
         below,
     );
-    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
+    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
 }
 
 /// The Forgejo connection, the role check and the repository list.
@@ -770,7 +773,7 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
         above,
         below,
     );
-    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
+    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
 }
 
 /// The Forgejo key legend, two compact rows.
@@ -983,9 +986,19 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
 
     let mut all_repos: Vec<Line> = Vec::new();
     match &app.role_check {
-        None => head.push(placeholder(
-            "no role check has been run yet — press c to list what the configured token can see",
-        )),
+        None => {
+            // W37-1: the stamp is persisted, so even a session that has not run a
+            // check can say when the last one ran; the fact does not vanish with the
+            // session that learned it.
+            match app.role_check_stamp() {
+                Some(stamp) => head.push(placeholder(&format!(
+                    "no role check has been run in this session — {stamp} — press c to check again"
+                ))),
+                None => head.push(placeholder(
+                    "no role check has been run yet — press c to list what the configured token can see",
+                )),
+            }
+        }
         Some(Err(failure)) => {
             // P-7: a refusal names the URL the user configured, not only the API path,
             // so a mistyped path connects to what was typed. S-2: the refusal carries
@@ -1104,6 +1117,125 @@ fn wrapped_rows(text: &str, width: usize) -> usize {
     rows
 }
 
+/// Break one logical line into wrapped rows no wider than `width`, keeping every
+/// span's style.
+///
+/// W36-1: the scroll offset used to count logical lines, so a single logical line
+/// taller than the panel body was dropped by `fit_panel_lines` and could never be
+/// brought back. The window now counts wrapped rows, so every row is addressable. A
+/// space is a break opportunity, and so is the zero-width space `breakable_path`
+/// inserts after each `/`, so a path never breaks inside a file name (H-5); a run of
+/// characters with no break is hard-broken only as a last resort.
+fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line.clone()];
+    }
+    let chars: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(|ch| (ch, span.style)))
+        .collect();
+    let visual: usize = chars.iter().filter(|(c, _)| *c != '\u{200b}').count();
+    if visual <= width {
+        return vec![line.clone()];
+    }
+    // Split into words at ordinary spaces. A no-break space (U+00A0) stays inside its
+    // word, so the login and the email it joins move together (N-2).
+    let mut words: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut word: Vec<(char, Style)> = Vec::new();
+    for (ch, style) in chars {
+        if ch == ' ' {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push((ch, style));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut row: Vec<(char, Style)> = Vec::new();
+    let mut row_w = 0usize;
+    for word in words {
+        let word_w = word.iter().filter(|(c, _)| *c != '\u{200b}').count();
+        // A word that does not fit is moved to the next row whole; only a word wider
+        // than the row itself is broken (at a zero-width opportunity, or hard).
+        if row_w > 0 {
+            if row_w + 1 + word_w <= width {
+                let style = word.first().map(|(_, style)| *style).unwrap_or_default();
+                row.push((' ', style));
+                row_w += 1;
+            } else {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+            }
+        }
+        let mut break_at: Option<usize> = None;
+        for (ch, style) in word {
+            if ch == '\u{200b}' {
+                row.push((ch, style));
+                break_at = Some(row.len());
+                continue;
+            }
+            if row_w + 1 > width {
+                match break_at.take() {
+                    Some(at) => {
+                        let rest = row.split_off(at);
+                        rows.push(std::mem::take(&mut row));
+                        row = rest;
+                        row_w = row.iter().filter(|(c, _)| *c != '\u{200b}').count();
+                    }
+                    None => {
+                        rows.push(std::mem::take(&mut row));
+                        row_w = 0;
+                    }
+                }
+            }
+            row.push((ch, style));
+            row_w += 1;
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows.into_iter().map(spans_from_chars).collect()
+}
+
+/// Rebuild one wrapped row as a `Line`, grouping neighbouring characters that share a
+/// style into one span, so the styling is preserved exactly.
+fn spans_from_chars(chars: Vec<(char, Style)>) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut text = String::new();
+    let mut style: Option<Style> = None;
+    for (ch, ch_style) in chars {
+        if style == Some(ch_style) {
+            text.push(ch);
+        } else {
+            if let Some(style) = style {
+                spans.push(Span::styled(std::mem::take(&mut text), style));
+            }
+            text.push(ch);
+            style = Some(ch_style);
+        }
+    }
+    if let Some(style) = style {
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// Every logical line the surface holds, wrapped to `width` rows.
+fn panel_rows(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    for line in lines {
+        rows.extend(wrap_line(line, width));
+    }
+    rows
+}
+
 /// Where the credentials file is, and the mode it has.
 fn credentials_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
@@ -1133,7 +1265,15 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
             "nothing yet — no model key and no Forgejo token",
         ));
     } else {
-        lines.push(field("present", &present.join(", ")));
+        // W36-1: the joined list was one logical line. With many secrets it wrapped
+        // to more rows than the panel body at 72×18, so `fit_panel_lines` dropped it
+        // from the bottom and no `[`/`]` offset could bring it back — a silent drop.
+        // One secret per logical line gives each its own row, so the panel's own
+        // scrolling reaches every name.
+        for (at, label) in present.iter().enumerate() {
+            let name = if at == 0 { "present" } else { "" };
+            lines.push(field(name, label));
+        }
     }
     lines.push(Line::from(""));
     // The screen's own keys come first, before the prose: the page map requires this
@@ -1202,7 +1342,7 @@ fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
         above,
         below,
     );
-    draw_panel(frame, scrolled(&lines, app.panel_scroll), title, area);
+    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
 }
 
 /// The recent runs, read from the records on disk.
@@ -1318,7 +1458,7 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             above,
             below,
         );
-        draw_panel(frame, scrolled(&notes, app.panel_scroll), title, parts[1]);
+        draw_scrolled_panel(frame, notes, app.panel_scroll, title, parts[1]);
     }
 }
 
@@ -1347,14 +1487,36 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             crate::app::filesize_text(footprint.bytes)
         )));
         if footprint.unconfigured_records > 0 {
-            // R-5: these records are now listed and marked, not only counted, so the
-            // sentence says where they are instead of implying they are invisible.
-            let text = if footprint.unconfigured_records == 1 {
-                "1 record belongs to an agent the configuration no longer lists and is marked `*` in the list above; it stays on disk until it is deleted.".to_owned()
+            // R-5: these records are now listed and marked, not only counted. W36-3:
+            // "the list above" is a window of the newest fifty, so an unconfigured
+            // record older than the window is *not* marked there — the sentence must
+            // not point at a row the list does not carry. The count and the marker's
+            // presence are stated separately, and the marker is named only for the
+            // records actually inside the window.
+            let total = footprint.unconfigured_records;
+            let listed = app
+                .recent
+                .iter()
+                .filter(|run| !app.agents().iter().any(|agent| agent.name == run.agent))
+                .count();
+            let noun = if total == 1 { "record belongs" } else { "records belong" };
+            let text = if listed == 0 {
+                format!(
+                    "{total} {noun} to an agent the configuration no longer lists; none is among the newest {} listed above, so none carries the `*` marker here — they stay on disk until they are deleted.",
+                    app.recent.len()
+                )
+            } else if listed == total {
+                if total == 1 {
+                    "1 record belongs to an agent the configuration no longer lists and is marked `*` in the list above; it stays on disk until it is deleted.".to_owned()
+                } else {
+                    format!(
+                        "{total} records belong to an agent the configuration no longer lists and are marked `*` in the list above; they stay on disk until they are deleted."
+                    )
+                }
             } else {
                 format!(
-                    "{} records belong to an agent the configuration no longer lists and are marked `*` in the list above; they stay on disk until they are deleted.",
-                    footprint.unconfigured_records
+                    "{total} {noun} to an agent the configuration no longer lists; the {listed} among the newest {} listed above are marked `*`, and the rest stay on disk until they are deleted.",
+                    app.recent.len()
                 )
             };
             lines.push(Line::from(text));
@@ -1616,18 +1778,15 @@ fn pushed_rows(lines: &[Line], width: usize) -> usize {
 /// The Agent panel was the first to answer this in its title (D-7); every sibling
 /// panel asks the same question now, so a short window declares what is below the
 /// fold rather than dropping it without a word (O-3).
-fn panel_overflows(lines: &[Line], area: Rect) -> bool {
-    pushed_rows(lines, area.width.saturating_sub(2) as usize)
-        > area.height.saturating_sub(2) as usize
-}
-
 /// Whether a scrolled panel still has content below the fold.
 ///
-/// The question is asked of the lines from `offset` on, not of the whole panel: the
-/// sixth round computed it for the unscrolled state only, so a scrolled panel dropped
-/// the declaration entirely (A-1).
+/// The question is asked of the wrapped rows from `offset` on (W36-1), not of the
+/// whole panel: the sixth round computed it for the unscrolled state only, so a
+/// scrolled panel dropped the declaration entirely (A-1).
 fn panel_overflows_from(lines: &[Line<'static>], area: Rect, offset: usize) -> bool {
-    panel_overflows(&scrolled(lines, offset), area)
+    let width = area.width.saturating_sub(2) as usize;
+    let body = area.height.saturating_sub(2) as usize;
+    offset.saturating_add(body) < panel_rows(lines, width).len()
 }
 
 /// The sentence a bordered panel puts in its title when its content does not fit.
@@ -1741,46 +1900,89 @@ fn fit_title(
     )
 }
 
-/// Slice a panel's logical lines so its body can be scrolled with a key.
+/// How many wrapped rows the panel or note area on show can scroll through.
 ///
-/// The offset counts logical lines, not terminal rows: a line that wraps still moves
-/// as one. The last line can always be brought to the top, so the very end of a panel
-/// is reachable however short the window is (Y-2).
-fn scrolled(lines: &[Line<'static>], offset: usize) -> Vec<Line<'static>> {
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    let first = offset.min(lines.len() - 1);
-    lines[first..].to_vec()
-}
-
-/// How many logical lines the panel or note area on show can scroll through.
-///
-/// This is the number of lines `[`/`]` (and, on a screen with no list, the arrows and
-/// page keys) can move the window over. Every surface with content reports its own
-/// line count — Forgejo included, where the list, the prose and the legend are one
-/// scrollable panel below 80×24 (A-3): the count is the scrollable form of that panel
-/// (`forgejo_scrolled_lines`), so the offset can reach the repository list and the key
-/// legend however short the window is.
+/// This is the number of rows `[`/`]` (and, on a screen with no list, the arrows and
+/// page keys) can move the window over. The offset counts wrapped rows, not logical
+/// lines (W36-1): a logical line taller than the body is drawn row by row, so every
+/// row is reachable however short the window is. The width used is the last frame's
+/// body width, so the count matches what was drawn; before the first frame it is the
+/// floor's own width.
 #[must_use]
 pub fn panel_total_lines(app: &App) -> usize {
+    panel_rows(&panel_lines(app), app.panel_width.get()).len()
+}
+
+/// The logical lines the panel or note area on show holds, in the order they are
+/// drawn. The windowing (`panel_rows`, `wrap_line`, `note_window`) works on this
+/// list, so it is the list a floor guard must prove reachable (W36-1).
+fn panel_lines(app: &App) -> Vec<Line<'static>> {
     match app.screen {
-        Screen::AgentConfig => agent_config_lines(app).len(),
-        Screen::Instructions => instruction_lines(app).len(),
-        Screen::Credentials => credentials_lines(app).len(),
-        Screen::Agents => agent_notes(app).len(),
-        Screen::Runs => run_notes(app).len(),
-        Screen::Forgejo => forgejo_scrolled_lines(app).len(),
+        Screen::AgentConfig => agent_config_lines(app),
+        Screen::Instructions => instruction_lines(app),
+        Screen::Credentials => credentials_lines(app),
+        Screen::Agents => agent_notes(app),
+        Screen::Runs => run_notes(app),
+        Screen::Forgejo => forgejo_scrolled_lines(app),
     }
 }
 
-/// Draw one bordered panel, already windowed by the caller.
+/// The text of every **wrapped row** the surface on show holds.
 ///
-/// A bordered panel never draws half a wrapped line: ratatui would clip the last
-/// wrapped row at the border, and a sentence that ends at a box edge reads as a
-/// rendering bug (W-3). Whole logical lines are dropped from the bottom until what
-/// is left fits; the title's `more below` declaration is what says the rest exists,
-/// and `[`/`]` reaches it.
+/// The floor guard drives each row to the top of its window and proves it is drawn:
+/// with row-based scrolling (W36-1), every row is addressable, so no logical line can
+/// be dropped in silence however short the body is.
+#[must_use]
+pub fn panel_rows_text(app: &App) -> Vec<String> {
+    panel_rows(&panel_lines(app), app.panel_width.get())
+        .iter()
+        .map(line_text)
+        .collect()
+}
+
+/// One line's spans joined into the text a person reads.
+fn line_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Draw one scrolled bordered panel, windowed by wrapped rows.
+///
+/// The offset counts wrapped rows (W36-1), so a logical line taller than the body is
+/// drawn row by row and every row is reachable. A row is drawn whole or not at all,
+/// so the half-a-wrapped-line rule (W-3) still holds, and the title's `more below` /
+/// `more above` declaration is the part that is never clipped.
+fn draw_scrolled_panel(
+    frame: &mut Frame,
+    lines: Vec<Line<'static>>,
+    offset: usize,
+    title: String,
+    area: Rect,
+) {
+    let width = area.width.saturating_sub(2) as usize;
+    let height = area.height.saturating_sub(2) as usize;
+    let rows = panel_rows(&lines, width);
+    let window: Vec<Line<'static>> = if rows.is_empty() {
+        Vec::new()
+    } else {
+        let first = offset.min(rows.len() - 1);
+        rows[first..].iter().take(height).cloned().collect()
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(window))
+            .block(Block::bordered().title(title))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Draw one bordered panel whose caller has already chosen the lines to draw.
+///
+/// This is the windowed (non-scrolling) form: the Forgejo panel below 80×24 fits its
+/// rows itself, and the add-agent form windows its body. Whole logical lines are
+/// dropped from the bottom until what is left fits; the title carries the declaration.
 fn draw_panel(frame: &mut Frame, lines: Vec<Line<'static>>, title: String, area: Rect) {
     let width = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
@@ -1810,31 +2012,6 @@ fn fit_panel_lines(
     lines
 }
 
-/// Keep a note area's tail, replacing what does not fit with a line that says so.
-///
-/// The Agents and Runs note areas are plain paragraphs with no title to carry the
-/// declaration, so the last row carries it instead: the tail is dropped from the
-/// bottom and one row is reserved for the sentence, which is never itself clipped
-/// (O-3).
-fn declared_notes(
-    mut lines: Vec<Line<'static>>,
-    width: usize,
-    height: usize,
-    declare: bool,
-) -> Vec<Line<'static>> {
-    if !declare {
-        return lines;
-    }
-    if height == 0 || pushed_rows(&lines, width) <= height {
-        return lines;
-    }
-    while !lines.is_empty() && pushed_rows(&lines, width) + 1 > height {
-        lines.pop();
-    }
-    lines.push(note_marker(MORE_BELOW_NOTE));
-    lines
-}
-
 /// A dim sentence used for a note area's own edge markers.
 fn note_marker(text: &str) -> Line<'static> {
     Line::from(Span::styled(
@@ -1845,11 +2022,11 @@ fn note_marker(text: &str) -> Line<'static> {
 
 /// Window a borderless note area, saying which way its content continues.
 ///
-/// At the top the rule is the sixth round's: the tail is dropped and the last row says
-/// `more below`. Scrolled away from the top, the first drawn row says there is content
-/// above (A-1) — and the tail still declares itself if it does not fit either. This is
-/// the note-area form of the same both-direction rule the bordered panels carry in
-/// their titles.
+/// At the top the tail is dropped and the last row says `more below`. Scrolled away
+/// from the top, the first drawn row says there is content above (A-1) — and the tail
+/// still declares itself if it does not fit either. The window counts wrapped rows
+/// (W36-1), so a logical line taller than the note area is drawn row by row and every
+/// row is reachable.
 fn note_window(
     lines: Vec<Line<'static>>,
     width: usize,
@@ -1857,24 +2034,30 @@ fn note_window(
     offset: usize,
     declare: bool,
 ) -> Vec<Line<'static>> {
-    if !declare {
+    if !declare || height == 0 {
         return lines;
     }
-    if offset == 0 || height == 0 {
-        return declared_notes(lines, width, height, declare);
+    let rows = panel_rows(&lines, width);
+    if rows.is_empty() {
+        return rows;
     }
-    let rest = scrolled(&lines, offset);
+    if offset == 0 {
+        if rows.len() <= height {
+            return rows;
+        }
+        let mut out: Vec<Line<'static>> = rows[..height.saturating_sub(1)].to_vec();
+        out.push(note_marker(MORE_BELOW_NOTE));
+        return out;
+    }
+    let first = offset.min(rows.len() - 1);
+    let rest = &rows[first..];
     let mut out = vec![note_marker(MORE_ABOVE_NOTE)];
     let room = height.saturating_sub(1);
-    let mut rest = rest;
-    if pushed_rows(&rest, width) > room {
-        while !rest.is_empty() && pushed_rows(&rest, width) + 1 > room {
-            rest.pop();
-        }
-        out.extend(rest);
+    if rest.len() > room {
+        out.extend(rest[..room.saturating_sub(1)].iter().cloned());
         out.push(note_marker(MORE_BELOW_NOTE));
     } else {
-        out.extend(rest);
+        out.extend(rest.iter().cloned());
     }
     out
 }
@@ -2150,7 +2333,7 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
     );
     let mut lines: Vec<Line> = vec![
         Line::from(
-            "The address is the Forgejo every agent on this machine uses; this machine is the only one it names.",
+            "The address is the Forgejo every agent on this machine uses, and the role check runs against it.",
         ),
         Line::from(""),
         Line::from(Span::styled(
