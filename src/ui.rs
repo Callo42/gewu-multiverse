@@ -247,20 +247,30 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
     // unreadable row is not left with a word and no explanation. The same rule covers
     // a record the hub had that is gone (W38-2): both are facts about a named agent,
     // not about what is selected.
-    if let Some((agent, reason)) = app.unreadable_run.as_ref() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "the newest run record of `{agent}` is there but could not be read: {reason}; what is shown is what the records left on disk say"
-            ),
-            Style::new().fg(Color::Yellow),
-        )));
-    } else if let Some(name) = app.forgotten_run.as_deref() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "a run record the hub had for `{name}` is no longer there; what is shown is what the records left on disk say"
-            ),
-            Style::new().fg(Color::Yellow),
-        )));
+    // w45 F3's one rule: a reason about an agent's run is drawn for that agent's row,
+    // naming the agent, whether or not it is selected. The unreadable reason keeps its
+    // place at the top (W38-2 wants the changed-history sentence high, above the
+    // acknowledgment line and the standing prose); the non-success and start-failure
+    // reasons follow the running line below, each for its own row. The loop is over
+    // the configured rows, so no agent's reason is left to a selection.
+    for agent in app.agents() {
+        let name = &agent.name;
+        if app.record_forgotten(name) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "a run record the hub had for `{name}` is no longer there; what is shown is what the records left on disk say"
+                ),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
+        if let Some(reason) = app.unreadable_reason(name) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "the newest run record of `{name}` is there but could not be read: {reason}; what is shown is what the records left on disk say"
+                ),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
     }
     if let Some(error) = &app.config_error {
         // The recovery key belongs with the error, not only in the legend that a short
@@ -312,24 +322,32 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
         app.supervisor.running_count(),
         app.supervisor.max_concurrent(),
     )));
-    // Why the selected agent's last run failed, on the screen the user looks at. A
-    // start that never became a run is named as a start, not as a run (D-8).
-    if let Some(name) = app.selected_name() {
-        if let Some(reason) = app.last_run_failure(&name) {
+    // Why each agent's last run failed, on the screen the user looks at. A start that
+    // never became a run is named as a start, not as a run (D-8). w45 F3: the sentence
+    // is drawn for every row, naming the agent, exactly as the unreadable reason is —
+    // one rule for reasons, on the hub as everywhere.
+    for agent in app.agents() {
+        let name = &agent.name;
+        // An unreadable record has no readable outcome to name; its reason is already
+        // drawn above, so it is not answered twice.
+        if app.unreadable_reason(name).is_some() {
+            continue;
+        }
+        if let Some(reason) = app.last_run_failure(name) {
             // Y-4: when a record the hub had is gone, the newest record left is not
             // silently promoted to "the last run". Say a record went missing, and
             // call the older failure what it is.
-            let label = if app.forgotten_run.as_deref() == Some(name.as_str()) {
+            let label = if app.record_forgotten(name) {
                 format!("the newest run record left for `{name}` did not go well")
             } else {
                 format!("the last run of `{name}` did not go well")
             };
             lines.push(Line::from(Span::styled(
-                format!("{label}: {}", app.reason_with_history(&name, &reason)),
+                format!("{label}: {}", app.reason_with_history(name, &reason)),
                 Style::new().fg(Color::Red),
             )));
         }
-        if let Some(reason) = app.last_start_failure(&name) {
+        if let Some(reason) = app.last_start_failure(name) {
             lines.push(Line::from(Span::styled(
                 format!("the last start of `{name}` did not go well: {reason}"),
                 Style::new().fg(Color::Red),
@@ -2236,17 +2254,6 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = (NewAgentForm::FIELDS.len() as u16 + 12).min(screen.height);
-    let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
 
     let mut lines: Vec<Line> = vec![
         Line::from(
@@ -2288,29 +2295,59 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             format!("{marker} {label:<16} {shown}"),
             style,
         )));
+        // w45 F1: the refusal reason is drawn on the row immediately after the field
+        // it names. The cursor is moved to that field (C-1), and the window below
+        // always keeps the cursor's row and this reason's row drawn together, so the
+        // box holds its own reason — it used to sit after the last field, which was
+        // the row the window dropped at the built geometry.
+        if at == form.cursor {
+            if let Some(error) = &form.error {
+                lines.push(Line::from(Span::styled(
+                    format!("  {error}"),
+                    Style::new().fg(Color::Red),
+                )));
+            }
+        }
     }
     lines.push(Line::from(""));
-    match &form.error {
-        Some(error) => lines.push(Line::from(Span::styled(
-            format!("  {error}"),
-            Style::new().fg(Color::Red),
-        ))),
-        None => lines.push(Line::from(Span::styled(
+    if form.error.is_none() {
+        lines.push(Line::from(Span::styled(
             "  tab/up/down or enter moves on   ctrl-s writes it from any field (enter writes it on the last)   esc cancels",
             Style::new().fg(Color::DarkGray),
-        ))),
+        )));
     }
+    // Size the box to what it holds, so `more below; enlarge the window` is true: a
+    // bigger terminal really does draw the rest of the form. The overlay area is the
+    // cap (a floor window still windows the body).
+    let inner = width.saturating_sub(2) as usize;
+    let content_rows = pushed_rows(&lines, inner) + 2;
+    let height = (content_rows as u16).min(screen.height).max(6);
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
     // A short window used to draw a `>` on a row it did not draw: the cursor walked
     // onto the two Forgejo fields invisibly (M-1). The body is windowed so the
     // cursor's own field is always among the drawn rows, and the title declares that
     // the form is longer than the window.
-    let inner = popup.width.saturating_sub(2) as usize;
     let content_height = popup.height.saturating_sub(2) as usize;
     let cursor_line = fields_at + form.cursor;
-    let cursor_rows = pushed_rows(&lines[cursor_line..=cursor_line], inner);
+    // The reason's own row is part of the span the window must keep drawn (w45 F1).
+    let must_last = if form.error.is_some() {
+        cursor_line + 1
+    } else {
+        cursor_line
+    };
+    let must_rows = pushed_rows(&lines[cursor_line..=must_last], inner);
     let mut first = 0usize;
     while first < cursor_line
-        && pushed_rows(&lines[first..cursor_line], inner) + cursor_rows > content_height
+        && pushed_rows(&lines[first..cursor_line], inner) + must_rows > content_height
     {
         first += 1;
     }
@@ -2348,17 +2385,6 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = 8.min(screen.height);
-    let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
     let count = prompt.value.chars().count();
     // The count, not the value: a person pasting a long token can see how much was
     // kept without the product ever printing the secret (P-2).
@@ -2389,6 +2415,21 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::DarkGray),
         ))),
     }
+    // Size the box to what it holds, so a longer refusal is drawn rather than clipped
+    // under a fixed guess; the overlay area is the cap.
+    let inner = width.saturating_sub(2) as usize;
+    let rows = pushed_rows(&lines, inner) + 2;
+    let height = (rows as u16).min(screen.height).max(5);
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
     let block = Block::bordered()
         .title(format!(" set the {} ", prompt.subject()))
         .border_style(Style::new().fg(Color::Cyan));
@@ -2411,17 +2452,6 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let height = 9.min(screen.height);
-    let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
     let mut lines: Vec<Line> = vec![
         Line::from(
             "The address is the Forgejo every agent in this configuration uses, and the role check runs against it.",
@@ -2443,6 +2473,21 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::DarkGray),
         ))),
     }
+    // Size the box to what it holds: a TOML refusal from the writer can wrap, and a
+    // fixed height used to clip its tail (the overlay sweep's own rule).
+    let inner = width.saturating_sub(2) as usize;
+    let rows = pushed_rows(&lines, inner) + 2;
+    let height = (rows as u16).min(screen.height).max(5);
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
     let block = Block::bordered()
         .title(" set the Forgejo instance address ")
         .border_style(Style::new().fg(Color::Cyan));
@@ -2493,23 +2538,29 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
             "Remove `{name}` from the configuration? It has no files under {config_dir} yet, and no run records."
         )
     };
-    let lines: Vec<Line> = vec![
+    let mut body: Vec<Line> = vec![
         Line::from(question),
         Line::from(format!(
             "Its secret in {} is left too, marked on the Credentials screen; press D there to delete a secret whose agent is gone.",
             breakable_path(&app.credentials_path.display().to_string())
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "y or enter remove it        n, esc or q keep it",
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
     ];
-    let rows = pushed_rows(&lines, width.saturating_sub(2) as usize) as u16;
-    let height = (rows + 2).min(screen.height).max(6);
+    let answer: Vec<Line> = vec![Line::from(Span::styled(
+        "y or enter remove it        n, esc or q keep it",
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    // The overlay sweep found the answer line was the row a floor window dropped in
+    // silence: the box is sized to what it holds, and when even that does not fit,
+    // whole body lines go from the bottom first and the title declares it — the same
+    // rule every other modal follows, with the destructive key never the part that
+    // falls off.
+    let inner_width = width.saturating_sub(2) as usize;
+    let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 2;
+    let height = (wanted as u16).min(screen.height).max(6);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -2520,9 +2571,24 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
+    let inner_height = popup.height.saturating_sub(2) as usize;
+    let mut dropped = false;
+    while !body.is_empty()
+        && pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) > inner_height
+    {
+        body.pop();
+        dropped = true;
+    }
+    let title = if dropped {
+        fit_title(width as usize, "remove an agent", None, None, false, true).0
+    } else {
+        " remove an agent ".to_owned()
+    };
     let block = Block::bordered()
-        .title(" remove an agent ")
+        .title(title)
         .border_style(Style::new().fg(Color::Red));
+    let mut lines = body;
+    lines.extend(answer);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2547,23 +2613,26 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
         .map(|agent| format!("`{agent}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    let lines: Vec<Line> = vec![
+    let mut body: Vec<Line> = vec![
         Line::from(format!(
             "Delete the leftover secrets for {names} from {}?",
             breakable_path(&app.credentials_path.display().to_string())
         )),
         Line::from("Their agents are not configured any more. The values are never shown."),
         Line::from(""),
-        Line::from(Span::styled(
-            "y or enter delete them        n, esc or q keep them",
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
     ];
-    let rows = pushed_rows(&lines, width.saturating_sub(2) as usize) as u16;
-    let height = (rows + 2).min(screen.height).max(6);
+    let answer: Vec<Line> = vec![Line::from(Span::styled(
+        "y or enter delete them        n, esc or q keep them",
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    // Same rule as the removal confirmation: sized to its content, the answer line
+    // pinned, and a declaration when even the floor cannot hold it (the overlay sweep).
+    let inner_width = width.saturating_sub(2) as usize;
+    let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 2;
+    let height = (wanted as u16).min(screen.height).max(6);
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -2574,9 +2643,24 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
+    let inner_height = popup.height.saturating_sub(2) as usize;
+    let mut dropped = false;
+    while !body.is_empty()
+        && pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) > inner_height
+    {
+        body.pop();
+        dropped = true;
+    }
+    let title = if dropped {
+        fit_title(width as usize, "delete leftover secrets", None, None, false, true).0
+    } else {
+        " delete leftover secrets ".to_owned()
+    };
     let block = Block::bordered()
-        .title(" delete leftover secrets ")
+        .title(title)
         .border_style(Style::new().fg(Color::Red));
+    let mut lines = body;
+    lines.extend(answer);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2795,11 +2879,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         height: screen.height.saturating_sub(8),
     };
     let width = (available.width.saturating_sub(2)).min(78);
-    // Size to the content, not to a fixed guess: the record path is a wrapped line,
-    // and a modal that clips it ends the sentence without its object (W-7). The
-    // available area is already inset from the panel, so it is the cap.
-    let height = (risk::LINES.len() as u16 + 10).min(available.height);
-    let popup = centered(available, width, height);
+    let inner_width = width.saturating_sub(2) as usize;
 
     let mut prose: Vec<Line> = Vec::new();
     for text in risk::LINES {
@@ -2852,13 +2932,25 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         )));
     }
 
+    // Size to the content, not to a fixed guess: the record path is a wrapped line,
+    // and a modal that clips it ends the sentence without its object (W-7). The
+    // available area is already inset from the panel, so it is the cap.
+    //
+    // w44 F2: the review dropped three of the eight terms bullets and declared `more
+    // below; enlarge the window`, but the box was capped at a fixed height, so
+    // enlarging revealed nothing — the declaration lied. The box is sized to what it
+    // holds now, so the declaration is true: a bigger window really does show the
+    // dropped bullets, and only the advertised floor has anything to declare.
+    let wanted = pushed_rows(&prose, inner_width) + pushed_rows(&answer, inner_width) + 2;
+    let height = (wanted as u16).min(available.height).max(3);
+    let popup = centered(available, width, height);
+
     // F-1: the modal is a bordered panel, so it obeys the same rule as every other
     // one — whole logical lines, never half a wrapped line. The answer line is the
     // modal's own key, so it is the last row to go: the prose is dropped from the
     // bottom first, then the sentences that follow the answer, and the title says
     // when anything was dropped (`more below; enlarge the window`). A person at the
     // floor therefore never reads a sentence that stops mid-thought in silence.
-    let inner_width = popup.width.saturating_sub(2) as usize;
     let inner_height = popup.height.saturating_sub(2) as usize;
     let mut dropped = false;
     while answer.len() > 1 && pushed_rows(&answer, inner_width) > inner_height {
@@ -2874,20 +2966,21 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let mut lines = prose;
     lines.extend(answer);
 
+    // w44 F3: the read-only review is not the first run. A record already exists and
+    // the acknowledgment is on file, so the overlay is titled for the state it is in;
+    // the terms text (and therefore the digest) keeps the first-run title it is
+    // written under.
+    let base = if app.ack_review {
+        risk::REVIEW_TITLE
+    } else {
+        risk::TITLE
+    };
     let title = if dropped {
         // The declaration is the part that must survive, so it is fitted to the box
         // before it is drawn (Y-1).
-        fit_title(
-            popup.width as usize,
-            risk::TITLE,
-            None,
-            None,
-            false,
-            true,
-        )
-        .0
+        fit_title(popup.width as usize, base, None, None, false, true).0
     } else {
-        format!(" {} ", risk::TITLE)
+        format!(" {base} ")
     };
     let block = Block::bordered()
         .title(title)
