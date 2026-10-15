@@ -246,7 +246,7 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             if agent == &name {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "the run record the hub had for `{name}` is there but could not be read: {reason}; what is shown is what the records left on disk say"
+                        "the newest run record of `{name}` is there but could not be read: {reason}; what is shown is what the records left on disk say"
                     ),
                     Style::new().fg(Color::Yellow),
                 )));
@@ -575,9 +575,17 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
         Some(agent) => {
             lines.push(field("agent", &agent.name));
             match app.instruction_summary() {
-                Some((path, exists, bytes)) => {
+                Some((path, exists, bytes, read_error)) => {
                     lines.push(field("instruction", &path.display().to_string()));
-                    if !exists {
+                    if let Some(reason) = read_error {
+                        // Z-3: a file that is there but cannot be read is not a file
+                        // that is not there. The wording is the transcript's own
+                        // (W38-1), so the same fate has one sentence on every screen.
+                        lines.push(field(
+                            "  on disk",
+                            &format!("— the record could not be read: {reason}"),
+                        ));
+                    } else if !exists {
                         lines.push(field("  on disk", "not there yet — press e to write it"));
                     } else if app.instruction_is_only_placeholder() {
                         lines.push(field(
@@ -636,11 +644,15 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
                 None => lines.push(field("instruction", "the name cannot be used")),
             }
             match app.steps_summary() {
-                Some((path, exists, count)) => {
+                Some((path, exists, count, read_error)) => {
                     lines.push(field("steps", &path.display().to_string()));
                     lines.push(field(
                         "  declared",
-                        &if exists {
+                        &if let Some(reason) = read_error {
+                            // Z-3: `none` is the word for a file with no declared
+                            // steps; a file that cannot be read is a different fact.
+                            format!("— the record could not be read: {reason}")
+                        } else if exists {
                             let noun = if count == 1 { "step" } else { "steps" };
                             format!("{count} shell {noun}, run in the workspace")
                         } else {
@@ -1433,8 +1445,8 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
                 Cell::from(marker),
                 Cell::from(ellipsise(&run.agent, name_w)),
                 Cell::from(ellipsise(&run.run_id, run_id_w)),
-                Cell::from(run.started_text()),
-                Cell::from(ellipsise(&run.describe(), outcome_w)),
+                Cell::from(app.run_started_text(run)),
+                Cell::from(ellipsise(&app.run_state_word(run), outcome_w)),
             ])
             .style(style)
         })
@@ -1572,11 +1584,14 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         if let Some(reason) = run.reason.as_deref() {
             lines.push(Line::from(format!(
                 "outcome: {} — {}",
-                run.describe(),
+                app.run_state_word(run),
                 app.reason_with_history(&run.agent, reason)
             )));
         } else {
-            lines.push(Line::from(format!("outcome: {}", run.describe())));
+            lines.push(Line::from(format!(
+                "outcome: {}",
+                app.run_state_word(run)
+            )));
         }
         // The offers lead the reason's tail: `T` and `o` are the page map's must-offers
         // at 80×24, so they are on one line above the paths and the prose, and cannot
@@ -1614,9 +1629,16 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
 ///
 /// The name column is widened to the shortest width that keeps every configured name
 /// distinct, up to the room the window has; the state column is given the room for its
-/// longest word; the model column takes what is left. When the window is too narrow
-/// for all of them, the state gives ground first, then the name falls back to its
-/// comfortable minimum, so identity outlives the labels.
+/// longest word; the model column is as wide as the longest model id needs and **no
+/// wider**. When the window is too narrow for all of them, the state gives ground
+/// first, then the name falls back to its comfortable minimum, so identity outlives
+/// the labels.
+///
+/// Z-2: the model column used to take all the slack, so at 200 columns the `state`
+/// cell sat ~180 columns from the agent name and a row stopped reading as a row. The
+/// rule is now the one the other columns already follow: a column is as wide as its
+/// content needs, and the slack a very wide window has left over is trailing blank
+/// space, not a gap inserted inside a row.
 fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
     const MARKER: usize = 2;
     const GAPS: usize = 5;
@@ -1641,9 +1663,19 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
     let state = state_wanted
         .min(available.saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + MODEL_MIN))
         .max(STATE_COLUMN_MIN.min(available));
-    let model = available
-        .saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + state)
-        .max(MODEL_MIN.min(available));
+    // The model column asks for the width of the longest model id it must draw (at
+    // least the minimum), and is then given whatever of that the row has room for.
+    // The leftover stays outside the table, so one row's fields stay together at any
+    // width.
+    let model_content = app
+        .agents()
+        .iter()
+        .map(|agent| agent.model.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(MODEL_MIN);
+    let room_for_model = available.saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + state);
+    let model = model_content.min(room_for_model).max(MODEL_MIN.min(available));
     [
         name as u16,
         model as u16,
@@ -2098,9 +2130,12 @@ fn running_clause(app: &App) -> String {
 ///
 /// The legend must not stop mid-list with no sign that more exists: it shows as many
 /// keys as fit and, when one does not, ends with a fixed tail naming the full list —
-/// the page map's own rule. On a wide terminal every key fits and the line ends with
-/// `? all keys` too. The `prefix` is the running count, which is rendered here so that
-/// it is on screen wherever the user is, not only on the Agents screen.
+/// the page map's own rule. `? all keys` is always the last thing on the line, so the
+/// full list is one key away wherever the line had to stop. On a wide terminal every
+/// key fits and the line ends with `? all keys`; when the running count is long enough
+/// that they cannot, the tail says which part is not drawn (Z-4). The `prefix` is the
+/// running count, which is rendered here so that it is on screen wherever the user is,
+/// not only on the Agents screen.
 fn key_legend(width: usize, prefix: &str) -> String {
     const KEYS: &[&str] = &[
         "s start",
@@ -2119,24 +2154,33 @@ fn key_legend(width: usize, prefix: &str) -> String {
         "d remove",
     ];
     let tail = "… more — ? all keys";
+    let all = "? all keys";
     // If the count would crowd out even the full-list hint, the hint wins: it is the
     // affordance the page map requires, and the count is repeated on the Agents screen.
     if width <= tail.chars().count() {
-        return "? all keys".to_owned();
+        return all.to_owned();
     }
     if prefix.chars().count() + tail.chars().count() > width {
         return tail.to_owned();
     }
     let mut line = prefix.to_owned();
-    for key in KEYS {
+    for (index, key) in KEYS.iter().enumerate() {
         let candidate = format!("{line}{key}   ");
-        if candidate.chars().count() + tail.chars().count() > width {
+        // Z-4: while keys remain, the tail is what will end the line; for the **last**
+        // key the line ends with `? all keys` instead, and reserving the longer tail
+        // there dropped `d remove` at 200 columns even though all fourteen fit.
+        let reserve = if index + 1 == KEYS.len() {
+            all.chars().count()
+        } else {
+            tail.chars().count()
+        };
+        if candidate.chars().count() + reserve > width {
             line.push_str(tail);
             return line;
         }
         line = candidate;
     }
-    let candidate = format!("{line}? all keys");
+    let candidate = format!("{line}{all}");
     if candidate.chars().count() <= width {
         candidate
     } else {
@@ -2323,7 +2367,7 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
 ///
 /// The address is not a secret, so it is drawn as itself — a masked address could not
 /// be corrected. The prompt says what pressing enter changes: the one global address
-/// every agent on this machine follows.
+/// every agent in this configuration follows.
 fn draw_url_prompt(frame: &mut Frame, app: &App) {
     let Some(prompt) = &app.url_prompt else {
         return;
@@ -2343,7 +2387,7 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
     );
     let mut lines: Vec<Line> = vec![
         Line::from(
-            "The address is the Forgejo every agent on this machine uses, and the role check runs against it.",
+            "The address is the Forgejo every agent in this configuration uses, and the role check runs against it.",
         ),
         Line::from(""),
         Line::from(Span::styled(
