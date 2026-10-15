@@ -1705,6 +1705,26 @@ fn every_panel_and_note_area_that_truncates_declares_it_at_eighty_columns() {
         agents.contains("… more below; enlarge the window"),
         "{agents}"
     );
+
+    // W36-1: the drop case. Declaring is not enough — a logical line taller than the
+    // body must be drawn row by row so every row is reachable, not dropped and
+    // declared. This drives every wrapped row of the Agent panel to the top of its
+    // window at 72×18; a row the row window cannot show fails here.
+    app.show(Screen::AgentConfig);
+    render_at(72, 18, &app);
+    let rows = gewu_multiverse::ui::panel_rows_text(&app);
+    for (index, row) in rows.iter().enumerate() {
+        let needle = normalised(row);
+        if needle.is_empty() {
+            continue;
+        }
+        app.panel_scroll = index;
+        let screen = normalised(&render_at(72, 18, &app));
+        assert!(
+            screen.contains(&needle),
+            "a wrapped row is dropped unreachably at 72×18: {row:?}"
+        );
+    }
 }
 
 #[test]
