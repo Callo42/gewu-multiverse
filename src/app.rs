@@ -2844,6 +2844,11 @@ impl App {
         action: &PendingAction,
         result: std::io::Result<std::process::ExitStatus>,
     ) {
+        // T-2: the hand-off program owned the keys while it was on screen. When it
+        // returns, the product owns them again; every hand-off outcome says so, so a
+        // habitual editor key (the `N` a beginner types after `^X`) is not sent to the
+        // product without the person being told the hand-over happened.
+        const KEYS_BACK: &str = "; the keys are the product's again";
         match (action.kind, result) {
             (ActionKind::Edit, Ok(status)) => {
                 // Compare the file before and after: never claim an edit that was not
@@ -2882,17 +2887,17 @@ impl App {
                     };
                     if changed {
                         self.status = format!(
-                            "{} {verb} edited in {program} ({file}); the files were read again",
+                            "{} {verb} edited in {program} ({file}); the files were read again{KEYS_BACK}",
                             action.label
                         );
                     } else if action.created {
                         // The hand-off itself made the file; the screen beside it now
                         // counts it. Saying `not changed` here is the lie H-1 and H-2
                         // found: report the creation instead.
-                        self.status = created_status(action, &program);
+                        self.status = format!("{}{KEYS_BACK}", created_status(action, &program));
                     } else {
                         self.status = format!(
-                            "{} {verb} not changed ({file}, opened in {program})",
+                            "{} {verb} not changed ({file}, opened in {program}){KEYS_BACK}",
                             action.label
                         );
                     }
@@ -2908,7 +2913,7 @@ impl App {
                     format!("your editor could not be started: {error}{created}");
             }
             (ActionKind::View, Ok(_)) => {
-                self.status = format!("{} was shown", action.label);
+                self.status = format!("{} was shown{KEYS_BACK}", action.label);
             }
             (ActionKind::View, Err(error)) => {
                 self.status = format!("a pager could not be started: {error}");
@@ -4367,6 +4372,47 @@ role = "member"
         std::fs::write(&action.path, "a changed instruction\n").expect("the file is changed");
         app.note_action(&action, Ok(success()));
         assert!(app.status.contains("was edited"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_hand_off_says_the_keys_are_the_products_again() {
+        // T-2: an editor that leaves at once (an untouched template) hands the keys
+        // back with no sentence; a habitual editor key then acts on the product. The
+        // hand-over is now visible in the after direction too.
+        for (keycode, expected) in [
+            (KeyCode::Char('t'), "created"),
+            (KeyCode::Char('e'), "created"),
+        ] {
+            let mut app = app_with(GOOD);
+            app.show_acknowledgment = false;
+            app.editor_configured = true;
+            app.on_key(key(keycode));
+            let action = app.take_action().expect("an edit");
+            app.note_action(&action, Ok(success()));
+            assert!(app.status.contains(expected), "{}", app.status);
+            assert!(
+                app.status.contains("the keys are the product's again"),
+                "{}",
+                app.status
+            );
+        }
+        // A view returns the keys too.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let run_id = "run-1-0001";
+        let dir = app.layout.state_root().join("one").join(run_id);
+        std::fs::create_dir_all(&dir).expect("the run directory");
+        std::fs::write(dir.join("run.log"), "a log\n").expect("a log");
+        app.refresh_recent();
+        app.on_key(key(KeyCode::Char('o')));
+        if let Some(action) = app.take_action() {
+            app.note_action(&action, Ok(success()));
+            assert!(
+                app.status.contains("the keys are the product's again"),
+                "{}",
+                app.status
+            );
+        }
     }
 
     #[test]
