@@ -131,6 +131,12 @@ impl Layout {
         self.root.join("endpoint-tests.toml")
     }
 
+    /// The role check's stamp, so the fact that a check ran survives a restart the
+    /// way the endpoint test does (W37-1). It holds no secret.
+    pub fn role_checks_file(&self) -> PathBuf {
+        self.root.join("role-checks.toml")
+    }
+
     /// The directory holding one directory per agent.
     pub fn agents_dir(&self) -> PathBuf {
         self.root.join("agents")
