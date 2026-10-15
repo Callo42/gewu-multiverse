@@ -2315,15 +2315,16 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let height = (risk::LINES.len() as u16 + 10).min(available.height);
     let popup = centered(available, width, height);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut prose: Vec<Line> = Vec::new();
     for text in risk::LINES {
-        lines.push(Line::from(vec![Span::raw("  * "), Span::raw(*text)]));
+        prose.push(Line::from(vec![Span::raw("  * "), Span::raw(*text)]));
     }
-    lines.push(Line::from(""));
+    prose.push(Line::from(""));
+    let mut answer: Vec<Line> = Vec::new();
     if app.ack_review {
         // Read-only: the record exists and a second person is reading it. Nothing
         // here writes, so nothing here may look like it does (C-3).
-        lines.push(Line::from(Span::styled(
+        answer.push(Line::from(Span::styled(
             "  esc or any key — close this, the record is unchanged",
             Style::new()
                 .fg(Color::Black)
@@ -2331,30 +2332,67 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )));
         if let Some(record) = app.ack_state.record_line() {
-            lines.push(Line::from(Span::styled(
+            answer.push(Line::from(Span::styled(
                 format!("  {record}"),
                 Style::new().fg(Color::DarkGray),
             )));
         }
     } else {
-        lines.push(Line::from(Span::styled(
+        answer.push(Line::from(Span::styled(
             "  y — I understand, record it once        n — not now",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(
+        answer.push(Line::from(
             "  Until it is recorded, starting an agent stays refused.",
         ));
-        lines.push(Line::from(format!(
+        answer.push(Line::from(format!(
             "  The record will be written to {}",
             breakable_path(&app.ack_path.display().to_string())
         )));
     }
 
+    // F-1: the modal is a bordered panel, so it obeys the same rule as every other
+    // one — whole logical lines, never half a wrapped line. The answer line is the
+    // modal's own key, so it is the last row to go: the prose is dropped from the
+    // bottom first, then the sentences that follow the answer, and the title says
+    // when anything was dropped (`more below; enlarge the window`). A person at the
+    // floor therefore never reads a sentence that stops mid-thought in silence.
+    let inner_width = popup.width.saturating_sub(2) as usize;
+    let inner_height = popup.height.saturating_sub(2) as usize;
+    let mut dropped = false;
+    while answer.len() > 1 && pushed_rows(&answer, inner_width) > inner_height {
+        answer.pop();
+        dropped = true;
+    }
+    while !prose.is_empty()
+        && pushed_rows(&prose, inner_width) + pushed_rows(&answer, inner_width) > inner_height
+    {
+        prose.pop();
+        dropped = true;
+    }
+    let mut lines = prose;
+    lines.extend(answer);
+
+    let title = if dropped {
+        // The declaration is the part that must survive, so it is fitted to the box
+        // before it is drawn (Y-1).
+        fit_title(
+            popup.width as usize,
+            risk::TITLE,
+            None,
+            None,
+            false,
+            true,
+        )
+        .0
+    } else {
+        format!(" {} ", risk::TITLE)
+    };
     let block = Block::bordered()
-        .title(format!(" {} ", risk::TITLE))
+        .title(title)
         .border_style(Style::new().fg(Color::Yellow));
     // The modal owns every row it covers: clear the full terminal width for those
     // rows before drawing it, so the panel's border and wrapped notes cannot survive
