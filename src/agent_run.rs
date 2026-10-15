@@ -55,9 +55,10 @@ pub const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
 /// The guidance line the product's own instruction template opens with.
 ///
 /// The template is not an instruction: it is a placeholder that tells the user where
-/// to write one. A run drops any line that is exactly this text before it sends the
-/// document, so a person who types *below* the guidance does not send the guidance to
-/// the model as if it were their instruction.
+/// to write one. A run drops this text from the document's first content line before it
+/// sends the document, so a person who types *below* the guidance — or *into* the line
+/// the editor opens on — does not send the guidance to the model as if it were their
+/// instruction (T-1).
 pub const INSTRUCTION_PLACEHOLDER: &str =
     "<replace this line with what the agent should do; a run reads this document before it does anything>";
 
@@ -794,45 +795,43 @@ fn signal_of(status: std::process::ExitStatus) -> Option<i32> {
     status.signal()
 }
 
-/// Drop the product's own guidance line from an instruction document.
+/// Drop the product's own guidance placeholder from an instruction document.
 ///
-/// The template puts the placeholder on the first line, so that is the line this
-/// removes. A later line that happens to hold the same text is the user's own
-/// document and is kept; the Instruction screen uses [`instruction_payload`] to show
-/// how the two sizes differ.
+/// The template puts the placeholder on the first content line, and the editor opens
+/// with the cursor on that line, so a person's own sentence joins it there — and the
+/// guidance was then sent to the model glued to the user's text (T-1). The
+/// placeholder **substring** is removed from that line, leaving whatever the person
+/// wrote around it. A later line that holds the same text is the user's own document
+/// and is kept; the Instruction screen uses [`instruction_payload`] to show how the
+/// two sizes differ.
 fn strip_placeholder(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    let drop_at = first_content_line(&lines).filter(|&at| lines[at].trim() == INSTRUCTION_PLACEHOLDER);
-    match drop_at {
-        None => lines.join("\n"),
-        Some(at) => lines
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != at)
-            .map(|(_, line)| *line)
-            .collect::<Vec<_>>()
-            .join("\n"),
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    if let Some(at) = first_content_line(&lines) {
+        if lines[at].contains(INSTRUCTION_PLACEHOLDER) {
+            lines[at] = lines[at].replace(INSTRUCTION_PLACEHOLDER, "");
+        }
     }
+    lines.join("\n")
 }
 
 /// The index of the first line that is not blank, if the text has one.
-fn first_content_line(lines: &[&str]) -> Option<usize> {
-    lines.iter().position(|line| !line.trim().is_empty())
+fn first_content_line<S: AsRef<str>>(lines: &[S]) -> Option<usize> {
+    lines.iter().position(|line| !line.as_ref().trim().is_empty())
 }
 
-/// Whether a run drops the product's own guidance line from this document.
+/// Whether a run drops the product's own guidance from this document.
 ///
-/// True only when the document's first non-blank line is the placeholder. The
-/// Instruction screen uses this to name the reason the two sizes differ: a document
-/// with no guidance line but a trailing newline differs by that byte alone, not by a
-/// dropped line (T-3, D-1).
+/// True when the document's first non-blank line holds the placeholder, whether alone
+/// or joined to the user's own text (T-1). The Instruction screen uses this to name
+/// the reason the two sizes differ: a document with no guidance but a trailing newline
+/// differs by that byte alone, not by dropped guidance (T-3, D-1).
 #[must_use]
 pub fn guidance_dropped(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     let lines: Vec<&str> = text.lines().collect();
     first_content_line(&lines)
-        .map(|at| lines[at].trim() == INSTRUCTION_PLACEHOLDER)
+        .map(|at| lines[at].contains(INSTRUCTION_PLACEHOLDER))
         .unwrap_or(false)
 }
 
@@ -1635,6 +1634,32 @@ mod tests {
         // A document that is nothing but the placeholder is refused, never sent.
         fs::write(&path, format!("{INSTRUCTION_PLACEHOLDER}\n")).expect("instruction");
         let error = read_instruction(&path).expect_err("still the placeholder");
+        assert!(error.contains("placeholder"), "{error}");
+    }
+
+    #[test]
+    fn a_sentence_typed_into_the_placeholder_line_is_sent_without_the_guidance() {
+        // T-1: the editor opens with its cursor on the template's own line, so a
+        // beginner's sentence joins the guidance there. The guidance must not travel to
+        // the model glued to that sentence, and the person's words must survive.
+        let root = scratch_root("agent-run-placeholder-joined");
+        let path = root.join("instruction.md");
+        for doc in [
+            format!("Summarise the notes.{INSTRUCTION_PLACEHOLDER}\n"),
+            format!("{INSTRUCTION_PLACEHOLDER}Summarise the notes.\n"),
+            format!("{INSTRUCTION_PLACEHOLDER}\n\nSummarise the notes.\n"),
+        ] {
+            fs::write(&path, &doc).expect("instruction");
+            let read = read_instruction(&path).expect("the instruction reads");
+            let read = String::from_utf8(read).expect("text");
+            assert!(read.contains("Summarise the notes."), "{read}");
+            assert!(!read.contains("replace this line"), "{read}");
+            let (on_disk, sent) = instruction_payload(doc.as_bytes());
+            assert!(on_disk > sent, "the guidance is counted as dropped: {doc:?}");
+        }
+        // A document of nothing but the joined guidance plus space is still empty.
+        fs::write(&path, format!("  {INSTRUCTION_PLACEHOLDER}  \n")).expect("instruction");
+        let error = read_instruction(&path).expect_err("no instruction at all");
         assert!(error.contains("placeholder"), "{error}");
     }
 

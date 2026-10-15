@@ -3688,8 +3688,9 @@ fn quote(text: &str) -> String {
 fn editable_template(target: EditTarget, agent: &str) -> String {
     match target {
         // The guidance is a single marked placeholder, not prose in the document: the
-        // run drops any line that is exactly this text before it sends the document,
-        // so a person who types below the guidance never sends the guidance itself.
+        // run drops this text from the document's first content line before it sends
+        // the document, so a person who types below the guidance — or into the line the
+        // editor opens on — never sends the guidance itself (T-1).
         EditTarget::Instruction => format!(
             "{}\n",
             crate::agent_run::INSTRUCTION_PLACEHOLDER
