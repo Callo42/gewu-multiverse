@@ -552,13 +552,46 @@ pub fn read(run_dir: &Path) -> io::Result<TranscriptFile> {
     Ok(TranscriptFile { records, partial })
 }
 
-/// The run's terminal record, when it has one.
-pub fn terminal_record(run_dir: &Path) -> Option<Record> {
-    let file = read(run_dir).ok()?;
-    file.records
+/// Read a transcript, telling a file that is **not there** from one that cannot be
+/// read at all.
+///
+/// [`read`] returns an empty transcript for a missing file and an error for a present
+/// file it cannot parse or open. A caller that must say which case it is in — a screen
+/// that reads a record it did not write — needs the two apart, so this returns
+/// `Ok(None)` for a file that is not there and `Err` for one that is present but
+/// unreadable (W38-1).
+pub fn read_checked(run_dir: &Path) -> io::Result<Option<TranscriptFile>> {
+    let path = run_dir.join(TRANSCRIPT_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => read(run_dir).map(Some),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source),
+    }
+}
+
+/// The run's terminal record, when it has one, naming a read failure.
+///
+/// A transcript that is present but unreadable is **not** a run with no ending:
+/// `Ok(None)` means no terminal record (or no file), `Err` means the record could not
+/// be read (W38-1).
+pub fn terminal_record_checked(run_dir: &Path) -> io::Result<Option<Record>> {
+    let Some(file) = read_checked(run_dir)? else {
+        return Ok(None);
+    };
+    Ok(file
+        .records
         .into_iter()
         .rev()
-        .find(|record| matches!(record, Record::RunFinished { .. }))
+        .find(|record| matches!(record, Record::RunFinished { .. })))
+}
+
+/// The run's terminal record, when it has one.
+///
+/// This keeps the old shape for callers that only need a record or nothing; the error
+/// case collapses to `None` here, so a screen that must distinguish the cases uses
+/// [`terminal_record_checked`] instead.
+pub fn terminal_record(run_dir: &Path) -> Option<Record> {
+    terminal_record_checked(run_dir).ok().flatten()
 }
 
 /// The timestamp of the run's opening record, when it is there.

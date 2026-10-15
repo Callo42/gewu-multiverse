@@ -238,6 +238,28 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
 /// The lines under the agent list.
 fn agent_notes(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
+    // W38-2: the sentence about a record the hub had is the moment's fact. It is drawn
+    // first, above the standing hazard and limits prose, so a short note area cannot
+    // push the only explanation of a changed history below the fold.
+    if let Some(name) = app.selected_name() {
+        if let Some((agent, reason)) = app.unreadable_run.as_ref() {
+            if agent == &name {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "the run record the hub had for `{name}` is there but could not be read: {reason}; what is shown is what the records left on disk say"
+                    ),
+                    Style::new().fg(Color::Yellow),
+                )));
+            }
+        } else if app.forgotten_run.as_deref() == Some(name.as_str()) {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "a run record the hub had for `{name}` is no longer there; what is shown is what the records left on disk say"
+                ),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
+    }
     if let Some(error) = &app.config_error {
         // The recovery key belongs with the error, not only in the legend that a short
         // window clips (T-7): say how to try the file again after fixing it.
@@ -295,14 +317,6 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(
                 format!("{label}: {}", app.reason_with_history(&name, &reason)),
                 Style::new().fg(Color::Red),
-            )));
-        }
-        if app.forgotten_run.as_deref() == Some(name.as_str()) {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "a run record the hub had for `{name}` is no longer there; what is shown is what the records left on disk say"
-                ),
-                Style::new().fg(Color::Yellow),
             )));
         }
         if let Some(reason) = app.last_start_failure(&name) {
@@ -430,24 +444,21 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     Style::new().fg(Color::Red),
                 )));
             }
+            let newest_run = app.latest_run(&agent.name);
+            let transcript_error = newest_run.and_then(|run| run.read_error.as_deref());
             match app.latest_run_log(&agent.name) {
-                Some(log) if log.is_file() => {
-                    // L-3: the log is the file that grows with every run, so its size
-                    // is shown beside its path rather than left to the filesystem.
-                    let size = App::file_size_text(&log)
-                        .unwrap_or_else(|| "size unknown".to_owned());
-                    lines.push(field(
-                        "newest log",
-                        &format!("{} ({size})", log.display()),
-                    ));
-                }
+                Some(log) if log.is_file() => lines.push(field(
+                    "newest log",
+                    &crate::run::file_sentence(&log, "log", None),
+                )),
                 // Y-7: a path to a file that is no longer there is not a thing. Mark it
-                // gone, rather than presenting it as if `o` would open it.
+                // gone, rather than presenting it as if `o` would open it. W38-3: the
+                // word is the same one the Runs note uses for the same missing file.
                 Some(log) => lines.push(field(
                     "newest log",
                     &format!(
-                        "{} — gone, the record has no log; press o to see what it says",
-                        log.display()
+                        "{}; press o to see what it says",
+                        crate::run::file_sentence(&log, "log", None)
                     ),
                 )),
                 // W32-3: `no run yet` is a claim about the agent, and a person who
@@ -459,21 +470,14 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     "no run record on this machine yet — run records live under the state directory",
                 )),
             }
-            // L-3: the transcript grows too, and was named nowhere with a size.
-            match app.latest_run_transcript(&agent.name) {
-                Some(path) if path.is_file() => {
-                    let size = App::file_size_text(&path)
-                        .unwrap_or_else(|| "size unknown".to_owned());
-                    lines.push(field(
-                        "transcript",
-                        &format!("{} ({size})", path.display()),
-                    ));
-                }
-                Some(path) => lines.push(field(
+            // L-3: the transcript grows too, and was named nowhere with a size. W38-1:
+            // a transcript that is present but unreadable says so, with the reason,
+            // rather than being left as a size a person would trust.
+            if let Some(path) = app.latest_run_transcript(&agent.name) {
+                lines.push(field(
                     "transcript",
-                    &format!("{} — gone, the record has no transcript", path.display()),
-                )),
-                None => {}
+                    &crate::run::file_sentence(&path, "transcript", transcript_error),
+                ));
             }
             if let Some(run_id) = app.supervisor.state(&agent.name).run_id() {
                 lines.push(field("run", run_id));
@@ -1443,7 +1447,13 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(outcome_w as u16),
     ];
     let table = Table::new(rows, widths).header(header).block(
-        Block::bordered().title(list_title("recent runs", first, shown, app.recent.len())),
+        Block::bordered().title(list_title_with_total(
+            "recent runs",
+            first,
+            shown,
+            app.recent.len(),
+            app.recent_total.max(app.recent.len()),
+        )),
     );
     frame.render_widget(table, parts[0]);
 
@@ -1583,17 +1593,15 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         // The paths are the detail: named here, below the offers, so a short note area
         // drops them rather than the offers (they stay reachable with `[`/`]`). Each
         // file's size is beside it, so the growth a Long-hauler watches is readable
-        // without leaving the product (L-3).
+        // without leaving the product (L-3). W38-1/W38-3: the same three-case wording
+        // as the Agent screen names the file, so a deleted transcript is `gone` here
+        // too, and one that is present but unreadable says so.
         let transcript = run.dir.join(crate::transcript::TRANSCRIPT_FILE);
-        let transcript_size = App::file_size_text(&transcript)
-            .unwrap_or_else(|| "size unknown".to_owned());
-        let log_size =
-            App::file_size_text(&run.log).unwrap_or_else(|| "size unknown".to_owned());
-        lines.push(Line::from(format!(
-            "the transcript is at {} ({transcript_size}) and the log at {} ({log_size})",
-            breakable_path(&transcript.display().to_string()),
-            breakable_path(&run.log.display().to_string())
-        )));
+        lines.push(Line::from(breakable_path(&format!(
+            "the transcript is at {} and the log at {}",
+            crate::run::file_sentence(&transcript, "transcript", run.read_error.as_deref()),
+            crate::run::file_sentence(&run.log, "log", None)
+        ))));
         lines.push(Line::from(Span::styled(
             "The outcome is decided by the process, not by what it wrote.",
             Style::new().fg(Color::DarkGray),
@@ -2079,8 +2087,10 @@ fn running_clause(app: &App) -> String {
     } else {
         // A `+` when the newest fifty records all finished since this UI started and
         // older records are on disk: the count may be larger than it can see (L-5).
+        // W39-3: the word is `ended`, not `finished`, because the count includes runs
+        // that timed out or were stopped — "finished" read as "succeeded".
         let plus = if app.finished_count_is_capped() { "+" } else { "" };
-        format!("{base}· {finished}{plus} finished   ")
+        format!("{base}· {finished}{plus} ended   ")
     }
 }
 
@@ -2833,12 +2843,29 @@ fn visible_window(total: usize, selected: usize, capacity: usize) -> (usize, usi
 /// The product's own rule, applied to lists as it already is to the footer legend and
 /// the window size: nothing is dropped **silently**.
 fn list_title(base: &str, first: usize, shown: usize, total: usize) -> String {
-    if total == 0 || total <= shown {
+    list_title_with_total(base, first, shown, total, total)
+}
+
+/// [`list_title`] where the arrows speak for the **window** while `of N` names the
+/// whole population.
+///
+/// The Runs list holds the newest fifty records of however many are on disk, so its
+/// `of N` must be the on-disk total — the list total, not the cap — while `↓ more` is
+/// true only of the window itself: the older records are not reachable by scrolling
+/// (W39-1). Every other list passes the same number twice and behaves as before.
+fn list_title_with_total(
+    base: &str,
+    first: usize,
+    shown: usize,
+    window: usize,
+    total: usize,
+) -> String {
+    if window == 0 || (window <= shown && total <= shown) {
         return format!(" {base} ");
     }
     let mut extra = format!("{}–{} of {total}", first + 1, first + shown);
     let more_above = first > 0;
-    let more_below = first + shown < total;
+    let more_below = first + shown < window;
     match (more_above, more_below) {
         (true, true) => extra.push_str(" — ↑↓ more"),
         (false, true) => extra.push_str(" — ↓ more"),
