@@ -211,7 +211,11 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     // the modal could cover the head of a wrapped sentence and leave its tail
     // (`writes both files for you.`) as the first screen a zero-knowledge user sees.
     // The modal is the screen while it is up; the note area returns when it closes.
-    let notes = if app.show_acknowledgment {
+    // F-1's class, generalized by enumeration (R-3/S-1): while any overlay owns the
+    // screen — the acknowledgment, the add-agent form, a prompt, a confirmation, the
+    // help — the note area behind it is not drawn at all, so a covered wrapped
+    // sentence can never leave its tail as the first thing a person reads.
+    let notes = if app.overlay_owns_screen() {
         Vec::new()
     } else {
         note_window(
@@ -474,7 +478,13 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             // LIB-2: the field is always drawn. A test whose stamp survived a restart
             // is shown with its age; an agent with no test at all says so, so a person
             // never sees a fact silently missing where the map says it is.
-            match app.endpoint_test_for(&agent.name) {
+            // S-2: while a probe is in flight the field says so, and the previous
+            // result is not drawn at all, so a stale result cannot read as current.
+            if let Some(sentence) = app.endpoint_probe_sentence(&agent.name) {
+                lines.push(field("endpoint test", &sentence));
+            }
+            if !app.testing_endpoint(&agent.name) {
+                match app.endpoint_test_for(&agent.name) {
                 // Y-5: a result about an endpoint or model that has since changed is
                 // history; it is dated and marked, never shown as if it were now.
                 Some(test) if test.is_current_for(agent) => {
@@ -506,6 +516,7 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     ),
                 )),
                 None => lines.push(field("endpoint test", "not tested yet — press p")),
+                }
             }
             match app.recorded_identity(&agent.name) {
                 Some(identity) => lines.push(field("identity", &identity.line())),
@@ -977,22 +988,27 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
         )),
         Some(Err(failure)) => {
             // P-7: a refusal names the URL the user configured, not only the API path,
-            // so a mistyped path connects to what was typed.
+            // so a mistyped path connects to what was typed. S-2: the refusal carries
+            // the stamp of when and where it was made.
             let at = app
                 .config
                 .as_ref()
                 .map(|config| config.forgejo.url.clone())
                 .unwrap_or_else(|| "the configured address".to_owned());
-            head.push(Line::from(Span::styled(
-                format!(
+            let line = match app.role_check_stamp() {
+                Some(stamp) => format!(
+                    "role check failed ({}) at {at}: {} — {stamp}",
+                    failure.class, failure.message
+                ),
+                None => format!(
                     "role check failed ({}) at {at}: {}",
                     failure.class, failure.message
                 ),
-                Style::new().fg(Color::Red),
-            )));
+            };
+            head.push(Line::from(Span::styled(line, Style::new().fg(Color::Red))));
         }
         Some(Ok(check)) => {
-            let summary = format!(
+            let mut summary = format!(
                 "{} — {}",
                 if check.administrative() {
                     "administrative view"
@@ -1001,6 +1017,9 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                 },
                 check.summary()
             );
+            if let Some(stamp) = app.role_check_stamp() {
+                summary = format!("{summary} — {stamp}");
+            }
             head.push(Line::from(summary));
             head.push(Line::from(""));
             if check.repositories.is_empty() {
@@ -1093,7 +1112,16 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
     // Which secret *names* are present, never a value: a person can confirm a key
     // loaded without the tool reading it back onto a screen.
     let present = app.present_secret_labels();
-    if let Some(problem) = crate::credentials::parse_problem(&app.credentials_path) {
+    if crate::credentials::is_absent(&app.credentials_path) {
+        // R-6: a file that is not there is not a file that cannot be created. The
+        // directory may be writable and a write path puts the file back (R-1), so the
+        // sentence names the absence and the key that writes it, instead of sending a
+        // person looking for a permissions problem that is not there.
+        lines.push(Line::from(Span::styled(
+            "the credentials file is not there yet — press k, f or A on this screen to write it",
+            Style::new().fg(Color::Red),
+        )));
+    } else if let Some(problem) = crate::credentials::parse_problem(&app.credentials_path) {
         // A file that could not be read is not an empty file. Say which it is.
         lines.push(Line::from(Span::styled(
             format!("the credentials file is not ready: {problem}"),
@@ -1184,7 +1212,13 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     // content needs (the reason leads, and `o`/`T` must survive beside it), never
     // leaving the list with less than its border, its header and **three** runs: a
     // window of one row is a window a person cannot survey (O-3, P-M3, Y-3).
-    let notes = run_notes(app);
+    // R-3/S-1: the run note area follows the same rule as the agent note area — not
+    // drawn at all while an overlay owns the screen, so no fragment survives under it.
+    let notes = if app.overlay_owns_screen() {
+        Vec::new()
+    } else {
+        run_notes(app)
+    };
     let inner = area.width.saturating_sub(2) as usize;
     let needed = pushed_rows(&notes, inner) as u16 + 2;
     // Border, header and three run rows belong to the list before the note area takes
@@ -1241,8 +1275,18 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::new()
             };
+            // R-5: a record whose agent the configuration no longer lists is marked
+            // `*` in the two-character marker column, so the list and the count agree
+            // and its transcript and log stay reachable.
+            let unlisted = !app.agents().iter().any(|agent| agent.name == run.agent);
+            let marker = match (at == app.run_selected, unlisted) {
+                (true, true) => ">*",
+                (true, false) => "> ",
+                (false, true) => " *",
+                (false, false) => "  ",
+            };
             Row::new(vec![
-                Cell::from(if at == app.run_selected { ">" } else { " " }),
+                Cell::from(marker),
                 Cell::from(ellipsise(&run.agent, name_w)),
                 Cell::from(ellipsise(&run.run_id, run_id_w)),
                 Cell::from(run.started_text()),
@@ -1263,17 +1307,19 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(table, parts[0]);
 
-    let above = app.panel_scroll > 0;
-    let below = panel_overflows_from(&notes, parts[1], app.panel_scroll);
-    let (title, _) = fit_title(
-        parts[1].width as usize,
-        "run records",
-        None,
-        None,
-        above,
-        below,
-    );
-    draw_panel(frame, scrolled(&notes, app.panel_scroll), title, parts[1]);
+    if !notes.is_empty() {
+        let above = app.panel_scroll > 0;
+        let below = panel_overflows_from(&notes, parts[1], app.panel_scroll);
+        let (title, _) = fit_title(
+            parts[1].width as usize,
+            "run records",
+            None,
+            None,
+            above,
+            below,
+        );
+        draw_panel(frame, scrolled(&notes, app.panel_scroll), title, parts[1]);
+    }
 }
 
 /// The lines under the run list, for the run on show.
@@ -1301,15 +1347,17 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             crate::app::filesize_text(footprint.bytes)
         )));
         if footprint.unconfigured_records > 0 {
-            let noun = if footprint.unconfigured_records == 1 {
-                "record belongs"
+            // R-5: these records are now listed and marked, not only counted, so the
+            // sentence says where they are instead of implying they are invisible.
+            let text = if footprint.unconfigured_records == 1 {
+                "1 record belongs to an agent the configuration no longer lists and is marked `*` in the list above; it stays on disk until it is deleted.".to_owned()
             } else {
-                "records belong"
+                format!(
+                    "{} records belong to an agent the configuration no longer lists and are marked `*` in the list above; they stay on disk until they are deleted.",
+                    footprint.unconfigured_records
+                )
             };
-            lines.push(Line::from(format!(
-                "{} {noun} to an agent the configuration no longer lists; they stay on disk until they are deleted.",
-                footprint.unconfigured_records
-            )));
+            lines.push(Line::from(text));
         }
         lines.push(Line::from(Span::styled(
             "To free their space, remove a run's directory under that path. The product only reads run records; it never deletes one by itself.",
@@ -1317,35 +1365,20 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         )));
     }
     // L-1, L-5: the list is capped at the newest fifty records. Say so at the point of
-    // the cap, rather than presenting fifty as the whole history. Every total here is
-    // named for what it counts: the configured agents' records are the list's own
-    // population, `on disk` is every record, and nothing is left out of "not listed"
-    // (F4, H-4).
+    // the cap, rather than presenting fifty as the whole history. R-5: the list now
+    // covers every record on disk — configured and unconfigured — so the only
+    // difference left is the cap, and it is named as such.
     if app.recent_total > app.recent.len() {
         let listed = app.recent.len();
-        let configured = app.recent_total;
-        let unconfigured = app.footprint.unconfigured_records;
-        let configured_older = configured - listed;
-        let not_listed = configured_older + unconfigured;
-        let text = if unconfigured == 0 {
+        let total = app.recent_total;
+        let older = total - listed;
+        let text = if older == 1 {
             format!(
-                "This list stops at the newest {listed} of the {configured} run records whose agents are configured: {configured_older} older records are not listed here, but they are still on disk."
+                "This list stops at the newest {listed} of the {total} run records on disk: 1 older record is not listed here, but it is still on disk."
             )
         } else {
-            let older_noun = if configured_older == 1 {
-                "older record"
-            } else {
-                "older records"
-            };
-            let unlisted_noun = if unconfigured == 1 {
-                "record"
-            } else {
-                "records"
-            };
-            let all_noun = if not_listed == 1 { "record" } else { "records" };
             format!(
-                "This list stops at the newest {listed} of the {configured} run records whose agents are configured ({} records are on disk in all): {configured_older} {older_noun} of configured agents and {unconfigured} {unlisted_noun} of agents the configuration no longer lists — {not_listed} {all_noun} in all — are not listed here, but they are still on disk.",
-                app.footprint.records
+                "This list stops at the newest {listed} of the {total} run records on disk: {older} older records are not listed here, but they are still on disk."
             )
         };
         lines.push(Line::from(Span::styled(
@@ -1989,7 +2022,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::Red),
         ))),
         None => lines.push(Line::from(Span::styled(
-            "  tab/up/down between fields   enter writes config.toml and credentials.toml   esc cancels",
+            "  tab/up/down between fields   ctrl-u clears the field   enter writes config.toml and credentials.toml   esc cancels",
             Style::new().fg(Color::DarkGray),
         ))),
     }
@@ -2078,7 +2111,7 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::Red),
         ))),
         None => lines.push(Line::from(Span::styled(
-            "  enter writes it   esc cancels",
+            "  enter writes it   ctrl-u clears the field   esc cancels",
             Style::new().fg(Color::DarkGray),
         ))),
     }
@@ -2132,7 +2165,7 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
             Style::new().fg(Color::Red),
         ))),
         None => lines.push(Line::from(Span::styled(
-            "  enter writes it for every agent   esc cancels",
+            "  enter writes it for every agent   ctrl-u clears the field   esc cancels",
             Style::new().fg(Color::DarkGray),
         ))),
     }

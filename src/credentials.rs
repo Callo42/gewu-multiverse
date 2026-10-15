@@ -92,6 +92,18 @@ pub enum CredentialsError {
         #[source]
         source: io::Error,
     },
+    /// The file is not there.
+    ///
+    /// This is deliberately *not* [`CredentialsError::Create`]: the directory around
+    /// it may be perfectly writable, and a write path puts the file back. The
+    /// sentence names the absence rather than a creation failure, because the old
+    /// wording sent a person looking for a permissions problem that is not there
+    /// (R-6), and the write paths used to fail before they could create it (R-1).
+    #[error("the credentials file {path} is not there")]
+    Absent {
+        /// The file that is not there.
+        path: PathBuf,
+    },
     /// The file could not be written.
     #[error("{path} cannot be written: {source}")]
     Write {
@@ -553,7 +565,7 @@ pub fn record_agent_identity(
     mode: &str,
     created_at: Option<u64>,
 ) -> Result<(), CredentialsError> {
-    let mut value = read_value(path)?;
+    let mut value = value_for_write(path)?;
     let table = value
         .as_table_mut()
         .ok_or_else(|| CredentialsError::MissingToken {
@@ -612,6 +624,35 @@ pub fn record_agent_identity(
     })
 }
 
+/// Read the file in order to rewrite it, creating it first when it is not there.
+///
+/// R-1: every write path used to begin with `read_value`, and a missing file was an
+/// error before the write could create it — so `k`, `f` and `A` could not put a
+/// secret back after the file was deleted in-session, and only a restart recovered.
+/// The write paths now put the file back with the file's own custody (the same
+/// `CredentialsFile::prepare` that creates it at mode 0600) and then write.
+fn value_for_write(path: &Path) -> Result<toml::Value, CredentialsError> {
+    match read_value(path) {
+        Ok(value) => Ok(value),
+        Err(CredentialsError::Absent { .. }) => {
+            CredentialsFile::prepare(path)?;
+            read_value(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the credentials file is not there at all (as opposed to unreadable).
+///
+/// The Credentials screen uses this to say the file is absent and name the key that
+/// writes it, instead of reporting a creation failure for a writable directory.
+pub fn is_absent(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(source) if source.kind() == io::ErrorKind::NotFound
+    )
+}
+
 /// Write the secrets a first-run form collected, preserving everything else.
 ///
 /// A value is written but never returned, logged or shown; the screen only ever holds
@@ -622,7 +663,7 @@ pub fn record_form_secrets(
     model_key: Option<&str>,
     forgejo_token: Option<&str>,
 ) -> Result<(), CredentialsError> {
-    let mut value = read_value(path)?;
+    let mut value = value_for_write(path)?;
     let table = value
         .as_table_mut()
         .ok_or_else(|| CredentialsError::MissingToken {
@@ -674,7 +715,7 @@ pub fn record_secret(
     if value.is_empty() {
         return Ok(());
     }
-    let mut root = read_value(path)?;
+    let mut root = value_for_write(path)?;
     let root = root
         .as_table_mut()
         .ok_or_else(|| CredentialsError::MissingToken {
@@ -716,7 +757,13 @@ pub fn remove_agent_secrets(
     path: &Path,
     agents: &[String],
 ) -> Result<Vec<String>, CredentialsError> {
-    let mut root = read_value(path)?;
+    // A file that is not there holds nothing to remove; writing one to delete from it
+    // would create a file as a side effect of a tidy-up.
+    let mut root = match read_value(path) {
+        Ok(value) => value,
+        Err(CredentialsError::Absent { .. }) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     let mut removed = Vec::new();
     if let Some(root) = root.as_table_mut() {
         for (table, label) in [
@@ -753,9 +800,8 @@ fn read_value(path: &Path) -> Result<toml::Value, CredentialsError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(CredentialsError::Create {
+            return Err(CredentialsError::Absent {
                 path: path.to_path_buf(),
-                source,
             });
         }
         Err(source) => {
@@ -1206,6 +1252,97 @@ mod tests {
                 .as_deref(),
             Some("supplied")
         );
+    }
+
+    // R-1 (severity 3): a credentials file deleted while the UI runs could not be put
+    // back in-session, because every write path began with a read that mapped
+    // `NotFound` to an error before the create-and-write could run. The guard deletes
+    // the file and writes again, exactly as `k`/`f`/`A` do after a person deletes it.
+    #[test]
+    fn a_deleted_credentials_file_is_put_back_by_a_secret_write() {
+        let root = scratch_root("credentials-deleted-secret");
+        let path = root.join("credentials.toml");
+        CredentialsFile::prepare(&path).expect("the file is prepared");
+        record_secret(&path, Some("model_keys"), "scribe", "sk-restored")
+            .expect("the first write works");
+        fs::remove_file(&path).expect("the test deletes the file");
+        assert!(is_absent(&path), "the file is gone");
+        record_secret(&path, Some("model_keys"), "scribe", "sk-restored")
+            .expect("a write puts the file back");
+        assert!(!is_absent(&path), "the file is back");
+        assert_eq!(
+            mode_of(&path).expect("the mode is readable"),
+            SECRET_FILE_MODE,
+            "the file that was put back keeps the private mode"
+        );
+        assert_eq!(
+            model_key(&path, "scribe").expect("the key").expose(),
+            "sk-restored"
+        );
+    }
+
+    #[test]
+    fn a_deleted_credentials_file_is_put_back_by_the_form_and_by_an_identity() {
+        let root = scratch_root("credentials-deleted-form");
+        let path = root.join("credentials.toml");
+        CredentialsFile::prepare(&path).expect("the file is prepared");
+        fs::remove_file(&path).expect("the test deletes the file");
+        record_form_secrets(&path, "scribe", Some("sk-form"), Some("role-token"))
+            .expect("the form puts the file back");
+        assert_eq!(
+            model_key(&path, "scribe").expect("the key").expose(),
+            "sk-form"
+        );
+        assert_eq!(
+            forgejo_token(&path).expect("the token").expose(),
+            "role-token"
+        );
+        fs::remove_file(&path).expect("the test deletes the file again");
+        record_agent_identity(
+            &path,
+            "scribe",
+            Some(&Secret::new("agent-token")),
+            "gewu-scribe",
+            "gewu-scribe@agents.invalid",
+            "managed",
+            None,
+        )
+        .expect("settling an identity puts the file back");
+        assert_eq!(
+            forgejo_agent_token(&path, "scribe")
+                .expect("the agent token")
+                .expose(),
+            "agent-token"
+        );
+        assert_eq!(mode_of(&path).expect("the mode"), SECRET_FILE_MODE);
+    }
+
+    #[test]
+    fn a_missing_file_is_reported_as_absent_not_as_a_creation_failure() {
+        let root = scratch_root("credentials-absent-words");
+        let path = root.join("credentials.toml");
+        let error = model_key(&path, "scribe").expect_err("there is no file");
+        assert!(
+            matches!(error, CredentialsError::Absent { .. }),
+            "a missing file is not a creation failure: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("is not there"), "{message}");
+        assert!(
+            !message.contains("cannot be created") && !message.contains("os error"),
+            "the wrong cause is named: {message}"
+        );
+        assert!(is_absent(&path));
+    }
+
+    #[test]
+    fn removing_leftovers_from_an_absent_file_creates_nothing() {
+        let root = scratch_root("credentials-absent-remove");
+        let path = root.join("credentials.toml");
+        let removed = remove_agent_secrets(&path, &["ghost".to_owned()])
+            .expect("an absent file has nothing to remove");
+        assert!(removed.is_empty());
+        assert!(is_absent(&path), "a tidy-up must not create a file");
     }
 }
 

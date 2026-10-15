@@ -510,6 +510,7 @@ fn the_endpoint_test_shows_a_success_and_a_clear_failure_with_its_class() {
     .expect("the credentials file is written");
     app.selected = 0;
     app.on_key(KeyEvent::from(KeyCode::Char('p')));
+    app.wait_for_probe();
     let test = app.endpoint_test.clone().expect("an endpoint test result");
     assert!(test.result.is_ok(), "{}", app.status);
     assert!(
@@ -540,6 +541,7 @@ fn the_endpoint_test_shows_a_success_and_a_clear_failure_with_its_class() {
     .expect("the credentials file is written");
     app.selected = 0;
     app.on_key(KeyEvent::from(KeyCode::Char('p')));
+    app.wait_for_probe();
     let test = app.endpoint_test.clone().expect("an endpoint test result");
     match &test.result {
         Err(failure) => {
@@ -1799,6 +1801,7 @@ concurrency = 1
     // a user drives it — rather than carrying a stale sentence across a screen change.
     app.show(Screen::AgentConfig);
     app.request_endpoint_test();
+    app.wait_for_probe();
     assert!(
         app.status.contains("the endpoint refused the connection"),
         "the footer does not carry the cause: {}",
@@ -2284,10 +2287,11 @@ fn a_removal_names_the_run_records_and_the_secret_and_credentials_deletes_it() {
     app.request_secret(SecretTarget::ModelKey);
     app.on_paste("sk-throwaway-for-this-test");
     app.on_key(KeyEvent::from(KeyCode::Enter));
-    assert!(app
-        .present_secret_labels()
-        .iter()
-        .any(|label| label.contains("model key for `scribe`")));
+    assert!(
+        app.present_secret_labels()
+            .iter()
+            .any(|label| label.contains("model key for `scribe`"))
+    );
 
     let state_dir = app.state_root().join("scribe");
     fs::create_dir_all(&state_dir).expect("a run record directory");
@@ -2612,13 +2616,11 @@ fn the_runs_list_and_the_footer_count_say_when_they_stop_at_fifty() {
     app.show(Screen::Runs);
     let screen = render_at(100, 30, &app);
     assert!(
-        screen.contains(
-            "This list stops at the newest 50 of the 60 run records whose agents are configured"
-        ),
+        screen.contains("This list stops at the newest 50 of the 60 run records on disk"),
         "the cap is not declared: {screen}"
     );
     assert!(
-        screen.contains("10 older") && screen.contains("records are not listed here"),
+        screen.contains("10 older") && screen.contains("not listed"),
         "the older records are not named: {screen}"
     );
     assert!(
@@ -2648,17 +2650,21 @@ fn one_fact_gets_one_number_on_the_runs_screen() {
             && screen.contains("of file bytes in total"),
         "the footprint is not one named quantity: {screen}"
     );
-    // The cap clause names its own population and the total on disk separately, and
-    // its `not listed` count is every record left off the list.
+    // R-5: the list now covers every record on disk; the only difference the cap
+    // clause declares is the cap itself, and the unconfigured records are listed and
+    // marked rather than merely counted.
     assert!(
-        screen.contains("whose agents are configured (70 records are on disk in all)"),
-        "the two totals are not told apart: {screen}"
+        screen.contains("run records on disk"),
+        "the total on disk is not named: {screen}"
     );
     assert!(
-        screen.contains("20 records in all") && screen.contains("are not listed here"),
-        "the unlisted count omits records: {screen}"
+        screen.contains("20 older records") && screen.contains("not listed"),
+        "the cap difference is not named: {screen}"
     );
-    assert!(screen.contains("10 records belong"), "{screen}");
+    assert!(
+        screen.contains("10 records belong") && screen.contains("marked `*` in the list above"),
+        "the unconfigured records are counted but not shown as listed: {screen}"
+    );
 }
 
 #[test]
@@ -2689,10 +2695,11 @@ fn the_run_records_footprint_and_the_cleanup_expectation_are_on_the_runs_screen(
 }
 
 #[test]
-fn a_removed_agents_records_are_counted_though_they_are_not_listed() {
-    // L-4: removing an agent dropped all its records from the screen while they stayed
-    // on disk. The footprint counts every record, and names the ones whose agent the
-    // configuration no longer lists.
+fn a_removed_agents_records_are_listed_and_marked() {
+    // L-4 / R-5: removing an agent used to drop all its records from the list while
+    // the footprint counted them, so their transcript and log could not be opened in
+    // the product until the agent was re-added. The records are now listed, marked
+    // `*`, and the count and the rows agree.
     let root = scratch("removed-records");
     let mut app = app_with_config(&root, EMPTY_CONFIG);
     app.show_acknowledgment = false;
@@ -2703,6 +2710,11 @@ fn a_removed_agents_records_are_counted_though_they_are_not_listed() {
         app.footprint.unconfigured_records, 4,
         "the records of the removed agent are the unconfigured ones"
     );
+    assert_eq!(
+        app.recent.len(),
+        4,
+        "the removed agent's records are listed, not only counted (R-5)"
+    );
     app.show(Screen::Runs);
     let screen = render_at(100, 30, &app);
     assert!(
@@ -2710,9 +2722,10 @@ fn a_removed_agents_records_are_counted_though_they_are_not_listed() {
         "the records are not counted: {screen}"
     );
     assert!(
-        screen.contains("no longer lists"),
-        "the unconfigured records are not named: {screen}"
+        screen.contains("no longer lists") && screen.contains("are marked `*`"),
+        "the unconfigured records are not named as listed: {screen}"
     );
+    assert!(screen.contains('*'), "the rows carry no marker: {screen}");
 }
 
 #[test]
@@ -3123,5 +3136,188 @@ fn the_first_run_modal_leaves_no_fragment_of_the_note_area() {
     assert!(
         screen.contains("concurrency is how many model requests"),
         "the note area did not return: {screen}"
+    );
+}
+
+/// The note-area guard: every overlay that owns the screen owns the note area behind
+/// it.
+///
+/// R-3 / S-1, F-1's third appearance. The first-run modal was fixed on its own; the
+/// class survived on the add-agent form. This test enumerates every overlay in the
+/// code — not the screens a walker happened to visit — draws each over the Agents and
+/// Runs screens at the two sizes the ORDER names and the taller window the walker
+/// found the fragment at (100×40), and fails if any fragment of a note-area sentence
+/// survives behind the overlay. The two note areas use the same predicate, so
+/// exercising both guards the class, not one screen. Closing the overlays restores
+/// the note areas whole.
+#[test]
+fn every_overlay_owns_the_note_area_behind_it() {
+    // 72×18 and 80×24 are the advertised sizes; 100×40 and 120×40 are where a short
+    // overlay over a tall window left the tail of a wrapped sentence showing.
+    const SIZES: [(u16, u16); 4] = [(72, 18), (80, 24), (100, 40), (120, 40)];
+    type Opener = Box<dyn Fn(&mut App)>;
+
+    // An empty hub: the note area is the one wrapped sentence whose tail
+    // (`writes both files for you.`) was the R-3/S-1 fragment.
+    let empty = scratch("overlay-note-fragment-empty");
+    gewu_multiverse::mode::write_private(
+        empty.join("credentials.toml"),
+        b"[model_keys]\n\"ghost\" = \"gw-fixture-ghost\"\n",
+    )
+    .expect("the credentials file is written");
+    let empty_openers: Vec<(&str, Opener)> = vec![
+        (
+            "first-run acknowledgment",
+            Box::new(|app: &mut App| app.show_acknowledgment = true),
+        ),
+        (
+            "add-agent form",
+            Box::new(|app: &mut App| app.request_new_agent()),
+        ),
+        (
+            "Forgejo address prompt",
+            Box::new(|app: &mut App| app.request_url_edit()),
+        ),
+        (
+            "leftover-secret delete",
+            Box::new(|app: &mut App| app.request_forget_secrets()),
+        ),
+        ("key help", Box::new(|app: &mut App| app.toggle_help())),
+    ];
+    for (label, open) in &empty_openers {
+        for (width, height) in SIZES {
+            let mut app = app_with_config(&empty, EMPTY_CONFIG);
+            app.show_acknowledgment = false;
+            open(&mut app);
+            assert!(
+                app.overlay_owns_screen(),
+                "{label} did not open, so the guard proves nothing"
+            );
+            let screen = render_at(width, height, &app);
+            assert!(
+                !screen.contains("writes both files for you"),
+                "{label} at {width}x{height} left the agent note-area tail behind it:\n{screen}"
+            );
+            app.show(Screen::Runs);
+            let runs = render_at(width, height, &app);
+            assert!(
+                !runs.contains("Run records are read from"),
+                "{label} at {width}x{height} left the run note area behind it:\n{runs}"
+            );
+        }
+    }
+
+    // A configured hub: the overlays that need an agent, over the longer note area.
+    // Every distinctive note line is gone while an overlay is up.
+    let full = scratch("overlay-note-fragment-full");
+    let full_openers: Vec<(&str, Opener)> = vec![
+        (
+            "add-agent form",
+            Box::new(|app: &mut App| app.request_new_agent()),
+        ),
+        (
+            "secret prompt",
+            Box::new(|app: &mut App| app.request_secret(SecretTarget::ModelKey)),
+        ),
+        (
+            "remove confirmation",
+            Box::new(|app: &mut App| app.request_remove_agent()),
+        ),
+        (
+            "editor confirmation",
+            Box::new(|app: &mut App| {
+                app.editor_configured = false;
+                app.on_key(KeyEvent::from(KeyCode::Char('e')));
+            }),
+        ),
+        ("key help", Box::new(|app: &mut App| app.toggle_help())),
+    ];
+    for (label, open) in &full_openers {
+        for (width, height) in SIZES {
+            let mut app = app(&full);
+            app.show_acknowledgment = false;
+            open(&mut app);
+            assert!(
+                app.overlay_owns_screen(),
+                "{label} did not open, so the guard proves nothing"
+            );
+            let screen = render_at(width, height, &app);
+            for fragment in [
+                "is not acknowledged",
+                "concurrency is how many model requests",
+                "not a sandbox",
+            ] {
+                assert!(
+                    !screen.contains(fragment),
+                    "{label} at {width}x{height} left the note-area fragment `{fragment}` behind it:\n{screen}"
+                );
+            }
+        }
+    }
+
+    // The note areas return whole the moment no overlay owns the screen.
+    let mut empty_app = app_with_config(&empty, EMPTY_CONFIG);
+    empty_app.show_acknowledgment = false;
+    assert!(
+        render_at(100, 40, &empty_app).contains("writes both files for you"),
+        "the empty-hub note area did not return"
+    );
+    let mut app = app(&full);
+    app.show_acknowledgment = false;
+    assert!(
+        render_at(100, 40, &app).contains("concurrency is how many model requests"),
+        "the agent note area did not return"
+    );
+}
+
+/// The in-flight guard for S-2: a probe that has started says so, draws no previous
+/// result as current, and its finished result is stamped.
+#[test]
+fn the_endpoint_test_says_it_is_in_flight_and_stamps_the_result() {
+    use gewu_multiverse::test_stub::{Stub, StubReply};
+
+    let completion = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}"#;
+    let mut reply = StubReply::json(completion);
+    reply.delay = std::time::Duration::from_millis(1500);
+    let stub = Stub::start(vec![reply]);
+    let root = scratch("endpoint-in-flight");
+    fs::write(
+        root.join("config.toml"),
+        CONFIG.replace("https://model.example.org/v1", &stub.url()),
+    )
+    .expect("the configuration is written");
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("endpoint-in-flight"),
+    );
+    app.show_acknowledgment = false;
+    gewu_multiverse::mode::write_private(
+        root.join("credentials.toml"),
+        b"[model_keys]\n\"scribe\" = \"gw-fixture-key\"\n",
+    )
+    .expect("the credentials file is written");
+    app.selected = 0;
+    app.show(Screen::AgentConfig);
+    app.on_key(KeyEvent::from(KeyCode::Char('p')));
+    // No frame is drawn between the key and this render, so the probe is in flight.
+    let during = render_at(100, 40, &app);
+    assert!(
+        during.contains("testing — started"),
+        "the endpoint test draws no in-flight state:\n{during}"
+    );
+    assert!(
+        app.status.contains("testing the endpoint of `scribe`"),
+        "the footer does not say a test is running: {}",
+        app.status
+    );
+    assert!(
+        !during.contains("not tested yet") && !during.contains("the endpoint answered"),
+        "a previous or absent result is drawn while the probe runs:\n{during}"
+    );
+    app.wait_for_probe();
+    let after = render_at(100, 40, &app);
+    assert!(
+        after.contains("the endpoint answered") && after.contains("tested just now"),
+        "the finished result is not shown and stamped:\n{after}"
     );
 }
