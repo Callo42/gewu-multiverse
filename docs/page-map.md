@@ -18,7 +18,10 @@ panel puts `more below; enlarge the window` in its title (always drawn), and the
 borderless note areas (Agents, Runs) reserve their last drawn row for the same
 sentence. A bordered panel never draws **half a wrapped line**: whole logical lines are dropped
 from the bottom until the rest fits, so a sentence never ends at the box edge — the
-`more below` declaration and `[`/`]` are what carry the rest. While **any overlay owns
+`more below` declaration and `[`/`]` are what carry the rest. The scroll offset counts
+**wrapped rows**, and a logical line taller than the body is drawn row by row rather
+than dropped, so no line is ever unreachable however short the body is (W36-1); a row
+is still drawn whole or not at all. While **any overlay owns
 the screen** — the first-run acknowledgment, the add-agent form, a secret or address
 prompt, a removal or leftover-delete confirmation, the editor confirmation or the key
 help — the note area behind it is **not drawn at all** — neither its content nor its
@@ -86,7 +89,7 @@ under its configuration and state roots is held to mode `0700` — the configura
 root, `agents/` and each agent, skill and workspace directory, and the state root with
 each agent, run and run-skills directory. Every file it writes is `0600` — the
 configuration file, the credentials file, the acknowledgment record, the endpoint-test
-record, the instruction,
+record, the role-check record, the instruction,
 steps and skill templates, the plan, the log and the transcript. The one exception is
 the `systemd` unit, which is `0644` because it holds no secret: it names paths only,
 and the directory around it is `0700`. The Credentials screen states the credentials
@@ -173,7 +176,7 @@ so no screen shows a path the run ignores (P-3); the add-agent form writes the d
 
 | State | Shows | Must offer |
 |---|---|---|
-| no token | `role token absent`; `admin token absent (identities are supplied)`; “no role check has been run yet — press c” | what a *role* is, in one line, before `c` is pressed |
+| no token | `role token absent`; `admin token absent (identities are supplied)`; “no role check has been run yet — press c”, or, when a check ran on this machine and its stamp is persisted, “no role check has been run in this session — checked <age> on <machine> — press c to check again” | what a *role* is, in one line, before `c` is pressed; when a check was made before, the stamp it left (`role_checked_at_ms` + `role_check_machine` in the role-check record beside the endpoint-test record) so the fact survives a restart instead of vanishing with the session (W37-1) |
 | a check was refused | `role check failed (<class>) at <configured url>: <reason>`; a token that is an administrator's but is checked as `member` says so and names `C` | the URL the user configured, led before the reason, and the account's real standing, not a bare class |
 | configured, unread | the URL and role | a sentence that says *not read yet*, not “could not be read” |
 | the address is wrong or belongs to another machine | `url <the configured address>` | `u` opens a visible one-field prompt on this screen, prefilled with the address in force, and writes **only** `[forgejo] url` for every agent on this machine, naming what changed and that `c` re-checks the role against it; the add-agent form's own address field says in its receipt when it moved the address for agents that already existed, instead of moving them silently (W32-1) |
@@ -205,7 +208,7 @@ so no screen shows a path the run ignores (P-3); the add-agent form writes the d
 | a run in progress | `running (<elapsed>)` (not `unknown start`); the transcript carries a `model_request_sent` written **before** each call, and the log says `waiting for the model`, so a wait is not a wedge | the start time from the run's own opening transcript record (not `plan.json`, which carries none), and that the run has not ended |
 | finished | outcome with its reason and duration; the reason leads the note area, and the note area grows to hold it, so it is never the line that wraps off — but never below the list's own minimum of border, header and **three** runs | `o` the log, `T` the **transcript**, both named at 80×24 even beside a wordy reason; the pager's `q` named; a run left by a dead UI reports the time it actually ran, never `0.0s`; the paths sit below the offers and are reachable with `[`/`]` |
 | many runs | newest first; a window whose title reads `recent runs a–b of N — ↓/↑ more`; the selected row carries `>`; a record whose agent the configuration no longer lists carries `*` in the marker column and is listed like any other, so its transcript and log stay openable (R-5); the `started (UTC)` column says which clock it is; a run id too long for its column is shortened with an ellipsis, never clipped mid-token, and the outcome column keeps room for `succeeded, 0.0s` even at the 72×18 floor — taking it from the run-id column, which is already shortened with a marker — so no cell ends mid-value (T-3); the list holds the newest fifty records and, when more exist on disk, the note area says how many older records are not listed — the total is every record on disk, so the count and the rows agree and no two different `on disk` numbers sit on one screen (L-1, F4, H-4, R-5) | `enter` opens the run's agent; selection readable in text, and never on a hidden row |
-| records on disk | `N run records on disk, <size> of file bytes` under the record path; when some belong to an agent the configuration no longer lists, how many; and that the product never deletes a record, so a person removes a run's directory to free its space; the size is the sum of **file bytes**, the same definition every size on every screen uses, and it is labelled in the binary units the arithmetic uses (`KiB`, `MiB`, `GiB`, and `B` below 1024), never `KB` over a value divided by 1024 (H-4, F-2) | the footprint and the cleanup expectation, on the screen that lists the records: where they live, how much room they take, and what is expected of a person (L-2, L-4) |
+| records on disk | `N run records on disk, <size> of file bytes` under the record path; when some belong to an agent the configuration no longer lists, how many **on disk** and how many of them are inside the newest fifty listed above — the count and the presence of the `*` marker are stated separately, so the sentence never points at a marked row the window does not carry (W36-3); and that the product never deletes a record, so a person removes a run's directory to free its space; the size is the sum of **file bytes**, the same definition every size on every screen uses, and it is labelled in the binary units the arithmetic uses (`KiB`, `MiB`, `GiB`, and `B` below 1024), never `KB` over a value divided by 1024 (H-4, F-2) | the footprint and the cleanup expectation, on the screen that lists the records: where they live, how much room they take, and what is expected of a person (L-2, L-4) |
 
 ## Overlays
 
@@ -248,7 +251,7 @@ so no screen shows a path the run ignores (P-3); the add-agent form writes the d
 | State | Shows | Must offer |
 |---|---|---|
 | wide terminal | the status line and the key legend | the legend may be long |
-| every screen, every state | a footer clause `Running: N of M`, and `· K finished` once a run has ended since this UI started; when the newest fifty records all finished since the UI started and older records exist on disk, `· K+ finished`, so the cap is never presented as exact (L-5) | the running count and what has finished, wherever the user is, not only on the hub |
+| every screen, every state | a footer clause `Running: N of M`, and `· K finished` once a run has ended since this UI started; `K` is a count over the newest fifty records, so whenever older records exist on disk it is printed `· K+ finished` — a lower bound, never the window presented as exact, including while a run inside the window is still in flight (W36-2, L-5) | the running count and what has finished, wherever the user is, not only on the hub |
 | 80×24 | the status line and the legend | the legend must not silently drop keys: it clips at a key boundary and ends with `? all keys`, and the way back (`esc agents`) is among the shown keys |
 | any status longer than the width | the status line, grown past its usual rows when it must be | the footer takes the body's spare rows for the status (never below the body's minimum), so a reason, a path or git's own `fatal:` line is read whole at 80×24, never clipped |
 | a window smaller than 72×18 | one line: “this window is too small to show the product; make it at least 72×18” | that line, instead of clipped panels, a clipped modal or a clipped help overlay |
