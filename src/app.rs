@@ -241,6 +241,20 @@ impl SecretPrompt {
     }
 }
 
+/// A one-field, **visible** prompt for the configured Forgejo address.
+///
+/// The address is not a secret: the product drew it on the Forgejo screen long before
+/// this prompt existed, and a person cannot correct a typo in a masked field. It is
+/// its own prompt because it was previously settable only as a side-effect of adding
+/// an agent, which silently re-pointed every existing agent at once (W32-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlPrompt {
+    /// What has been typed so far, drawn as itself.
+    pub value: String,
+    /// Why the last attempt to write it did not work.
+    pub error: Option<String>,
+}
+
 /// A cheap fingerprint of a file: its size and its modification time.
 ///
 /// Taken before an editor is handed a path and compared after it returns, so the
@@ -321,6 +335,14 @@ pub struct EndpointTest {
     /// When the test was run, in unix milliseconds. A result with no time can outlive
     /// the endpoint it tested and still read as current (Y-5).
     pub tested_at_ms: u64,
+    /// The machine that made the test, when the record names one.
+    ///
+    /// A test result belongs to a machine and a time (W32-2): the configuration
+    /// directory can be copied to a second machine, and a record with no machine in
+    /// it is read there as a test this machine never made. `None` means the record
+    /// does not name a machine — an older record — and the surface says so rather
+    /// than claiming either way.
+    pub machine: Option<String>,
 }
 
 /// Why the endpoint test failed, with the class a person can act on.
@@ -350,6 +372,14 @@ impl EndpointTest {
     pub fn is_current_for(&self, agent: &crate::config::AgentConfig) -> bool {
         self.agent == agent.name && self.endpoint == agent.endpoint && self.model == agent.model
     }
+
+    /// How this test's machine relates to the machine reading it (W32-2).
+    pub fn machine_relation(&self) -> crate::machine::Relation {
+        match &self.machine {
+            Some(mark) => crate::machine::relation(mark),
+            None => crate::machine::Relation::Unnamed,
+        }
+    }
 }
 
 /// One endpoint test as it is written down, so its stamp survives a restart and ages
@@ -370,6 +400,9 @@ struct EndpointTestRecord {
     failed_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failed_message: Option<String>,
+    /// The machine the test was made on, when this version wrote the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine: Option<String>,
 }
 
 impl EndpointTestRecord {
@@ -386,6 +419,7 @@ impl EndpointTestRecord {
             answered,
             failed_class,
             failed_message,
+            machine: test.machine.clone(),
         }
     }
 
@@ -410,6 +444,7 @@ impl EndpointTestRecord {
             model: self.model,
             result,
             tested_at_ms: self.tested_at_ms,
+            machine: self.machine,
         }
     }
 }
@@ -690,6 +725,8 @@ pub struct App {
     pub add_agent: Option<NewAgentForm>,
     /// A one-field prompt for a secret, when one is open.
     pub secret_prompt: Option<SecretPrompt>,
+    /// A one-field prompt for the Forgejo address, when one is open (W32-1).
+    pub url_prompt: Option<UrlPrompt>,
     /// An agent waiting on the "remove it?" confirmation, when one is open.
     pub confirm_remove: Option<String>,
     /// The leftover per-agent secrets (agents no longer configured) waiting on a delete
@@ -816,6 +853,7 @@ impl App {
             ack_review: false,
             add_agent: None,
             secret_prompt: None,
+            url_prompt: None,
             confirm_remove: None,
             confirm_forget: None,
             editor_confirm: None,
@@ -1422,6 +1460,7 @@ impl App {
         self.add_agent.is_some()
             || self.editor_confirm.is_some()
             || self.secret_prompt.is_some()
+            || self.url_prompt.is_some()
             || self.confirm_remove.is_some()
             || self.confirm_forget.is_some()
             || self.show_help
@@ -1469,13 +1508,30 @@ impl App {
         let Some(form) = self.add_agent.clone() else {
             return;
         };
+        // W32-1: the form's address field writes the **global** `[forgejo] url`. When
+        // it differs from the address in force and other agents exist, the form moved
+        // every one of them, so its receipt must say so rather than hide it.
+        let moved_address = self
+            .config
+            .as_ref()
+            .filter(|config| !config.agents.is_empty())
+            .filter(|config| {
+                let typed = form.fields[4].trim();
+                !typed.is_empty() && typed != config.forgejo.url
+            })
+            .map(|config| config.forgejo.url.clone());
         match self.write_new_agent(&form) {
             Ok(name) => {
                 self.add_agent = None;
                 self.reload();
-                self.status = format!(
-                    "created `{name}`: write its instruction with e, then press s to start it"
-                );
+                self.status = match moved_address {
+                    Some(previous) => format!(
+                        "created `{name}`: write its instruction with e, then press s to start it — the form also moved the Forgejo address from {previous} for every agent on this machine; u on the Forgejo screen edits it on its own"
+                    ),
+                    None => format!(
+                        "created `{name}`: write its instruction with e, then press s to start it"
+                    ),
+                };
             }
             Err(message) => {
                 if let Some(open) = self.add_agent.as_mut() {
@@ -1687,6 +1743,12 @@ impl App {
         };
         let value = prompt.value.trim().to_owned();
         if value.is_empty() {
+            // F-2's sweep: every refusal replaces the optimistic status, so the
+            // footer and the prompt hold the same answer.
+            self.status = format!(
+                "not written: no {} was typed, and an empty secret is refused",
+                prompt.target.describe()
+            );
             if let Some(open) = self.secret_prompt.as_mut() {
                 open.error = Some("a secret cannot be empty".to_owned());
             }
@@ -1710,11 +1772,112 @@ impl App {
                 );
             }
             Err(error) => {
+                // F-2: a refusal replaces the optimistic status, not sits under it.
+                // The footer and the prompt hold the same sentence, so a person who
+                // asks "did it get written?" is answered on the line they look at.
+                let refusal = error.to_string();
+                self.status = format!(
+                    "not written: the {} for {subject} was refused — {refusal}",
+                    prompt.target.describe()
+                );
                 if let Some(open) = self.secret_prompt.as_mut() {
-                    open.error = Some(error.to_string());
+                    open.error = Some(refusal);
                 }
             }
         }
+    }
+
+    /// Open the one-field prompt that edits the configured Forgejo address (W32-1).
+    ///
+    /// The address was settable only by adding an agent, whose writer silently moved
+    /// the **global** `[forgejo] url` for every agent that already existed. It has its
+    /// own place now: `u` on the Forgejo screen, prefilled with the address in force,
+    /// and its own sentence saying that every agent on this machine follows it.
+    pub fn request_url_edit(&mut self) {
+        let Some(settings) = self.forgejo_settings() else {
+            self.status = "the configuration could not be read, so the address cannot be edited"
+                .to_owned();
+            return;
+        };
+        self.status =
+            "type the Forgejo address and press enter; it applies to every agent on this machine"
+                .to_owned();
+        self.url_prompt = Some(UrlPrompt {
+            value: settings.url,
+            error: None,
+        });
+    }
+
+    /// One key while the address prompt is open.
+    fn on_url_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.submit_url(),
+            KeyCode::Esc => {
+                self.url_prompt = None;
+                self.status = "the Forgejo address was not changed".to_owned();
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.url_prompt.as_mut() {
+                    prompt.value.pop();
+                }
+            }
+            KeyCode::Char(character) => {
+                if let Some(prompt) = self.url_prompt.as_mut() {
+                    prompt.value.push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Write the address the prompt holds, preserving every other field.
+    fn submit_url(&mut self) {
+        let Some(prompt) = self.url_prompt.clone() else {
+            return;
+        };
+        let url = prompt.value.trim().to_owned();
+        if url.is_empty() {
+            self.status = "not written: the Forgejo address cannot be empty".to_owned();
+            if let Some(open) = self.url_prompt.as_mut() {
+                open.error = Some("the address cannot be empty".to_owned());
+            }
+            return;
+        }
+        let Some(existing) = self.config.clone() else {
+            self.status = format!(
+                "the configuration file cannot be read, so the address cannot be written; fix {} first",
+                self.config_path().display()
+            );
+            return;
+        };
+        let mut updated = existing.clone();
+        updated.forgejo.url = url.clone();
+        let text = render_full_config(&updated, &updated.agents);
+        if let Err(error) = Config::from_text(&self.config_path(), &text) {
+            self.status = error.to_string();
+            if let Some(open) = self.url_prompt.as_mut() {
+                open.error = Some(error.to_string());
+            }
+            return;
+        }
+        if let Err(error) = crate::mode::write_private(self.config_path(), text.as_bytes()) {
+            let message = format!("{} cannot be written: {error}", self.config_path().display());
+            self.status = message.clone();
+            if let Some(open) = self.url_prompt.as_mut() {
+                open.error = Some(message);
+            }
+            return;
+        }
+        self.url_prompt = None;
+        self.reload();
+        // The old address may have been another machine's instance; the view from it
+        // is not this address's view, so no stale repository list is kept. The new
+        // address must be checked on its own (`c`).
+        self.role_check = None;
+        self.repo_selected = 0;
+        self.status = format!(
+            "the Forgejo address is now {url} — it applies to every agent on this machine; press c to check the role against it"
+        );
     }
 
     /// Ask to leave. If runs are in flight, name what leaving ends and ask again.
@@ -2085,6 +2248,9 @@ impl App {
             model: agent.model,
             result,
             tested_at_ms: crate::time::now_unix_ms(),
+            // W32-2: the result is written with the machine that made it, so a record
+            // copied to a second machine is not read there as a test of this one.
+            machine: crate::machine::mark(),
         };
         // LIB-2: write the result down before showing it, so the stamp is a fact the
         // next start can read (and age) instead of a session's line that vanishes with
@@ -2895,7 +3061,7 @@ impl App {
                     format!("the newest transcript of `{name}`"),
                 ),
                 None => {
-                    self.status = format!("`{name}` has no run yet");
+                    self.status = format!("`{name}` has no run record on this machine yet");
                     return;
                 }
             }
@@ -2942,7 +3108,7 @@ impl App {
                     format!("the newest log of `{name}`"),
                 ),
                 None => {
-                    self.status = format!("`{name}` has no run yet");
+                    self.status = format!("`{name}` has no run record on this machine yet");
                     return;
                 }
             }
@@ -3457,14 +3623,22 @@ impl App {
                     .to_owned();
             return;
         }
-        let (first, more) = match text.find(['\n', '\r']) {
-            Some(at) => (&text[..at], true),
-            None => (text, false),
+        let (first, rest) = match text.find(['\n', '\r']) {
+            Some(at) => (&text[..at], Some(&text[at..])),
+            None => (text, None),
         };
-        let note = if more {
-            "kept the first line; the rest of the paste was not used"
-        } else {
-            "pasted into the field"
+        // W32-4: the loss clause is only true when something a person typed was
+        // dropped. A terminal's own newline after a copied one-line secret is not
+        // paste content, so the sentence names exactly what happened.
+        let note = match rest {
+            None => "pasted into the field",
+            Some(rest) if rest.chars().all(|c| c == '\n' || c == '\r') => {
+                "kept the first line; a trailing newline was ignored"
+            }
+            Some(rest) if rest.trim().is_empty() => {
+                "kept the first line; the whitespace after it was ignored"
+            }
+            Some(_) => "kept the first line; the rest of the paste was not used",
         };
         if let Some(form) = self.add_agent.as_mut() {
             form.fields[form.cursor] = first.to_owned();
@@ -3472,6 +3646,11 @@ impl App {
             return;
         }
         if let Some(prompt) = self.secret_prompt.as_mut() {
+            prompt.value = first.to_owned();
+            self.status = note.to_owned();
+            return;
+        }
+        if let Some(prompt) = self.url_prompt.as_mut() {
             prompt.value = first.to_owned();
             self.status = note.to_owned();
             return;
@@ -3589,6 +3768,10 @@ impl App {
         }
         if self.secret_prompt.is_some() {
             self.on_secret_key(key);
+            return;
+        }
+        if self.url_prompt.is_some() {
+            self.on_url_key(key);
             return;
         }
         if self.confirm_remove.is_some() {
@@ -3770,6 +3953,12 @@ impl App {
             }
             KeyCode::Char('v') if self.screen == Screen::Forgejo => {
                 self.request_secret(SecretTarget::ForgejoAgentToken);
+            }
+            // W32-1: the configured Forgejo address has its own place. It was
+            // settable only by adding an agent, which silently moved it for every
+            // existing agent.
+            KeyCode::Char('u') if self.screen == Screen::Forgejo => {
+                self.request_url_edit();
             }
             KeyCode::Char('A')
                 if matches!(self.screen, Screen::Credentials | Screen::Forgejo) =>
@@ -4435,7 +4624,13 @@ concurrency = 1
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         app.on_key(key(KeyCode::Char('o')));
-        assert!(app.status.contains("no run yet"), "{}", app.status);
+        // W32-3: the sentence names what **this machine** knows, not what the agent
+        // did on another one.
+        assert!(
+            app.status.contains("no run record on this machine yet"),
+            "{}",
+            app.status
+        );
         assert!(app.take_action().is_none());
     }
 
@@ -4707,9 +4902,18 @@ role = "member"
                 || text.contains(".log"))
     }
 
+    /// The class a refusal draws, when it draws one: the word in the first `(…)` after
+    /// the word `failed`. `None` means the sentence carries no class at all.
+    fn class_in_refusal(text: &str) -> Option<String> {
+        let at = text.find("failed (")? + "failed (".len();
+        let rest = &text[at..];
+        let end = rest.find(')')?;
+        Some(rest[..end].to_owned())
+    }
+
     #[test]
     fn every_secret_refusal_a_person_acts_on_names_the_key_section_or_path_to_act_on() {
-        // V-1 conformance guard.
+        // V-1 conformance guard, extended by F-3.
         //
         // How it enumerates: it drives each refusal path through the built `App`
         // (the same key a person presses), reads the sentence the product draws, and
@@ -4718,28 +4922,52 @@ role = "member"
         // class literal that concerns a secret and fails if one was not among the
         // driven paths — so a new `missing_*`/`*_token` refusal cannot be added
         // without a driven row and a sentence that names how to act.
-        let mut produced: Vec<(&str, String)> = Vec::new();
+        //
+        // F-3: naming the key is not enough; the **class** must name the same thing
+        // every time. A missing role token drawn under `credentials` — the class for a
+        // credentials file that cannot be read — sends a reader to the file. Each
+        // driven row now carries the class it must draw, and that class is compared
+        // against the sentence itself.
+        struct Refusal {
+            path: &'static str,
+            /// The class this refusal must draw, when it draws one at all.
+            class: Option<&'static str>,
+            status: String,
+        }
+        let mut produced: Vec<Refusal> = Vec::new();
 
         // `c`: no role token is recorded.
         {
             let mut app = app_with(GOOD);
             app.on_key(key(KeyCode::Char('y')));
             app.on_key(key(KeyCode::Char('c')));
-            produced.push(("c role token", app.status.clone()));
+            produced.push(Refusal {
+                path: "c role token",
+                class: Some("no_role_token"),
+                status: app.status.clone(),
+            });
         }
         // `C`: no administrator token is recorded.
         {
             let mut app = app_with(GOOD);
             app.on_key(key(KeyCode::Char('y')));
             app.on_key(key(KeyCode::Char('C')));
-            produced.push(("C administrator token", app.status.clone()));
+            produced.push(Refusal {
+                path: "C administrator token",
+                class: Some("missing_admin_token"),
+                status: app.status.clone(),
+            });
         }
         // `i`: no agent token and no administrator token.
         {
             let mut app = app_with(GOOD);
             app.on_key(key(KeyCode::Char('y')));
             app.on_key(key(KeyCode::Char('i')));
-            produced.push(("i agent token", app.status.clone()));
+            produced.push(Refusal {
+                path: "i agent token",
+                class: Some("no_agent_token"),
+                status: app.status.clone(),
+            });
         }
         // `s`: no model key, with an instruction so the refusal is reached.
         {
@@ -4748,21 +4976,52 @@ role = "member"
             let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
             std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
             app.on_key(key(KeyCode::Char('s')));
-            produced.push(("s model key", app.status.clone()));
+            produced.push(Refusal {
+                path: "s model key",
+                // This refusal leads with the fix rather than a `failed (class)`
+                // clause; the key it names is what the guard checks for it.
+                class: None,
+                status: app.status.clone(),
+            });
         }
         // `p`: the endpoint test finds no model key.
         {
             let mut app = app_with(GOOD);
             app.on_key(key(KeyCode::Char('y')));
             app.on_key(key(KeyCode::Char('p')));
-            produced.push(("p endpoint test", app.status.clone()));
+            produced.push(Refusal {
+                path: "p endpoint test",
+                class: Some("missing_key"),
+                status: app.status.clone(),
+            });
         }
 
-        for (path, status) in &produced {
+        for row in &produced {
             assert!(
-                names_a_key_section_or_path(status),
-                "V-1: the refusal from `{path}` names no key, section or path a person \
-                 can act on: {status}"
+                names_a_key_section_or_path(&row.status),
+                "V-1: the refusal from `{}` names no key, section or path a person \
+                 can act on: {}",
+                row.path,
+                row.status
+            );
+            // F-3: the class must name the thing that is missing, not a neighbouring
+            // class. `credentials` here would read as a broken credentials file.
+            let drawn = class_in_refusal(&row.status);
+            if let Some(expected) = row.class {
+                assert_eq!(
+                    drawn.as_deref(),
+                    Some(expected),
+                    "F-3: the refusal from `{}` draws the class {:?}, not `{expected}`: {}",
+                    row.path,
+                    drawn,
+                    row.status
+                );
+            }
+            assert!(
+                drawn.as_deref() != Some("credentials"),
+                "F-3: a missing key is reported under the class `credentials`, which names \
+                 a credentials file that cannot be read: {}",
+                row.status
             );
         }
 
@@ -4779,7 +5038,7 @@ role = "member"
             assert!(
                 produced
                     .iter()
-                    .any(|(_, status)| status.contains(&format!("({class})"))),
+                    .any(|row| row.status.contains(&format!("({class})"))),
                 "V-1: the secret-refusal class `{class}` is declared in the source but no \
                  driven path above produces it; add its path and make it name its key"
             );
@@ -4874,6 +5133,7 @@ role = "member"
             model: "m".to_owned(),
             result: Ok("the endpoint answered".to_owned()),
             tested_at_ms: crate::time::now_unix_ms(),
+            machine: None,
         };
         assert!(test.describe().contains("tested just now"), "{}", test.describe());
         let same = AgentConfig {
@@ -4906,6 +5166,7 @@ role = "member"
             model: "m".to_owned(),
             result: Ok("the endpoint answered: ok".to_owned()),
             tested_at_ms: 1_700_000_000_000,
+            machine: None,
         };
         write_endpoint_test(&path, &one).expect("the test is written");
         let two = EndpointTest {
@@ -4917,6 +5178,7 @@ role = "member"
                 message: "the endpoint refused the connection".to_owned(),
             }),
             tested_at_ms: 1_700_000_001_000,
+            machine: None,
         };
         write_endpoint_test(&path, &two).expect("the second test is written");
         let mut back = read_endpoint_tests(&path);
@@ -4952,6 +5214,7 @@ role = "member"
                 model: "m".to_owned(),
                 result: Ok("the endpoint answered: ok".to_owned()),
                 tested_at_ms: 1_700_000_000_000,
+                machine: None,
             },
         )
         .expect("the test is written");
@@ -5584,6 +5847,149 @@ concurrency = 3
         assert_eq!(
             app.secret_prompt.as_ref().expect("the prompt is open").value,
             "secret-two"
+        );
+    }
+
+    #[test]
+    fn a_paste_that_only_trailed_a_newline_is_not_reported_as_lost_content() {
+        // W32-4: a token copied with a trailing newline drew `the rest of the paste was
+        // not used`, though nothing a person typed was dropped. The sentence now names
+        // exactly what happened.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.show(Screen::Credentials);
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_paste("a-real-looking-token\n");
+        assert_eq!(
+            app.status,
+            "kept the first line; a trailing newline was ignored"
+        );
+        assert_eq!(
+            app.secret_prompt.as_ref().expect("the prompt").value,
+            "a-real-looking-token"
+        );
+        // Whitespace that is not a newline is named as whitespace, not as lost text.
+        app.on_paste("another-token\n   ");
+        assert_eq!(
+            app.status,
+            "kept the first line; the whitespace after it was ignored"
+        );
+        // Real lost content keeps the loss clause: a person did type it.
+        app.on_paste("first\nsecond");
+        assert_eq!(
+            app.status,
+            "kept the first line; the rest of the paste was not used"
+        );
+    }
+
+    #[test]
+    fn a_refused_secret_write_replaces_the_status_it_started_from() {
+        // F-2: after a refused write the footer still read `pasted into the field`.
+        // The refusal replaces the optimistic sentence; the prompt holds the same
+        // answer, so the footer and the box agree.
+        let root = scratch_root("refused-secret-status");
+        std::fs::write(root.join("config.toml"), GOOD).expect("the configuration");
+        let mut app =
+            App::with_runner(Layout::rooted_at(root), quiet_runner("refused-secret-status"));
+        app.show_acknowledgment = false;
+        app.show(Screen::Credentials);
+        // Widen the file so the write itself is refused for its mode.
+        let path = app.layout.credentials_file();
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
+        std::fs::write(&path, "").expect("the file");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("the widened mode");
+        }
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_paste("a-throwaway-key");
+        assert_eq!(app.status, "pasted into the field");
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            app.status.starts_with("not written:"),
+            "the optimistic paste sentence survived the refusal: {}",
+            app.status
+        );
+        let error = app
+            .secret_prompt
+            .as_ref()
+            .expect("the prompt stays open")
+            .error
+            .clone()
+            .expect("the refusal is in the prompt");
+        assert!(app.status.contains(&error), "the box and the footer disagree");
+        // An empty secret is the second refusal path, and it replaces the status too.
+        app.secret_prompt.as_mut().expect("open").value.clear();
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            app.status.contains("empty secret is refused"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn the_forgejo_address_has_its_own_key_and_changes_only_the_address() {
+        // W32-1: the address was settable only by adding an agent, and that form moved
+        // the global address for every agent. `u` edits it on its own.
+        let root = scratch_root("forgejo-url-key");
+        std::fs::write(root.join("config.toml"), GOOD).expect("the configuration");
+        let mut app = App::with_runner(Layout::rooted_at(root), quiet_runner("forgejo-url"));
+        app.show_acknowledgment = false;
+        app.show(Screen::Forgejo);
+        app.on_key(key(KeyCode::Char('u')));
+        let prompt = app.url_prompt.as_ref().expect("the address prompt is open");
+        assert_eq!(prompt.value, "https://forgejo.example.org");
+        // The prompt is prefilled, so a person can correct one character.
+        app.url_prompt.as_mut().expect("open").value.clear();
+        for character in "http://127.0.0.1:39634".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.url_prompt.is_none(), "the prompt closed on success");
+        assert!(
+            app.status.contains("http://127.0.0.1:39634"),
+            "{}",
+            app.status
+        );
+        // Only the address changed: both agents and their endpoints survive.
+        let config = app.config.as_ref().expect("the configuration is re-read");
+        assert_eq!(config.forgejo.url, "http://127.0.0.1:39634");
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.agents[0].endpoint, "https://m.example.org");
+    }
+
+    #[test]
+    fn the_form_says_when_it_moved_the_address_for_existing_agents() {
+        // W32-1's sibling: the add-agent form still writes the global address, but it
+        // no longer does so silently.
+        let root = scratch_root("form-moved-url");
+        std::fs::write(root.join("config.toml"), GOOD).expect("the configuration");
+        let mut app = App::with_runner(Layout::rooted_at(root), quiet_runner("form-moved-url"));
+        app.show_acknowledgment = false;
+        app.on_key(key(KeyCode::Char('n')));
+        let fields = [
+            "third",
+            "https://m.example.org",
+            "m",
+            "gw-throwaway-key",
+            "http://127.0.0.1:39999",
+            "",
+        ];
+        for (at, value) in fields.iter().enumerate() {
+            if at > 0 {
+                app.on_key(key(KeyCode::Tab));
+            }
+            for character in value.chars() {
+                app.on_key(key(KeyCode::Char(character)));
+            }
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            app.status.contains("moved the Forgejo address"),
+            "the form moved every agent's address silently: {}",
+            app.status
         );
     }
 

@@ -172,7 +172,11 @@ impl IdentityError {
         match self {
             IdentityError::UnsafeName { .. } => "unsafe_name",
             IdentityError::NoAdminToken => "no_admin_token",
-            IdentityError::NoRoleToken => "credentials",
+            // F-3: the class always names the thing that is missing. `credentials` is
+            // the class for a credentials file that cannot be read, and a person who
+            // reads it there can take the file for broken; the missing role token is
+            // its own class, beside `no_agent_token` and `missing_admin_token`.
+            IdentityError::NoRoleToken => "no_role_token",
             IdentityError::NoAgentToken { .. } => "no_agent_token",
             IdentityError::NotOurs { .. } => "not_ours",
             IdentityError::Credentials(_) => "credentials",
