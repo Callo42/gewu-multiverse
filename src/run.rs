@@ -147,7 +147,22 @@ pub enum RunOutcome {
 }
 
 impl RunOutcome {
-    /// The word written in the transcript and shown on screen.
+    /// Every outcome, in the order a screen may list them.
+    ///
+    /// The vocabulary guard drives the screens over this list, so a new outcome cannot
+    /// be added without a word on every screen (W39-2).
+    pub const ALL: [RunOutcome; 4] = [
+        RunOutcome::Succeeded,
+        RunOutcome::Failed,
+        RunOutcome::Stopped,
+        RunOutcome::TimedOut,
+    ];
+
+    /// The one word for this outcome, written in the transcript and shown on screen.
+    ///
+    /// This is the product's vocabulary map: the hub, the Runs list and the Runs note
+    /// all read this word, so one outcome cannot be `timed_out` in one place and
+    /// `timed out` in another (W39-2).
     pub fn as_str(self) -> &'static str {
         match self {
             RunOutcome::Succeeded => "succeeded",
@@ -184,6 +199,9 @@ pub struct RunSummary {
     pub duration_ms: Option<u64>,
     /// When it started, as written in the transcript.
     pub started_at: Option<String>,
+    /// The reason the run's own transcript could not be read, when it is present but
+    /// unreadable — as distinct from a file that is not there (W38-1).
+    pub read_error: Option<String>,
     /// The run's log file.
     pub log: PathBuf,
     /// The run's directory.
@@ -212,6 +230,9 @@ impl RunSummary {
                     None => outcome,
                 }
             }
+            // A record that is present but unreadable is not a run whose ending was
+            // never written: it is one whose ending the product cannot read (W38-1).
+            None if self.read_error.is_some() => "unreadable".to_owned(),
             // A run whose start is recorded but whose end is not is running, not
             // "unknown": its `plan.json` and opening transcript record are on disk.
             None => match self.started_at.as_deref() {
@@ -311,50 +332,81 @@ pub fn runs_of_agent(state_root: &Path, agent: &str) -> Vec<RunSummary> {
 }
 
 /// Read one run's records into a summary.
+///
+/// The transcript is read once, and a read that fails on a file that is **there** is
+/// carried in `read_error` rather than swallowed: a screen must be able to say the
+/// record could not be read instead of calling it a run with no terminal record
+/// (W38-1).
 fn summarise(agent: &str, run_id: &str, run_dir: &Path) -> RunSummary {
     let log = run_dir.join(LOG_FILE);
-    let Some(finished) = transcript::terminal_record(run_dir) else {
-        return RunSummary {
-            agent: agent.to_owned(),
-            run_id: run_id.to_owned(),
-            outcome: None,
-            reason: None,
-            duration_ms: None,
-            // The opening record is written before the run does anything, so a run in
-            // progress has a start time even though it has no terminal record yet.
-            started_at: transcript::first_started_at(run_dir),
-            log,
-            dir: run_dir.to_path_buf(),
-        };
+    let (file, read_error) = match transcript::read_checked(run_dir) {
+        Ok(file) => (file, None),
+        Err(source) => (None, Some(source.to_string())),
     };
-    if let Record::RunFinished {
-        outcome,
-        duration_ms,
-        reason,
-        ..
-    } = finished
-    {
-        RunSummary {
-            agent: agent.to_owned(),
-            run_id: run_id.to_owned(),
-            outcome: RunOutcome::parse(&outcome),
+    let started_at = file.as_ref().and_then(|file| {
+        file.records.iter().find_map(|record| match record {
+            Record::RunStarted { ts, .. } => Some(ts.clone()),
+            _ => None,
+        })
+    });
+    let finished = file.as_ref().and_then(|file| {
+        file.records
+            .iter()
+            .rev()
+            .find(|record| matches!(record, Record::RunFinished { .. }))
+            .cloned()
+    });
+    let (outcome, reason, duration_ms) = match finished {
+        Some(Record::RunFinished {
+            outcome,
+            duration_ms,
             reason,
-            duration_ms: Some(duration_ms),
-            started_at: transcript::first_started_at(run_dir),
-            log,
-            dir: run_dir.to_path_buf(),
+            ..
+        }) => (RunOutcome::parse(&outcome), reason, Some(duration_ms)),
+        _ => (None, None, None),
+    };
+    RunSummary {
+        agent: agent.to_owned(),
+        run_id: run_id.to_owned(),
+        outcome,
+        reason,
+        duration_ms,
+        started_at,
+        read_error,
+        log,
+        dir: run_dir.to_path_buf(),
+    }
+}
+
+/// One wording for one fate of a file a run left behind (W38-1, W38-3).
+///
+/// Three cases, three sentences, wherever the file is named:
+///
+/// - the file is there and shows its **size**;
+/// - the file is **not there**, so it is `gone, the record has no <kind>`;
+/// - the file is there but its size **cannot be read** (permission denied), or a
+///   caller passes a content error in `read_error` (`transcript.jsonl` that is not
+///   JSONL), and then it says the reason.
+///
+/// The three cases are decided in one place so the Runs note and the Agent screen
+/// cannot call the same missing file two different things.
+pub fn file_sentence(path: &Path, kind: &str, read_error: Option<&str>) -> String {
+    if let Some(reason) = read_error {
+        return format!("{} — the record could not be read: {reason}", path.display());
+    }
+    match fs::metadata(path) {
+        Ok(meta) => format!(
+            "{} ({})",
+            path.display(),
+            crate::app::filesize_text(meta.len())
+        ),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            format!("{} — gone, the record has no {kind}", path.display())
         }
-    } else {
-        RunSummary {
-            agent: agent.to_owned(),
-            run_id: run_id.to_owned(),
-            outcome: None,
-            reason: None,
-            duration_ms: None,
-            started_at: transcript::first_started_at(run_dir),
-            log,
-            dir: run_dir.to_path_buf(),
-        }
+        Err(source) => format!(
+            "{} — the record could not be read: {source}",
+            path.display()
+        ),
     }
 }
 
@@ -627,11 +679,75 @@ mod tests {
             reason: None,
             duration_ms: None,
             started_at: Some(crate::time::rfc3339(1_000_000)),
+            read_error: None,
             log: PathBuf::from("/tmp/run.log"),
             dir: PathBuf::from("/tmp/run"),
         };
         assert_eq!(run.describe_at(1_012_000), "running (12s)");
         // A clock before the recorded start never prints a negative age.
         assert_eq!(run.describe_at(500), "running");
+    }
+
+    #[test]
+    fn one_word_for_one_outcome_on_every_screen() {
+        // W39-2: the hub printed `timed out` while the Runs screen printed
+        // `timed_out` for the same record, against the code's own "one word for one
+        // outcome, on every screen". The guard drives the code's own vocabulary map:
+        // every outcome's word round-trips through `parse`, the hub's `State::word`
+        // is exactly that word, and the Runs screen's `describe` is the same string.
+        for outcome in RunOutcome::ALL {
+            assert_eq!(
+                RunOutcome::parse(outcome.as_str()),
+                Some(outcome),
+                "the word {:?} does not round-trip",
+                outcome.as_str()
+            );
+            let state = crate::supervisor::State::Finished {
+                run_id: "run-1".to_owned(),
+                outcome,
+                reason: None,
+                duration_ms: 0,
+            };
+            assert_eq!(
+                state.word(),
+                outcome.as_str(),
+                "the hub and the Runs screen disagree about {outcome:?}"
+            );
+            let summary = RunSummary {
+                agent: "scribe".to_owned(),
+                run_id: "run-1".to_owned(),
+                outcome: Some(outcome),
+                reason: None,
+                duration_ms: None,
+                started_at: None,
+                read_error: None,
+                log: PathBuf::new(),
+                dir: PathBuf::new(),
+            };
+            assert_eq!(
+                summary.describe(),
+                outcome.as_str(),
+                "the Runs screen does not print the outcome's one word"
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_transcript_that_cannot_be_read_is_not_a_run_with_no_ending() {
+        // W38-1: a corrupt transcript was reported as `no terminal record` with the
+        // file still advertised at a normal size. The summary now carries the read
+        // error, and the word is about the record, not about the run's ending.
+        let root = scratch_root("unreadable-transcript");
+        let dir = root.join("scribe").join("run-300-0005-1");
+        fs::create_dir_all(&dir).expect("the run directory is created");
+        fs::write(
+            dir.join(crate::transcript::TRANSCRIPT_FILE),
+            b"this line is not a record\n",
+        )
+        .expect("a corrupt transcript is written");
+        let runs = recent_runs(&root, &["scribe".to_owned()], 10);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].read_error.is_some(), "the read error is dropped");
+        assert_eq!(runs[0].describe(), "unreadable");
     }
 }
