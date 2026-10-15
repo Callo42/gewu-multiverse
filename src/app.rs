@@ -353,19 +353,25 @@ impl EndpointTest {
 
 /// A byte count in the product's own words, so the file that grows with every run has
 /// a size a person can watch (L-3).
+///
+/// The unit is the one the arithmetic uses: the divisor is 1024, so the label is the
+/// binary one (`KiB`, `MiB`, `GiB`), never `KB`. A label that names a different
+/// definition from the number under it is the one-definition class again (F-2, its
+/// third appearance); `du` reads a byte count in the same binary units, so a person
+/// can reconcile the screen with their own tools.
 pub fn filesize_text(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
     }
-    let kb = bytes as f64 / 1024.0;
-    if kb < 1024.0 {
-        return format!("{kb:.1} KB");
+    let kib = bytes as f64 / 1024.0;
+    if kib < 1024.0 {
+        return format!("{kib:.1} KiB");
     }
-    let mb = kb / 1024.0;
-    if mb < 1024.0 {
-        return format!("{mb:.1} MB");
+    let mib = kib / 1024.0;
+    if mib < 1024.0 {
+        return format!("{mib:.1} MiB");
     }
-    format!("{:.1} GB", mb / 1024.0)
+    format!("{:.1} GiB", mib / 1024.0)
 }
 
 /// How long ago a test ran, in words, so a success cannot masquerade as current.
@@ -3806,8 +3812,11 @@ mod tests {
         // a unit a person reads, not as a raw byte count.
         assert_eq!(filesize_text(0), "0 B");
         assert_eq!(filesize_text(1023), "1023 B");
-        assert_eq!(filesize_text(4096), "4.0 KB");
-        assert_eq!(filesize_text(2 * 1024 * 1024), "2.0 MB");
+        // F-2: the number is bytes/1024, so the label is the binary unit. `4.0 KB`
+        // over this value named a definition the number did not use.
+        assert_eq!(filesize_text(4096), "4.0 KiB");
+        assert_eq!(filesize_text(2 * 1024 * 1024), "2.0 MiB");
+        assert_eq!(filesize_text(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 
     /// Write model keys, so a start reaches the supervisor rather than being refused
