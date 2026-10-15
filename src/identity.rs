@@ -138,9 +138,12 @@ pub enum IdentityError {
     )]
     NoRoleToken,
     /// No token was supplied for this agent, and there is no administrator token.
-    #[error(
-        "the credentials file records no Forgejo token for the agent `{agent}`; press v on the Forgejo screen to supply it"
-    )]
+    ///
+    // N-3: the surviving sibling of the round-9 class. The refusal a user acts on
+    // opens with the thing that is missing and names the product's own key for the
+    // fix (`v` on the Forgejo screen), never a file and a TOML section; the
+    // credentials file is still named on the Credentials screen itself.
+    #[error("the agent token for `{agent}` is absent — press v on the Forgejo screen to supply it")]
     NoAgentToken {
         /// The agent whose token is absent.
         agent: String,
@@ -466,5 +469,35 @@ mod tests {
         let line = identity.line();
         assert!(line.contains("gewu-scribe"), "{line}");
         assert!(line.contains("managed"), "{line}");
+    }
+
+    #[test]
+    fn every_token_refusal_names_the_key_a_person_can_press() {
+        // N-3: the refusal class has had survivors in three rounds because the sweep
+        // followed the finding's own file rather than the code. This guard reads the
+        // refusal strings themselves: a sentence about a missing token must name the
+        // product's own key and must not send a person to a file or a TOML section.
+        let refusals = [
+            IdentityError::NoRoleToken.to_string(),
+            IdentityError::NoAgentToken {
+                agent: "scribe".to_owned(),
+            }
+            .to_string(),
+            IdentityError::NoAdminToken.to_string(),
+        ];
+        for refusal in &refusals {
+            assert!(
+                refusal.contains("absent") || refusal.contains("no administrator token"),
+                "a token refusal does not say what is missing: {refusal}"
+            );
+            assert!(
+                !refusal.contains(".toml") && !refusal.contains("credentials file"),
+                "a token refusal sends a person to a file: {refusal}"
+            );
+            assert!(
+                refusal.contains("press"),
+                "a token refusal names no key: {refusal}"
+            );
+        }
     }
 }

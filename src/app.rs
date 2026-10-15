@@ -4477,10 +4477,16 @@ role = "member"
         let mut app = app_with(GOOD);
         app.on_key(key(KeyCode::Char('y')));
         app.on_key(key(KeyCode::Char('i')));
-        assert!(app.status.contains("no Forgejo token"), "{}", app.status);
+        assert!(app.status.contains("agent token"), "{}", app.status);
+        assert!(app.status.contains("absent"), "{}", app.status);
         assert!(
             !app.status.contains("[forgejo_agent_tokens]"),
             "{}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("credentials file"),
+            "the refusal sends a person to a file: {}",
             app.status
         );
         assert!(
