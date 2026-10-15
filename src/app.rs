@@ -773,6 +773,12 @@ impl App {
                     }
                 }
                 self.load_agent_modes();
+                // R-1: a tree an older version left keeps its old modes until the
+                // product happens to write each path again. Hold the product's own
+                // roots back to the one custody on every load, before anything is
+                // read, so the mode the screen prints is the mode on disk.
+                crate::mode::hold_tree_private(self.layout.root());
+                crate::mode::hold_tree_private(self.layout.state_root());
                 match CredentialsFile::prepare(&self.layout.credentials_file()) {
                     Ok(file) => {
                         self.credentials_path = file.path().to_path_buf();

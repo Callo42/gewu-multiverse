@@ -49,6 +49,47 @@ pub fn hold_dir_private_below(stop: &Path, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Hold every path under one of the product's own roots to the one custody.
+///
+/// The product holds each directory it *creates* to `0700` and each file it *writes*
+/// to `0600`, but a tree an older version left behind is never revisited, so an old
+/// run directory or configuration file keeps the umask mode it was made with (R-1).
+/// This walks a root and holds its directories to `0700` and its plain files to
+/// `0600`.
+///
+/// A directory named `workspace` is held itself but **not** descended into: the clone
+/// inside it is git's, not the product's, and its modes are not the product's to
+/// change (the workspace holds no secret the custody rule protects; the `0700`
+/// workspace is what blocks traversal). Symlinks are never followed, and a path that
+/// cannot be changed is left as it is rather than failing the load.
+pub fn hold_tree_private(root: &Path) {
+    if !root.is_dir() {
+        return;
+    }
+    let _ = set_mode(root, PRIVATE_DIR_MODE);
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            let _ = set_mode(&path, PRIVATE_DIR_MODE);
+            if path.file_name().map(|name| name == "workspace").unwrap_or(false) {
+                continue;
+            }
+            hold_tree_private(&path);
+        } else if file_type.is_file() {
+            let _ = set_mode(&path, SECRET_FILE_MODE);
+        }
+    }
+}
+
 /// Render a mode the way `chmod` writes it, for people to read.
 pub fn render(mode: u32) -> String {
     format!("{:04o}", mode)
@@ -79,6 +120,49 @@ mod tests {
     fn a_mode_is_rendered_with_leading_zeroes() {
         assert_eq!(render(0o600), "0600");
         assert_eq!(render(0o700), "0700");
+    }
+
+    #[test]
+    fn a_tree_from_an_older_version_is_held_back_to_the_one_custody() {
+        // R-1: a tree an older version wrote keeps its umask modes; the product holds
+        // its own roots to the custody it promises on every load. A workspace's
+        // contents are git's and are not touched.
+        let root = crate::test_support::scratch_root("mode-hold-tree");
+        let run = root.join("state").join("scribe").join("run-1");
+        let workspace = root.join("agents").join("scribe").join("workspace");
+        let clone = workspace.join("notes");
+        fs::create_dir_all(&run).expect("the run directory");
+        fs::create_dir_all(&clone).expect("the clone directory");
+        let config = root.join("config.toml");
+        fs::write(&config, "x\n").expect("a file");
+        let transcript = run.join("transcript.jsonl");
+        fs::write(&transcript, "{}\n").expect("a file");
+        let git_file = clone.join("HEAD");
+        fs::write(&git_file, "ref\n").expect("a git file");
+        for path in [&run, &workspace, &clone] {
+            set_mode(path, 0o775).expect("widened for the test");
+        }
+        set_mode(&config, 0o664).expect("widened for the test");
+        set_mode(&transcript, 0o664).expect("widened for the test");
+        set_mode(&git_file, 0o644).expect("git's own mode");
+
+        hold_tree_private(&root);
+
+        for dir in [&run, &workspace] {
+            assert_eq!(mode_of(dir).expect("mode"), PRIVATE_DIR_MODE, "{dir:?}");
+        }
+        assert_eq!(mode_of(&config).expect("mode"), SECRET_FILE_MODE);
+        assert_eq!(mode_of(&transcript).expect("mode"), SECRET_FILE_MODE);
+        assert_eq!(
+            mode_of(&clone).expect("mode"),
+            0o775,
+            "a clone below the workspace is git's, not the product's"
+        );
+        assert_eq!(
+            mode_of(&git_file).expect("mode"),
+            0o644,
+            "the clone's contents are git's, not the product's"
+        );
     }
 
     #[test]
