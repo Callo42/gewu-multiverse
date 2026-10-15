@@ -612,6 +612,90 @@ impl IdentityReport {
     }
 }
 
+/// A network check running on its own thread, so the screen can say it is in flight.
+///
+/// S-2: the endpoint test ran on the UI thread and the screen redrew only when it
+/// returned, so for up to the probe bound the previous result kept being drawn as if
+/// it were current and there was no sign the key had registered. Every network check
+/// that displays a result — the endpoint test, the role check, the administrator's
+/// role check and the identity — now runs here, behind an in-flight sentence, and the
+/// result that lands is stamped with the time and the machine that made it (W32-2).
+pub struct Probe {
+    /// Which check is running, for the sentence drawn while it is in flight.
+    pub what: ProbeWhat,
+    /// When the thread started, in unix milliseconds.
+    pub started_at_ms: u64,
+    /// The machine that started it, when the mark can be read.
+    pub machine: Option<String>,
+    receiver: std::sync::mpsc::Receiver<ProbeDone>,
+}
+
+impl std::fmt::Debug for Probe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Probe")
+            .field("what", &self.what)
+            .field("started_at_ms", &self.started_at_ms)
+            .field("machine", &self.machine)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which check is in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeWhat {
+    /// The selected agent's endpoint.
+    Endpoint { agent: String },
+    /// The configured role's role check.
+    Role,
+    /// The administrator token's role check.
+    AdminRole,
+    /// The selected agent's identity.
+    Identity { agent: String },
+}
+
+impl ProbeWhat {
+    /// The in-flight sentence for this check, naming the machine when it is known.
+    pub fn in_flight(&self, machine: Option<&str>) -> String {
+        let here = match machine {
+            Some(mark) => format!(" on {mark}"),
+            None => String::new(),
+        };
+        match self {
+            ProbeWhat::Endpoint { agent } => {
+                format!("testing the endpoint of `{agent}`{here} — the result follows")
+            }
+            ProbeWhat::Role => {
+                format!("checking the configured role{here} — the result follows")
+            }
+            ProbeWhat::AdminRole => {
+                format!("checking the administrator role{here} — the result follows")
+            }
+            ProbeWhat::Identity { agent } => {
+                format!("settling the identity of `{agent}`{here} — the result follows")
+            }
+        }
+    }
+}
+
+/// The result a background thread sends back to the UI.
+enum ProbeDone {
+    Endpoint {
+        agent: String,
+        endpoint: String,
+        model: String,
+        result: Result<String, EndpointFailure>,
+    },
+    Role {
+        admin: bool,
+        url: String,
+        result: Result<RoleCheck, ForgejoFailure>,
+    },
+    Identity {
+        agent: String,
+        result: Result<AgentIdentity, ForgejoFailure>,
+    },
+}
+
 /// The one line the identity key writes to the status.
 ///
 /// It is a receipt, not a second copy of the report: the report itself is drawn on
@@ -780,6 +864,11 @@ pub struct App {
     /// all. The record is what lets the stamp age across restarts; the session's own
     /// test above wins for the agent it names so a fresh result is shown at once.
     pub persisted_endpoint_tests: Vec<EndpointTest>,
+    /// The network check in flight, if any.
+    ///
+    /// A check runs on its own thread so the screen can draw an in-flight sentence and
+    /// never presents the previous result as the current one (S-2).
+    pub probe: Option<Probe>,
     /// The result of the last role check, if any.
     pub role_check: Option<Result<RoleCheck, ForgejoFailure>>,
     /// Which repository the Forgejo screen has selected.
@@ -872,6 +961,7 @@ impl App {
             footprint: crate::run::RunFootprint::default(),
             endpoint_test: None,
             persisted_endpoint_tests: Vec::new(),
+            probe: None,
             role_check: None,
             repo_selected: 0,
             identity_report: None,
@@ -1089,16 +1179,23 @@ impl App {
             .iter()
             .map(|agent| agent.name.clone())
             .collect();
-        self.recent = recent_runs(self.layout.state_root(), &names, RECENT_RUNS_LIMIT);
+        // R-5: the list is built from every agent directory on disk, not only the
+        // configured ones, so a removed agent's records are listed (marked `*`) and
+        // their transcript and log stay reachable. The count and the rows then agree.
+        let mut listed = names.clone();
+        listed.extend(crate::run::unconfigured_agents(
+            self.layout.state_root(),
+            &names,
+        ));
+        self.recent = recent_runs(self.layout.state_root(), &listed, RECENT_RUNS_LIMIT);
         // The cap is on the list, not on the records. Measure the records too, so the
         // screens can say how many older ones exist and how much room they take
         // (L-1, L-2, L-4): a list that stops at fifty without saying so is the finding.
-        self.footprint =
-            crate::run::state_footprint(self.layout.state_root(), &names);
-        self.recent_total = self
-            .footprint
-            .records
-            .saturating_sub(self.footprint.unconfigured_records);
+        self.footprint = crate::run::state_footprint(self.layout.state_root(), &names);
+        // `recent_total` is every record on disk now that the list covers every
+        // record; the difference the cap clause declares is the cap, not a hidden
+        // population (R-5).
+        self.recent_total = self.footprint.records;
         self.last_scan = Some(Instant::now());
         if self.run_selected >= self.recent.len() {
             self.run_selected = self.recent.len().saturating_sub(1);
@@ -1468,6 +1565,19 @@ impl App {
             // review there, it does not quit the product, so the footer must not
             // advertise `q quit` under it.
             || (self.show_acknowledgment && self.ack_review)
+    }
+
+    /// Whether an overlay is drawn over the body and so owns the note area behind it.
+    ///
+    /// F-1's class, generalized by enumeration: a bordered overlay can cover the head
+    /// of a wrapped note-area sentence and leave its tail (`writes both files for
+    /// you.`) as the first thing a zero-knowledge user reads. The acknowledgment is
+    /// the topmost overlay and is not in `overlay_owns_keys` (it does not own `q`),
+    /// so it is added here; every other overlay is the same set. One predicate governs
+    /// the note area, and a new overlay added to `overlay_owns_keys` is covered
+    /// without a second list.
+    pub fn overlay_owns_screen(&self) -> bool {
+        self.overlay_owns_keys() || self.show_acknowledgment
     }
 
     /// One key while the add-agent form is open.
@@ -2212,63 +2322,53 @@ impl App {
             self.status = "the configuration lists no agent to test".to_owned();
             return;
         };
+        if let Some(sentence) = self.probe_sentence() {
+            self.status = format!("{sentence}; the previous check is still in flight");
+            return;
+        }
+        // S-2: the probe runs on its own thread, so the screen can draw the in-flight
+        // sentence and never shows the previous result as the current one. The key is
+        // read, the request made and the result classified off the UI thread; the
+        // result is applied in `finish_probe` on the next tick.
         let credentials = self.layout.credentials_file();
-        let result = match credentials::model_key(&credentials, &agent.name) {
-            Err(error) => Err(EndpointFailure {
-                class: "missing_key".to_owned(),
-                message: error.to_string(),
-            }),
-            Ok(key) => {
-                let config = model::ModelConfig {
-                    endpoint: agent.endpoint.clone(),
-                    model: agent.model.clone(),
-                    api_key: key,
-                    timeout: model::PROBE_TIMEOUT,
-                };
-                match model::probe(&config) {
-                    Ok(reply) => Ok(reply.summary()),
+        let name = agent.name.clone();
+        let endpoint = agent.endpoint.clone();
+        let model_id = agent.model.clone();
+        self.start_probe(
+            ProbeWhat::Endpoint {
+                agent: name.clone(),
+            },
+            move || {
+                let result = match credentials::model_key(&credentials, &name) {
                     Err(error) => Err(EndpointFailure {
-                        class: error.class().to_owned(),
+                        class: "missing_key".to_owned(),
                         message: error.to_string(),
                     }),
+                    Ok(key) => {
+                        let config = model::ModelConfig {
+                            endpoint: endpoint.clone(),
+                            model: model_id.clone(),
+                            api_key: key,
+                            timeout: model::PROBE_TIMEOUT,
+                        };
+                        match model::probe(&config) {
+                            Ok(reply) => Ok(reply.summary()),
+                            Err(error) => Err(EndpointFailure {
+                                class: error.class().to_owned(),
+                                message: error.to_string(),
+                            }),
+                        }
+                    }
+                };
+                ProbeDone::Endpoint {
+                    agent: name,
+                    endpoint,
+                    model: model_id,
+                    result,
                 }
-            }
-        };
-        let short = match &result {
-            Ok(_) => "ok".to_owned(),
-            // The class alone is not the reason: the footer grows to hold the same
-            // sentence the Agent screen shows, so a refused connection or a bad name
-            // is read at 80×24, not just the word `transport` (O-2).
-            Err(_) => describe_endpoint_result(&result),
-        };
-        self.status = format!("endpoint test for `{}`: {short}", agent.name);
-        let test = EndpointTest {
-            agent: agent.name,
-            endpoint: agent.endpoint,
-            model: agent.model,
-            result,
-            tested_at_ms: crate::time::now_unix_ms(),
-            // W32-2: the result is written with the machine that made it, so a record
-            // copied to a second machine is not read there as a test of this one.
-            machine: crate::machine::mark(),
-        };
-        // LIB-2: write the result down before showing it, so the stamp is a fact the
-        // next start can read (and age) instead of a session's line that vanishes with
-        // no note. A failure to save is said on the same status line rather than
-        // hidden: the person is told the result will not outlive the session.
-        match write_endpoint_test(&self.layout.endpoint_tests_file(), &test) {
-            Ok(()) => {
-                self.persisted_endpoint_tests =
-                    read_endpoint_tests(&self.layout.endpoint_tests_file());
-            }
-            Err(error) => {
-                self.status = format!(
-                    "{} — the result could not be saved for the next start: {error}",
-                    self.status
-                );
-            }
-        }
-        self.endpoint_test = Some(test);
+            },
+        );
+        self.status = self.probe_sentence().unwrap_or_default();
     }
 
     /// The endpoint test the Agent screen knows for one agent.
@@ -2285,6 +2385,201 @@ impl App {
         self.persisted_endpoint_tests
             .iter()
             .find(|test| test.agent == agent)
+    }
+
+    /// The sentence for the network check in flight, when one is.
+    pub fn probe_sentence(&self) -> Option<String> {
+        self.probe
+            .as_ref()
+            .map(|probe| probe.what.in_flight(probe.machine.as_deref()))
+    }
+
+    /// The in-flight sentence for this agent's endpoint test, when one is running.
+    ///
+    /// The field says a test is under way and when it started, so the result that is
+    /// still on screen from the last probe is never read as the current one (S-2).
+    pub fn endpoint_probe_sentence(&self, agent: &str) -> Option<String> {
+        let started = self.endpoint_probe_started_at(agent)?;
+        Some(format!(
+            "testing — started {} (the result will replace this)",
+            tested_age(started)
+        ))
+    }
+
+    /// Whether this agent's endpoint is being tested right now (S-2).
+    pub fn testing_endpoint(&self, agent: &str) -> bool {
+        matches!(
+            &self.probe,
+            Some(probe)
+                if matches!(&probe.what, ProbeWhat::Endpoint { agent: name } if name == agent)
+        )
+    }
+
+    /// When the in-flight endpoint test for this agent started, in unix milliseconds.
+    pub fn endpoint_probe_started_at(&self, agent: &str) -> Option<u64> {
+        match &self.probe {
+            Some(probe) => match &probe.what {
+                ProbeWhat::Endpoint { agent: name } if name == agent => Some(probe.started_at_ms),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Start a network check on its own thread, replacing no running one.
+    ///
+    /// The caller has already refused when a check is in flight; the thread only
+    /// computes and sends, and [`App::poll_probe`] applies the result on the UI thread
+    /// so the state changes in one place.
+    fn start_probe(&mut self, what: ProbeWhat, work: impl FnOnce() -> ProbeDone + Send + 'static) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        self.probe = Some(Probe {
+            what,
+            started_at_ms: crate::time::now_unix_ms(),
+            machine: crate::machine::mark(),
+            receiver,
+        });
+    }
+
+    /// Apply a finished network check, if one has finished since the last tick.
+    fn poll_probe(&mut self) {
+        let done = match &self.probe {
+            Some(probe) => match probe.receiver.try_recv() {
+                Ok(done) => Some(done),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // The thread ended without a result. Say so instead of leaving the
+                    // in-flight sentence standing for ever.
+                    self.status =
+                        "the check ended without a result; press the key again to retry".to_owned();
+                    self.probe = None;
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(done) = done {
+            self.probe = None;
+            self.finish_probe(done);
+        }
+    }
+
+    /// Wait for the check in flight to finish, applying it on this thread.
+    ///
+    /// Used by the tests, which drive a check and then read the sentence it draws; the
+    /// real terminal loop lets [`App::tick`] apply the result on the next frame.
+    pub fn wait_for_probe(&mut self) {
+        while self.probe.is_some() {
+            self.poll_probe();
+            if self.probe.is_some() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// Apply one finished check on the UI thread.
+    fn finish_probe(&mut self, done: ProbeDone) {
+        match done {
+            ProbeDone::Endpoint {
+                agent,
+                endpoint,
+                model,
+                result,
+            } => {
+                let short = match &result {
+                    Ok(_) => "ok".to_owned(),
+                    Err(_) => describe_endpoint_result(&result),
+                };
+                self.status = format!("endpoint test for `{agent}`: {short}");
+                let test = EndpointTest {
+                    agent,
+                    endpoint,
+                    model,
+                    result,
+                    tested_at_ms: crate::time::now_unix_ms(),
+                    // W32-2: the result is written with the machine that made it.
+                    machine: crate::machine::mark(),
+                };
+                // LIB-2: write the result down before showing it, so the stamp is a
+                // fact the next start can read (and age). A failure to save is said on
+                // the same status line rather than hidden.
+                match write_endpoint_test(&self.layout.endpoint_tests_file(), &test) {
+                    Ok(()) => {
+                        self.persisted_endpoint_tests =
+                            read_endpoint_tests(&self.layout.endpoint_tests_file());
+                    }
+                    Err(error) => {
+                        self.status = format!(
+                            "{} — the result could not be saved for the next start: {error}",
+                            self.status
+                        );
+                    }
+                }
+                self.endpoint_test = Some(test);
+            }
+            ProbeDone::Role { admin, url, result } => {
+                if admin {
+                    self.apply_admin_role_check(result);
+                } else {
+                    self.apply_role_check(url, result);
+                }
+            }
+            ProbeDone::Identity { agent, result } => {
+                self.status = identity_receipt(&agent, &result);
+                self.identity_report = Some(IdentityReport { agent, result });
+            }
+        }
+    }
+
+    /// Apply the role check's result, in the sentence the Forgejo screen made before.
+    fn apply_role_check(&mut self, url: String, result: Result<RoleCheck, ForgejoFailure>) {
+        self.status = match &result {
+            Ok(check) => format!("role check: {}", check.summary()),
+            // The configured URL leads the refusal: a mistyped path is the common
+            // cause, and the API path alone does not connect the failure to what the
+            // user typed (P-7).
+            Err(failure) => format!(
+                "role check failed ({}) at {}: {}",
+                failure.class, url, failure.message
+            ),
+        };
+        self.role_check = Some(result);
+        self.repo_selected = 0;
+    }
+
+    /// Apply the administrator role check's result, keeping the last good view.
+    fn apply_admin_role_check(&mut self, result: Result<RoleCheck, ForgejoFailure>) {
+        self.status = match &result {
+            Ok(check) => format!("role check (administrator token): {}", check.summary()),
+            Err(failure) => format!(
+                "role check with the administrator token failed ({}): {}",
+                failure.class, failure.message
+            ),
+        };
+        // A failed administrator check must not wipe a good view the user already has:
+        // keep the last successful list and show the failure beside it instead.
+        match result {
+            Ok(check) => {
+                self.role_check = Some(Ok(check));
+                self.repo_selected = 0;
+            }
+            Err(failure) => {
+                let keep = matches!(self.role_check, Some(Ok(_)));
+                let message = format!(
+                    "role check with the administrator token failed ({}): {}",
+                    failure.class, failure.message
+                );
+                if keep {
+                    self.forgejo_note = Some(message);
+                } else {
+                    self.role_check = Some(Err(failure));
+                    self.repo_selected = 0;
+                }
+            }
+        }
     }
 
     /// The Forgejo the configuration names, when the configuration was read.
@@ -2317,32 +2612,42 @@ impl App {
             };
             return;
         };
-        let result = match identity::role_token(&self.credentials_path, settings.role) {
-            Ok(token) => {
-                let config = forgejo::ForgejoConfig {
-                    url: settings.url.clone(),
-                    token,
-                    timeout: forgejo::DEFAULT_TIMEOUT,
-                };
-                forgejo::role_check(&config, settings.role).map_err(failure_of)
+        if let Some(sentence) = self.probe_sentence() {
+            self.status = format!("{sentence}; the previous check is still in flight");
+            return;
+        }
+        let role = settings.role;
+        let url = settings.url.clone();
+        // The token read is local and fast; the network call is what runs on the
+        // background thread, behind the in-flight sentence (S-2).
+        let token = match identity::role_token(&self.credentials_path, role) {
+            Ok(token) => token,
+            Err(error) => {
+                self.apply_role_check(
+                    url,
+                    Err(ForgejoFailure {
+                        class: error.class().to_owned(),
+                        message: error.to_string(),
+                    }),
+                );
+                return;
             }
-            Err(error) => Err(ForgejoFailure {
-                class: error.class().to_owned(),
-                message: error.to_string(),
-            }),
         };
-        self.status = match &result {
-            Ok(check) => format!("role check: {}", check.summary()),
-            // The configured URL leads the refusal: a mistyped path is the common
-            // cause, and the API path alone does not connect the failure to what the
-            // user typed (P-7).
-            Err(failure) => format!(
-                "role check failed ({}) at {}: {}",
-                failure.class, settings.url, failure.message
-            ),
-        };
-        self.role_check = Some(result);
-        self.repo_selected = 0;
+        let config_url = url.clone();
+        self.start_probe(ProbeWhat::Role, move || {
+            let config = forgejo::ForgejoConfig {
+                url: config_url,
+                token,
+                timeout: forgejo::DEFAULT_TIMEOUT,
+            };
+            let result = forgejo::role_check(&config, role).map_err(failure_of);
+            ProbeDone::Role {
+                admin: false,
+                url,
+                result,
+            }
+        });
+        self.status = self.probe_sentence().unwrap_or_default();
     }
 
     /// Run the role check with the administrator token, so both roles can be compared
@@ -2353,16 +2658,29 @@ impl App {
                 .to_owned();
             return;
         };
-        let result = match credentials::forgejo_admin_token(&self.credentials_path) {
+        if let Some(sentence) = self.probe_sentence() {
+            self.status = format!("{sentence}; the previous check is still in flight");
+            return;
+        }
+        let url = settings.url.clone();
+        match credentials::forgejo_admin_token(&self.credentials_path) {
             Ok(Some(token)) => {
-                let config = forgejo::ForgejoConfig {
-                    url: settings.url.clone(),
-                    token,
-                    timeout: forgejo::DEFAULT_TIMEOUT,
-                };
-                forgejo::role_check(&config, Role::Admin).map_err(failure_of)
+                self.start_probe(ProbeWhat::AdminRole, move || {
+                    let config = forgejo::ForgejoConfig {
+                        url: url.clone(),
+                        token,
+                        timeout: forgejo::DEFAULT_TIMEOUT,
+                    };
+                    let result = forgejo::role_check(&config, Role::Admin).map_err(failure_of);
+                    ProbeDone::Role {
+                        admin: true,
+                        url,
+                        result,
+                    }
+                });
+                self.status = self.probe_sentence().unwrap_or_default();
             }
-            Ok(None) => Err(ForgejoFailure {
+            Ok(None) => self.apply_admin_role_check(Err(ForgejoFailure {
                 class: "missing_admin_token".to_owned(),
                 // V-1: the refusal a person acts on names the product's own key for the
                 // fix. The old sentence named the credentials file and no key, so the
@@ -2373,39 +2691,11 @@ impl App {
                 message: "no administrator token is configured, so only the configured \
                           role can be checked — press A on the Credentials screen to add one"
                     .to_owned(),
-            }),
-            Err(error) => Err(ForgejoFailure {
+            })),
+            Err(error) => self.apply_admin_role_check(Err(ForgejoFailure {
                 class: "credentials".to_owned(),
                 message: error.to_string(),
-            }),
-        };
-        self.status = match &result {
-            Ok(check) => format!("role check (administrator token): {}", check.summary()),
-            Err(failure) => format!(
-                "role check with the administrator token failed ({}): {}",
-                failure.class, failure.message
-            ),
-        };
-        // A failed administrator check must not wipe a good view the user already has:
-        // keep the last successful list and show the failure beside it instead.
-        match result {
-            Ok(check) => {
-                self.role_check = Some(Ok(check));
-                self.repo_selected = 0;
-            }
-            Err(failure) => {
-                let keep = matches!(self.role_check, Some(Ok(_)));
-                let message = format!(
-                    "role check with the administrator token failed ({}): {}",
-                    failure.class, failure.message
-                );
-                if keep {
-                    self.forgejo_note = Some(message);
-                } else {
-                    self.role_check = Some(Err(failure));
-                    self.repo_selected = 0;
-                }
-            }
+            })),
         }
     }
 
@@ -2427,18 +2717,29 @@ impl App {
                 "the configuration could not be read, so no identity can be settled".to_owned();
             return;
         };
-        let result =
-            identity::resolve(&settings.url, &name, &self.credentials_path).map_err(|error| {
-                ForgejoFailure {
-                    class: error.class().to_owned(),
-                    message: crate::model::in_product_words(&error.to_string()),
+        if let Some(sentence) = self.probe_sentence() {
+            self.status = format!("{sentence}; the previous check is still in flight");
+            return;
+        }
+        let url = settings.url.clone();
+        let credentials = self.credentials_path.clone();
+        self.start_probe(
+            ProbeWhat::Identity {
+                agent: name.clone(),
+            },
+            move || {
+                let result =
+                    identity::resolve(&url, &name, &credentials).map_err(|error| ForgejoFailure {
+                        class: error.class().to_owned(),
+                        message: crate::model::in_product_words(&error.to_string()),
+                    });
+                ProbeDone::Identity {
+                    agent: name,
+                    result,
                 }
-            });
-        self.status = identity_receipt(&name, &result);
-        self.identity_report = Some(IdentityReport {
-            agent: name,
-            result,
-        });
+            },
+        );
+        self.status = self.probe_sentence().unwrap_or_default();
     }
 
     /// The identity recorded for an agent, in the one shape every surface uses.
@@ -3217,9 +3518,24 @@ impl App {
                     } else {
                         ""
                     };
+                    // R-4: `code None` was a Rust `Option` on a screen, the emergency
+                    // save the product had just detected was not named, and the return
+                    // clause every other hand-off outcome carries was missing. The
+                    // interruption now reads as a sentence, names the file to recover
+                    // from where it happened, and says the keys are the product's again.
+                    let ending = match status.code() {
+                        Some(code) => format!("left with code {code}"),
+                        None => "was interrupted".to_owned(),
+                    };
+                    let recovery = match editor_backup(&action.path) {
+                        Some(backup) => format!(
+                            "; an earlier edit was not saved and the editor kept it in {} — open that file to recover",
+                            backup.display()
+                        ),
+                        None => String::new(),
+                    };
                     self.status = format!(
-                        "{program} left with code {:?} for {} ({file}); it may not have been saved{created}",
-                        status.code(),
+                        "{program} {ending} for {} ({file}); it may not have been saved{created}{recovery}{KEYS_BACK}",
                         action.label
                     );
                 } else {
@@ -3367,6 +3683,9 @@ impl App {
     /// records. The terminal loop calls this on every tick.
     pub fn tick(&mut self) {
         self.supervisor.poll(Instant::now());
+        // S-2: a network check that finished on its background thread is applied here, on
+        // the UI thread, before the next draw.
+        self.poll_probe();
         self.note_stop_proven();
         self.refresh_workspace_note();
         let stale = match self.last_scan {
@@ -3695,6 +4014,20 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if key.code == KeyCode::Char('c') {
                 self.ask_to_leave("ctrl-c");
+                return;
+            }
+            // S-3: `ctrl-u` clears the one-line field that is open. It is handled
+            // here, before the control guard's blanket return, so the prefilled
+            // address and every other field can be replaced with one key instead of
+            // backspacing over the old value.
+            if key.code == KeyCode::Char('u') {
+                if let Some(form) = self.add_agent.as_mut() {
+                    form.fields[form.cursor].clear();
+                } else if let Some(prompt) = self.secret_prompt.as_mut() {
+                    prompt.value.clear();
+                } else if let Some(prompt) = self.url_prompt.as_mut() {
+                    prompt.value.clear();
+                }
             }
             return;
         }
@@ -4568,6 +4901,90 @@ concurrency = 1
     }
 
     #[test]
+    fn an_interrupted_editor_return_names_recovery_and_says_the_keys_are_back() {
+        // R-4: the return from an interrupted editor read `code None` (a Rust
+        // `Option` on a screen), did not name the emergency-save file the product had
+        // just detected, and did not carry the return clause every other hand-off
+        // outcome has.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.editor_configured = true;
+        app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Enter));
+        let action = app.take_action().expect("an edit");
+        let backup = action.path.with_file_name(".instruction.md.swp");
+        std::fs::write(&backup, "unsaved words").expect("the emergency save is written");
+        let interrupted = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -9 $$")
+            .status()
+            .expect("the shell runs");
+        assert!(
+            interrupted.code().is_none(),
+            "the test really interrupted the editor"
+        );
+        app.note_action(&action, Ok(interrupted));
+        assert!(app.status.contains("was interrupted"), "{}", app.status);
+        assert!(
+            !app.status.contains("code None"),
+            "a Rust `Option` reached the screen: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains(".instruction.md.swp"),
+            "the recovery file is not named: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("the keys are the product's again"),
+            "the return is silent: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_prefilled_field_can_be_cleared_with_one_key() {
+        // S-3: the prefilled address could only be corrected by backspacing over it,
+        // and a person who typed appended to the old value instead. `ctrl-u` clears
+        // the field on every one-line prompt.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        app.request_url_edit();
+        assert!(
+            !app.url_prompt
+                .as_ref()
+                .expect("the address prompt")
+                .value
+                .is_empty(),
+            "the address prompt is prefilled"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.url_prompt.as_ref().expect("the address prompt").value,
+            "",
+            "ctrl-u did not clear the address"
+        );
+        app.url_prompt = None;
+        app.request_secret(SecretTarget::ModelKey);
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.secret_prompt.as_ref().expect("the secret prompt").value,
+            "",
+            "ctrl-u did not clear the secret prompt"
+        );
+        app.secret_prompt = None;
+        app.request_new_agent();
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.add_agent.as_ref().expect("the form").fields[0],
+            "",
+            "ctrl-u did not clear the form field"
+        );
+    }
+
+    #[test]
     fn backing_out_of_an_editor_confirmation_creates_no_file() {
         // H-1/H-2's sibling: the file used to be made when the key was pressed, so a
         // person who pressed `esc` on `no $EDITOR … press enter` was left with a
@@ -4849,6 +5266,7 @@ role = "member"
         let mut app = app_with(GOOD);
         app.on_key(key(KeyCode::Char('y')));
         app.on_key(key(KeyCode::Char('i')));
+        app.wait_for_probe();
         assert!(app.status.contains("agent token"), "{}", app.status);
         assert!(app.status.contains("absent"), "{}", app.status);
         assert!(
@@ -4963,6 +5381,7 @@ role = "member"
             let mut app = app_with(GOOD);
             app.on_key(key(KeyCode::Char('y')));
             app.on_key(key(KeyCode::Char('i')));
+            app.wait_for_probe();
             produced.push(Refusal {
                 path: "i agent token",
                 class: Some("no_agent_token"),
@@ -4989,6 +5408,7 @@ role = "member"
             let mut app = app_with(GOOD);
             app.on_key(key(KeyCode::Char('y')));
             app.on_key(key(KeyCode::Char('p')));
+            app.wait_for_probe();
             produced.push(Refusal {
                 path: "p endpoint test",
                 class: Some("missing_key"),
