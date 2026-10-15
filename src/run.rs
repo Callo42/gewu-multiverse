@@ -44,6 +44,35 @@ pub fn looks_like_run_id(name: &str) -> bool {
     !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '-')
 }
 
+/// The instant a run id was made, when its shape carries one.
+///
+/// A run id begins with the millisecond clock the supervisor made it at, so a run
+/// whose opening transcript record has not landed yet still has a start time on disk
+/// — in its own directory name. Z-1 reads it so the Runs screen can say `running`
+/// from the first frame the hub says it, instead of `unknown start`.
+pub fn started_ms_from_run_id(run_id: &str) -> Option<u64> {
+    let rest = run_id.strip_prefix(RUN_ID_PREFIX)?;
+    let (millis, _sequence) = rest.split_once('-')?;
+    millis.parse().ok()
+}
+
+/// The one word for a run in flight, on every screen.
+///
+/// The hub (`State::word`) and the Runs row (`RunSummary::describe_at`) both print
+/// this, so the first seconds of a run cannot be `running` on one screen and
+/// `unknown start` on the other (Z-1).
+pub fn running_word(elapsed_ms: u64) -> String {
+    format!("running ({}s)", elapsed_ms / 1000)
+}
+
+/// The one word for a record that is present but cannot be read (W38-1, W41-2).
+///
+/// A run `unreadable` is not a run that never happened: the word says the product
+/// cannot read the record, never that there is no run. The hub's state column and
+/// the Runs row print this same string, so a corrupt transcript cannot read as
+/// `idle` ("no run") on the hub while Runs says `unreadable`.
+pub const UNREADABLE_WORD: &str = "unreadable";
+
 /// Everything a run needs to know, written down before it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -232,14 +261,12 @@ impl RunSummary {
             }
             // A record that is present but unreadable is not a run whose ending was
             // never written: it is one whose ending the product cannot read (W38-1).
-            None if self.read_error.is_some() => "unreadable".to_owned(),
+            None if self.read_error.is_some() => UNREADABLE_WORD.to_owned(),
             // A run whose start is recorded but whose end is not is running, not
             // "unknown": its `plan.json` and opening transcript record are on disk.
             None => match self.started_at.as_deref() {
                 Some(started) => match crate::time::parse_rfc3339(started) {
-                    Some(start) if now_ms > start => {
-                        format!("running ({}s)", (now_ms - start) / 1000)
-                    }
+                    Some(start) if now_ms >= start => running_word(now_ms - start),
                     _ => "running".to_owned(),
                 },
                 None => "no terminal record".to_owned(),
@@ -748,6 +775,50 @@ mod tests {
         let runs = recent_runs(&root, &["scribe".to_owned()], 10);
         assert_eq!(runs.len(), 1);
         assert!(runs[0].read_error.is_some(), "the read error is dropped");
-        assert_eq!(runs[0].describe(), "unreadable");
+        assert_eq!(runs[0].describe(), UNREADABLE_WORD);
+    }
+
+    #[test]
+    fn one_word_for_a_run_in_flight_and_for_a_record_that_cannot_be_read() {
+        // Z-1 / W41-2: the state vocabulary is the code's own, on the hub and on Runs.
+        // A run the hub calls `running (Ns)` must read the same on the Runs row, and a
+        // record the product cannot read must not be `idle` (the word for no run) on
+        // one screen while the other says `unreadable`.
+        let now = crate::time::now_unix_ms();
+        for elapsed in [0u64, 1_500, 61_000] {
+            let state = crate::supervisor::State::Running {
+                run_id: "run-1".to_owned(),
+                pid: 1,
+                elapsed_ms: elapsed,
+            };
+            let mut summary = RunSummary {
+                agent: "scribe".to_owned(),
+                run_id: "run-1".to_owned(),
+                outcome: None,
+                reason: None,
+                duration_ms: None,
+                started_at: Some(crate::time::rfc3339(now.saturating_sub(elapsed))),
+                read_error: None,
+                log: PathBuf::new(),
+                dir: PathBuf::new(),
+            };
+            assert_eq!(state.word(), running_word(elapsed));
+            assert_eq!(
+                state.word(),
+                summary.describe_at(now),
+                "the hub and the Runs row disagree about a run in flight"
+            );
+            // A present-but-unreadable record is one word on both screens, and it is
+            // never the word for no run.
+            summary.started_at = None;
+            summary.read_error = Some("not a record".to_owned());
+            let unreadable = crate::supervisor::State::Unreadable {
+                run_id: "run-1".to_owned(),
+                reason: "not a record".to_owned(),
+            };
+            assert_eq!(unreadable.word(), UNREADABLE_WORD);
+            assert_eq!(unreadable.word(), summary.describe_at(now));
+            assert_ne!(unreadable.word(), crate::supervisor::State::Idle.word());
+        }
     }
 }

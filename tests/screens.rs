@@ -497,6 +497,36 @@ fn the_instruction_screen_shows_the_files_on_disk_and_the_editing_keys() {
 }
 
 #[test]
+fn an_unreadable_instruction_or_steps_file_is_named_unreadable_not_missing() {
+    // Z-3: a present but unreadable `instruction.md` read `not there yet` and a present
+    // but unreadable `steps.txt` read `none` — the words for files that are not there,
+    // the last survivors of the W38-1 class. Both now carry the reason, the same
+    // sentence the transcript uses.
+    let root = scratch("instruction-unreadable");
+    let mut app = app(&root);
+    app.on_key(KeyEvent::from(KeyCode::Char('y')));
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    // Directories stand in for the two files: present, not readable as documents.
+    fs::create_dir_all(paths.instruction()).expect("a directory stands in for the file");
+    fs::create_dir_all(paths.steps_file()).expect("a directory stands in for the file");
+    app.show(Screen::Instructions);
+    let screen = render(&app);
+    show("Instruction, both files unreadable", &app);
+    assert!(
+        screen.contains("could not be read"),
+        "neither unreadable file is named as such:\n{screen}"
+    );
+    assert!(
+        !screen.contains("not there yet"),
+        "a document that is there is called absent:\n{screen}"
+    );
+    assert!(
+        !screen.contains("none — press t"),
+        "a steps file that is there is called `none`:\n{screen}"
+    );
+}
+
+#[test]
 fn the_endpoint_test_shows_a_success_and_a_clear_failure_with_its_class() {
     use gewu_multiverse::test_stub::{Stub, StubReply};
 
@@ -784,6 +814,24 @@ fn the_key_legend_never_stops_without_naming_the_full_list() {
     assert!(
         legend.trim_end().ends_with("? all keys"),
         "the legend must end with the affordance: {legend:?}"
+    );
+
+    // Z-4: at 200 columns every key fits, and the line still ends with the
+    // full-list affordance. The last key used to be dropped because the loop
+    // reserved the longer `… more` tail even for it.
+    let wide = render_at(200, 30, &app);
+    let legend = wide
+        .lines()
+        .find(|line| line.contains("s start"))
+        .expect("the action legend is on screen");
+    assert!(legend.contains("d remove"), "the last key is missing: {legend:?}");
+    assert!(
+        legend.trim_end().ends_with("? all keys"),
+        "the wide legend must end with the affordance: {legend:?}"
+    );
+    assert!(
+        !legend.contains("… more"),
+        "every key fits at 200 columns, so there is nothing more: {legend:?}"
     );
 }
 
@@ -2347,6 +2395,28 @@ fn the_hub_state_column_never_clips_a_word_mid_token() {
 }
 
 #[test]
+fn the_hub_row_stays_a_row_at_two_hundred_columns() {
+    // Z-2: at 200 columns the model column absorbed all the slack, so the state cell
+    // sat ~180 columns from the agent name and a row stopped reading as a row. A
+    // column is now as wide as its content needs; the leftover is trailing blank
+    // space, and the fields of one row stay together at every width.
+    let root = scratch("wide-hub-row");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::Agents);
+    let hub = render_at(200, 30, &app);
+    let row = hub
+        .lines()
+        .find(|line| line.contains("scribe"))
+        .expect("the agent row is drawn");
+    let state_at = row.rfind("idle").expect("the state cell is on the row");
+    assert!(
+        state_at < 100,
+        "at 200 columns the state cell is {state_at} columns from the start of the row: {row:?}"
+    );
+}
+
+#[test]
 fn an_endpoint_test_is_dated_and_marked_when_the_endpoint_changed() {
     // Y-5: the result outlived the endpoint it tested and read as current. It is now
     // dated, and a result about another endpoint is marked not current.
@@ -3012,9 +3082,16 @@ fn the_address_prompt_says_what_the_address_is_for() {
     app.show(Screen::Forgejo);
     app.request_url_edit();
     let screen = render_at(100, 40, &app);
+    // W41-1: the prompt used to say "every agent on this machine", which is false on a
+    // shared machine where each person's configuration has its own address. It now
+    // names the thing that is true: this configuration.
     assert!(
-        normalised(&screen).contains(&normalised("every agent on this machine uses")),
+        normalised(&screen).contains(&normalised("every agent in this configuration uses")),
         "{screen}"
+    );
+    assert!(
+        !normalised(&screen).contains(&normalised("every agent on this machine")),
+        "the address prompt still speaks for the whole machine: {screen}"
     );
     assert!(
         normalised(&screen).contains(&normalised("the role check runs against it")),
