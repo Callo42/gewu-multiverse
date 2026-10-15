@@ -2664,7 +2664,7 @@ fn the_run_records_footprint_and_the_cleanup_expectation_are_on_the_runs_screen(
         "the footprint count is missing: {screen}"
     );
     assert!(
-        screen.contains("KB") || screen.contains("B of file bytes"),
+        screen.contains("KiB") || screen.contains("B of file bytes"),
         "the footprint has no room figure: {screen}"
     );
     assert!(
@@ -2712,7 +2712,7 @@ fn the_agent_screen_names_the_size_of_the_log_and_the_transcript() {
     app.show(Screen::AgentConfig);
     let screen = render_at(100, 50, &app);
     assert!(screen.contains("newest log"), "the log field is gone: {screen}");
-    assert!(screen.contains("4.0 KB"), "the log's size is not shown: {screen}");
+    assert!(screen.contains("4.0 KiB"), "the log's size is not shown: {screen}");
     assert!(
         screen.contains("transcript"),
         "the transcript field is not drawn: {screen}"
