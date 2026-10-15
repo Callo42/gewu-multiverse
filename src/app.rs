@@ -5980,6 +5980,20 @@ role = "member"
         assert!(!state.is_live());
         assert_eq!(state.word(), "stopped");
         assert!(crate::transcript::terminal_record(&dir).is_some());
+        // O1: the hub seeds `stopped` while the Runs list used to keep reading the
+        // record it held before the reconciliation, so the two screens disagreed for a
+        // moment about whether the abandoned run was still running. Reading the records
+        // back after the reconciliation closes that window.
+        let newest = app
+            .recent
+            .iter()
+            .find(|run| run.agent == "one")
+            .expect("the run is listed");
+        assert_eq!(
+            newest.outcome,
+            Some(crate::run::RunOutcome::Stopped),
+            "the Runs list still says the abandoned run is running"
+        );
     }
 
     #[test]
