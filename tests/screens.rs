@@ -1365,15 +1365,21 @@ fn the_key_reference_scrolls_so_every_key_survives_a_short_window() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('?')));
     let first = render_at(80, 24, &app);
-    assert!(first.contains("of 17"), "the range is missing: {first}");
-    // Scroll to the end; the last line must be reachable.
+    assert!(first.contains("of 18"), "the range is missing: {first}");
+    // Scroll to the end; the last line must be reachable, and every key with it —
+    // including `u`, the Forgejo address key W32-1 added, so the reference lists it.
+    let mut seen = first.clone();
     for _ in 0..20 {
         app.on_key(KeyEvent::from(KeyCode::Down));
+        seen.push_str(&render_at(80, 24, &app));
     }
-    let last = render_at(80, 24, &app);
     assert!(
-        last.contains("esc or enter close it"),
-        "the last help line is unreachable: {last}"
+        seen.contains("esc or enter close it"),
+        "the last help line is unreachable"
+    );
+    assert!(
+        seen.contains("set the instance address"),
+        "the key help does not list `u`, the Forgejo address key"
     );
 }
 
@@ -2250,6 +2256,7 @@ fn an_endpoint_test_is_dated_and_marked_when_the_endpoint_changed() {
         model: "example-model".to_owned(),
         result: Ok("the endpoint answered: replied `ok`; 3 tokens used".to_owned()),
         tested_at_ms: gewu_multiverse::time::now_unix_ms(),
+        machine: gewu_multiverse::machine::mark(),
     });
     app.show(Screen::AgentConfig);
     let fresh = render_at(80, 40, &app);
@@ -2957,5 +2964,164 @@ fn a_wrapped_identity_never_glues_the_login_to_the_email() {
     assert!(
         !screen.contains("someone-else\n<someone@else.invalid>"),
         "the login and the email were split at their own space: {screen}"
+    );
+}
+
+#[test]
+fn an_endpoint_test_from_another_machine_is_not_drawn_as_this_machines_result() {
+    // W32-2: a test result belongs to a machine and a time. A record copied from
+    // another machine must not be drawn as if this machine's endpoint had answered.
+    use gewu_multiverse::app::{EndpointFailure, EndpointTest};
+    let root = scratch("endpoint-machine");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.show(Screen::AgentConfig);
+    let base = EndpointTest {
+        agent: "scribe".to_owned(),
+        endpoint: "https://model.example.org/v1".to_owned(),
+        model: "example-model".to_owned(),
+        result: Ok("the endpoint answered: ok".to_owned()),
+        tested_at_ms: gewu_multiverse::time::now_unix_ms(),
+        machine: Some("another-host/00000000000000000000000000000000".to_owned()),
+    };
+    app.endpoint_test = Some(base.clone());
+    let screen = render_at(100, 40, &app);
+    assert!(screen.contains("tested just now"), "{screen}");
+    assert!(
+        screen.contains("tested on another machine"),
+        "a foreign machine's test is drawn as this machine's: {screen}"
+    );
+
+    // A record that names no machine says so, rather than claiming either way.
+    app.endpoint_test = Some(EndpointTest {
+        machine: None,
+        ..base.clone()
+    });
+    let screen = render_at(100, 40, &app);
+    assert!(
+        screen.contains("does not name the machine"),
+        "{screen}"
+    );
+
+    // This machine's own mark gains no clause.
+    app.endpoint_test = Some(EndpointTest {
+        machine: gewu_multiverse::machine::mark(),
+        ..base
+    });
+    let screen = render_at(100, 40, &app);
+    assert!(
+        !screen.contains("tested on another machine")
+            && !screen.contains("does not name the machine"),
+        "{screen}"
+    );
+    // The class and the cause of a failure are still drawn beside the age.
+    app.endpoint_test = Some(EndpointTest {
+        agent: "scribe".to_owned(),
+        endpoint: "https://model.example.org/v1".to_owned(),
+        model: "example-model".to_owned(),
+        result: Err(EndpointFailure {
+            class: "transport".to_owned(),
+            message: "the endpoint refused the connection".to_owned(),
+        }),
+        tested_at_ms: gewu_multiverse::time::now_unix_ms(),
+        machine: gewu_multiverse::machine::mark(),
+    });
+    let screen = render_at(100, 40, &app);
+    assert!(screen.contains("transport"), "{screen}");
+    assert!(screen.contains("refused the connection"), "{screen}");
+}
+
+#[test]
+fn a_settled_identity_and_its_last_failure_are_one_verdict() {
+    // W32-5: the panel drew a settled identity sentence and, below it, the last
+    // identity failure with no word joining them, so a reader could not tell whether
+    // the identity was usable now. The failure is now appended to the identity line,
+    // and the tail no longer repeats it.
+    use gewu_multiverse::app::{ForgejoFailure, IdentityReport};
+    use gewu_multiverse::config::Role;
+    use gewu_multiverse::forgejo::{Permissions, Repository, RoleCheck, Viewer};
+    use gewu_multiverse::identity::IdentityMode;
+    let root = scratch("identity-connected");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let credentials = app.credentials_path.clone();
+    fs::write(
+        &credentials,
+        "[forgejo_logins]\nscribe = \"onboarder\"\n\n[forgejo_emails]\nscribe = \"onboarder@example.invalid\"\n",
+    )
+    .expect("the credentials file");
+    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).expect("0600");
+    app.role_check = Some(Ok(RoleCheck {
+        url: "http://127.0.0.1:39634".to_owned(),
+        role: Role::Member,
+        viewer: Viewer {
+            login: "onboarder".to_owned(),
+            email: None,
+            description: None,
+            is_admin: false,
+        },
+        repositories: vec![Repository {
+            full_name: "onboarder/notes".to_owned(),
+            namespace: "onboarder".to_owned(),
+            name: "notes".to_owned(),
+            private: false,
+            default_branch: Some("main".to_owned()),
+            html_url: None,
+            permissions: Permissions {
+                admin: false,
+                push: true,
+                pull: true,
+            },
+        }],
+        private_visible: 0,
+    }));
+    app.identity_report = Some(IdentityReport {
+        agent: "scribe".to_owned(),
+        result: Err(ForgejoFailure {
+            class: "bad_token".to_owned(),
+            message: "the Forgejo refused the token (HTTP 401)".to_owned(),
+        }),
+    });
+    app.show(Screen::Forgejo);
+    let screen = render_at(100, 40, &app);
+    assert!(
+        screen.contains("onboarder\u{a0}<onboarder@example.invalid>"),
+        "the settled identity left the panel: {screen}"
+    );
+    assert!(
+        screen.contains("the last check failed (bad_token)"),
+        "the failure is not joined to the identity: {screen}"
+    );
+    // The tail copy of a failed report is gone: one verdict, not two.
+    assert!(
+        !screen.contains("identity for `scribe`: failed"),
+        "the failure is still drawn twice: {screen}"
+    );
+    let _ = IdentityMode::Supplied;
+}
+
+#[test]
+fn the_first_run_modal_leaves_no_fragment_of_the_note_area() {
+    // F-1: at 100x40 the first screen showed `writes both files for you.` below the
+    // modal — the tail of a sentence whose head the modal hid. While the modal owns
+    // the screen, the note area is not drawn.
+    let root = scratch("first-run-fragment");
+    let mut app = app(&root);
+    app.show_acknowledgment = true;
+    let screen = render_at(100, 40, &app);
+    assert!(
+        !screen.contains("writes both files for you"),
+        "a dangling fragment of the note area is on the first screen: {screen}"
+    );
+    assert!(
+        screen.contains("Before the first agent runs"),
+        "the modal itself is missing: {screen}"
+    );
+    // Once the modal closes, the note area returns whole.
+    app.show_acknowledgment = false;
+    let screen = render_at(100, 40, &app);
+    assert!(
+        screen.contains("concurrency is how many model requests"),
+        "the note area did not return: {screen}"
     );
 }

@@ -83,6 +83,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_editor_confirm(frame, app);
     } else if app.secret_prompt.is_some() {
         draw_secret_prompt(frame, app);
+    } else if app.url_prompt.is_some() {
+        draw_url_prompt(frame, app);
     } else if app.confirm_remove.is_some() {
         draw_remove_confirm(frame, app);
     } else if app.confirm_forget.is_some() {
@@ -204,17 +206,22 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     // A note area that runs out of rows declares its tail instead of dropping it
     // without a word — the same rule the panels follow in their titles (O-3) — and a
     // note area scrolled away from its top says so too (A-1).
-    // While the first-run modal owns the screen, the note area behind it does not
-    // declare that more is below: the sentence would point at rows the modal hides,
-    // which is noise, not an offer (W-5). The declaration returns the moment the
-    // modal closes. Everywhere else the both-direction rule holds unchanged.
-    let notes = note_window(
-        agent_notes(app),
-        area.width as usize,
-        parts[1].height as usize,
-        app.panel_scroll,
-        !app.show_acknowledgment,
-    );
+    // F-1: while the acknowledgment modal owns the screen, the note area behind it is
+    // not drawn at all. It used to be drawn with only its declaration suppressed, so
+    // the modal could cover the head of a wrapped sentence and leave its tail
+    // (`writes both files for you.`) as the first screen a zero-knowledge user sees.
+    // The modal is the screen while it is up; the note area returns when it closes.
+    let notes = if app.show_acknowledgment {
+        Vec::new()
+    } else {
+        note_window(
+            agent_notes(app),
+            area.width as usize,
+            parts[1].height as usize,
+            app.panel_scroll,
+            true,
+        )
+    };
     frame.render_widget(
         Paragraph::new(Text::from(notes)).wrap(Wrap { trim: true }),
         parts[1],
@@ -436,7 +443,14 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                         log.display()
                     ),
                 )),
-                None => lines.push(field("newest log", "no run yet")),
+                // W32-3: `no run yet` is a claim about the agent, and a person who
+                // copied the configuration to a second machine is not told that their
+                // agent never ran. The run records are machine-local, so the sentence
+                // names what this machine knows.
+                None => lines.push(field(
+                    "newest log",
+                    "no run record on this machine yet — run records live under the state directory",
+                )),
             }
             // L-3: the transcript grows too, and was named nowhere with a size.
             match app.latest_run_transcript(&agent.name) {
@@ -464,7 +478,25 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                 // Y-5: a result about an endpoint or model that has since changed is
                 // history; it is dated and marked, never shown as if it were now.
                 Some(test) if test.is_current_for(agent) => {
-                    lines.push(field("endpoint test", &test.describe()));
+                    // W32-2: a test belongs to a machine as well as a time. A record
+                    // that names another machine is not this machine's result, and a
+                    // record that names none says so — neither is drawn as if this
+                    // machine had answered.
+                    use crate::machine::Relation;
+                    let base = test.describe();
+                    let line = match test.machine_relation() {
+                        Relation::Here => base,
+                        Relation::Elsewhere => format!(
+                            "{base} — but it was tested on another machine; press p to test it here"
+                        ),
+                        Relation::Unnamed => format!(
+                            "{base} — the record does not name the machine it was tested on; press p to test it here"
+                        ),
+                        Relation::Undecidable => format!(
+                            "{base} — this machine's own name cannot be read, so the product cannot say where it was tested; press p to test it here"
+                        ),
+                    };
+                    lines.push(field("endpoint test", &line));
                 }
                 Some(test) => lines.push(field(
                     "endpoint test",
@@ -737,7 +769,7 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
 /// leaves the repository list more than one row at 80×24.
 fn forgejo_legend() -> Vec<Line<'static>> {
     [
-        "c role   C admin role   v agent token   A admin token   i identity",
+        "u url   c role   C admin role   v agent token   A admin token   i identity",
         "up/down choose one   g clone   P pull request   U update the newest",
     ]
     .iter()
@@ -869,19 +901,33 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
         },
     ));
     if let Some(agent) = app.selected_agent() {
+        // W32-5: the settled sentence and the last failure were two fields with no
+        // word joining them, so a reader could not tell whether the identity was
+        // usable now. The failure is appended to the identity line itself, and the
+        // tail (`forgejo_frame`) no longer repeats it, so the panel has one verdict.
+        let last_identity_failure = app
+            .identity_report_for(&agent.name)
+            .and_then(|report| report.result.err());
+        let failure_clause = |failure: &crate::app::ForgejoFailure| {
+            format!(
+                " — the last check failed ({}): {}",
+                failure.class, failure.message
+            )
+        };
         match app.recorded_identity(&agent.name) {
             Some(identity) => {
                 // One shape on every surface, and it names the agent: the login, the
                 // email and the mode of the account a clone or a pull request acts as
                 // (F1, F6). A second person with several agents never has to guess
                 // whose identity is on show.
-                head.push(field(
-                    "agent identity",
-                    &format!(
-                        "{} — clones and pull requests act as this account",
-                        identity.line()
-                    ),
-                ));
+                let mut line = format!(
+                    "{} — clones and pull requests act as this account",
+                    identity.line()
+                );
+                if let Some(failure) = &last_identity_failure {
+                    line.push_str(&failure_clause(failure));
+                }
+                head.push(field("agent identity", &line));
             }
             None => {
                 // What `i` will do, before it does it: with an administrator token the
@@ -895,7 +941,7 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                 // second person with several agents never has to guess whose
                 // selection the screen is showing (F1). The supplied path keeps the
                 // page map's `v supplies the token` clause whole at 80×24.
-                let sentence = if admin {
+                let mut sentence = if admin {
                     format!(
                         "not settled for `{}` — press i for `{login}`; the account is created and managed",
                         agent.name
@@ -906,6 +952,9 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                         agent.name
                     )
                 };
+                if let Some(failure) = &last_identity_failure {
+                    sentence.push_str(&failure_clause(failure));
+                }
                 head.push(field("agent identity", &sentence));
             }
         }
@@ -978,9 +1027,13 @@ fn forgejo_frame(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     // there is one, otherwise the identity recorded in the credentials file once the
     // role check has run, so a second person who restarts the product can still read
     // it (H-3).
+    // W32-5: a **failure** is drawn on the identity line above, joined to the
+    // settled sentence; drawing it here too would be the two-verdicts defect again.
+    // The report (with its creation time) stays on the tail for a settled identity.
     if let Some(report) = app
         .selected_agent()
         .and_then(|agent| app.identity_report_for(&agent.name))
+        .filter(|report| report.result.is_ok())
     {
         tail.push(Line::from(""));
         tail.push(Line::from(format!(
@@ -1089,6 +1142,13 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
     ));
     lines.push(Line::from(
         "Its contents are never printed: nothing here is shown, logged or put on a command line.",
+    ));
+    // W32-6: the product never said it is one machine. The configuration directory,
+    // the credentials file, the acknowledgment record and the endpoint-test record
+    // belong to the machine they were made on, and a person who copies the directory
+    // to a second machine must be told what travels with it and what stays behind.
+    lines.push(Line::from(
+        "This configuration, its credentials, the acknowledgment and the endpoint-test record belong to the machine they were made on; copying the configuration directory to another machine carries the Forgejo address, the secrets and the endpoint test with it, but a record that names another machine is labelled as such where it is shown. The run records live under the state directory and do not travel with the configuration.",
     ));
     lines.push(Line::from(Span::styled(
         "An agent runs as you, so it can read this file with your rights. The screen shows you where it is.",
@@ -2033,6 +2093,60 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     );
 }
 
+/// The one-field prompt for the configured Forgejo address (W32-1).
+///
+/// The address is not a secret, so it is drawn as itself — a masked address could not
+/// be corrected. The prompt says what pressing enter changes: the one global address
+/// every agent on this machine follows.
+fn draw_url_prompt(frame: &mut Frame, app: &App) {
+    let Some(prompt) = &app.url_prompt else {
+        return;
+    };
+    let screen = overlay_area(frame.area());
+    let width = (screen.width.saturating_sub(2)).min(76);
+    let height = 9.min(screen.height);
+    let popup = centered(screen, width, height);
+    frame.render_widget(
+        Clear,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+    let mut lines: Vec<Line> = vec![
+        Line::from(
+            "The address is the Forgejo every agent on this machine uses; this machine is the only one it names.",
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("> {}", prompt.value),
+            Style::new().fg(Color::Black).bg(Color::Cyan),
+        )),
+        Line::from(""),
+    ];
+    match &prompt.error {
+        Some(error) => lines.push(Line::from(Span::styled(
+            format!("  {error}"),
+            Style::new().fg(Color::Red),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "  enter writes it for every agent   esc cancels",
+            Style::new().fg(Color::DarkGray),
+        ))),
+    }
+    let block = Block::bordered()
+        .title(" set the Forgejo instance address ")
+        .border_style(Style::new().fg(Color::Cyan));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
 /// How much a masked field holds, with the count in the right number.
 fn hidden_count(count: usize) -> String {
     if count == 1 {
@@ -2350,8 +2464,9 @@ const HELP_LINES: &[&str] = &[
     "Panel:     [ / ] scroll the panel or note area; on Agent, Instruction and Credentials",
     "           the arrows and PageUp/PageDown move it too, so its last line is reachable",
     "Forgejo:   c check the configured role   C check the administrator token",
-    "           i settle the agent's identity   up/down choose a repository",
-    "           g clone it   P open a pull request   U update the newest one",
+    "           u set the instance address   i settle the agent's identity",
+    "           up/down choose a repository   g clone it",
+    "           P open a pull request   U update the newest one",
     "Secrets:   k set the model key (Credentials)   f set the role token (Credentials)",
     "           v set the agent's own Forgejo token (Forgejo)   A set the administrator token",
     "           D delete the leftover secrets of agents no longer configured (Credentials)",
