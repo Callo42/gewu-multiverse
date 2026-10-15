@@ -49,6 +49,12 @@ pub enum AckState {
         /// were accepted under this version (C-3); the value is read from the file,
         /// never assumed to be the running version.
         app_version: String,
+        /// The machine the confirmation was made on, when the record names one.
+        ///
+        /// The modal's own sentence says `this machine`, and a configuration
+        /// directory copied to a second machine carries the record with it; the mark
+        /// lets the screen say whose acknowledgment this is (W32-6).
+        machine: Option<String>,
     },
     /// A record is there but cannot be trusted, so it is not treated as a confirmation.
     Unreadable {
@@ -73,6 +79,7 @@ impl AckState {
             Ok(record) if record.acknowledged => AckState::Recorded {
                 acknowledged_at_unix: record.acknowledged_at_unix,
                 app_version: record.app_version,
+                machine: record.machine,
             },
             Ok(_) => AckState::Missing,
             Err(error) => AckState::Unreadable {
@@ -97,6 +104,7 @@ impl AckState {
             AckState::Recorded {
                 acknowledged_at_unix,
                 app_version,
+                ..
             } => format!(
                 "acknowledged on {} (version {})",
                 crate::time::compact_utc(acknowledged_at_unix.saturating_mul(1000)),
@@ -123,14 +131,35 @@ impl AckState {
             AckState::Recorded {
                 acknowledged_at_unix,
                 app_version,
+                machine,
             } => Some(format!(
-                "the risk was acknowledged on {} (version {}; this build is {}); press R to read the terms again — the record is not changed",
+                "the risk was acknowledged on {} (version {}; this build is {}; {}) — press R to read the terms again; the record is not changed",
                 crate::time::compact_utc(acknowledged_at_unix.saturating_mul(1000)),
                 version_label(app_version),
-                env!("CARGO_PKG_VERSION")
+                env!("CARGO_PKG_VERSION"),
+                machine_clause(machine.as_deref())
             )),
             _ => None,
         }
+    }
+}
+
+/// How the record's machine relates to this one, as a clause for a sentence.
+///
+/// A record with no machine mark (one written before the mark existed) says so rather
+/// than claiming it was made here or elsewhere.
+fn machine_clause(machine: Option<&str>) -> String {
+    match machine.map(str::trim).filter(|mark| !mark.is_empty()) {
+        Some(mark) => match crate::machine::relation(mark) {
+            crate::machine::Relation::Here => "recorded on this machine".to_owned(),
+            crate::machine::Relation::Elsewhere => format!(
+                "recorded on another machine ({mark}) — this machine has not recorded a confirmation"
+            ),
+            crate::machine::Relation::Unnamed | crate::machine::Relation::Undecidable => {
+                "the record does not name the machine it was made on".to_owned()
+            }
+        },
+        None => "the record does not name the machine it was made on".to_owned(),
     }
 }
 
@@ -143,12 +172,19 @@ pub fn record(path: &Path) -> Result<AckState, io::Error> {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
+    // W32-6: the confirmation is made on one machine; the record carries which one, so
+    // a copied directory does not present another machine's confirmation as this
+    // machine's own.
+    let machine = crate::machine::mark()
+        .map(|mark| format!("machine = {}", toml_string(&mark)))
+        .unwrap_or_default();
     let text = format!(
         "# Written once, when the risk of running an agent was confirmed.\n\
          # Removing this file makes the next start show the acknowledgment again.\n\
          acknowledged = true\n\
          acknowledged_at_unix = {stamp}\n\
-         app_version = \"{}\"\n",
+         app_version = \"{}\"\n\
+         {machine}\n",
         env!("CARGO_PKG_VERSION")
     );
     let mut file = fs::OpenOptions::new()
@@ -161,6 +197,11 @@ pub fn record(path: &Path) -> Result<AckState, io::Error> {
     file.sync_all()?;
     set_mode(path, SECRET_FILE_MODE)?;
     Ok(AckState::read(path))
+}
+
+/// A TOML string literal for a value the record writes.
+fn toml_string(text: &str) -> String {
+    toml::Value::String(text.to_owned()).to_string()
 }
 
 /// The version a record carries, or `unknown` when the file did not say.
@@ -181,6 +222,8 @@ struct Record {
     acknowledged_at_unix: u64,
     #[serde(default)]
     app_version: String,
+    #[serde(default)]
+    machine: Option<String>,
 }
 
 #[cfg(test)]

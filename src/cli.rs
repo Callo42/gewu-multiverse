@@ -67,6 +67,12 @@ Options:
     -h, --help           Print this help and stop.
     -V, --version        Print the version and stop.
 
+This configuration, its credentials and its run records belong to the machine they
+were made on. Copying the configuration directory to a second machine carries the
+Forgejo address, the secrets and the endpoint-test record with it; the run records
+live under the state directory and do not travel with it. A record that names
+another machine is labelled as such where it is shown.
+
 No secret is ever passed as an argument; put secrets in the credentials file,
 which is created with mode 0600.";
 
@@ -265,6 +271,15 @@ mod tests {
     fn the_help_text_says_where_secrets_go() {
         assert!(HELP.contains("credentials file"));
         assert!(HELP.contains("0600"));
+    }
+
+    #[test]
+    fn the_help_text_says_the_configuration_belongs_to_one_machine() {
+        // W32-6: the product never said it is one machine. A person who copies the
+        // configuration to a second machine is told what travels and what does not.
+        assert!(HELP.contains("belong to the machine they\nwere made on"), "{HELP}");
+        assert!(HELP.contains("run records"), "{HELP}");
+        assert!(HELP.contains("do not travel"), "{HELP}");
     }
 
     #[test]

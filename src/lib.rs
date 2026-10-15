@@ -21,6 +21,8 @@
 //! - [`paths`] — the two roots and every path derived from an agent's name;
 //! - [`config`] — the configuration file and its validation;
 //! - [`mode`] — the file modes the private files are held to;
+//! - [`machine`] — which machine a fact was learned on, so a copied record is not
+//!   read as this machine's own (W32-2, W32-6);
 //! - [`credentials`] — the credentials file, and the secrets it hands out;
 //! - [`risk`] — the first-run risk acknowledgment and its record;
 //! - [`time`] — the clock, and how an instant is written down;
@@ -51,6 +53,7 @@ pub mod credentials;
 pub mod editor;
 pub mod forgejo;
 pub mod identity;
+pub mod machine;
 pub mod mode;
 pub mod model;
 pub mod naming;
