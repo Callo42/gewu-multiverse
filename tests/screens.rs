@@ -2838,3 +2838,111 @@ fn the_editor_confirmation_names_the_file_and_agrees_with_its_subject() {
         "the advice still promises a prompt that may never come: {screen}"
     );
 }
+
+#[test]
+fn a_set_editor_is_named_before_it_opens() {
+    // N-1: with `$EDITOR` set the product went straight into the editor, so the
+    // program was named only on return. It is now named by the same confirmation the
+    // unset case uses, before the terminal is handed over.
+    let root = scratch("editor-configured-confirm");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    app.editor_configured = true;
+    app.show(Screen::Instructions);
+    app.on_key(KeyEvent::from(KeyCode::Char('e')));
+    assert!(
+        app.editor_confirm.is_some(),
+        "the configured editor takes the screen with no confirmation"
+    );
+    assert!(
+        app.take_action().is_none(),
+        "the hand-off must wait for the confirmation"
+    );
+    let screen = render(&app);
+    assert!(
+        screen.contains("`$EDITOR` is set, so the instruction of `scribe` opens in"),
+        "the program is not named before it opens: {screen}"
+    );
+    assert!(screen.contains("enter open it"), "{screen}");
+    assert!(screen.contains("esc cancel"), "{screen}");
+}
+
+#[test]
+fn the_acknowledgment_modal_is_whole_or_declares_itself_at_the_floor() {
+    // F-1 (severity 3): at 72×18 the modal drew half a wrapped line and said nothing.
+    // It now follows the same rule as every bordered panel: whole logical lines, and
+    // `more below; enlarge the window` in the title when any was dropped, with the
+    // answer line kept as the last drawn row. This is the guard at the floor.
+    let root = scratch("ack-floor");
+    let mut app = app(&root);
+    assert!(app.show_acknowledgment, "the first-run modal is up");
+    // At the advertised minimum (80×24) the modal is whole and declares nothing.
+    let wide = render_at(80, 24, &app);
+    assert!(
+        !wide.contains("Before the first agent runs — more below"),
+        "the modal declares an overflow it does not have at 80×24: {wide}"
+    );
+    assert!(wide.contains("y — I understand, record it once"), "{wide}");
+    assert!(wide.contains("The record will be written to"), "{wide}");
+    // At the 72×18 floor the prose is dropped whole and the title says so; the answer
+    // line survives as the last drawn row.
+    let floor = render_at(72, 18, &app);
+    assert!(
+        floor.contains("Before the first agent runs — more below; enlarge the window"),
+        "the modal drops content in silence at the floor: {floor}"
+    );
+    assert!(
+        floor.contains("y — I understand, record it once"),
+        "the answer line is not drawn at the floor: {floor}"
+    );
+    // The read-only review modal declares and keeps its own close line at the floor.
+    app.ack_review = true;
+    let review = render_at(72, 18, &app);
+    assert!(
+        review.contains("Before the first agent runs — more below"),
+        "the review modal drops content in silence at the floor: {review}"
+    );
+    assert!(
+        review.contains("esc or any key — close this"),
+        "the review modal has no visible way out at the floor: {review}"
+    );
+}
+
+#[test]
+fn a_wrapped_identity_never_glues_the_login_to_the_email() {
+    // N-2: at the width where the identity wraps at its own space, the next row began
+    // with the email and the login read as glued to it. The separator is a no-break
+    // space now, so the pair wraps whole.
+    let root = scratch("wrapped-identity");
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
+    let paths = app.selected_paths().expect("paths");
+    let workspace = paths.workspace();
+    fs::create_dir_all(workspace).expect("the workspace exists");
+    let git = |args: &[&str]| {
+        let status = process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "someone-else"]);
+    git(&["config", "user.email", "someone@else.invalid"]);
+    git(&["commit", "--allow-empty", "-m", "one"]);
+    app.reload();
+    app.show(Screen::AgentConfig);
+    // The workspace note is read once a second while its screen is on show.
+    app.tick();
+    let screen = render_at(100, 40, &app);
+    assert!(
+        screen.contains("someone-else\u{a0}<someone@else.invalid>"),
+        "the identity pair is not protected from the wrap: {screen}"
+    );
+    assert!(
+        !screen.contains("someone-else\n<someone@else.invalid>"),
+        "the login and the email were split at their own space: {screen}"
+    );
+}
