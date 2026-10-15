@@ -2202,8 +2202,17 @@ impl App {
         let state = match workspace::inspect(workspace) {
             Ok(Some(state)) => state,
             Ok(None) => {
-                return "not a git repository — the product reads it as a directory, not as history"
-                    .to_owned();
+                // R-2: the product's own clone lands at `workspace/<repo>`, so after a
+                // successful clone the root is still not a repository. Reading that as
+                // “not a git repository” contradicted the clone that just happened; the
+                // clones below the root are named instead.
+                let clones = workspace::cloned_repositories(workspace);
+                if clones.is_empty() {
+                    return "not a git repository — the product reads it as a directory, not as \
+                            history"
+                        .to_owned();
+                }
+                return self.cloned_workspace_note(&clones);
             }
             Err(workspace::WorkspaceError::GitMissing { .. }) => {
                 return "git is not installed, so the product cannot read what is in this directory"
@@ -2250,6 +2259,49 @@ impl App {
         format!(
             "on {}, {} ({age}), {changed} — {whose}",
             state.branch, state.commit
+        )
+    }
+
+    /// One sentence about the repositories cloned below a workspace root (R-2).
+    ///
+    /// Each clone is named with what the product can read of it — branch, commit and
+    /// age, and whether the tree is clean — so the clone the product itself made is
+    /// visible on the screen that used to call the root “not a git repository”.
+    fn cloned_workspace_note(&self, clones: &[workspace::ClonedRepository]) -> String {
+        let listed: Vec<String> = clones
+            .iter()
+            .map(|clone| match &clone.state {
+                Some(state) => {
+                    let changed = match state.changed {
+                        0 => "clean".to_owned(),
+                        1 => "1 changed path".to_owned(),
+                        count => format!("{count} changed paths"),
+                    };
+                    if state.commit.is_empty() {
+                        format!(
+                            "{} (on {} (no commit yet), {changed})",
+                            clone.name, state.branch
+                        )
+                    } else {
+                        let age = tested_age(state.committed_at.saturating_mul(1000));
+                        format!(
+                            "{} (on {}, {} ({age}), {changed})",
+                            clone.name, state.branch, state.commit
+                        )
+                    }
+                }
+                None => format!("{} (the repository could not be read)", clone.name),
+            })
+            .collect();
+        let noun = if clones.len() == 1 {
+            "repository"
+        } else {
+            "repositories"
+        };
+        format!(
+            "not a git repository; it holds {} cloned {noun}: {}",
+            clones.len(),
+            listed.join(", ")
         )
     }
 
@@ -4377,6 +4429,24 @@ role = "member"
     }
 
     #[test]
+    fn the_role_check_refusal_names_the_products_own_keys() {
+        // T-4: the role-token refusal drew the credentials file and the TOML key
+        // `forgejo_token`; its sibling (the missing model key) names the product's own
+        // keys. `f` on the Credentials screen is what writes `forgejo_token`.
+        let mut app = app_with(GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(key(KeyCode::Char('c')));
+        assert!(app.status.contains("role token absent"), "{}", app.status);
+        assert!(
+            app.status.contains("f on the Credentials screen"),
+            "{}",
+            app.status
+        );
+        assert!(!app.status.contains("forgejo_token"), "{}", app.status);
+        assert!(!app.status.contains("credentials.toml"), "{}", app.status);
+    }
+
+    #[test]
     fn a_failed_runs_reason_is_readable_from_the_agent() {
         // F-G: the reason lives on the screen, not only in a transient status.
         let mut app = app_with(GOOD);
@@ -5455,5 +5525,64 @@ concurrency = 3
         let note = app.workspace_note_for("one");
         assert!(note.contains("not the agent's"), "{note}");
         assert!(!note.contains("cannot say whether"), "{note}");
+    }
+
+    #[test]
+    fn a_clone_below_the_workspace_root_is_named_not_denied() {
+        // R-2: the product's own clone lands at `workspace/<repo>`, so the root is
+        // not a repository after a successful clone. The note names the clone instead
+        // of saying the workspace is not a git repository.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
+        let clone = paths.workspace().join("notes");
+        std::fs::create_dir_all(&clone).expect("the clone directory");
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "gewu-one"]);
+        git(
+            &clone,
+            &["config", "user.email", "gewu-one@agents.invalid"],
+        );
+        std::fs::write(clone.join("README"), "hello\n").expect("a file");
+        git(&clone, &["add", "README"]);
+        git(&clone, &["commit", "-q", "-m", "first"]);
+
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("not a git repository"), "{note}");
+        assert!(note.contains("holds 1 cloned repository"), "{note}");
+        assert!(note.contains("notes"), "{note}");
+        assert!(note.contains("on main"), "{note}");
+        // A workspace with no clone keeps the plain sentence.
+        let empty = paths.workspace().join("empty");
+        std::fs::create_dir_all(&empty).expect("an empty workspace");
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("notes"), "the clone is still the one on show: {note}");
+    }
+
+    #[test]
+    fn a_fresh_repository_with_no_commit_is_not_gits_fatal_text() {
+        // T-5: a fresh `git init` has no resolvable HEAD; reading it used to draw
+        // git's own `fatal: ambiguous argument 'HEAD'` on the Agent screen.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
+        let workspace = paths.workspace().to_path_buf();
+        git(&workspace, &["init", "-q", "-b", "main"]);
+        git(&workspace, &["config", "user.name", "gewu-one"]);
+        git(
+            &workspace,
+            &["config", "user.email", "gewu-one@agents.invalid"],
+        );
+
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("no commit yet"), "{note}");
+        assert!(!note.contains("fatal"), "{note}");
+        assert!(note.contains("main"), "{note}");
     }
 }
