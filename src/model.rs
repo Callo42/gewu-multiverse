@@ -566,6 +566,15 @@ pub fn in_product_words(text: &str) -> String {
         || text.contains("Name or service not known")
     {
         "the address could not be resolved".to_owned()
+    } else if text.contains("Peer disconnected") || text.contains("Broken pipe") {
+        // S-4: the peer closed after the request was read. `the request could not be
+        // sent` was false and `io:` is the transport library's prefix, so the whole
+        // sentence is replaced with the product's own account of what happened.
+        "the request was sent, but the endpoint closed the connection".to_owned()
+    } else if text.contains("io: ") {
+        // Any other `io:` cause keeps the transport's words but loses the library's
+        // prefix, so no raw `io:` reaches a screen (S-4's class).
+        text.replace("io: ", "")
     } else {
         text.to_owned()
     }
@@ -797,6 +806,16 @@ mod tests {
         );
         // Anything the product does not know keeps the transport's sentence.
         assert_eq!(in_product_words("a frobnicator failed"), "a frobnicator failed");
+        // S-4: a dropped connection is the product's sentence, not the transport's.
+        assert_eq!(
+            in_product_words("the request could not be sent: io: Peer disconnected"),
+            "the request was sent, but the endpoint closed the connection"
+        );
+        assert!(!in_product_words("an io: Peer disconnected").contains("io:"));
+        assert_eq!(
+            in_product_words("io: some other transport cause"),
+            "some other transport cause"
+        );
     }
 
     #[test]

@@ -260,6 +260,34 @@ pub fn recent_runs(state_root: &Path, agents: &[String], limit: usize) -> Vec<Ru
     all
 }
 
+/// The agent directory names under the state root that the configuration no longer
+/// lists.
+///
+/// R-5: the Runs note area counted a removed agent's records but the list did not
+/// show them, so their transcript and log could not be opened in-app until the agent
+/// was re-added. The list is now built from these names too, and a record whose agent
+/// is not configured is marked in the table, so the count and the rows agree.
+pub fn unconfigured_agents(state_root: &Path, configured: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = fs::read_dir(state_root) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !configured.iter().any(|known| known == &name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
 /// Every run recorded for one agent, in no particular order.
 pub fn runs_of_agent(state_root: &Path, agent: &str) -> Vec<RunSummary> {
     let dir = state_root.join(agent);
