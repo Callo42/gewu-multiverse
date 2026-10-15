@@ -2162,7 +2162,75 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     let screen = overlay_area(frame.area());
     let program = crate::editor::editor();
     let width = (screen.width.saturating_sub(2)).min(74);
-    let height = 7.min(screen.height);
+    let inner_width = width.saturating_sub(2) as usize;
+    // The verb agrees with the label: `the declared steps … open`, `the instruction
+    // … opens`. One fixed wording cannot be true of both (F6).
+    let verb = if action.target.map(|target| target.is_plural()).unwrap_or(false) {
+        "open"
+    } else {
+        "opens"
+    };
+    // N-1: the program is named **before** it takes the screen in both cases. The
+    // set case used to be named only after the hand-off returned, because its status
+    // line was erased as the UI stepped aside; the same confirmation the unset case
+    // uses names it where a person can read it, and gives a way to back out.
+    let mut body: Vec<Line> = vec![
+        Line::from(format!(
+            "{}, so {} {verb} in:",
+            if app.editor_configured {
+                "`$EDITOR` is set"
+            } else {
+                "No `$EDITOR` is set"
+            },
+            action.label
+        )),
+        Line::from(Span::styled(
+            format!("  {program}"),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if program.trim() == "vi" {
+        body.push(Line::from(
+            "  In vi: press i to type, Esc to stop typing, then :wq and enter to save and quit, or :q! to leave without saving.",
+        ));
+    } else if program.trim() == "nano" {
+        // The overlay names the program; it must also say how to leave it, or a person
+        // who presses `e` is stranded in an editor whose screen says esc does nothing
+        // (M-4). The wording must be true in **both** cases: with nothing changed,
+        // `^X` leaves at once and never asks, so a sentence that promises a prompt and
+        // a `N` sends the person's `N` to the product, where it opens the add-agent
+        // form (F5). `if it asks` is the part that is true either way.
+        body.push(Line::from(
+            "  In nano: ^X leaves; if it asks, Y and enter saves and N does not.",
+        ));
+    }
+    if !app.editor_configured {
+        body.push(Line::from(Span::styled(
+            "Set `$EDITOR` (for example, export EDITOR=nano) to use another editor.",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    let answer: Vec<Line> = vec![Line::from(Span::styled(
+        "enter open it        esc cancel",
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    // Size the box to what it holds, and never let it grow past the screen it is
+    // drawn on. When a narrow floor forces a choice, whole body lines go from the
+    // bottom and the action line stays; the title declares what was left out, so the
+    // overlay follows the same rule as every other bordered surface (F-1's class).
+    let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width);
+    let height = (wanted as u16 + 2).min(screen.height);
+    let inner_height = height.saturating_sub(2) as usize;
+    let mut dropped = false;
+    while !body.is_empty()
+        && pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) > inner_height
+    {
+        body.pop();
+        dropped = true;
+    }
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -2173,51 +2241,15 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
-    // The verb agrees with the label: `the declared steps … open`, `the instruction
-    // … opens`. One fixed wording cannot be true of both (F6).
-    let verb = if action.target.map(|target| target.is_plural()).unwrap_or(false) {
-        "open"
+    let title = if dropped {
+        fit_title(width as usize, "open an editor", None, None, false, true).0
     } else {
-        "opens"
+        " open an editor ".to_owned()
     };
-    let mut lines: Vec<Line> = vec![
-        Line::from(format!(
-            "No `$EDITOR` is set, so {} {verb} in:",
-            action.label
-        )),
-        Line::from(Span::styled(
-            format!("  {program}"),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )),
-    ];
-    if program.trim() == "vi" {
-        lines.push(Line::from(
-            "  In vi: press i to type, Esc to stop typing, then :wq and enter to save and quit, or :q! to leave without saving.",
-        ));
-    } else if program.trim() == "nano" {
-        // The overlay names the program; it must also say how to leave it, or a person
-        // who presses `e` is stranded in an editor whose screen says esc does nothing
-        // (M-4). The wording must be true in **both** cases: with nothing changed,
-        // `^X` leaves at once and never asks, so a sentence that promises a prompt and
-        // a `N` sends the person's `N` to the product, where it opens the add-agent
-        // form (F5). `if it asks` is the part that is true either way.
-        lines.push(Line::from(
-            "  In nano: ^X leaves; if it asks, Y and enter saves and N does not.",
-        ));
-    }
-    lines.push(Line::from(Span::styled(
-        "Set `$EDITOR` (for example, export EDITOR=nano) to use another editor.",
-        Style::new().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        "enter open it        esc cancel",
-        Style::new()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
+    let mut lines = body;
+    lines.extend(answer);
     let block = Block::bordered()
-        .title(" open an editor ")
+        .title(title)
         .border_style(Style::new().fg(Color::Yellow));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -2315,15 +2347,16 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let height = (risk::LINES.len() as u16 + 10).min(available.height);
     let popup = centered(available, width, height);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut prose: Vec<Line> = Vec::new();
     for text in risk::LINES {
-        lines.push(Line::from(vec![Span::raw("  * "), Span::raw(*text)]));
+        prose.push(Line::from(vec![Span::raw("  * "), Span::raw(*text)]));
     }
-    lines.push(Line::from(""));
+    prose.push(Line::from(""));
+    let mut answer: Vec<Line> = Vec::new();
     if app.ack_review {
         // Read-only: the record exists and a second person is reading it. Nothing
         // here writes, so nothing here may look like it does (C-3).
-        lines.push(Line::from(Span::styled(
+        answer.push(Line::from(Span::styled(
             "  esc or any key — close this, the record is unchanged",
             Style::new()
                 .fg(Color::Black)
@@ -2331,30 +2364,67 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )));
         if let Some(record) = app.ack_state.record_line() {
-            lines.push(Line::from(Span::styled(
+            answer.push(Line::from(Span::styled(
                 format!("  {record}"),
                 Style::new().fg(Color::DarkGray),
             )));
         }
     } else {
-        lines.push(Line::from(Span::styled(
+        answer.push(Line::from(Span::styled(
             "  y — I understand, record it once        n — not now",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(
+        answer.push(Line::from(
             "  Until it is recorded, starting an agent stays refused.",
         ));
-        lines.push(Line::from(format!(
+        answer.push(Line::from(format!(
             "  The record will be written to {}",
             breakable_path(&app.ack_path.display().to_string())
         )));
     }
 
+    // F-1: the modal is a bordered panel, so it obeys the same rule as every other
+    // one — whole logical lines, never half a wrapped line. The answer line is the
+    // modal's own key, so it is the last row to go: the prose is dropped from the
+    // bottom first, then the sentences that follow the answer, and the title says
+    // when anything was dropped (`more below; enlarge the window`). A person at the
+    // floor therefore never reads a sentence that stops mid-thought in silence.
+    let inner_width = popup.width.saturating_sub(2) as usize;
+    let inner_height = popup.height.saturating_sub(2) as usize;
+    let mut dropped = false;
+    while answer.len() > 1 && pushed_rows(&answer, inner_width) > inner_height {
+        answer.pop();
+        dropped = true;
+    }
+    while !prose.is_empty()
+        && pushed_rows(&prose, inner_width) + pushed_rows(&answer, inner_width) > inner_height
+    {
+        prose.pop();
+        dropped = true;
+    }
+    let mut lines = prose;
+    lines.extend(answer);
+
+    let title = if dropped {
+        // The declaration is the part that must survive, so it is fitted to the box
+        // before it is drawn (Y-1).
+        fit_title(
+            popup.width as usize,
+            risk::TITLE,
+            None,
+            None,
+            false,
+            true,
+        )
+        .0
+    } else {
+        format!(" {} ", risk::TITLE)
+    };
     let block = Block::bordered()
-        .title(format!(" {} ", risk::TITLE))
+        .title(title)
         .border_style(Style::new().fg(Color::Yellow));
     // The modal owns every row it covers: clear the full terminal width for those
     // rows before drawing it, so the panel's border and wrapped notes cannot survive

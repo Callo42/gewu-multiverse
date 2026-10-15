@@ -28,6 +28,7 @@ use crate::risk::{self, AckState};
 use crate::run::{RunModel, RunOutcome, RunSummary, recent_runs};
 use crate::supervisor::{ModeChange, StartDisposition, State, StopDisposition, Supervisor};
 use crate::systemd::Mode;
+use crate::words;
 use crate::workspace::{self, GitCredential, GitIdentity};
 
 /// How often the runs screen re-reads the records on disk.
@@ -353,19 +354,25 @@ impl EndpointTest {
 
 /// A byte count in the product's own words, so the file that grows with every run has
 /// a size a person can watch (L-3).
+///
+/// The unit is the one the arithmetic uses: the divisor is 1024, so the label is the
+/// binary one (`KiB`, `MiB`, `GiB`), never `KB`. A label that names a different
+/// definition from the number under it is the one-definition class again (F-2, its
+/// third appearance); `du` reads a byte count in the same binary units, so a person
+/// can reconcile the screen with their own tools.
 pub fn filesize_text(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B");
     }
-    let kb = bytes as f64 / 1024.0;
-    if kb < 1024.0 {
-        return format!("{kb:.1} KB");
+    let kib = bytes as f64 / 1024.0;
+    if kib < 1024.0 {
+        return format!("{kib:.1} KiB");
     }
-    let mb = kb / 1024.0;
-    if mb < 1024.0 {
-        return format!("{mb:.1} MB");
+    let mib = kib / 1024.0;
+    if mib < 1024.0 {
+        return format!("{mib:.1} MiB");
     }
-    format!("{:.1} GB", mb / 1024.0)
+    format!("{:.1} GiB", mib / 1024.0)
 }
 
 /// How long ago a test ran, in words, so a success cannot masquerade as current.
@@ -2243,14 +2250,23 @@ impl App {
         };
         let whose = match (&state.local_identity, &recorded) {
             (Some(identity), Some(agent_identity)) if identity == agent_identity => {
-                format!("the local git identity is the agent's ({identity})")
+                // N-2: the login and its email are one fact; the space between them
+                // is drawn as a no-break space so a wrap cannot eat it and leave the
+                // email glued to the login. The stored value stays ASCII for the
+                // comparison above.
+                let shown = words::join_identity(identity);
+                format!("the local git identity is the agent's ({shown})")
             }
             (Some(identity), Some(_)) => {
-                format!("the local git identity is {identity}, not the agent's")
+                let shown = words::join_identity(identity);
+                format!("the local git identity is {shown}, not the agent's")
             }
-            (Some(identity), None) => format!(
-                "the local git identity is {identity}; no Forgejo identity is recorded for this agent yet, so the product cannot say whether it is the agent's — press i to settle one"
-            ),
+            (Some(identity), None) => {
+                let shown = words::join_identity(identity);
+                format!(
+                    "the local git identity is {shown}; no Forgejo identity is recorded for this agent yet, so the product cannot say whether it is the agent's — press i to settle one"
+                )
+            }
             (None, _) => "no local git identity is set".to_owned(),
         };
         let changed = match state.changed {
@@ -2676,20 +2692,20 @@ impl App {
             created: false,
             template: Some(template.into_bytes()),
         };
-        // A person who set no `$EDITOR` is exactly the person who does not know which
-        // editor this is, or how to leave it. Name the program on screen first, and
-        // wait for `enter`, because a status line would be erased the moment the UI
-        // steps aside for the editor.
+        // N-1: the program is named **before** it takes the screen in both cases. A
+        // status line is erased the moment the UI steps aside for the editor, so both
+        // paths wait on a confirmation that names the program (and, for the product's
+        // own fallback editor, says how to leave it). The confirmation is also the
+        // one place a person can back out before anything is written (H-1, H-2).
         let program = crate::editor::editor();
+        self.editor_confirm = Some(action);
         if self.editor_configured {
-            self.pending = Some(action);
             self.status = format!(
-                "opening the {} of `{name}` in {program}{}",
+                "`$EDITOR` is set: press enter to open the {} of `{name}` in {program}{}",
                 target.label(),
                 recovery.as_deref().unwrap_or("")
             );
         } else {
-            self.editor_confirm = Some(action);
             self.status = format!(
                 "no $EDITOR is set: press enter to open the {} of `{name}` in {program}{}",
                 target.label(),
@@ -3806,8 +3822,11 @@ mod tests {
         // a unit a person reads, not as a raw byte count.
         assert_eq!(filesize_text(0), "0 B");
         assert_eq!(filesize_text(1023), "1023 B");
-        assert_eq!(filesize_text(4096), "4.0 KB");
-        assert_eq!(filesize_text(2 * 1024 * 1024), "2.0 MB");
+        // F-2: the number is bytes/1024, so the label is the binary unit. `4.0 KB`
+        // over this value named a definition the number did not use.
+        assert_eq!(filesize_text(4096), "4.0 KiB");
+        assert_eq!(filesize_text(2 * 1024 * 1024), "2.0 MiB");
+        assert_eq!(filesize_text(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 
     /// Write model keys, so a start reaches the supervisor rather than being refused
@@ -4140,6 +4159,10 @@ concurrency = 1
         let paths = app.selected_paths().expect("paths");
         assert!(!paths.instruction().exists());
         app.on_key(key(KeyCode::Char('e')));
+        // N-1: the program is named before it opens, so the hand-off waits on the
+        // confirmation; `enter` is the key that opens it.
+        assert!(app.editor_confirm.is_some(), "the program is named first");
+        app.on_key(key(KeyCode::Enter));
         // Nothing is written until the hand-off begins; a cancelled confirmation
         // leaves the directory as it was (H-1, H-2).
         assert!(!paths.instruction().exists(), "no file before the hand-off");
@@ -4158,6 +4181,7 @@ concurrency = 1
         app.editor_configured = true;
         let paths = app.selected_paths().expect("paths");
         app.on_key(key(KeyCode::Char('t')));
+        app.on_key(key(KeyCode::Enter));
         let action = app.take_action().expect("a steps edit");
         assert_eq!(action.path, paths.steps_file());
         assert!(action.created, "the hand-off created the steps file");
@@ -4168,6 +4192,7 @@ concurrency = 1
         assert!(!template.contains("Until model calls exist"), "{template}");
         assert!(template.contains("before the model is"), "{template}");
         app.on_key(key(KeyCode::Char('K')));
+        app.on_key(key(KeyCode::Enter));
         let action = app.take_action().expect("a skills edit");
         // `K` opens a scratch `SKILL.md`, never a directory.
         assert_eq!(action.path, paths.skills_dir().join("new-skill").join("SKILL.md"));
@@ -4184,6 +4209,7 @@ concurrency = 1
         app.show_acknowledgment = false;
         app.editor_configured = true;
         app.on_key(key(KeyCode::Char('K')));
+        app.on_key(key(KeyCode::Enter));
         let action = app.take_action().expect("an edit");
         let failure = std::process::Command::new("false")
             .status()
@@ -4234,6 +4260,7 @@ concurrency = 1
             app.show_acknowledgment = false;
             app.editor_configured = true;
             app.on_key(key(keycode));
+            app.on_key(key(KeyCode::Enter));
             let action = app.take_action().expect("an edit");
             assert!(action.created, "the hand-off created the file");
             // The editor ran and saved nothing: the fingerprint is unchanged.
@@ -4362,6 +4389,7 @@ role = "member"
         std::fs::write(paths.instruction(), "an instruction already written\n")
             .expect("the instruction exists");
         app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Enter));
         let action = app.take_action().expect("an edit was asked for");
         assert!(!action.created, "the file was already there");
         app.note_action(&action, Ok(success()));
@@ -4374,6 +4402,7 @@ role = "member"
         app.show_acknowledgment = false;
         app.editor_configured = true;
         app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Enter));
         let action = app.take_action().expect("an edit was asked for");
         std::fs::write(&action.path, "a changed instruction\n").expect("the file is changed");
         app.note_action(&action, Ok(success()));
@@ -4393,6 +4422,7 @@ role = "member"
             app.show_acknowledgment = false;
             app.editor_configured = true;
             app.on_key(key(keycode));
+            app.on_key(key(KeyCode::Enter));
             let action = app.take_action().expect("an edit");
             app.note_action(&action, Ok(success()));
             assert!(app.status.contains(expected), "{}", app.status);
@@ -4468,10 +4498,16 @@ role = "member"
         let mut app = app_with(GOOD);
         app.on_key(key(KeyCode::Char('y')));
         app.on_key(key(KeyCode::Char('i')));
-        assert!(app.status.contains("no Forgejo token"), "{}", app.status);
+        assert!(app.status.contains("agent token"), "{}", app.status);
+        assert!(app.status.contains("absent"), "{}", app.status);
         assert!(
             !app.status.contains("[forgejo_agent_tokens]"),
             "{}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("credentials file"),
+            "the refusal sends a person to a file: {}",
             app.status
         );
         assert!(

@@ -60,7 +60,7 @@ pub struct GitIdentity {
 impl GitIdentity {
     /// The identity, as one line.
     pub fn line(&self) -> String {
-        format!("{} <{}>", self.login, self.email)
+        crate::words::identity_pair(&self.login, &self.email)
     }
 }
 
