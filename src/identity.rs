@@ -97,9 +97,8 @@ impl AgentIdentity {
     /// One line for a screen.
     pub fn line(&self) -> String {
         format!(
-            "{} <{}> as `{}` ({})",
-            self.login,
-            self.email,
+            "{} as `{}` ({})",
+            crate::words::identity_pair(&self.login, &self.email),
             self.agent,
             self.mode.as_str(),
         )

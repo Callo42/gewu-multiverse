@@ -28,6 +28,7 @@ use crate::risk::{self, AckState};
 use crate::run::{RunModel, RunOutcome, RunSummary, recent_runs};
 use crate::supervisor::{ModeChange, StartDisposition, State, StopDisposition, Supervisor};
 use crate::systemd::Mode;
+use crate::words;
 use crate::workspace::{self, GitCredential, GitIdentity};
 
 /// How often the runs screen re-reads the records on disk.
@@ -2249,14 +2250,23 @@ impl App {
         };
         let whose = match (&state.local_identity, &recorded) {
             (Some(identity), Some(agent_identity)) if identity == agent_identity => {
-                format!("the local git identity is the agent's ({identity})")
+                // N-2: the login and its email are one fact; the space between them
+                // is drawn as a no-break space so a wrap cannot eat it and leave the
+                // email glued to the login. The stored value stays ASCII for the
+                // comparison above.
+                let shown = words::join_identity(identity);
+                format!("the local git identity is the agent's ({shown})")
             }
             (Some(identity), Some(_)) => {
-                format!("the local git identity is {identity}, not the agent's")
+                let shown = words::join_identity(identity);
+                format!("the local git identity is {shown}, not the agent's")
             }
-            (Some(identity), None) => format!(
-                "the local git identity is {identity}; no Forgejo identity is recorded for this agent yet, so the product cannot say whether it is the agent's — press i to settle one"
-            ),
+            (Some(identity), None) => {
+                let shown = words::join_identity(identity);
+                format!(
+                    "the local git identity is {shown}; no Forgejo identity is recorded for this agent yet, so the product cannot say whether it is the agent's — press i to settle one"
+                )
+            }
             (None, _) => "no local git identity is set".to_owned(),
         };
         let changed = match state.changed {

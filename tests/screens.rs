@@ -1034,9 +1034,10 @@ fn the_identity_and_its_mode_are_on_the_forgejo_screen_persistently() {
     app.show(Screen::Forgejo);
     let screen = render(&app);
     // F6: one shape on every surface — login, email, agent and mode — and it names
-    // the agent, not only the account (F1).
+    // the agent, not only the account (F1). N-2: the space between the login and the
+    // email is a no-break space, so a wrap can never eat it and glue the two.
     assert!(
-        screen.contains("gewu-scribe <gewu-scribe@agents.invalid> as `scribe` (managed)"),
+        screen.contains("gewu-scribe\u{a0}<gewu-scribe@agents.invalid> as `scribe` (managed)"),
         "{screen}"
     );
     assert!(screen.contains("act as this account"), "{screen}");
@@ -1087,7 +1088,7 @@ fn the_identity_report_survives_a_restart_and_its_creation_time_ages() {
     let screen = render_at(100, 40, &app);
     assert!(screen.contains("identity for `scribe`"), "{screen}");
     assert!(
-        screen.contains("gewu-scribe <gewu-scribe@agents.invalid> as `scribe` (managed)"),
+        screen.contains("gewu-scribe\u{a0}<gewu-scribe@agents.invalid> as `scribe` (managed)"),
         "{screen}"
     );
     assert!(
