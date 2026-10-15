@@ -256,14 +256,23 @@ pub struct WorkspaceState {
 ///
 /// `Ok(None)` is a directory that holds no repository — the product says so plainly
 /// rather than guessing. `Err(GitMissing)` is a machine with no git, which is also
-/// said plainly (W-2). A repository with no commits is a state, not an error.
+/// said plainly (W-2). A repository with no commits is a state, not an error: a fresh
+/// `git init` has no resolvable `HEAD`, and asking for one used to surface git's own
+/// `fatal: ambiguous argument 'HEAD'` on the Agent screen (T-5). The branch is read
+/// from the symbolic ref in that case, and the empty history is reported as a state.
 pub fn inspect(workspace: &Path) -> Result<Option<WorkspaceState>, WorkspaceError> {
     if !workspace.join(".git").exists() {
         return Ok(None);
     }
-    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], workspace, None)?
-        .trim()
-        .to_owned();
+    let branch = match run_git(&["rev-parse", "--abbrev-ref", "HEAD"], workspace, None) {
+        Ok(text) => text.trim().to_owned(),
+        // No commit yet: `rev-parse` cannot resolve `HEAD`, but the checked-out branch
+        // still has a name. Neither failure is fatal; only a repository git cannot
+        // read at all reaches the `?` on the status read below.
+        Err(_) => run_git(&["symbolic-ref", "--short", "HEAD"], workspace, None)
+            .map(|text| text.trim().to_owned())
+            .unwrap_or_default(),
+    };
     // A repository with no commit has no HEAD to log; that is an empty history, not
     // a failure to read one.
     let head = run_git(&["log", "-1", "--format=%h%n%ct"], workspace, None).unwrap_or_default();
@@ -303,9 +312,55 @@ pub fn inspect(workspace: &Path) -> Result<Option<WorkspaceState>, WorkspaceErro
 }
 
 /// The branch a workspace's repository is on.
+///
+/// A repository with no commit has no resolvable `HEAD` but still has a checked-out
+/// branch; that state is a branch name, not a git `fatal:` sentence (T-5).
 pub fn current_branch(repository: &Path) -> Result<String, WorkspaceError> {
-    let text = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], repository, None)?;
-    Ok(text.trim().to_owned())
+    match run_git(&["rev-parse", "--abbrev-ref", "HEAD"], repository, None) {
+        Ok(text) => Ok(text.trim().to_owned()),
+        Err(_) => {
+            let text = run_git(&["symbolic-ref", "--short", "HEAD"], repository, None)?;
+            Ok(text.trim().to_owned())
+        }
+    }
+}
+
+/// One repository cloned into a directory below a workspace root.
+///
+/// The product's own clone puts a repository at `workspace/<repo>`, so the workspace
+/// root is often not itself a repository while a clone stands one level down (R-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClonedRepository {
+    /// The directory name inside the workspace.
+    pub name: String,
+    /// What could be read of the repository, when it could be read.
+    pub state: Option<WorkspaceState>,
+}
+
+/// The git repositories directly below `workspace`, in name order.
+///
+/// Used when the workspace root is not a git repository: rather than reading the
+/// clone the product itself made as “not a git repository”, the screen names it.
+pub fn cloned_repositories(workspace: &Path) -> Vec<ClonedRepository> {
+    let Ok(entries) = std::fs::read_dir(workspace) else {
+        return Vec::new();
+    };
+    let mut found: Vec<ClonedRepository> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !entry.path().is_dir() {
+            continue;
+        }
+        if !entry.path().join(".git").exists() {
+            continue;
+        }
+        found.push(ClonedRepository {
+            name,
+            state: inspect(&entry.path()).ok().flatten(),
+        });
+    }
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
 }
 
 /// Push the current branch to `origin`, as the agent.

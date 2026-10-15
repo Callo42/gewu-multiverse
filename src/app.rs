@@ -773,6 +773,12 @@ impl App {
                     }
                 }
                 self.load_agent_modes();
+                // R-1: a tree an older version left keeps its old modes until the
+                // product happens to write each path again. Hold the product's own
+                // roots back to the one custody on every load, before anything is
+                // read, so the mode the screen prints is the mode on disk.
+                crate::mode::hold_tree_private(self.layout.root());
+                crate::mode::hold_tree_private(self.layout.state_root());
                 match CredentialsFile::prepare(&self.layout.credentials_file()) {
                     Ok(file) => {
                         self.credentials_path = file.path().to_path_buf();
@@ -2202,8 +2208,17 @@ impl App {
         let state = match workspace::inspect(workspace) {
             Ok(Some(state)) => state,
             Ok(None) => {
-                return "not a git repository — the product reads it as a directory, not as history"
-                    .to_owned();
+                // R-2: the product's own clone lands at `workspace/<repo>`, so after a
+                // successful clone the root is still not a repository. Reading that as
+                // “not a git repository” contradicted the clone that just happened; the
+                // clones below the root are named instead.
+                let clones = workspace::cloned_repositories(workspace);
+                if clones.is_empty() {
+                    return "not a git repository — the product reads it as a directory, not as \
+                            history"
+                        .to_owned();
+                }
+                return self.cloned_workspace_note(&clones);
             }
             Err(workspace::WorkspaceError::GitMissing { .. }) => {
                 return "git is not installed, so the product cannot read what is in this directory"
@@ -2250,6 +2265,49 @@ impl App {
         format!(
             "on {}, {} ({age}), {changed} — {whose}",
             state.branch, state.commit
+        )
+    }
+
+    /// One sentence about the repositories cloned below a workspace root (R-2).
+    ///
+    /// Each clone is named with what the product can read of it — branch, commit and
+    /// age, and whether the tree is clean — so the clone the product itself made is
+    /// visible on the screen that used to call the root “not a git repository”.
+    fn cloned_workspace_note(&self, clones: &[workspace::ClonedRepository]) -> String {
+        let listed: Vec<String> = clones
+            .iter()
+            .map(|clone| match &clone.state {
+                Some(state) => {
+                    let changed = match state.changed {
+                        0 => "clean".to_owned(),
+                        1 => "1 changed path".to_owned(),
+                        count => format!("{count} changed paths"),
+                    };
+                    if state.commit.is_empty() {
+                        format!(
+                            "{} (on {} (no commit yet), {changed})",
+                            clone.name, state.branch
+                        )
+                    } else {
+                        let age = tested_age(state.committed_at.saturating_mul(1000));
+                        format!(
+                            "{} (on {}, {} ({age}), {changed})",
+                            clone.name, state.branch, state.commit
+                        )
+                    }
+                }
+                None => format!("{} (the repository could not be read)", clone.name),
+            })
+            .collect();
+        let noun = if clones.len() == 1 {
+            "repository"
+        } else {
+            "repositories"
+        };
+        format!(
+            "not a git repository; it holds {} cloned {noun}: {}",
+            clones.len(),
+            listed.join(", ")
         )
     }
 
@@ -2792,6 +2850,11 @@ impl App {
         action: &PendingAction,
         result: std::io::Result<std::process::ExitStatus>,
     ) {
+        // T-2: the hand-off program owned the keys while it was on screen. When it
+        // returns, the product owns them again; every hand-off outcome says so, so a
+        // habitual editor key (the `N` a beginner types after `^X`) is not sent to the
+        // product without the person being told the hand-over happened.
+        const KEYS_BACK: &str = "; the keys are the product's again";
         match (action.kind, result) {
             (ActionKind::Edit, Ok(status)) => {
                 // Compare the file before and after: never claim an edit that was not
@@ -2830,17 +2893,17 @@ impl App {
                     };
                     if changed {
                         self.status = format!(
-                            "{} {verb} edited in {program} ({file}); the files were read again",
+                            "{} {verb} edited in {program} ({file}); the files were read again{KEYS_BACK}",
                             action.label
                         );
                     } else if action.created {
                         // The hand-off itself made the file; the screen beside it now
                         // counts it. Saying `not changed` here is the lie H-1 and H-2
                         // found: report the creation instead.
-                        self.status = created_status(action, &program);
+                        self.status = format!("{}{KEYS_BACK}", created_status(action, &program));
                     } else {
                         self.status = format!(
-                            "{} {verb} not changed ({file}, opened in {program})",
+                            "{} {verb} not changed ({file}, opened in {program}){KEYS_BACK}",
                             action.label
                         );
                     }
@@ -2856,7 +2919,7 @@ impl App {
                     format!("your editor could not be started: {error}{created}");
             }
             (ActionKind::View, Ok(_)) => {
-                self.status = format!("{} was shown", action.label);
+                self.status = format!("{} was shown{KEYS_BACK}", action.label);
             }
             (ActionKind::View, Err(error)) => {
                 self.status = format!("a pager could not be started: {error}");
@@ -3636,8 +3699,9 @@ fn quote(text: &str) -> String {
 fn editable_template(target: EditTarget, agent: &str) -> String {
     match target {
         // The guidance is a single marked placeholder, not prose in the document: the
-        // run drops any line that is exactly this text before it sends the document,
-        // so a person who types below the guidance never sends the guidance itself.
+        // run drops this text from the document's first content line before it sends
+        // the document, so a person who types below the guidance — or into the line the
+        // editor opens on — never sends the guidance itself (T-1).
         EditTarget::Instruction => format!(
             "{}\n",
             crate::agent_run::INSTRUCTION_PLACEHOLDER
@@ -4317,6 +4381,47 @@ role = "member"
     }
 
     #[test]
+    fn a_hand_off_says_the_keys_are_the_products_again() {
+        // T-2: an editor that leaves at once (an untouched template) hands the keys
+        // back with no sentence; a habitual editor key then acts on the product. The
+        // hand-over is now visible in the after direction too.
+        for (keycode, expected) in [
+            (KeyCode::Char('t'), "created"),
+            (KeyCode::Char('e'), "created"),
+        ] {
+            let mut app = app_with(GOOD);
+            app.show_acknowledgment = false;
+            app.editor_configured = true;
+            app.on_key(key(keycode));
+            let action = app.take_action().expect("an edit");
+            app.note_action(&action, Ok(success()));
+            assert!(app.status.contains(expected), "{}", app.status);
+            assert!(
+                app.status.contains("the keys are the product's again"),
+                "{}",
+                app.status
+            );
+        }
+        // A view returns the keys too.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let run_id = "run-1-0001";
+        let dir = app.layout.state_root().join("one").join(run_id);
+        std::fs::create_dir_all(&dir).expect("the run directory");
+        std::fs::write(dir.join("run.log"), "a log\n").expect("a log");
+        app.refresh_recent();
+        app.on_key(key(KeyCode::Char('o')));
+        if let Some(action) = app.take_action() {
+            app.note_action(&action, Ok(success()));
+            assert!(
+                app.status.contains("the keys are the product's again"),
+                "{}",
+                app.status
+            );
+        }
+    }
+
+    #[test]
     fn an_unset_editor_asks_before_it_takes_the_screen() {
         // F-D: with no `$EDITOR`, name the program and wait, rather than dropping the
         // user into the editor's own screen with no hint.
@@ -4374,6 +4479,24 @@ role = "member"
             "{}",
             app.status
         );
+    }
+
+    #[test]
+    fn the_role_check_refusal_names_the_products_own_keys() {
+        // T-4: the role-token refusal drew the credentials file and the TOML key
+        // `forgejo_token`; its sibling (the missing model key) names the product's own
+        // keys. `f` on the Credentials screen is what writes `forgejo_token`.
+        let mut app = app_with(GOOD);
+        app.on_key(key(KeyCode::Char('y')));
+        app.on_key(key(KeyCode::Char('c')));
+        assert!(app.status.contains("role token absent"), "{}", app.status);
+        assert!(
+            app.status.contains("f on the Credentials screen"),
+            "{}",
+            app.status
+        );
+        assert!(!app.status.contains("forgejo_token"), "{}", app.status);
+        assert!(!app.status.contains("credentials.toml"), "{}", app.status);
     }
 
     #[test]
@@ -5455,5 +5578,64 @@ concurrency = 3
         let note = app.workspace_note_for("one");
         assert!(note.contains("not the agent's"), "{note}");
         assert!(!note.contains("cannot say whether"), "{note}");
+    }
+
+    #[test]
+    fn a_clone_below_the_workspace_root_is_named_not_denied() {
+        // R-2: the product's own clone lands at `workspace/<repo>`, so the root is
+        // not a repository after a successful clone. The note names the clone instead
+        // of saying the workspace is not a git repository.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
+        let clone = paths.workspace().join("notes");
+        std::fs::create_dir_all(&clone).expect("the clone directory");
+        git(&clone, &["init", "-q", "-b", "main"]);
+        git(&clone, &["config", "user.name", "gewu-one"]);
+        git(
+            &clone,
+            &["config", "user.email", "gewu-one@agents.invalid"],
+        );
+        std::fs::write(clone.join("README"), "hello\n").expect("a file");
+        git(&clone, &["add", "README"]);
+        git(&clone, &["commit", "-q", "-m", "first"]);
+
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("not a git repository"), "{note}");
+        assert!(note.contains("holds 1 cloned repository"), "{note}");
+        assert!(note.contains("notes"), "{note}");
+        assert!(note.contains("on main"), "{note}");
+        // A workspace with no clone keeps the plain sentence.
+        let empty = paths.workspace().join("empty");
+        std::fs::create_dir_all(&empty).expect("an empty workspace");
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("notes"), "the clone is still the one on show: {note}");
+    }
+
+    #[test]
+    fn a_fresh_repository_with_no_commit_is_not_gits_fatal_text() {
+        // T-5: a fresh `git init` has no resolvable HEAD; reading it used to draw
+        // git's own `fatal: ambiguous argument 'HEAD'` on the Agent screen.
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
+        let workspace = paths.workspace().to_path_buf();
+        git(&workspace, &["init", "-q", "-b", "main"]);
+        git(&workspace, &["config", "user.name", "gewu-one"]);
+        git(
+            &workspace,
+            &["config", "user.email", "gewu-one@agents.invalid"],
+        );
+
+        let note = app.workspace_note_for("one");
+        assert!(note.contains("no commit yet"), "{note}");
+        assert!(!note.contains("fatal"), "{note}");
+        assert!(note.contains("main"), "{note}");
     }
 }

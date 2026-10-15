@@ -127,6 +127,16 @@ pub enum IdentityError {
         "no administrator token is configured, so no agent identity can be created; press A on the Credentials screen to add one, or v on the Forgejo screen to supply the agent's own token"
     )]
     NoAdminToken,
+    /// The role check needs `forgejo_token`, and none is recorded.
+    ///
+    // T-4: the sibling of `NoAgentToken`. A refusal a user acts on names the
+    // product's own keys for the fix (`f` on the Credentials screen writes
+    // `forgejo_token`), never a file and a TOML section; the credentials file is
+    // still named on the Credentials screen itself.
+    #[error(
+        "role token absent — press 5 and then f on the Credentials screen to add one"
+    )]
+    NoRoleToken,
     /// No token was supplied for this agent, and there is no administrator token.
     #[error(
         "the credentials file records no Forgejo token for the agent `{agent}`; press v on the Forgejo screen to supply it"
@@ -160,6 +170,7 @@ impl IdentityError {
         match self {
             IdentityError::UnsafeName { .. } => "unsafe_name",
             IdentityError::NoAdminToken => "no_admin_token",
+            IdentityError::NoRoleToken => "credentials",
             IdentityError::NoAgentToken { .. } => "no_agent_token",
             IdentityError::NotOurs { .. } => "not_ours",
             IdentityError::Credentials(_) => "credentials",
@@ -388,6 +399,7 @@ pub fn role_token(credentials_path: &std::path::Path, role: Role) -> Result<Secr
         Err(CredentialsError::MissingToken { .. }) if role == Role::Admin => {
             credentials::forgejo_admin_token(credentials_path)?.ok_or(IdentityError::NoAdminToken)
         }
+        Err(CredentialsError::MissingToken { .. }) => Err(IdentityError::NoRoleToken),
         Err(error) => Err(IdentityError::Credentials(error)),
     }
 }
