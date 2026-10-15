@@ -2166,7 +2166,7 @@ fn a_record_the_hub_had_that_is_gone_is_named_and_not_called_the_last_run() {
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
-    app.forgotten_run = Some("scribe".to_owned());
+    app.forgotten_runs = vec!["scribe".to_owned()];
     app.show(Screen::Agents);
     let screen = render_at(80, 24, &app);
     assert!(
@@ -2927,7 +2927,7 @@ fn a_record_the_hub_had_is_named_before_the_standing_prose() {
     let root = scratch("forgotten-first");
     let mut app = app(&root);
     app.show_acknowledgment = false;
-    app.forgotten_run = Some("scribe".to_owned());
+    app.forgotten_runs = vec!["scribe".to_owned()];
     // A long configuration note stands in for the standing prose that used to lead.
     app.config_note = Some(
         "configuration read from /tmp/example/state: the configuration no longer lists an agent whose run was stopped; ".repeat(20),
@@ -3360,10 +3360,12 @@ fn the_acknowledgment_modal_is_whole_or_declares_itself_at_the_floor() {
         "the answer line is not drawn at the floor: {floor}"
     );
     // The read-only review modal declares and keeps its own close line at the floor.
+    // w44 F3: the review is titled for the state it is in — a record exists — so the
+    // declaration rides on the review's own title, not the first-run one.
     app.ack_review = true;
     let review = render_at(72, 18, &app);
     assert!(
-        review.contains("Before the first agent runs — more below"),
+        review.contains("The terms you acknowledged — read-only — more below"),
         "the review modal drops content in silence at the floor: {review}"
     );
     assert!(
