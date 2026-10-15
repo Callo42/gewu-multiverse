@@ -15,11 +15,50 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::mode::{SECRET_FILE_MODE, set_mode};
 
 /// The heading of the acknowledgment screen.
 pub const TITLE: &str = "Before the first agent runs";
+
+/// What a record can and cannot prove, stated where the record is read (C-4).
+///
+/// The Compliance walk asked the product to be honest about its own record: it is a
+/// plain TOML file, there is no signature or MAC, and anyone who can read the
+/// directory can edit it or write one. The product must not let a reader take it for
+/// something it is not, so the limit is said in the review overlay and in the hub's
+/// note area — the same sentence in both places.
+pub const RECORD_LIMIT: &str = "This record is a plain file (mode 0600) that anyone who can read this directory can also edit; the product does not sign it, so it shows what was recorded, not that the product recorded it. Its digest only tells whether the terms text has changed since then.";
+
+/// One text for the terms this build shows, and the digest the record carries.
+///
+/// The digest is of the text, not of the file, so formatting the record cannot make
+/// it look as though the terms changed.
+pub fn terms_text() -> String {
+    format!("{TITLE}\n{}", LINES.join("\n"))
+}
+
+/// A SHA-256 digest of the terms text this build shows, as the record writes it.
+///
+/// C-4: the record is not tamper-evident — anyone with the file can rewrite both the
+/// terms and this digest — but the digest is checkable, so the product can tell
+/// whether the terms **it now shows** are the ones the record was made under. That is
+/// the whole claim, and it is the claim the screens make.
+pub fn terms_digest() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(terms_text().as_bytes());
+    format!("sha256:{}", hex(hasher.finalize().as_slice()))
+}
+
+/// Lower-case hex, for a digest a person can compare by hand.
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
 
 /// What the user is asked to understand, in plain language. Each line is short
 /// enough to sit on one row of the acknowledgment screen at its usual width.
@@ -55,6 +94,13 @@ pub enum AckState {
         /// directory copied to a second machine carries the record with it; the mark
         /// lets the screen say whose acknowledgment this is (W32-6).
         machine: Option<String>,
+        /// The digest of the terms text the record was made under (C-4).
+        ///
+        /// `None` for a record written before the digest existed. The product checks
+        /// it against the terms it now shows and says plainly that a match only means
+        /// the text has not changed — the file is not signed and anyone can rewrite
+        /// both the terms and the digest.
+        terms_digest: Option<String>,
     },
     /// A record is there but cannot be trusted, so it is not treated as a confirmation.
     Unreadable {
@@ -80,6 +126,7 @@ impl AckState {
                 acknowledged_at_unix: record.acknowledged_at_unix,
                 app_version: record.app_version,
                 machine: record.machine,
+                terms_digest: record.terms_digest,
             },
             Ok(_) => AckState::Missing,
             Err(error) => AckState::Unreadable {
@@ -127,20 +174,60 @@ impl AckState {
     /// the one now running, so the comparison a Migrator came for can be made on the
     /// screen (F3).
     pub fn record_line(&self) -> Option<String> {
+        self.record_line_with(None)
+    }
+
+    /// [`AckState::record_line`] with one extra clause in the version parenthetical.
+    ///
+    /// U3: the comparison the line already makes (the record's version against this
+    /// build) is joined by what the configuration has been used by since, so an older
+    /// build reading newer data has its own word rather than silence.
+    pub fn record_line_with(&self, extra: Option<&str>) -> Option<String> {
+        let extra = extra.map(|clause| format!("; {clause}")).unwrap_or_default();
         match self {
             AckState::Recorded {
                 acknowledged_at_unix,
                 app_version,
                 machine,
+                ..
             } => Some(format!(
-                "the risk was acknowledged on {} (version {}; this build is {}; {}) — press R to read the terms again; the record is not changed",
+                "the risk was acknowledged on {} (version {}; this build is {}{}; {}) — press R to read the terms again; the record is not changed",
                 crate::time::compact_utc(acknowledged_at_unix.saturating_mul(1000)),
                 version_label(app_version),
                 env!("CARGO_PKG_VERSION"),
+                extra,
                 machine_clause(machine.as_deref())
             )),
             _ => None,
         }
+    }
+
+    /// What the record's digest can and cannot say, checked against the terms this
+    /// build shows (C-4).
+    ///
+    /// Three answers, all honest: the digest matches, the digest differs (the terms
+    /// text changed), or the record carries no digest (it was written before the
+    /// digest existed). None of them claims the file was written by the product.
+    pub fn terms_check(&self) -> Option<String> {
+        let AckState::Recorded {
+            terms_digest: stored_field,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let stored_digest = stored_field.as_deref().map(str::trim);
+        Some(match stored_digest {
+            Some(stored) if stored == terms_digest() => {
+                "the digest this record carries matches the terms shown here: the text has not changed since it was recorded".to_owned()
+            }
+            Some(_) => {
+                "the digest this record carries does not match the terms shown here: the terms text has changed since it was recorded".to_owned()
+            }
+            None => {
+                "this record carries no digest of the terms, so the product cannot tell whether the terms have changed since it was made".to_owned()
+            }
+        })
     }
 }
 
@@ -188,11 +275,16 @@ pub fn record(path: &Path) -> Result<AckState, io::Error> {
     let text = format!(
         "# Written once, when the risk of running an agent was confirmed.\n\
          # Removing this file makes the next start show the acknowledgment again.\n\
+         # This file is not signed or tamper-evident: anyone who can read it can edit\n\
+         # it. terms_digest lets the product check only whether the terms text has\n\
+         # changed since it was written (C-4).\n\
          acknowledged = true\n\
          acknowledged_at_unix = {stamp}\n\
          app_version = \"{}\"\n\
+         terms_digest = {}\n\
          {machine}\n",
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        toml_string(&terms_digest())
     );
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -231,6 +323,8 @@ struct Record {
     app_version: String,
     #[serde(default)]
     machine: Option<String>,
+    #[serde(default)]
+    terms_digest: Option<String>,
 }
 
 #[cfg(test)]

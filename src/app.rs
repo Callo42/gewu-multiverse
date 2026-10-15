@@ -860,6 +860,10 @@ pub struct App {
     pub ack_path: PathBuf,
     /// The state of that record.
     pub ack_state: AckState,
+    /// The newest version that has opened this configuration, from the `last-seen`
+    /// record (U3). `None` when the record is absent or unreadable, which is not an
+    /// error: it means the product cannot tell which version opened it last.
+    pub last_seen: Option<crate::version::LastSeen>,
     /// Whether the first-run acknowledgment is on screen now.
     pub show_acknowledgment: bool,
     /// Whether the acknowledgment is on screen in **review** mode: a second person
@@ -1018,6 +1022,7 @@ impl App {
             credentials_error: None,
             ack_path,
             ack_state: AckState::Missing,
+            last_seen: None,
             show_acknowledgment: false,
             ack_review: false,
             add_agent: None,
@@ -1124,6 +1129,14 @@ impl App {
                     }
                 }
                 self.ack_state = AckState::read(&self.layout.acknowledgment_file());
+                // U3: write down that this build has opened the configuration, keeping
+                // the newest version that ever has. A build older than the record does
+                // not move it back, so the reverse of an upgrade is not silent.
+                self.last_seen = crate::version::note_started(
+                    &self.layout.last_seen_file(),
+                    crate::version::running(),
+                )
+                .ok();
                 // LIB-2: the endpoint tests are a fact the product learned, not a
                 // session's transient line. Read them back so the Agent screen can
                 // draw the stamp (and its age) after a restart.
@@ -1146,6 +1159,7 @@ impl App {
                 self.ack_state = AckState::Unreadable {
                     reason: "the configuration directory could not be prepared".to_owned(),
                 };
+                self.last_seen = None;
             }
         }
         self.clamp_selection();
@@ -1196,6 +1210,14 @@ impl App {
         self.forgotten_run = None;
         self.unreadable_run = None;
         for name in names {
+            // U2's sibling: a state the supervisor already holds as `Unreadable`
+            // (from this session, or from a previous `reload`) must put the reason
+            // back on the screen. Clearing `unreadable_run` at the top of this pass
+            // and never re-deriving it left the hub word without its note after `r`.
+            if let State::Unreadable { reason, .. } = self.supervisor.state(&name) {
+                self.unreadable_run = Some((name.clone(), reason));
+                continue;
+            }
             // An outcome whose record is gone is dropped before seeding, so `r` after
             // deleting the run records puts the hub back in step with the ledger
             // instead of leaving it claiming an outcome no record holds (T-5).
@@ -1638,6 +1660,64 @@ impl App {
         self.ack_state.is_confirmed()
     }
 
+    /// The acknowledgment line with the version comparison (U3).
+    ///
+    /// Forward, the record line already names the version the record carries and the
+    /// one now running. Backward — a build older than the data — the line gains what
+    /// the configuration has been used by since, and the record's own version is
+    /// flagged when it is newer than this build, so going back is not silent.
+    pub fn ack_record_line(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(clause) = self.ack_version_clause() {
+            parts.push(clause);
+        }
+        if let AckState::Recorded { app_version, .. } = &self.ack_state {
+            if crate::version::is_newer(app_version, crate::version::running()) {
+                parts.push("the record was made by a newer version than this build".to_owned());
+            }
+        }
+        // C-4: the landing screen says what the record is and is not, in one clause.
+        // The full limit and the digest check are in the review overlay (`R`), where
+        // the record is actually read.
+        parts.push(
+            "it is a plain file, not signed, so anyone who can read this directory can edit it"
+                .to_owned(),
+        );
+        let extra = parts.join("; ");
+        self.ack_state.record_line_with(Some(&extra))
+    }
+
+    /// The `used by version X since <date>` clause, when this build is older than the
+    /// configuration's own `last-seen` record (U3).
+    fn ack_version_clause(&self) -> Option<String> {
+        let seen = self.last_seen.as_ref()?;
+        if !crate::version::is_newer(&seen.version, crate::version::running()) {
+            return None;
+        }
+        Some(format!(
+            "used by version {} since {}",
+            seen.version,
+            crate::time::compact_utc(seen.opened_at_unix.saturating_mul(1000))
+        ))
+    }
+
+    /// The sentence a build older than the configuration's data must have (U3).
+    ///
+    /// `None` in every other case: a fresh configuration, or one this build is at
+    /// least as new as, says nothing extra. The sentence is a fact, not a refusal —
+    /// the product cannot know what a newer version wrote, and it says so.
+    pub fn version_mismatch_note(&self) -> Option<String> {
+        let seen = self.last_seen.as_ref()?;
+        if !crate::version::is_newer(&seen.version, crate::version::running()) {
+            return None;
+        }
+        Some(format!(
+            "this configuration has been used by version {}, which is newer than this build ({}); this build cannot know what that version wrote — run a build at least that new to read the configuration exactly",
+            seen.version,
+            crate::version::running()
+        ))
+    }
+
     /// Write the acknowledgment and close the dialog.
     pub fn confirm_acknowledgment(&mut self) {
         // A review never records: it is a second person reading terms already agreed.
@@ -1702,7 +1782,7 @@ impl App {
     pub fn request_new_agent(&mut self) {
         self.add_agent = Some(NewAgentForm::new());
         self.status =
-            "add an agent: name it, give it an endpoint and a model, then press enter"
+            "add an agent: name it, give it an endpoint and a model, then press ctrl-s (or walk to the last field and press enter) to write it"
                 .to_owned();
     }
 
@@ -1748,7 +1828,20 @@ impl App {
     fn on_form_key(&mut self, key: KeyEvent) {
         let count = NewAgentForm::FIELDS.len();
         match key.code {
-            KeyCode::Enter => self.submit_new_agent(),
+            // C-1: `enter` no longer submits from any field. It moves to the next
+            // field, and only on the **last** field does it write the agent; the
+            // explicit `ctrl-s` (handled in `on_key`) writes it from any field. A
+            // stray `enter` in a middle field used to submit an incomplete form, and
+            // the next paste — meant for the next field — landed in whatever field the
+            // cursor had not left.
+            KeyCode::Enter => {
+                let last = count.saturating_sub(1);
+                match self.add_agent.as_mut() {
+                    Some(form) if form.cursor < last => form.cursor += 1,
+                    Some(_) => self.submit_new_agent(),
+                    None => {}
+                }
+            }
             KeyCode::Esc => {
                 self.add_agent = None;
                 self.status = "no agent was added".to_owned();
@@ -1807,8 +1900,15 @@ impl App {
                     ),
                 };
             }
-            Err(message) => {
+            Err((field, message)) => {
+                // C-1: the cursor goes to the field the reason names, so the reason
+                // and the field are read together and the next paste lands where it was
+                // meant to. A refusal with no field (a file that cannot be written)
+                // leaves the cursor where the user had it.
                 if let Some(open) = self.add_agent.as_mut() {
+                    if let Some(at) = field {
+                        open.cursor = at;
+                    }
                     open.error = Some(message.clone());
                 }
                 self.status = message;
@@ -1821,7 +1921,7 @@ impl App {
     /// The configuration is validated before it is written, so a file the product
     /// would refuse never reaches disk. A secret value is written but never returned or
     /// shown.
-    fn write_new_agent(&self, form: &NewAgentForm) -> Result<String, String> {
+    fn write_new_agent(&self, form: &NewAgentForm) -> Result<String, (Option<usize>, String)> {
         let name = form.fields[0].trim().to_owned();
         let endpoint = form.fields[1].trim().to_owned();
         let model = form.fields[2].trim().to_owned();
@@ -1829,38 +1929,45 @@ impl App {
         let forgejo_url = form.fields[4].trim().to_owned();
         let forgejo_token = form.fields[5].trim().to_owned();
         if name.is_empty() {
-            return Err("the agent needs a name".to_owned());
+            return Err((Some(0), "the agent needs a name".to_owned()));
         }
         if let Some(problem) = crate::config::agent_name_problem(&name) {
             // The reason comes first and the echoed value is not repeated: a very long
             // name used to push the reason off the status area, leaving the user with
             // their own typing and no word of what was wrong.
-            return Err(format!("cannot use that name for an agent: {problem}"));
+            return Err((
+                Some(0),
+                format!("cannot use that name for an agent: {problem}"),
+            ));
         }
         if endpoint.is_empty() {
-            return Err("the agent needs a model endpoint".to_owned());
+            return Err((Some(1), "the agent needs a model endpoint".to_owned()));
         }
         if model.is_empty() {
-            return Err("the agent needs a model id".to_owned());
+            return Err((Some(2), "the agent needs a model id".to_owned()));
         }
         // The first fix round let the form create an agent with no key, and the
         // product's own next step was then to edit `[model_keys]` in a file. Require
         // the key here: an agent the form creates can run, and no screen's only way
         // forward is a developer instruction.
         if model_key.is_empty() {
-            return Err(
+            return Err((
+                Some(3),
                 "the agent needs a model key so a run can start; it is written to the \
                  credentials file and never shown"
                     .to_owned(),
-            );
+            ));
         }
         if self.agents().iter().any(|agent| agent.name == name) {
-            return Err(format!("an agent named `{name}` already exists"));
+            return Err((Some(0), format!("an agent named `{name}` already exists")));
         }
         let Some(existing) = self.config.clone() else {
-            return Err(format!(
-                "the configuration file cannot be read, so an agent cannot be added; fix {} first",
-                self.config_path().display()
+            return Err((
+                None,
+                format!(
+                    "the configuration file cannot be read, so an agent cannot be added; fix {} first",
+                    self.config_path().display()
+                ),
             ));
         };
         let url = if forgejo_url.is_empty() {
@@ -1869,9 +1976,12 @@ impl App {
             forgejo_url
         };
         let text = render_config(&existing, &url, &name, &endpoint, &model);
-        Config::from_text(&self.config_path(), &text).map_err(|error| error.to_string())?;
+        Config::from_text(&self.config_path(), &text).map_err(|error| (None, error.to_string()))?;
         crate::mode::write_private(self.config_path(), text.as_bytes()).map_err(|error| {
-            format!("{} cannot be written: {error}", self.config_path().display())
+            (
+                None,
+                format!("{} cannot be written: {error}", self.config_path().display()),
+            )
         })?;
         credentials::record_form_secrets(
             &self.credentials_path,
@@ -1879,7 +1989,7 @@ impl App {
             (!model_key.is_empty()).then_some(model_key.as_str()),
             (!forgejo_token.is_empty()).then_some(forgejo_token.as_str()),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| (None, error.to_string()))?;
         Ok(name)
     }
 
@@ -2246,20 +2356,39 @@ impl App {
     /// newest record, terminal or not: after a recovery the next run succeeded, and an
     /// older failure is not "the last run" (O-1). A record that is not terminal yet is
     /// not a last run either.
+    ///
+    /// C-3: "did not go well" is every terminal outcome but `succeeded`, not only
+    /// `failed`. A `timed_out` or `stopped` run has a reason too, and the hub is the
+    /// landing screen; leaving its reason only on Runs was the finding.
     pub fn last_run_failure(&self, name: &str) -> Option<String> {
+        self.last_non_success_run(name).map(|(_, reason)| reason)
+    }
+
+    /// The newest terminal run of an agent that did not succeed: its outcome and its
+    /// reason, when the record carries one.
+    ///
+    /// The outcome is carried so a screen can name it beside the reason instead of
+    /// saying `failed` about a run that timed out (C-3). The rule is one rule on every
+    /// outcome surface: a run that did not succeed has its reason named where its
+    /// outcome is shown.
+    pub fn last_non_success_run(&self, name: &str) -> Option<(RunOutcome, String)> {
         match self.supervisor.state(name) {
             State::Finished {
-                outcome: RunOutcome::Failed,
+                outcome,
                 reason: Some(reason),
                 ..
-            } => Some(reason),
+            } if !outcome.is_success() => Some((outcome, reason)),
             State::Finished { .. } => None,
             _ => self
                 .recent
                 .iter()
                 .find(|run| run.agent == name)
-                .filter(|run| run.outcome == Some(RunOutcome::Failed))
-                .and_then(|run| run.reason.clone()),
+                .and_then(|run| match run.outcome {
+                    Some(outcome) if !outcome.is_success() => {
+                        run.reason.clone().map(|reason| (outcome, reason))
+                    }
+                    _ => None,
+                }),
         }
     }
 
@@ -3598,8 +3727,11 @@ impl App {
                 }
             }
         };
-        if !path.is_file() {
-            self.status = format!("{} is not there yet", path.display());
+        if !crate::run::is_readable_file(&path) {
+            // U1: a transcript that is a directory (or unreadable) is present, not
+            // absent; the same three-case sentence the screens use names the real
+            // reason, and a missing file reads `gone, the record has no transcript`.
+            self.status = crate::run::file_sentence(&path, "transcript", None);
             return;
         }
         self.pending = Some(PendingAction {
@@ -3645,8 +3777,11 @@ impl App {
                 }
             }
         };
-        if !path.is_file() {
-            self.status = format!("{} is not there yet", path.display());
+        if !crate::run::is_readable_file(&path) {
+            // U1: `o` on a `run.log` that is a directory used to say `is not there
+            // yet`, the word for a file that is not there. It is there; it cannot be
+            // read, and the reason is the sentence.
+            self.status = crate::run::file_sentence(&path, "log", None);
             return;
         }
         self.pending = Some(PendingAction {
@@ -4289,6 +4424,14 @@ impl App {
                 } else if let Some(prompt) = self.url_prompt.as_mut() {
                     prompt.value.clear();
                 }
+            }
+            // C-1: the add-agent form's explicit submit key. `enter` writes it from
+            // the last field; `ctrl-s` writes it from whatever field the cursor is on,
+            // so a person who has filled the required fields does not have to walk
+            // through the optional ones — and a stray `enter` in a middle field can
+            // no longer submit an incomplete form (the finding).
+            if key.code == KeyCode::Char('s') && self.add_agent.is_some() {
+                self.submit_new_agent();
             }
             return;
         }
@@ -6725,10 +6868,24 @@ concurrency = 3
         }
         app.on_key(key(KeyCode::Tab));
         app.on_key(key(KeyCode::Char('m')));
-        // The model key is left empty on purpose.
-        app.on_key(key(KeyCode::Enter));
+        // The model key is left empty on purpose. C-1: the explicit `ctrl-s` submits
+        // from any field, and the refusal puts the cursor on the field it names.
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.adding_agent());
         assert!(app.status.contains("model key"), "{}", app.status);
+        assert_eq!(
+            app.add_agent.as_ref().map(|form| form.cursor),
+            Some(3),
+            "the cursor did not go to the field the reason names"
+        );
+        assert!(
+            app.add_agent
+                .as_ref()
+                .and_then(|form| form.error.as_deref())
+                .unwrap_or("")
+                .contains("model key"),
+            "the reason is not drawn beside the field"
+        );
         assert!(app.agents().is_empty());
     }
 
@@ -6744,7 +6901,7 @@ concurrency = 3
         for _ in 0..200 {
             app.on_key(key(KeyCode::Char('a')));
         }
-        app.on_key(key(KeyCode::Enter));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.status.starts_with("cannot use that name"), "{}", app.status);
         assert!(app.status.contains("longer than 32"), "{}", app.status);
         assert!(!app.status.contains("aaaa"), "{}", app.status);

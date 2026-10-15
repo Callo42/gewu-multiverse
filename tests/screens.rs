@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gewu_multiverse::app::{App, Screen, SecretTarget};
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::run::{RunOutcome, RunSummary, new_run_id};
@@ -725,7 +725,8 @@ fn the_add_agent_form_writes_both_files_and_never_shows_a_secret() {
     assert!(!typed.contains("sk-test-secret-value"), "{typed}");
     assert!(typed.contains('*'), "{typed}");
 
-    app.on_key(KeyEvent::from(KeyCode::Enter));
+    // C-1: `enter` no longer submits from a middle field; the explicit `ctrl-s` does.
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
     assert!(!app.adding_agent());
     assert!(app.status.contains("created `scribe`"), "{}", app.status);
     assert!(!app.status.contains("sk-test-secret-value"), "{}", app.status);
@@ -1395,7 +1396,7 @@ fn the_add_agent_form_names_the_submit_key_at_eighty_columns() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('n')));
     let form = render_at(80, 24, &app);
-    assert!(form.contains("enter writes it"), "{form}");
+    assert!(form.contains("ctrl-s writes it"), "{form}");
     assert!(form.contains("esc cancels"), "{form}");
 }
 
