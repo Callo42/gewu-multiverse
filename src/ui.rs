@@ -457,22 +457,23 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             if let Some(run_id) = app.supervisor.state(&agent.name).run_id() {
                 lines.push(field("run", run_id));
             }
-            if let Some(test) = &app.endpoint_test {
-                if test.agent == agent.name {
-                    // Y-5: a result about an endpoint or model that has since changed is
-                    // history; it is dated and marked, never shown as if it were now.
-                    if test.is_current_for(agent) {
-                        lines.push(field("endpoint test", &test.describe()));
-                    } else {
-                        lines.push(field(
-                            "endpoint test",
-                            &format!(
-                                "not current — the endpoint or model changed since it ran ({}); press p to test it again",
-                                test.describe()
-                            ),
-                        ));
-                    }
+            // LIB-2: the field is always drawn. A test whose stamp survived a restart
+            // is shown with its age; an agent with no test at all says so, so a person
+            // never sees a fact silently missing where the map says it is.
+            match app.endpoint_test_for(&agent.name) {
+                // Y-5: a result about an endpoint or model that has since changed is
+                // history; it is dated and marked, never shown as if it were now.
+                Some(test) if test.is_current_for(agent) => {
+                    lines.push(field("endpoint test", &test.describe()));
                 }
+                Some(test) => lines.push(field(
+                    "endpoint test",
+                    &format!(
+                        "not current — the endpoint or model changed since it ran ({}); press p to test it again",
+                        test.describe()
+                    ),
+                )),
+                None => lines.push(field("endpoint test", "not tested yet — press p")),
             }
             match app.recorded_identity(&agent.name) {
                 Some(identity) => lines.push(field("identity", &identity.line())),
@@ -1459,8 +1460,12 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     // The legend is the product's own key list. Under an overlay that owns the plain
     // keys, `q` is a letter in a field or a cancel, never `quit`, so the line is
-    // replaced with the one thing that is true there (E-2).
-    let legend = if app.overlay_owns_keys() {
+    // replaced with the one thing that is true there (E-2). The read-only
+    // acknowledgment review closes on **any** key, so its footer says so instead of
+    // naming `esc` as if the two disagreed (V-2).
+    let legend = if app.show_acknowledgment && app.ack_review {
+        "any key closes this overlay; the record is unchanged"
+    } else if app.overlay_owns_keys() {
         "esc closes this overlay"
     } else {
         "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open   r re-read"
@@ -1942,14 +1947,22 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     {
         first += 1;
     }
-    let overflows = first > 0 || pushed_rows(&lines[first..], inner) > content_height;
+    let above = first > 0;
+    let below = pushed_rows(&lines[first..], inner) > content_height;
     // The action line lives in the title as well as the body: at 80x24 the intro
     // prose pushes the body's last line off, and the key that submits the form must
-    // never be the line that disappears (P-3).
-    let mut title = " add an agent — enter writes it, esc cancels ".to_owned();
-    if overflows {
-        title = format!("{title} — enlarge the window ");
-    }
+    // never be the line that disappears (P-3). LIB-1: the declaration is the same one
+    // every other bordered surface uses, fitted to the width, and it names the
+    // direction the window has moved in (above and/or below) instead of the one-off
+    // phrase this form used to carry.
+    let (title, _) = fit_title(
+        popup.width as usize,
+        "add an agent — enter writes it, esc cancels",
+        None,
+        None,
+        above,
+        below,
+    );
     let block = Block::bordered()
         .title(title)
         .border_style(Style::new().fg(Color::Cyan));
@@ -2151,6 +2164,19 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
     );
 }
 
+/// An editor named as an example: never the one already chosen.
+///
+/// The unset hand-off names `nano` or `vi` as the program about to open; an example
+/// that named the same one would make `to use another editor` impossible to follow
+/// (V-3). The example is always the other of the two, so it changes something.
+fn example_editor(current: &str) -> &'static str {
+    if current.trim() == "nano" {
+        "vi"
+    } else {
+        "nano"
+    }
+}
+
 /// The no-`$EDITOR` confirmation, over the screen, before the editor takes over.
 ///
 /// A status line would be erased the instant the UI steps aside for the editor, so the
@@ -2205,8 +2231,14 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
         ));
     }
     if !app.editor_configured {
+        // V-3: the example must not name the program already chosen — following it
+        // would change nothing, and the sentence promises `another editor`. The
+        // alternative is named, so the example always differs from the current one.
         body.push(Line::from(Span::styled(
-            "Set `$EDITOR` (for example, export EDITOR=nano) to use another editor.",
+            format!(
+                "Set `$EDITOR` (for example, export EDITOR={}) to use another editor.",
+                example_editor(&program)
+            ),
             Style::new().fg(Color::DarkGray),
         )));
     }
@@ -2357,7 +2389,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         // Read-only: the record exists and a second person is reading it. Nothing
         // here writes, so nothing here may look like it does (C-3).
         answer.push(Line::from(Span::styled(
-            "  esc or any key — close this, the record is unchanged",
+            "  any key closes this; the record is unchanged",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -2615,5 +2647,16 @@ mod tests {
             "the declaration was drawn under the modal"
         );
         assert_eq!(suppressed.len(), 30, "the content itself is unchanged");
+    }
+
+    #[test]
+    fn the_editor_example_never_names_the_editor_already_in_use() {
+        // V-3: the unset hand-off named `nano` as the example while choosing `nano`
+        // itself, so following the example changed nothing. The example is always the
+        // other of the two fallbacks.
+        assert_eq!(example_editor("nano"), "vi");
+        assert_eq!(example_editor("vi"), "nano");
+        assert_ne!(example_editor("nano"), "nano");
+        assert_ne!(example_editor("vi"), "vi");
     }
 }
