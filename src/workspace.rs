@@ -236,7 +236,8 @@ pub fn set_identity(repository: &Path, identity: &GitIdentity) -> Result<(), Wor
 ///
 /// A workspace with history is otherwise only a path on the Agent screen, so a
 /// person about to run an agent cannot tell what branch or commit it is on, whether
-/// it is dirty, or whose identity its commits carry (W-2). Every field here is read
+/// it is dirty, or what local git identity the repository is configured with (the
+/// identity the next commit would carry — W-2, w46 F4). Every field here is read
 /// from the repository itself, or is `None` when git cannot answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceState {

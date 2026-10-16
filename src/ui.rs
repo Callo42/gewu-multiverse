@@ -477,9 +477,11 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                 ));
                 lines.push(field("workspace", &paths.workspace().display().to_string()));
                 // W-2: a workspace that already has history is not only a path. The
-                // branch, the commit and its age, whether it is dirty and whose
-                // identity its commits carry are read from the repository; what the
-                // product cannot read (no repository, no git) is said plainly.
+                // branch, the commit and its age, whether it is dirty and the
+                // repository's configured local git identity (what the next commit
+                // would carry, not the author of the commits already there) are read
+                // from the repository; what the product cannot read (no repository,
+                // no git) is said plainly.
                 if let Some(note) = app.workspace_note() {
                     lines.push(field("repository", note));
                 }
@@ -638,6 +640,15 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
                         lines.push(field(
                             "  on disk",
                             "not there yet — press e to write it; the file holds only the guidance line",
+                        ));
+                    } else if app.instruction_is_blank() {
+                        // w47 F3: a document the person emptied is not a written one.
+                        // Without this branch the screen drew `on disk 0 bytes` and a
+                        // sends line for bytes a run refuses as empty, so the only
+                        // surface that told the truth was the failed run.
+                        lines.push(field(
+                            "  on disk",
+                            "not there yet — press e to write it; the file is empty",
                         ));
                     } else {
                         lines.push(field("  on disk", &format!("{bytes} bytes")));
@@ -2271,6 +2282,13 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     ];
     // Where the field block starts, so the window can keep the cursor's own row drawn.
     let fields_at = lines.len();
+    // The field the shown reason names (or the cursor's field when it names none). The
+    // reason row and the cursor row are both tracked as they are pushed, so the window
+    // below can keep both drawn (w46 F1/w47 F2) and the reason is read beside the field
+    // it is about, not beside whatever the cursor happens to be on.
+    let reason_at = form.reason_at();
+    let mut cursor_line = fields_at;
+    let mut reason_line: Option<usize> = None;
     for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
         let value = &form.fields[at];
         // A masked value says how much it holds: the mask alone is the same block of
@@ -2291,19 +2309,25 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
         } else {
             Style::new()
         };
+        if at == form.cursor {
+            cursor_line = lines.len();
+        }
         lines.push(Line::from(Span::styled(
             format!("{marker} {label:<16} {shown}"),
             style,
         )));
         // w45 F1: the refusal reason is drawn on the row immediately after the field
-        // it names. The cursor is moved to that field (C-1), and the window below
-        // always keeps the cursor's row and this reason's row drawn together, so the
-        // box holds its own reason — it used to sit after the last field, which was
-        // the row the window dropped at the built geometry.
-        if at == form.cursor {
+        // it names, so the reason and the field are read together; w46 F1/w47 F2: the
+        // row is the **named** field's, not the cursor's, and the reason is withdrawn
+        // by the first key that edits a field or moves on. The window below keeps the
+        // cursor's row and this reason's row drawn together, so the box holds its own
+        // reason — it used to sit after the last field, which was the row the window
+        // dropped at the built geometry.
+        if reason_at == Some(at) {
             if let Some(error) = &form.error {
+                reason_line = Some(lines.len());
                 lines.push(Line::from(Span::styled(
-                    format!("  {error}"),
+                    format!("  {}", error.message),
                     Style::new().fg(Color::Red),
                 )));
             }
@@ -2337,17 +2361,14 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     // cursor's own field is always among the drawn rows, and the title declares that
     // the form is longer than the window.
     let content_height = popup.height.saturating_sub(2) as usize;
-    let cursor_line = fields_at + form.cursor;
-    // The reason's own row is part of the span the window must keep drawn (w45 F1).
-    let must_last = if form.error.is_some() {
-        cursor_line + 1
-    } else {
-        cursor_line
-    };
-    let must_rows = pushed_rows(&lines[cursor_line..=must_last], inner);
+    // The reason's own row is part of the span the window must keep drawn (w45 F1),
+    // and so is the cursor's row even when the reason names another field (w46 F1).
+    let must_first = reason_line.map_or(cursor_line, |reason| cursor_line.min(reason));
+    let must_last = reason_line.map_or(cursor_line, |reason| cursor_line.max(reason));
+    let must_rows = pushed_rows(&lines[must_first..=must_last], inner);
     let mut first = 0usize;
-    while first < cursor_line
-        && pushed_rows(&lines[first..cursor_line], inner) + must_rows > content_height
+    while first < must_first
+        && pushed_rows(&lines[first..must_first], inner) + must_rows > content_height
     {
         first += 1;
     }
@@ -2846,17 +2867,17 @@ fn draw_help(frame: &mut Frame, app: &App) {
 
 /// Every key the product binds, with one line of what it does.
 const HELP_LINES: &[&str] = &[
-    "Screens:   1-6 open a screen   tab / left / right move   esc back to Agents",
-    "Moving:    up / down choose   enter open the chosen agent (or add one when none)",
-    "An agent:  s start   x stop   p test its endpoint   m switch tui/systemd supervision",
-    "           e edit its instruction   t edit its declared steps   K start a new skill",
-    "           o open its newest log   T open its newest transcript   d remove it",
+    "Screens:   1-6 open a screen   tab / left / right (or l) move   esc back to Agents",
+    "Moving:    up / down (or j / k) choose   enter open the chosen agent (or add one when none)",
+    "Jump:      Home / g to the top   End / G to the bottom (on Forgejo, g clones instead)",
+    "An agent:  s start   x stop   p test its endpoint   i settle its Forgejo identity",
+    "           m switch tui/systemd supervision   e edit its instruction   t edit its declared steps",
+    "           K start a new skill   o open its newest log   T open its newest transcript   d remove it",
     "A new one: n or a open the add-agent form (also enter on an empty list)",
     "Panel:     [ / ] scroll the panel or note area; on Agent, Instruction and Credentials",
     "           the arrows and PageUp/PageDown move it too, so its last line is reachable",
     "Forgejo:   c check the configured role   C check the administrator token",
-    "           u set the instance address   i settle the agent's identity",
-    "           up/down choose a repository   g clone it",
+    "           u set the instance address   up/down choose a repository   g clone it",
     "           P open a pull request   U update the newest one",
     "Secrets:   k set the model key (Credentials)   f set the role token (Credentials)",
     "           v set the agent's own Forgejo token (Forgejo)   A set the administrator token",

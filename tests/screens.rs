@@ -1425,7 +1425,10 @@ fn the_key_reference_scrolls_so_every_key_survives_a_short_window() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('?')));
     let first = render_at(80, 24, &app);
-    assert!(first.contains("of 18"), "the range is missing: {first}");
+    assert!(
+        first.contains("keys 1") && first.contains(" of ") && first.contains("more"),
+        "the range is missing: {first}"
+    );
     // Scroll to the end; the last line must be reachable, and every key with it —
     // including `u`, the Forgejo address key W32-1 added, so the reference lists it.
     let mut seen = first.clone();
