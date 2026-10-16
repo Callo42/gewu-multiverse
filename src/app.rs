@@ -389,7 +389,7 @@ impl EndpointTest {
     pub fn describe(&self) -> String {
         format!(
             "{} — tested {}",
-            describe_endpoint_result(&self.result),
+            bad_key_recovery(&self.agent, &describe_endpoint_result(&self.result)),
             tested_age(self.tested_at_ms)
         )
     }
@@ -882,6 +882,25 @@ struct PendingStart {
     waiting: bool,
 }
 
+/// The in-product next step when a model call was refused for its key.
+///
+/// A refused key is a credential fact, and the page map's Credentials row says a
+/// refusal names that screen's own keys (`press 5 and then k on the Credentials
+/// screen`), never a file and a TOML section. This appends the pointer where the
+/// failure is drawn on a screen; the run's log and transcript keep the raw sentence
+/// for the audit trail. It names the agent whose call was refused, prints no value,
+/// and claims nothing about whether the stored complaint still holds — so a
+/// historical failure stays history, and the product never promises that a new key
+/// by itself repairs a provider or account problem.
+fn bad_key_recovery(agent: &str, reason: &str) -> String {
+    if !reason.contains("(bad_key)") {
+        return reason.to_owned();
+    }
+    format!(
+        "{reason} — if the model key is no longer current, press 5 and then k on the Credentials screen to replace it for `{agent}`"
+    )
+}
+
 /// The sentence for a run that has ended: the outcome, how long it ran, and its own
 /// reason — the same shape the Runs note builds, so the status and the row agree.
 fn run_ended_sentence(
@@ -896,7 +915,7 @@ fn run_ended_sentence(
         duration_ms as f64 / 1000.0
     );
     match reason.filter(|reason| !reason.is_empty()) {
-        Some(reason) => format!("{timed} — {reason}"),
+        Some(reason) => format!("{timed} — {}", bad_key_recovery(agent, reason)),
         None => timed,
     }
 }
@@ -2002,6 +2021,12 @@ impl App {
             Ok(name) => {
                 self.add_agent = None;
                 self.reload();
+                // The status says "created `X`: write its instruction with e", and
+                // `e`/`s` act on the **selected** agent. The selection follows the
+                // agent the receipt names, so the sentence, the highlight and the next
+                // key all refer to the same row — including a sorted or scrolled list,
+                // because the index is found by name after the reload.
+                self.select_agent_named(&name);
                 self.status = match moved_address {
                     Some(previous) => format!(
                         "created `{name}`: write its instruction with e, then press s to start it — the form also moved the Forgejo address from {previous} for every agent in this configuration; u on the Forgejo screen edits it on its own"
@@ -2543,7 +2568,7 @@ impl App {
             .agent_paths(agent)
             .ok()
             .map(|paths| paths.instruction().display().to_string());
-        match live {
+        let drawn = match live {
             Some(live) => match foreign_path(&text, &live) {
                 Some(path) => format!(
                     "{text} (the path `{path}` is from when that run ran; the instruction now is {live})"
@@ -2551,7 +2576,11 @@ impl App {
                 None => text,
             },
             None => text,
-        }
+        };
+        // A refused model key is answered with the product's own key-setting route,
+        // wherever the reason is drawn. Logs and transcripts keep the raw sentence,
+        // so this is the screen's sentence only.
+        bad_key_recovery(agent, &drawn)
     }
 
     /// Why one agent's most recent *start* did not go well, when it never became a run.
@@ -2951,7 +2980,9 @@ impl App {
             } => {
                 let short = match &result {
                     Ok(_) => "ok".to_owned(),
-                    Err(_) => describe_endpoint_result(&result),
+                    // A refused key names the product's own key-setting route on the
+                    // line the refusal is drawn, not only in the help.
+                    Err(_) => bad_key_recovery(&agent, &describe_endpoint_result(&result)),
                 };
                 self.status = format!("endpoint test for `{agent}`: {short}");
                 let test = EndpointTest {
@@ -4527,6 +4558,20 @@ impl App {
             self.selected = 0;
         } else if self.selected >= count {
             self.selected = count - 1;
+        }
+    }
+
+    /// Point the Agents selection at one configured agent, by name.
+    ///
+    /// The add-agent form uses this after it writes an agent: its receipt names the
+    /// new agent, and `e`/`s` act on whatever the selection is, so the two must agree
+    /// or the next key edits or starts a different agent than the sentence said.
+    /// The index is found **by name** after the reload, so a list whose order changed
+    /// or scrolled cannot leave the selection on the wrong row. A name the
+    /// configuration does not list leaves the selection where it was.
+    fn select_agent_named(&mut self, name: &str) {
+        if let Some(at) = self.agents().iter().position(|agent| agent.name == name) {
+            self.selected = at;
         }
     }
 
