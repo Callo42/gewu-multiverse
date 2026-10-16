@@ -107,6 +107,19 @@ pub enum State {
         /// How long it lasted, in milliseconds.
         duration_ms: u64,
     },
+    /// A start waiting for a slot was called off before it ran.
+    ///
+    /// A start that never occupied a slot is not a run: it has no process, no
+    /// record on disk and no outcome. Keeping it apart from `Finished` is what
+    /// stops the hub and the Agent screen from calling it "the last run",
+    /// overwriting the state of the run that really ran, and warning that a run
+    /// record has disappeared when the placeholder was never written.
+    CalledOff {
+        /// The run id the start would have had.
+        run_id: String,
+        /// Why it was called off.
+        reason: String,
+    },
     /// The agent runs as a user unit, and systemd could not be asked about it, so
     /// whether it is running is not known here. This is never shown as running and
     /// never shown as stopped: the screens say the state is unknown.
@@ -134,6 +147,10 @@ impl State {
                 // `RunOutcome::as_str`, so `timed_out` cannot become `timed out` here.
                 outcome.as_str().to_owned()
             }
+            // A called-off start is named as a start, never as a run: the state
+            // column must not overwrite the real run's outcome with a word reserved
+            // for executed work.
+            State::CalledOff { .. } => "start called off".to_owned(),
             State::Unavailable { .. } => "state unknown".to_owned(),
         }
     }
@@ -186,7 +203,8 @@ impl State {
             | State::Running { run_id, .. }
             | State::Stopping { run_id, .. }
             | State::Unreadable { run_id, .. }
-            | State::Finished { run_id, .. } => Some(run_id),
+            | State::Finished { run_id, .. }
+            | State::CalledOff { run_id, .. } => Some(run_id),
         }
     }
 
@@ -894,13 +912,14 @@ impl Supervisor {
                 }
                 _ => "the start was called off before a slot was free".to_owned(),
             };
+            // A start that never occupied a slot is not a run. Keep it distinct from
+            // the agent's real last run, so the hub does not call it "the last run"
+            // and the record check does not look for a record that was never written.
             self.states.insert(
                 name.to_owned(),
-                State::Finished {
+                State::CalledOff {
                     run_id: queued.run_id,
-                    outcome: RunOutcome::Stopped,
-                    reason: Some(reason),
-                    duration_ms: 0,
+                    reason,
                 },
             );
             self.reindex_queue();
@@ -1843,7 +1862,8 @@ mod tests {
                 State::Idle
                 | State::Stopping { .. }
                 | State::Unavailable { .. }
-                | State::Unreadable { .. } => false,
+                | State::Unreadable { .. }
+                | State::CalledOff { .. } => false,
             }
         });
         assert_eq!(supervisor.running_count(), 1);
@@ -1851,7 +1871,7 @@ mod tests {
     }
 
     #[test]
-    fn calling_off_a_waiting_start_leaves_a_stopped_run_behind() {
+    fn calling_off_a_waiting_start_is_not_a_run() {
         let binary = fake_agent("sup-cancel", "sleep 30");
         let (layout, _) = layout("sup-cancel");
         let one = layout.ensure_agent("one").expect("one");
@@ -1865,12 +1885,11 @@ mod tests {
             .expect("queued");
         assert_eq!(supervisor.stop("two"), StopDisposition::Cancelled);
         assert_eq!(supervisor.waiting_count(), 0);
+        // The start never occupied a slot, so it is not left as a finished run that
+        // the hub would call "the last run".
         assert!(matches!(
             supervisor.state("two"),
-            State::Finished {
-                outcome: RunOutcome::Stopped,
-                ..
-            }
+            State::CalledOff { .. }
         ));
         supervisor.stop_all(Duration::from_secs(5));
     }
