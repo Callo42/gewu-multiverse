@@ -66,6 +66,25 @@ instruction = "agents/two/instruction.md"
 concurrency = 1
 "#;
 
+/// One agent, `two`, so a record left by a since-removed agent `one` is history the
+/// configuration no longer lists.
+const TWO_ONLY: &str = r#"
+[forgejo]
+url = "https://forgejo.example.org"
+role = "member"
+
+[limits]
+run_timeout_secs = 30
+max_concurrent_agents = 1
+
+[[agents]]
+name = "two"
+model = "example-model"
+endpoint = "https://model.example.org/v1"
+instruction = "agents/two/instruction.md"
+concurrency = 1
+"#;
+
 /// A fresh, empty configuration directory for one test.
 fn scratch(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -218,6 +237,14 @@ fn wait_for_file(path: &Path) {
 /// A queued fixture: two agents under a limit of one, each with a prior successful
 /// run on disk, and neither started yet.
 fn queued_app(root: &Path) -> (App, PathBuf) {
+    queued_app_with(root, true)
+}
+
+/// The same fixture, optionally with a real prior run for each row.
+///
+/// `with_history = false` is the shape that proves the never-written reserved start
+/// id is never mistaken for a vanished record: there is no real record to check.
+fn queued_app_with(root: &Path, with_history: bool) -> (App, PathBuf) {
     fs::write(root.join("config.toml"), QUEUED).expect("the configuration is written");
     let (runner, gate) = gated_runner();
     let mut app = App::with_runner(Layout::rooted_at(root.to_path_buf()), runner);
@@ -233,22 +260,24 @@ fn queued_app(root: &Path) -> (App, PathBuf) {
         "[model_keys]\n\"one\" = \"gw-fixture-key\"\n\"two\" = \"gw-fixture-key\"\n",
     )
     .expect("the keys are written");
-    // A real prior run for every row, so "the last run" is a fact that must survive a
-    // later called-off start.
-    write_run(
-        app.state_root(),
-        "one",
-        "run-100-0001-1",
-        RunOutcome::Succeeded,
-        None,
-    );
-    write_run(
-        app.state_root(),
-        "two",
-        "run-100-0002-1",
-        RunOutcome::Succeeded,
-        None,
-    );
+    if with_history {
+        // A real prior run for every row, so "the last run" is a fact that must
+        // survive a later called-off start.
+        write_run(
+            app.state_root(),
+            "one",
+            "run-100-0001-1",
+            RunOutcome::Succeeded,
+            None,
+        );
+        write_run(
+            app.state_root(),
+            "two",
+            "run-100-0002-1",
+            RunOutcome::Succeeded,
+            None,
+        );
+    }
     app.reload();
     app.show(Screen::Agents);
     assert_eq!(app.selected_name().as_deref(), Some("one"));
@@ -510,8 +539,12 @@ fn a_refused_key_names_the_credentials_route() {
 
     let drawn = app.reason_with_history("one", reason);
     assert!(
-        drawn.contains("press 5 and then k on the Credentials screen"),
+        drawn.contains("press 5 and k on the Credentials screen"),
         "the refusal does not name the product's key route: {drawn}"
+    );
+    assert!(
+        drawn.contains("select `one`"),
+        "the refusal does not name whose key the route sets: {drawn}"
     );
     assert!(
         drawn.contains("the endpoint refused the key (HTTP 401)"),
@@ -526,16 +559,22 @@ fn a_refused_key_names_the_credentials_route() {
         "the refusal printed a value: {drawn}"
     );
 
-    // The hub and the Agent screen both carry it.
+    // The hub and the Agent screen both carry it. A narrow note area can wrap the
+    // sentence at the panel border, so each half is checked rather than one unbroken
+    // run across the wrap.
     let hub = flat(&render_at(100, 40, &app));
     assert!(
-        hub.contains("press 5 and then k on the Credentials screen"),
+        hub.contains("press 5 and k")
+            && hub.contains("Credentials screen")
+            && hub.contains("select `one`"),
         "the hub does not carry the key route:\n{hub}"
     );
     app.show(Screen::AgentConfig);
     let detail = flat(&render_at(100, 40, &app));
     assert!(
-        detail.contains("press 5 and then k on the Credentials screen"),
+        detail.contains("press 5 and k")
+            && detail.contains("Credentials screen")
+            && detail.contains("select `one`"),
         "the Agent screen does not carry the key route:\n{detail}"
     );
 
@@ -553,7 +592,7 @@ fn a_refused_key_names_the_credentials_route() {
     };
     assert!(
         test.describe()
-            .contains("press 5 and then k on the Credentials screen"),
+            .contains("press 5 and k on the Credentials screen"),
         "the endpoint test does not name the key route: {}",
         test.describe()
     );
@@ -580,6 +619,217 @@ fn a_refused_key_names_the_credentials_route() {
         app.last_run_failure("one").as_deref(),
         Some(reason),
         "the stored run reason was rewritten"
+    );
+    app.shutdown();
+}
+
+/// While a called-off start is held, a real record the hub once read and that is then
+/// deleted by hand is still reported as gone, and the call-off keeps its own place.
+#[test]
+fn a_called_off_start_reports_a_genuinely_vanished_record() {
+    let root = scratch("called-off-vanished");
+    let (mut app, gate) = queued_app(&root);
+
+    // Start `one`, queue `two`, then call `two`'s waiting start off.
+    app.on_key(key(KeyCode::Char('s')));
+    app.on_key(key(KeyCode::Char('j')));
+    app.on_key(key(KeyCode::Char('s')));
+    wait_for_file(&gate.join("one-started"));
+    app.on_key(key(KeyCode::Char('x')));
+    assert!(
+        app.status.contains("called off while it waited"),
+        "the start was not called off: {}",
+        app.status
+    );
+
+    // `two`'s real prior record was observed; nothing is reported gone yet.
+    app.reload();
+    assert!(
+        !app.record_forgotten("two"),
+        "a record still on disk was reported gone"
+    );
+
+    // Delete the real prior record, then re-read while the call-off is held.
+    let real = app.state_root().join("two").join("run-100-0002-1");
+    fs::remove_dir_all(&real).expect("the real record is deleted by hand");
+    app.reload();
+    assert!(
+        app.record_forgotten("two"),
+        "a real record the hub had observed vanished without a word"
+    );
+    let hub = flat(&render_at(100, 40, &app));
+    assert!(
+        hub.contains("no longer there"),
+        "the vanished-record notice was not drawn:\n{hub}"
+    );
+    assert!(
+        hub.contains("the last start of `two` was called off"),
+        "the call-off was lost when its real record vanished:\n{hub}"
+    );
+    app.shutdown();
+}
+
+/// A called-off start never wrote a record, so its reserved id is never reported as a
+/// vanished record — there is no real record for the agent at all.
+#[test]
+fn a_called_off_start_with_no_prior_record_reports_nothing_gone() {
+    let root = scratch("called-off-nohistory");
+    let (mut app, gate) = queued_app_with(&root, false);
+
+    app.on_key(key(KeyCode::Char('s')));
+    app.on_key(key(KeyCode::Char('j')));
+    app.on_key(key(KeyCode::Char('s')));
+    wait_for_file(&gate.join("one-started"));
+    app.on_key(key(KeyCode::Char('x')));
+    assert!(
+        app.status.contains("called off while it waited"),
+        "the start was not called off: {}",
+        app.status
+    );
+
+    // The closed record of `one` is real; `two` never wrote one. Neither the call-off
+    // nor the reserved id may raise a missing-record notice.
+    app.reload();
+    assert!(
+        !app.record_forgotten("two"),
+        "the reserved start id was reported as a vanished record"
+    );
+    let hub = flat(&render_at(100, 40, &app));
+    assert!(
+        !hub.contains("no longer there"),
+        "a spurious vanished-record notice was drawn:\n{hub}"
+    );
+    app.shutdown();
+}
+
+/// The refused-key pointer names the agent whose call failed, and following it with
+/// the product's own keys writes that agent's key, leaves the other agent's key alone
+/// and starts nothing.
+#[test]
+fn a_refused_key_pointer_leads_to_the_named_agents_key() {
+    let root = scratch("bad-key-target");
+    let root = &root;
+    let mut app = app_with(root, QUEUED);
+    confirm_risk(root, &mut app);
+    for name in ["one", "two"] {
+        let paths = app.ensure_agent(name).expect("the agent is prepared");
+        fs::write(paths.instruction(), format!("do something for {name}\n"))
+            .expect("the instruction is written");
+    }
+    fs::write(
+        root.join("credentials.toml"),
+        "[model_keys]\n\"one\" = \"gw-fixture-key-one\"\n\"two\" = \"gw-fixture-key-two\"\n",
+    )
+    .expect("the keys are written");
+    let reason = "the model call failed (bad_key): the endpoint refused the key (HTTP 401)";
+    write_run(
+        app.state_root(),
+        "one",
+        "run-100-0001-1",
+        RunOutcome::Failed,
+        Some(reason),
+    );
+    write_run(
+        app.state_root(),
+        "two",
+        "run-100-0002-1",
+        RunOutcome::Succeeded,
+        None,
+    );
+    app.reload();
+    app.show(Screen::Agents);
+    assert_eq!(app.selected_name().as_deref(), Some("one"));
+    // Move the selection to `two`: the failure and the pointer belong to `one` while
+    // the selected agent is not `one`.
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_name().as_deref(), Some("two"));
+
+    let hub = flat(&render_at(120, 40, &app));
+    assert!(
+        hub.contains("the last run of `one` did not go well"),
+        "the hub did not name one's failure:\n{hub}"
+    );
+    assert!(
+        hub.contains("select `one`") && hub.contains("to replace its model key"),
+        "the pointer does not name the agent and the selection step:\n{hub}"
+    );
+
+    // Follow the pointer exactly: Agents (1), select `one`, Credentials (5), `k`.
+    app.show(Screen::Agents);
+    app.on_key(key(KeyCode::Char('k'))); // move up, back to `one`
+    assert_eq!(app.selected_name().as_deref(), Some("one"));
+    app.show(Screen::Credentials);
+    app.on_key(key(KeyCode::Char('k')));
+    assert!(
+        app.status.contains("model key for `one`"),
+        "the prompt names the wrong agent: {}",
+        app.status
+    );
+    for character in "gw-fixture-key-new-one".chars() {
+        app.on_key(key(KeyCode::Char(character)));
+    }
+    app.on_key(key(KeyCode::Enter));
+    assert!(
+        app.status.contains("recorded the model key for one"),
+        "the receipt names the wrong agent: {}",
+        app.status
+    );
+
+    let creds = fs::read_to_string(&app.credentials_path).expect("the credentials file");
+    assert!(
+        creds.contains("one = \"gw-fixture-key-new-one\""),
+        "one's key was not replaced:\n{creds}"
+    );
+    assert!(
+        creds.contains("two = \"gw-fixture-key-two\""),
+        "two's key was changed:\n{creds}"
+    );
+    assert!(
+        app.supervisor.unfinished_run("one").is_none(),
+        "saving a key started one"
+    );
+    assert!(
+        app.supervisor.unfinished_run("two").is_none(),
+        "saving a key started two"
+    );
+    // The stored reason is history and is not rewritten by the key write.
+    app.show(Screen::Agents);
+    assert_eq!(
+        app.last_run_failure("one").as_deref(),
+        Some(reason),
+        "the stored run reason was rewritten"
+    );
+    app.shutdown();
+}
+
+/// A refused key whose agent the configuration no longer lists promises no route that
+/// cannot be followed, and says why there is nothing to replace here.
+#[test]
+fn a_refused_key_for_a_removed_agent_promises_no_route() {
+    let root = scratch("bad-key-removed");
+    let mut app = app_with(&root, TWO_ONLY);
+    let reason = "the model call failed (bad_key): the endpoint refused the key (HTTP 401)";
+    write_run(
+        app.state_root(),
+        "one",
+        "run-100-0001-1",
+        RunOutcome::Failed,
+        Some(reason),
+    );
+    app.reload();
+
+    let drawn = app.reason_with_history("one", reason);
+    assert!(
+        drawn.contains("(bad_key)"),
+        "the removed agent's history lost its cause: {drawn}"
+    );
+    assert!(
+        !drawn.contains("press 5 and k on the Credentials screen"),
+        "a removed agent was promised a route it cannot follow: {drawn}"
+    );
+    assert!(
+        drawn.contains("no longer lists `one`"),
+        "the removed agent's history does not say why there is no route: {drawn}"
     );
     app.shutdown();
 }

@@ -13,6 +13,7 @@
 //!   put in [`App::take_action`] for the terminal loop to carry out, because the
 //!   loop is the part that can step out of the UI and put it back.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -885,19 +886,21 @@ struct PendingStart {
 /// The in-product next step when a model call was refused for its key.
 ///
 /// A refused key is a credential fact, and the page map's Credentials row says a
-/// refusal names that screen's own keys (`press 5 and then k on the Credentials
-/// screen`), never a file and a TOML section. This appends the pointer where the
-/// failure is drawn on a screen; the run's log and transcript keep the raw sentence
-/// for the audit trail. It names the agent whose call was refused, prints no value,
-/// and claims nothing about whether the stored complaint still holds — so a
-/// historical failure stays history, and the product never promises that a new key
-/// by itself repairs a provider or account problem.
+/// refusal names that screen's own keys, never a file and a TOML section. The `k`
+/// prompt writes the key of the agent **selected on the Agents screen**, so the
+/// sentence names that selection step too: following it lands on the agent whose
+/// call was refused, not on whichever row happened to be selected. This appends the
+/// pointer where the failure is drawn on a screen; the run's log and transcript keep
+/// the raw sentence for the audit trail. It names the agent, prints no value, and
+/// claims nothing about whether the stored complaint still holds — so a historical
+/// failure stays history, and the product never promises that a new key by itself
+/// repairs a provider or account problem.
 fn bad_key_recovery(agent: &str, reason: &str) -> String {
     if !reason.contains("(bad_key)") {
         return reason.to_owned();
     }
     format!(
-        "{reason} — if the model key is no longer current, press 5 and then k on the Credentials screen to replace it for `{agent}`"
+        "{reason} — if the model key is no longer current, press 1 and use up/down to select `{agent}`, then press 5 and k on the Credentials screen to replace its model key"
     )
 }
 
@@ -996,6 +999,17 @@ pub struct App {
     /// One entry per named row, so the unreadable reason shares the one rule with
     /// every other run reason: it is drawn for its row (w45 F3).
     pub unreadable_runs: Vec<(String, String)>,
+    /// The newest **real** run record the hub has observed for each agent, by agent
+    /// name.
+    ///
+    /// A run record is written by the run itself. A waiting or called-off start has a
+    /// reserved id that is never written, so it is never remembered here and can never
+    /// be reported as a vanished record. Keeping the last real record lets a later
+    /// re-read tell that a record the hub once read is gone even while the supervisor
+    /// holds a `start called off` state for that agent, which has no run of its own to
+    /// check. It is in-memory only: a reopened UI starts empty and invents nothing
+    /// about records it never read.
+    known_records: HashMap<String, String>,
     /// A line about the freshly written sample configuration, when one was written.
     pub config_note: Option<String>,
     /// The screen on show.
@@ -1134,6 +1148,7 @@ impl App {
             panel_scroll: 0,
             forgotten_runs: Vec::new(),
             unreadable_runs: Vec::new(),
+            known_records: HashMap::new(),
             config_note: None,
             screen: Screen::Agents,
             selected: 0,
@@ -1318,7 +1333,24 @@ impl App {
             // An outcome whose record is gone is dropped before seeding, so `r` after
             // deleting the run records puts the hub back in step with the ledger
             // instead of leaving it claiming an outcome no record holds (T-5).
-            if let State::Finished { run_id, .. } = self.supervisor.state(&name) {
+            //
+            // The record to check is the agent's **real** terminal record: a finished
+            // run names its own id; a start that is waiting or was called off never
+            // wrote one, so the check falls back to the newest real terminal record
+            // the hub observed for the agent — and never to the reserved start id,
+            // which names nothing on disk. A real record that has since been deleted
+            // is reported even while the call-off state is held, and the call-off
+            // keeps its own place. A run still in flight is not checked: its own
+            // terminal record has not been written yet.
+            let observed = match self.supervisor.state(&name) {
+                State::Finished { run_id, .. } => Some(run_id.clone()),
+                State::CalledOff { .. } | State::Waiting { .. } => {
+                    self.known_records.get(&name).cloned()
+                }
+                _ => None,
+            };
+            if let Some(run_id) = observed {
+                let finished = matches!(self.supervisor.state(&name), State::Finished { .. });
                 // The run's own record is the truth, on disk and now: the in-memory
                 // list may predate a terminal record written by the reconciliation
                 // just above. A record that is gone takes its cached outcome with it;
@@ -1328,13 +1360,17 @@ impl App {
                 match crate::transcript::terminal_record_checked(&dir) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        self.supervisor.forget_state(&name);
+                        if finished {
+                            self.supervisor.forget_state(&name);
+                        }
                         // Say so once, and never let the next-oldest record pass
                         // silently for "the last run" (Y-4).
                         self.forgotten_runs.push(name.clone());
                     }
                     Err(source) => {
-                        self.supervisor.forget_state(&name);
+                        if finished {
+                            self.supervisor.forget_state(&name);
+                        }
                         self.unreadable_runs.push((name.clone(), source.to_string()));
                     }
                 }
@@ -1425,6 +1461,7 @@ impl App {
             &names,
         ));
         self.recent = recent_runs(self.layout.state_root(), &listed, RECENT_RUNS_LIMIT);
+        self.remember_observed_records();
         // The cap is on the list, not on the records. Measure the records too, so the
         // screens can say how many older ones exist and how much room they take
         // (L-1, L-2, L-4): a list that stops at fifty without saying so is the finding.
@@ -1436,6 +1473,32 @@ impl App {
         self.last_scan = Some(Instant::now());
         if self.run_selected >= self.recent.len() {
             self.run_selected = self.recent.len().saturating_sub(1);
+        }
+    }
+
+    /// Remember the newest **terminal** real run record seen on disk for every agent.
+    ///
+    /// `recent` is newest-first, so the first terminal row for an agent is its newest
+    /// finished record. A record newer than the remembered one moves the memory
+    /// forward; a record that is **gone** leaves the memory where it was, which is what
+    /// lets the next `seed_states_from_records` name a record the hub once read and now
+    /// cannot find. A run still in flight has no terminal record yet and is not
+    /// remembered; a reserved start id never reaches `recent` at all because a waiting
+    /// start writes no record, so it is never remembered and never checked.
+    fn remember_observed_records(&mut self) {
+        for run in &self.recent {
+            if run.outcome.is_none() {
+                continue;
+            }
+            match self.known_records.get(&run.agent) {
+                // The remembered record is the same one or a newer one that has since
+                // been deleted; do not let an older record overwrite it.
+                Some(known) if known.as_str() >= run.run_id.as_str() => {}
+                _ => {
+                    self.known_records
+                        .insert(run.agent.clone(), run.run_id.clone());
+                }
+            }
         }
     }
 
@@ -2580,6 +2643,24 @@ impl App {
         // A refused model key is answered with the product's own key-setting route,
         // wherever the reason is drawn. Logs and transcripts keep the raw sentence,
         // so this is the screen's sentence only.
+        //
+        // The route selects the agent on the Agents screen before `k`, and an agent
+        // the configuration no longer lists has no row to select and no key to
+        // replace. The route is promised only for a configured agent; a removed
+        // agent's history says plainly that there is nothing to replace here, and a
+        // configuration that cannot be read at all promises no route because it
+        // cannot say which agents exist.
+        if drawn.contains("(bad_key)") {
+            match &self.config {
+                Some(_) if !self.agents().iter().any(|listed| listed.name == agent) => {
+                    return format!(
+                        "{drawn} — the configuration no longer lists `{agent}`, so there is no model key to replace here"
+                    );
+                }
+                None => return drawn,
+                Some(_) => {}
+            }
+        }
         bad_key_recovery(agent, &drawn)
     }
 
