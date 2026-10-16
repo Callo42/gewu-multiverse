@@ -127,6 +127,21 @@ impl EditTarget {
     }
 }
 
+/// A refusal the add-agent form is showing: the words, and the field they name.
+///
+/// w46 F1/w47 F2: the reason is drawn on the row after the field it **names**, not on
+/// the row after the cursor's field. The two coincide at the refusal (the cursor is
+/// moved to the named field), but storing the field here means a later draw can never
+/// read the reason against the wrong field, and a refusal that names no field (a file
+/// that cannot be written) is drawn against the cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormRefusal {
+    /// The field the reason is about, when it names one.
+    pub field: Option<usize>,
+    /// The sentence.
+    pub message: String,
+}
+
 /// The in-TUI form that gets a first user to a named agent without a text editor.
 ///
 /// The fields are exactly what an agent needs to run against a model, plus the
@@ -138,8 +153,8 @@ pub struct NewAgentForm {
     pub fields: [String; 6],
     /// Which field the next key types into.
     pub cursor: usize,
-    /// Why the last attempt to create the agent did not work.
-    pub error: Option<String>,
+    /// Why the last attempt to create the agent did not work, and the field it names.
+    pub error: Option<FormRefusal>,
 }
 
 impl NewAgentForm {
@@ -160,6 +175,20 @@ impl NewAgentForm {
             cursor: 0,
             error: None,
         }
+    }
+
+    /// The field a shown reason is drawn after: the one it names, or the cursor's.
+    pub fn reason_at(&self) -> Option<usize> {
+        self.error
+            .as_ref()
+            .map(|refusal| refusal.field.unwrap_or(self.cursor))
+    }
+
+    /// Drop the standing refusal. Called by every key that edits a field or moves the
+    /// cursor, so a reason that was true of the state before the key is not read
+    /// against the state after it (w46 F1, w47 F2).
+    pub fn withdraw_refusal(&mut self) -> Option<FormRefusal> {
+        self.error.take()
     }
 }
 
@@ -838,6 +867,40 @@ fn failure_of(error: forgejo::ForgejoError) -> ForgejoFailure {
     }
 }
 
+/// A run this UI started, kept until its state moves on so its receipt can be
+/// rewritten in the present tense of the new state (w46 F2/w47 F1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingStart {
+    /// The agent the run belongs to.
+    agent: String,
+    /// The run's identity, so a receipt is never rewritten from another run's state.
+    run_id: String,
+    /// The exact status sentence the start drew. Only that sentence is replaced.
+    receipt: String,
+    /// Whether the receipt said the run was still waiting for a slot, so the first
+    /// sight of it running is news worth a new sentence.
+    waiting: bool,
+}
+
+/// The sentence for a run that has ended: the outcome, how long it ran, and its own
+/// reason — the same shape the Runs note builds, so the status and the row agree.
+fn run_ended_sentence(
+    agent: &str,
+    outcome: crate::run::RunOutcome,
+    reason: Option<&str>,
+    duration_ms: u64,
+) -> String {
+    let timed = format!(
+        "`{agent}` ended: {}, {:.1}s",
+        outcome.as_str(),
+        duration_ms as f64 / 1000.0
+    );
+    match reason.filter(|reason| !reason.is_empty()) {
+        Some(reason) => format!("{timed} — {reason}"),
+        None => timed,
+    }
+}
+
 /// Everything the screens draw.
 #[derive(Debug)]
 pub struct App {
@@ -971,6 +1034,15 @@ pub struct App {
     /// record closes, the same agent's status is rewritten as `stopped … is proven
     /// gone`, so the row and the status never disagree about whether the stop is done.
     pending_stop: Option<String>,
+    /// A run this UI started, and the exact receipt the status line carries for it.
+    ///
+    /// w46 F2/w47 F1: `started X: run …, process …` is true at the moment the start
+    /// lands and false the moment the run ends — the process it names is gone. The
+    /// receipt is kept here, with the run it names, so the tick that first sees the
+    /// run's state move can replace the receipt with what is true **now** (running, or
+    /// the outcome the Runs note builds). A later action's sentence is never
+    /// overwritten: only the exact receipt this UI drew is replaced.
+    pending_start: Option<PendingStart>,
     /// When this UI started, so the footer can say what finished while the user was
     /// looking at another screen.
     started_ms: u64,
@@ -1062,6 +1134,7 @@ impl App {
             workspace_note: None,
             start_failure: None,
             pending_stop: None,
+            pending_start: None,
             started_ms: crate::time::now_unix_ms(),
             forgejo_note: None,
             last_scan: None,
@@ -1451,17 +1524,22 @@ impl App {
     /// credentials file, and a person auditing what exists should not see a name for
     /// an agent that does not. The secret is not deleted behind the user's back —
     /// the surface simply tells the truth about who it belongs to.
+    ///
+    /// w46 F5: the age in that note is the **file's** last write, because the file
+    /// records no per-secret time — and writing any other secret refreshes it. The
+    /// sentence says both, so an unrelated write does not silently restate what the
+    /// note seems to measure: it measures the file, and the note says so.
     pub fn present_secret_labels(&self) -> Vec<String> {
         let configured: Vec<&str> = self.agents().iter().map(|agent| agent.name.as_str()).collect();
-        // The credentials file's own modification time is the closest thing to "when
-        // did this leftover arrive": the secret carries no timestamp, the file does.
+        // The credentials file's own modification time is the only time the file
+        // carries: the secret itself has none.
         let age = file_age(&self.credentials_path);
         crate::credentials::present_secret_names(&self.credentials_path)
             .into_iter()
             .map(|name| match backticked_agent(&name) {
                 Some(agent) if !configured.contains(&agent.as_str()) => match &age {
                     Some(age) => format!(
-                        "{name} (no agent with that name is configured; left by a credentials file last written {age})"
+                        "{name} (no agent with that name is configured; the credentials file holding it was last written {age} — that is the file's own time, and writing any secret moves it)"
                     ),
                     None => format!("{name} (no agent with that name is configured)"),
                 },
@@ -1835,6 +1913,23 @@ impl App {
         self.overlay_owns_keys() || self.show_acknowledgment
     }
 
+    /// Drop the add-agent form's standing refusal, and the status sentence that
+    /// repeats it, when a key edits a field or moves the cursor.
+    ///
+    /// w46 F1/w47 F2: the reason is a receipt of the refusal. Once the state it
+    /// complained about has been touched, the sentence is no longer about what is on
+    /// screen, so it is withdrawn rather than left standing under a filled field.
+    fn withdraw_form_refusal(&mut self) {
+        let Some(form) = self.add_agent.as_mut() else {
+            return;
+        };
+        if let Some(refusal) = form.withdraw_refusal() {
+            if self.status == refusal.message {
+                self.status.clear();
+            }
+        }
+    }
+
     /// One key while the add-agent form is open.
     fn on_form_key(&mut self, key: KeyEvent) {
         let count = NewAgentForm::FIELDS.len();
@@ -1847,6 +1942,7 @@ impl App {
             // cursor had not left.
             KeyCode::Enter => {
                 let last = count.saturating_sub(1);
+                self.withdraw_form_refusal();
                 match self.add_agent.as_mut() {
                     Some(form) if form.cursor < last => form.cursor += 1,
                     Some(_) => self.submit_new_agent(),
@@ -1858,21 +1954,25 @@ impl App {
                 self.status = "no agent was added".to_owned();
             }
             KeyCode::Tab | KeyCode::Down => {
+                self.withdraw_form_refusal();
                 if let Some(form) = self.add_agent.as_mut() {
                     form.cursor = (form.cursor + 1) % count;
                 }
             }
             KeyCode::BackTab | KeyCode::Up => {
+                self.withdraw_form_refusal();
                 if let Some(form) = self.add_agent.as_mut() {
                     form.cursor = (form.cursor + count - 1) % count;
                 }
             }
             KeyCode::Backspace => {
+                self.withdraw_form_refusal();
                 if let Some(form) = self.add_agent.as_mut() {
                     form.fields[form.cursor].pop();
                 }
             }
             KeyCode::Char(character) => {
+                self.withdraw_form_refusal();
                 if let Some(form) = self.add_agent.as_mut() {
                     form.fields[form.cursor].push(character);
                 }
@@ -1920,7 +2020,10 @@ impl App {
                     if let Some(at) = field {
                         open.cursor = at;
                     }
-                    open.error = Some(message.clone());
+                    open.error = Some(FormRefusal {
+                        field,
+                        message: message.clone(),
+                    });
                 }
                 self.status = message;
             }
@@ -2520,15 +2623,29 @@ impl App {
         };
         match self.supervisor.start(&paths, &model, steps) {
             Ok(StartDisposition::Started { run_id, pid }) => {
-                self.status = format!("started `{name}`: run {run_id}, process {pid}");
+                let receipt = format!("started `{name}`: run {run_id}, process {pid}");
+                self.status = receipt.clone();
+                self.pending_start = Some(PendingStart {
+                    agent: name.clone(),
+                    run_id,
+                    receipt,
+                    waiting: false,
+                });
                 self.refresh_recent();
             }
             Ok(StartDisposition::Queued { run_id, position }) => {
-                self.status = format!(
+                let receipt = format!(
                     "`{name}` is waiting its turn: {} of {} agents are running, this is start {position} in line (run {run_id})",
                     self.supervisor.running_count(),
                     self.supervisor.max_concurrent(),
                 );
+                self.status = receipt.clone();
+                self.pending_start = Some(PendingStart {
+                    agent: name.clone(),
+                    run_id,
+                    receipt,
+                    waiting: true,
+                });
             }
             Ok(StartDisposition::Busy { run_id }) => {
                 // Lead with the state, not the ledger: the question is "is it running
@@ -2559,11 +2676,17 @@ impl App {
         self.status = match self.supervisor.stop(&name) {
             StopDisposition::Signalled => {
                 self.pending_stop = Some(name.clone());
+                // The stop takes over the receipt: its own sentence is the truth
+                // about the run from here, and `note_stop_proven` finishes it.
+                self.pending_start = None;
                 format!(
                     "stopping `{name}`: its process group was signalled and will be proven gone"
                 )
             }
-            StopDisposition::Cancelled => format!("`{name}` was called off while it waited"),
+            StopDisposition::Cancelled => {
+                self.pending_start = None;
+                format!("`{name}` was called off while it waited")
+            }
             StopDisposition::Nothing => format!("`{name}` is not running"),
             StopDisposition::Failed { reason } => {
                 format!("`{name}` could not be stopped: {reason}")
@@ -4058,6 +4181,22 @@ impl App {
         }
     }
 
+    /// Whether the instruction document a run would send holds no words at all.
+    ///
+    /// w47 F3: a document the person emptied (0 bytes or blank space) is a different
+    /// state from a written one and from a missing one. The screen asks this the same
+    /// way the run does — through the document a run would actually send — so the two
+    /// cannot disagree about whether the instruction is empty.
+    pub fn instruction_is_blank(&self) -> bool {
+        let Some(paths) = self.selected_paths() else {
+            return false;
+        };
+        match std::fs::read(paths.instruction()) {
+            Ok(bytes) => crate::agent_run::instruction_is_blank(&bytes),
+            Err(_) => false,
+        }
+    }
+
     /// The skills on disk for the selected agent: name and manifest size.
     pub fn skills_summary(&self) -> Vec<(String, u64)> {
         let Some(paths) = self.selected_paths() else {
@@ -4116,6 +4255,7 @@ impl App {
         // the UI thread, before the next draw.
         self.poll_probe();
         self.note_stop_proven();
+        self.note_run_moved();
         self.refresh_workspace_note();
         let stale = match self.last_scan {
             Some(at) => at.elapsed() >= RECENT_RUNS_REFRESH,
@@ -4148,6 +4288,65 @@ impl App {
                 "stopped `{name}`: its process group was signalled and is proven gone"
             );
             self.pending_stop = None;
+        }
+    }
+
+    /// When a run this UI started moves on, rewrite its receipt in the present tense
+    /// of the new state (w46 F2/w47 F1).
+    ///
+    /// `started \`X\`: run …, process …` names a process that has exited once the run
+    /// is over, and `X is waiting its turn` is false once X is running. This is the one
+    /// place the status is brought back into agreement with the row it is about. Only
+    /// the exact receipt this UI drew is replaced: any other key the user has since
+    /// pressed has already made the status say something else, and that sentence is
+    /// not ours to overwrite.
+    ///
+    /// A queued start is watched across **both** of its moves: waiting → running
+    /// rewrites the waiting receipt and keeps the watch on the now-running receipt, so
+    /// the run's end can still replace it. Only the exact receipt this UI drew is
+    /// owned; a later keypress
+    /// drops the record at the guard above and nothing of the user's is overwritten.
+    fn note_run_moved(&mut self) {
+        let Some(mut pending) = self.pending_start.clone() else {
+            return;
+        };
+        if self.status != pending.receipt {
+            self.pending_start = None;
+            return;
+        }
+        let state = self.supervisor.state(&pending.agent);
+        match &state {
+            State::Finished {
+                run_id,
+                outcome,
+                reason,
+                duration_ms,
+            } if *run_id == pending.run_id => {
+                // The run is over: the outcome is the truth, and there is nothing
+                // left to watch.
+                self.status = run_ended_sentence(
+                    &pending.agent,
+                    *outcome,
+                    reason.as_deref(),
+                    *duration_ms,
+                );
+                self.pending_start = None;
+            }
+            State::Starting { run_id, pid } | State::Running { run_id, pid, .. }
+                if pending.waiting && *run_id == pending.run_id =>
+            {
+                // A queued start has taken its slot. The receipt becomes the running
+                // one, and the watch stays with the run: the end must still replace
+                // this sentence. Only this UI's exact receipt is owned.
+                pending.receipt = format!(
+                    "`{}` started running: run {run_id}, process {pid}",
+                    pending.agent
+                );
+                pending.waiting = false;
+                self.status = pending.receipt.clone();
+                self.pending_start = Some(pending);
+            }
+            _ => {}
         }
     }
 
@@ -4388,10 +4587,13 @@ impl App {
             }
             Some(_) => "kept the first line; the rest of the paste was not used",
         };
-        if let Some(form) = self.add_agent.as_mut() {
-            form.fields[form.cursor] = first.to_owned();
-            self.status = note.to_owned();
-            return;
+        if self.add_agent.is_some() {
+            self.withdraw_form_refusal();
+            if let Some(form) = self.add_agent.as_mut() {
+                form.fields[form.cursor] = first.to_owned();
+                self.status = note.to_owned();
+                return;
+            }
         }
         if let Some(prompt) = self.secret_prompt.as_mut() {
             prompt.value = first.to_owned();
@@ -4450,6 +4652,7 @@ impl App {
             // address and every other field can be replaced with one key instead of
             // backspacing over the old value.
             if key.code == KeyCode::Char('u') {
+                self.withdraw_form_refusal();
                 if let Some(form) = self.add_agent.as_mut() {
                     form.fields[form.cursor].clear();
                 } else if let Some(prompt) = self.secret_prompt.as_mut() {
@@ -6963,7 +7166,8 @@ concurrency = 3
         assert!(
             app.add_agent
                 .as_ref()
-                .and_then(|form| form.error.as_deref())
+                .and_then(|form| form.error.as_ref())
+                .map(|refusal| refusal.message.as_str())
                 .unwrap_or("")
                 .contains("model key"),
             "the reason is not drawn beside the field"
@@ -6987,6 +7191,52 @@ concurrency = 3
         assert!(app.status.starts_with("cannot use that name"), "{}", app.status);
         assert!(app.status.contains("longer than 32"), "{}", app.status);
         assert!(!app.status.contains("aaaa"), "{}", app.status);
+    }
+
+    /// w46 F1/w47 F2's enumeration: every refusal the add-agent form can show carries
+    /// the field it is about, and that field is one the form can draw a reason against.
+    ///
+    /// This is the guard a next sibling cannot slip past: a new field-specific refusal
+    /// that returns `None` (or an index past the last field) fails here, and the drawn
+    /// guard in `tests/wave24-guards.rs` proves every one of them lands on the row after
+    /// its field.
+    #[test]
+    fn every_add_agent_refusal_names_the_field_it_is_about() {
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let attempt = |app: &App, fields: [&str; 6]| {
+            app.write_new_agent(&NewAgentForm {
+                fields: fields.map(str::to_owned),
+                cursor: 0,
+                error: None,
+            })
+        };
+        let base = [
+            "third",
+            "https://m.example.org/v1",
+            "m",
+            "gw-throwaway-key",
+            "",
+            "",
+        ];
+        // One required field empty at a time, in field order: the refusal names it.
+        for at in 0..4 {
+            let mut fields = base;
+            fields[at] = "";
+            let (field, message) = attempt(&app, fields).expect_err("the field is required");
+            assert_eq!(field, Some(at), "{message}");
+        }
+        // An unusable name and a duplicate name both name the name field.
+        let mut fields = base;
+        fields[0] = "has spaces";
+        assert_eq!(attempt(&app, fields).expect_err("unusable").0, Some(0));
+        let mut fields = base;
+        fields[0] = "one";
+        assert_eq!(attempt(&app, fields).expect_err("duplicate").0, Some(0));
+        // A refusal that names no field is the file-level one, and only that: the
+        // config cannot be read, so there is no field to move the cursor to.
+        app.config = None;
+        assert_eq!(attempt(&app, base).expect_err("no config").0, None);
     }
 
     #[test]

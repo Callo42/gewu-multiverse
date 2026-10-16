@@ -846,6 +846,17 @@ pub fn instruction_payload(bytes: &[u8]) -> (usize, usize) {
     (bytes.len(), strip_placeholder(bytes).len())
 }
 
+/// Whether the document a run would send holds no words at all.
+///
+/// A run refuses an empty document, a whitespace-only one and one that is nothing but
+/// the guidance placeholder. The Instruction screen must not draw a byte count and a
+/// sends line for any of them as if they were a written instruction (w47 F3): the
+/// empty case is a sentence of its own.
+#[must_use]
+pub fn instruction_is_blank(bytes: &[u8]) -> bool {
+    strip_placeholder(bytes).trim().is_empty()
+}
+
 /// Read the agent's instruction document.
 fn read_instruction(path: &Path) -> Result<Vec<u8>, String> {
     let metadata = match fs::metadata(path) {
@@ -901,8 +912,16 @@ fn read_instruction(path: &Path) -> Result<Vec<u8>, String> {
     // it (P-4).
     let cleaned = strip_placeholder(&bytes);
     if cleaned.trim().is_empty() {
+        // w47 F3: a document a person emptied is not the same as one that never held
+        // the product's guidance line. The sentence says which state this is, so the
+        // screen's `the file is empty` and the run's own refusal agree.
+        let which = if guidance_dropped(&bytes) {
+            "is still the placeholder"
+        } else {
+            "holds no words, only blank space"
+        };
         return Err(format!(
-            "the instruction document {} is still the placeholder; write what the agent should do",
+            "the instruction document {} {which}; write what the agent should do",
             path.display()
         ));
     }
@@ -1825,6 +1844,39 @@ mod tests {
         let end = execute(&dir);
         assert!(!end.is_success());
         assert!(end.reason.expect("a reason").contains("link"));
+    }
+
+    #[test]
+    fn a_document_a_run_refuses_is_never_presented_as_written() {
+        // w47 F3: every state of the instruction document has its own truth. The
+        // screen's `the file is empty` and the run's own refusal must agree about
+        // which state a document the person emptied is in.
+        let root = scratch_root("agent-run-document-states");
+        let path = root.join("instruction.md");
+        // Missing: a sentence naming the file and the next step.
+        let missing = read_instruction(&path).expect_err("there is no document");
+        assert!(missing.contains("no instruction document"), "{missing}");
+        // Empty (0 bytes): `is empty`.
+        fs::write(&path, "").expect("written");
+        let empty = read_instruction(&path).expect_err("empty");
+        assert!(empty.contains("is empty"), "{empty}");
+        assert!(instruction_is_blank("" .as_bytes()));
+        // Whitespace-only: not the placeholder, and not a written instruction either.
+        fs::write(&path, " \n\t\n").expect("written");
+        let blank = read_instruction(&path).expect_err("blank");
+        assert!(blank.contains("only blank space"), "{blank}");
+        assert!(instruction_is_blank(b" \n\t\n"));
+        assert!(!blank.contains("placeholder"), "a blank document was called a placeholder: {blank}");
+        // Placeholder only: the older sentence, unchanged.
+        fs::write(&path, format!("{INSTRUCTION_PLACEHOLDER}\n")).expect("written");
+        let placeholder = read_instruction(&path).expect_err("placeholder");
+        assert!(placeholder.contains("placeholder"), "{placeholder}");
+        assert!(instruction_is_blank(INSTRUCTION_PLACEHOLDER.as_bytes()));
+        // Present with words: it reads, and is not blank.
+        fs::write(&path, "write a note\n").expect("written");
+        let read = read_instruction(&path).expect("a written document reads");
+        assert_eq!(String::from_utf8(read).expect("text"), "write a note");
+        assert!(!instruction_is_blank(b"write a note\n"));
     }
 
     #[test]
