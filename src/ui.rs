@@ -353,6 +353,21 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
                 Style::new().fg(Color::Red),
             )));
         }
+        // A start called off while it waited is named as a start, never as a run,
+        // and is kept beside — not instead of — the agent's real last run. The row's
+        // state word already says `start called off`; this gives the reason a short
+        // note area cannot hide once the status line is gone.
+        if let crate::supervisor::State::CalledOff { reason, .. } =
+            app.supervisor.state(name)
+        {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "the last start of `{name}` was called off: {}",
+                    app.reason_with_history(name, &reason)
+                ),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
     }
     if let Some(error) = app.supervisor.last_error() {
         lines.push(Line::from(Span::styled(
@@ -528,8 +543,32 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     &crate::run::file_sentence(&path, "transcript", transcript_error),
                 ));
             }
-            if let Some(run_id) = app.supervisor.state(&agent.name).run_id() {
-                lines.push(field("run", run_id));
+            let run_state = app.supervisor.state(&agent.name);
+            if let Some(run_id) = run_state.run_id() {
+                // A start that has not occupied a slot is named `start`, not `run`:
+                // its id is not the id of any record on disk, so calling it `run`
+                // made a waiting or called-off start read as the previous run the
+                // `newest log`/`transcript` fields point at.
+                let label = if matches!(
+                    run_state,
+                    crate::supervisor::State::Waiting { .. }
+                        | crate::supervisor::State::CalledOff { .. }
+                ) {
+                    "start"
+                } else {
+                    "run"
+                };
+                lines.push(field(label, run_id));
+            }
+            // A called-off start names its reason here, so the detail tells the same
+            // story as the hub: the last **start** was called off, while the
+            // `last failure`/`last run` fields and the newest log/transcript keep the
+            // real run's own facts.
+            if let crate::supervisor::State::CalledOff { reason, .. } = &run_state {
+                lines.push(field(
+                    "last start",
+                    &format!("called off — {}", app.reason_with_history(&agent.name, reason)),
+                ));
             }
             // LIB-2: the field is always drawn. A test whose stamp survived a restart
             // is shown with its age; an agent with no test at all says so, so a person
