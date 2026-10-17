@@ -33,7 +33,6 @@ use gewu_multiverse::cli::{Cli, Invocation, help_text, parse_args};
 use gewu_multiverse::editor;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::ui;
-use gewu_multiverse::words;
 use gewu_multiverse::workspace;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -136,15 +135,14 @@ fn run(cli: Cli) -> Result<(), StartupError> {
     let mut app = App::new(layout);
     let mut screen = Screen::enter()?;
     let drawn = event_loop(&mut screen, &mut app);
-    // Stop every run before the terminal comes back, and prove the children are gone.
-    let stopped = app.shutdown();
+    // Stop every run and call off every waiting start before the terminal comes back,
+    // and prove the children are gone. The receipt names both, so a person who queued a
+    // start knows it was called off rather than silently lost.
+    let report = app.shutdown();
     let left = screen.leave();
     drawn.and(left)?;
-    if stopped > 0 {
-        println!(
-            "gewu-multiverse: stopped {} before leaving",
-            words::counted(stopped, "running agent", "running agents")
-        );
+    if let Some(line) = report.describe() {
+        println!("gewu-multiverse: {line}");
     }
     Ok(())
 }

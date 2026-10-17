@@ -779,6 +779,14 @@ impl Supervisor {
         self.states.remove(name);
     }
 
+    /// Forget the last supervisor-level error, which is not tied to an agent's record.
+    ///
+    /// A new agent under a removed agent's name must not open the Agent screen with a
+    /// failure from the earlier agent. The error is a transient sentence, not history.
+    pub fn forget_last_error(&mut self) {
+        self.last_error = None;
+    }
+
     /// Put a present-but-unreadable record on the hub's state column.
     ///
     /// W41-2: a fresh start left the state `idle` (the word for no run) while the

@@ -390,7 +390,7 @@ impl EndpointTest {
     pub fn describe(&self) -> String {
         format!(
             "{} — tested {}",
-            bad_key_recovery(&self.agent, &describe_endpoint_result(&self.result)),
+            failure_recovery(&self.agent, &describe_endpoint_result(&self.result)),
             tested_age(self.tested_at_ms)
         )
     }
@@ -883,25 +883,33 @@ struct PendingStart {
     waiting: bool,
 }
 
-/// The in-product next step when a model call was refused for its key.
+/// The in-product next step when a model call failed for a reason a person can act on.
 ///
 /// A refused key is a credential fact, and the page map's Credentials row says a
 /// refusal names that screen's own keys, never a file and a TOML section. The `k`
 /// prompt writes the key of the agent **selected on the Agents screen**, so the
 /// sentence names that selection step too: following it lands on the agent whose
-/// call was refused, not on whichever row happened to be selected. This appends the
-/// pointer where the failure is drawn on a screen; the run's log and transcript keep
-/// the raw sentence for the audit trail. It names the agent, prints no value, and
-/// claims nothing about whether the stored complaint still holds — so a historical
-/// failure stays history, and the product never promises that a new key by itself
-/// repairs a provider or account problem.
-fn bad_key_recovery(agent: &str, reason: &str) -> String {
-    if !reason.contains("(bad_key)") {
-        return reason.to_owned();
+/// call was refused, not on whichever row happened to be selected. A `server_error`
+/// is not a promise that a retry will work: the endpoint answered, and the product's
+/// own next steps are to try the run again or to test the endpoint, both on the named
+/// agent. This appends the pointer where the failure is drawn on a screen; the run's
+/// log and transcript keep the raw sentence for the audit trail. It names the agent,
+/// prints no value, starts nothing, and claims nothing about whether the stored
+/// complaint still holds — so a historical failure stays history.
+fn failure_recovery(agent: &str, reason: &str) -> String {
+    if reason.contains("(bad_key)") {
+        return format!(
+            "{reason} — if the model key is no longer current, press 1 and use up/down to select `{agent}`, then press 5 and k on the Credentials screen to replace its model key"
+        );
     }
-    format!(
-        "{reason} — if the model key is no longer current, press 1 and use up/down to select `{agent}`, then press 5 and k on the Credentials screen to replace its model key"
-    )
+    if reason.contains("(server_error)") {
+        // The endpoint's own answer can be long. Put the next step first, so a short
+        // panel or a note area still shows it before the answer's body.
+        return format!(
+            "press 1 and use up/down to select `{agent}`, then press s to try again or p to test the endpoint — {reason}"
+        );
+    }
+    reason.to_owned()
 }
 
 /// The sentence for a run that has ended: the outcome, how long it ran, and its own
@@ -918,8 +926,44 @@ fn run_ended_sentence(
         duration_ms as f64 / 1000.0
     );
     match reason.filter(|reason| !reason.is_empty()) {
-        Some(reason) => format!("{timed} — {}", bad_key_recovery(agent, reason)),
+        Some(reason) => format!("{timed} — {}", failure_recovery(agent, reason)),
         None => timed,
+    }
+}
+
+/// What leaving did, so the line printed after the terminal is restored is complete.
+///
+/// A `tui` run is stopped; a start that never occupied a slot is called off. Both are
+/// work this UI had in flight, and the receipt names both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShutdownReport {
+    /// Runs that were running and were stopped.
+    pub stopped: usize,
+    /// Starts that were waiting for a slot when the UI left.
+    pub called_off: usize,
+}
+
+impl ShutdownReport {
+    /// The sentence printed after the UI closes, or `None` when nothing was in flight.
+    pub fn describe(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if self.stopped > 0 {
+            parts.push(format!(
+                "stopped {}",
+                words::counted(self.stopped, "running agent", "running agents")
+            ));
+        }
+        if self.called_off > 0 {
+            parts.push(format!(
+                "called off {}",
+                words::counted(self.called_off, "waiting start", "waiting starts")
+            ));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" and "))
+        }
     }
 }
 
@@ -1010,6 +1054,14 @@ pub struct App {
     /// check. It is in-memory only: a reopened UI starts empty and invents nothing
     /// about records it never read.
     known_records: HashMap<String, String>,
+    /// The run ids, per configured agent, that predate the agent now under that name.
+    ///
+    /// The product writes this boundary when an agent is created. A name is a
+    /// directory, not an identity: after a removed agent's name is used again, the
+    /// earlier records must stay the earlier agent's. The map is read from the
+    /// agent's state directory at load time; an agent with no such note keeps every
+    /// record under its name, as it did before the note existed.
+    previous_runs: HashMap<String, Vec<String>>,
     /// A line about the freshly written sample configuration, when one was written.
     pub config_note: Option<String>,
     /// The screen on show.
@@ -1149,6 +1201,7 @@ impl App {
             forgotten_runs: Vec::new(),
             unreadable_runs: Vec::new(),
             known_records: HashMap::new(),
+            previous_runs: HashMap::new(),
             config_note: None,
             screen: Screen::Agents,
             selected: 0,
@@ -1204,7 +1257,7 @@ impl App {
                             Ok(config) => {
                                 self.apply_config(config);
                                 self.config_note = Some(format!(
-                                    "a commented sample configuration was written to {} — press n to add your first agent",
+                                    "a commented sample configuration was written to {}; the add-agent form is on the Agents screen after this one",
                                     self.layout.config_file().display()
                                 ));
                             }
@@ -1274,6 +1327,7 @@ impl App {
                 self.last_seen = None;
             }
         }
+        self.load_previous_runs();
         self.clamp_selection();
         self.refresh_recent();
         self.reconcile_abandoned_runs();
@@ -1378,7 +1432,10 @@ impl App {
             if self.supervisor.state(&name) != State::Idle {
                 continue;
             }
-            let newest = self.recent.iter().find(|run| run.agent == name);
+            let newest = self
+                .recent
+                .iter()
+                .find(|run| run.agent == name && self.run_is_current(run));
             // W41-2: a fresh start read a present-but-unreadable transcript as `idle`
             // — the word for "no run" — while the Runs screen said `unreadable`. The
             // newest record for the agent is on disk and its error is known; the hub
@@ -1394,7 +1451,7 @@ impl App {
             let Some(run) = self
                 .recent
                 .iter()
-                .find(|run| run.agent == name && run.outcome.is_some())
+                .find(|run| run.agent == name && run.outcome.is_some() && self.run_is_current(run))
             else {
                 continue;
             };
@@ -1428,7 +1485,11 @@ impl App {
             if self.supervisor.state(&name).is_live() {
                 continue;
             }
-            let Some(run) = self.recent.iter().find(|run| run.agent == name) else {
+            let Some(run) = self
+                .recent
+                .iter()
+                .find(|run| run.agent == name && self.run_is_current(run))
+            else {
                 continue;
             };
             if run.outcome.is_some() {
@@ -1443,6 +1504,56 @@ impl App {
             self.supervisor
                 .note_abandoned(&name, &run.dir, &run.run_id);
         }
+    }
+
+    /// Read each configured agent's note of records that predate it.
+    ///
+    /// The note belongs to the agent's state directory and holds run ids only. It is
+    /// read here so every screen can decide whether a record is the current agent's
+    /// or an earlier agent's before it draws a state, a marker or a route.
+    fn load_previous_runs(&mut self) {
+        self.previous_runs.clear();
+        let names: Vec<String> = self
+            .agents()
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
+        for name in names {
+            let ids = crate::run::previous_run_ids(&self.layout.state_root().join(&name));
+            if !ids.is_empty() {
+                self.previous_runs.insert(name, ids);
+            }
+        }
+    }
+
+    /// Whether a record predates the agent the configuration lists under that name.
+    fn run_is_earlier(&self, run: &RunSummary) -> bool {
+        self.previous_runs
+            .get(&run.agent)
+            .is_some_and(|ids| ids.iter().any(|id| id == &run.run_id))
+    }
+
+    /// Whether a record belongs to the agent now configured under that name.
+    ///
+    /// A record of an agent the configuration no longer lists is not current, and
+    /// neither is a record that predates the current agent with the same name.
+    pub fn run_is_current(&self, run: &RunSummary) -> bool {
+        self.agents().iter().any(|agent| agent.name == run.agent) && !self.run_is_earlier(run)
+    }
+
+    /// How many earlier agents' records are still present under configured names.
+    ///
+    /// The on-disk count, not only the newest fifty in `recent`: the Runs note states
+    /// the footprint of every record, so this count has to agree with it.
+    pub fn earlier_records_on_disk(&self) -> usize {
+        self.previous_runs
+            .iter()
+            .map(|(agent, ids)| {
+                ids.iter()
+                    .filter(|id| self.layout.state_root().join(agent).join(id).is_dir())
+                    .count()
+            })
+            .sum()
     }
 
     /// Read the recent run records again.
@@ -1487,7 +1598,7 @@ impl App {
     /// start writes no record, so it is never remembered and never checked.
     fn remember_observed_records(&mut self) {
         for run in &self.recent {
-            if run.outcome.is_none() {
+            if run.outcome.is_none() || !self.run_is_current(run) {
                 continue;
             }
             match self.known_records.get(&run.agent) {
@@ -1572,7 +1683,7 @@ impl App {
             return note.clone();
         }
         if !self.ack_state.is_confirmed() {
-            return "the risk acknowledgment is not confirmed, so starting an agent is refused"
+            return "the risk acknowledgment is not confirmed, so starting an agent is refused — press R to read the terms, then y to record it"
                 .to_owned();
         }
         format!(
@@ -1921,7 +2032,7 @@ impl App {
         self.show_acknowledgment = false;
         self.ack_review = false;
         self.status =
-            "the risk was not acknowledged, so starting an agent is refused until it is recorded"
+            "the risk was not acknowledged, so starting an agent is refused — press R to read the terms, then y to record the acknowledgment"
                 .to_owned();
     }
 
@@ -2083,6 +2194,23 @@ impl App {
         match self.write_new_agent(&form) {
             Ok(name) => {
                 self.add_agent = None;
+                // A name reused after a removal must not carry the old agent's live
+                // state, failure note or observed record into the new agent. The disk
+                // boundary was written by `write_new_agent`; this clears what this
+                // session still held under the same name before the reload seeds the
+                // new agent from its own records.
+                self.supervisor.forget_state(&name);
+                self.supervisor.forget_last_error();
+                self.known_records.remove(&name);
+                self.forgotten_runs.retain(|agent| agent != &name);
+                self.unreadable_runs.retain(|(agent, _)| agent != &name);
+                if self
+                    .start_failure
+                    .as_ref()
+                    .is_some_and(|(agent, _)| agent == &name)
+                {
+                    self.start_failure = None;
+                }
                 self.reload();
                 // The status says "created `X`: write its instruction with e", and
                 // `e`/`s` act on the **selected** agent. The selection follows the
@@ -2118,7 +2246,34 @@ impl App {
         }
     }
 
-    /// Write `config.toml` and `credentials.toml` for a new agent.
+    /// The rejected name as it is quoted in a refusal.
+    ///
+    /// A name is at most 32 characters when accepted; an invalid one can be longer. The
+    /// quoted form keeps both ends of a longer value and marks the cut, so the refusal
+    /// names what was typed without filling the status line. Control characters are drawn
+    /// as `?` so a value cannot break the line it is quoted on.
+    fn quoted_name(name: &str) -> String {
+        let cleaned: String = name
+            .chars()
+            .map(|character| if character.is_control() { '?' } else { character })
+            .collect();
+        let characters: Vec<char> = cleaned.chars().collect();
+        if characters.len() <= crate::config::MAX_AGENT_NAME_LEN {
+            return cleaned;
+        }
+        let room = crate::config::MAX_AGENT_NAME_LEN.saturating_sub(1);
+        let head = room.div_ceil(2);
+        let tail = room - head;
+        format!(
+            "{}…{}",
+            characters[..head].iter().collect::<String>(),
+            characters[characters.len() - tail..]
+                .iter()
+                .collect::<String>()
+        )
+    }
+
+/// Write `config.toml` and `credentials.toml` for a new agent.
     ///
     /// The configuration is validated before it is written, so a file the product
     /// would refuse never reaches disk. A secret value is written but never returned or
@@ -2134,12 +2289,16 @@ impl App {
             return Err((Some(0), "the agent needs a name".to_owned()));
         }
         if let Some(problem) = crate::config::agent_name_problem(&name) {
-            // The reason comes first and the echoed value is not repeated: a very long
-            // name used to push the reason off the status area, leaving the user with
-            // their own typing and no word of what was wrong.
+            // Name the value that was refused, so the person can see what the rule is
+            // about, and keep the rule's own words. A value too long to quote in full
+            // is shortened with an ellipsis: the reason must still be readable on the
+            // status line rather than pushed off it.
             return Err((
                 Some(0),
-                format!("cannot use that name for an agent: {problem}"),
+                format!(
+                    "cannot use `{}` for an agent: it {problem}",
+                    Self::quoted_name(&name)
+                ),
             ));
         }
         if endpoint.is_empty() {
@@ -2172,6 +2331,27 @@ impl App {
                 ),
             ));
         };
+        // A name is a directory, not an identity. Before the new agent's
+        // configuration is written, record which run directories already exist under
+        // that name, so the new agent starts with no inherited state and the earlier
+        // records stay the earlier agent's. The note holds run ids only: no run
+        // record is created, read or rewritten.
+        let paths = self
+            .layout
+            .agent(&name)
+            .map_err(|error| (None, error.to_string()))?;
+        paths
+            .ensure_state_dir()
+            .map_err(|error| (None, error.to_string()))?;
+        crate::run::mark_existing_runs_previous(paths.state_dir()).map_err(|error| {
+            (
+                None,
+                format!(
+                    "the run records already under {} could not be set apart from the new agent, so nothing was written: {error}",
+                    paths.state_dir().display()
+                ),
+            )
+        })?;
         let url = if forgejo_url.is_empty() {
             existing.forgejo.url.clone()
         } else {
@@ -2500,19 +2680,38 @@ impl App {
     /// same one question rather than leaving in silence (C-1).
     fn ask_to_leave(&mut self, chord: &str) {
         let live = self.supervisor.running_count();
-        if live == 0 || self.confirm_quit.is_some() {
+        let waiting = self.supervisor.waiting_count();
+        if (live == 0 && waiting == 0) || self.confirm_quit.is_some() {
             self.should_quit = true;
             return;
         }
-        self.confirm_quit = Some(live);
-        // One run is `it`, not `them` (C-8).
-        let (noun, pronoun) = if live == 1 {
-            ("run", "it")
+        self.confirm_quit = Some(live + waiting);
+        // One run is `it`, not `them` (C-8). A start that is only waiting is a start,
+        // not a run: it is called off, not stopped, and it is named here because
+        // leaving ends it too.
+        let run_noun = if live == 1 { "run" } else { "runs" };
+        let run_pronoun = if live == 1 { "it" } else { "them" };
+        let waiting_noun = if waiting == 1 {
+            "waiting start"
         } else {
-            ("runs", "them")
+            "waiting starts"
+        };
+        let waiting_pronoun = if waiting == 1 { "it" } else { "them" };
+        let mut consequences: Vec<String> = Vec::new();
+        if live > 0 {
+            consequences.push(format!("stops the {live} {run_noun} this UI started"));
+        }
+        if waiting > 0 {
+            consequences.push(format!("calls off the {waiting} {waiting_noun}"));
+        }
+        let advice = match (live, waiting) {
+            (0, _) => format!("call {waiting_pronoun} off"),
+            (_, 0) => format!("stop {run_pronoun}"),
+            _ => format!("stop {run_pronoun} and call {waiting_pronoun} off"),
         };
         self.status = format!(
-            "leaving stops the {live} {noun} this UI started; press {chord} again to quit and stop {pronoun}, or any other key to stay"
+            "leaving {}; press {chord} again to quit and {advice}, or any other key to stay",
+            consequences.join(" and ")
         );
     }
 
@@ -2547,7 +2746,11 @@ impl App {
         }
         self.recent
             .iter()
-            .find(|run| run.agent == name && run.outcome == Some(RunOutcome::Failed))
+            .find(|run| {
+                run.agent == name
+                    && run.outcome == Some(RunOutcome::Failed)
+                    && self.run_is_current(run)
+            })
             .and_then(|run| run.reason.clone())
     }
 
@@ -2584,7 +2787,7 @@ impl App {
             _ => self
                 .recent
                 .iter()
-                .find(|run| run.agent == name)
+                .find(|run| run.agent == name && self.run_is_current(run))
                 .and_then(|run| match run.outcome {
                     Some(outcome) if !outcome.is_success() => {
                         run.reason.clone().map(|reason| (outcome, reason))
@@ -2650,18 +2853,42 @@ impl App {
         // agent's history says plainly that there is nothing to replace here, and a
         // configuration that cannot be read at all promises no route because it
         // cannot say which agents exist.
-        if drawn.contains("(bad_key)") {
+        if drawn.contains("(bad_key)") || drawn.contains("(server_error)") {
             match &self.config {
                 Some(_) if !self.agents().iter().any(|listed| listed.name == agent) => {
                     return format!(
-                        "{drawn} — the configuration no longer lists `{agent}`, so there is no model key to replace here"
+                        "the configuration no longer lists `{agent}`, so there is no start, model key or endpoint test here — {drawn}"
                     );
                 }
                 None => return drawn,
                 Some(_) => {}
             }
         }
-        bad_key_recovery(agent, &drawn)
+        failure_recovery(agent, &drawn)
+    }
+
+    /// A run record's reason, with the route that belongs to **that record's** agent.
+    ///
+    /// The Runs screen shows records of agents the configuration no longer lists, and
+    /// of earlier agents whose name has since been used again. A bad key or a server
+    /// error in such a record must not point at the current same-named agent: `s`,
+    /// `p` and `k` act on the selected configured agent, not on the record's own agent.
+    /// The record's own facts stay; the route it cannot follow is replaced by the way
+    /// to read that record.
+    pub fn reason_for_run(&self, run: &RunSummary, reason: &str) -> String {
+        if self.run_is_current(run) {
+            return self.reason_with_history(&run.agent, reason);
+        }
+        let text = crate::model::in_product_words(reason);
+        let listed = self.agents().iter().any(|agent| agent.name == run.agent);
+        let belongs_to = if listed {
+            "an earlier agent with that name"
+        } else {
+            "an agent the configuration no longer lists"
+        };
+        format!(
+            "this record belongs to {belongs_to}, so there is no start, key or endpoint-test route here — T and o on the Runs screen read its own history; {text}"
+        )
     }
 
     /// Why one agent's most recent *start* did not go well, when it never became a run.
@@ -2681,7 +2908,7 @@ impl App {
         if !self.ack_state.is_confirmed() {
             self.show_acknowledgment = true;
             self.status =
-                "refused: no agent may be started before the risk acknowledgment is confirmed"
+                "refused: no agent may be started before the risk acknowledgment is confirmed — read the terms and press y to record it"
                     .to_owned();
             return;
         }
@@ -3063,7 +3290,7 @@ impl App {
                     Ok(_) => "ok".to_owned(),
                     // A refused key names the product's own key-setting route on the
                     // line the refusal is drawn, not only in the help.
-                    Err(_) => bad_key_recovery(&agent, &describe_endpoint_result(&result)),
+                    Err(_) => failure_recovery(&agent, &describe_endpoint_result(&result)),
                 };
                 self.status = format!("endpoint test for `{agent}`: {short}");
                 let test = EndpointTest {
@@ -4076,7 +4303,7 @@ impl App {
         }
         self.recent
             .iter()
-            .find(|run| run.agent == name)
+            .find(|run| run.agent == name && self.run_is_current(run))
             .map(|run| run.dir.clone())
     }
 
@@ -4085,7 +4312,9 @@ impl App {
     /// A screen that must say *why* a file cannot be shown — gone, or present but
     /// unreadable — reads the run summary rather than the path alone (W38-1).
     pub fn latest_run(&self, name: &str) -> Option<&RunSummary> {
-        self.recent.iter().find(|run| run.agent == name)
+        self.recent
+            .iter()
+            .find(|run| run.agent == name && self.run_is_current(run))
     }
 
     /// The log file of the newest run of one agent, for a screen to name.
@@ -4462,10 +4691,17 @@ impl App {
         }
     }
 
-    /// Stop every run and report how many were stopped. Called before leaving.
-    pub fn shutdown(&mut self) -> usize {
-        self.supervisor
-            .stop_all(Duration::from_secs(STOP_ALL_BUDGET_SECS))
+    /// Stop every run, call off every waiting start, and report both counts.
+    ///
+    /// The waiting count is read before `stop_all` cancels the queue: the exit receipt
+    /// must name the starts it called off, not only the runs it stopped. A waiting
+    /// start writes no run record, before or after this.
+    pub fn shutdown(&mut self) -> ShutdownReport {
+        let called_off = self.supervisor.waiting_count();
+        let stopped = self
+            .supervisor
+            .stop_all(Duration::from_secs(STOP_ALL_BUDGET_SECS));
+        ShutdownReport { stopped, called_off }
     }
 
     /// Move a step along the tab bar.
@@ -4658,7 +4894,35 @@ impl App {
 
     /// Open the selected agent's configuration screen, or the add-agent form when the
     /// list is empty: `enter` must never be a silent dead end either.
+    ///
+    /// On Runs, `enter` is about the selected **run**, not the current Agents
+    /// selection. A current run opens its own agent; a record that belongs to an agent
+    /// the configuration no longer lists, or to an earlier agent with the same name,
+    /// names its history keys instead. It never falls back to whichever agent happens
+    /// to be selected on the hub.
     fn open_selected_agent(&mut self) {
+        if self.screen == Screen::Runs {
+            let Some(run) = self.selected_run().cloned() else {
+                self.status = "there is no run to open".to_owned();
+                return;
+            };
+            if !self.run_is_current(&run) {
+                let listed = self.agents().iter().any(|agent| agent.name == run.agent);
+                let belongs_to = if listed {
+                    "an earlier agent with that name"
+                } else {
+                    "an agent the configuration no longer lists"
+                };
+                self.status = format!(
+                    "run {} belongs to {belongs_to}, not to the configured `{}`; press T to read its transcript or o its log, or 1 to choose a configured agent",
+                    run.run_id, run.agent
+                );
+                return;
+            }
+            self.select_agent_named(&run.agent);
+            self.show(Screen::AgentConfig);
+            return;
+        }
         if self.selected_agent().is_some() {
             self.show(Screen::AgentConfig);
         } else if self.agents().is_empty() {
@@ -4806,8 +5070,25 @@ impl App {
             // reassurance — an unbound key used to answer `no key is bound to that`
             // and the product never said the run was still going (E-8).
             self.confirm_quit = None;
-            self.status =
-                "the run continues and this UI stays; q will ask again before leaving".to_owned();
+            let live = self.supervisor.running_count();
+            let waiting = self.supervisor.waiting_count();
+            self.status = match (live, waiting) {
+                (0, 0) => {
+                    "nothing is running or waiting, and this UI stays; q will ask again before leaving"
+                        .to_owned()
+                }
+                (0, _) => {
+                    "the waiting start continues and this UI stays; q will ask again before leaving"
+                        .to_owned()
+                }
+                (_, 0) => {
+                    "the run continues and this UI stays; q will ask again before leaving".to_owned()
+                }
+                (_, _) => {
+                    "the run and the waiting start continue and this UI stays; q will ask again before leaving"
+                        .to_owned()
+                }
+            };
             return;
         }
         if self.show_help {
@@ -7302,21 +7583,26 @@ concurrency = 3
     }
 
     #[test]
-    fn a_very_long_invalid_name_puts_the_reason_first_and_does_not_echo_it() {
-        // S-5: a long invalid name used to push the reason off the status area.
+    fn a_very_long_invalid_name_is_quoted_shortly_and_keeps_the_reason() {
+        // A long invalid name used to push the reason off the status area. The refusal
+        // now names the rejected value in a shortened quote, so both the value and the
+        // rule are readable.
         let root = scratch_root("app-long-name");
         std::fs::write(root.join("config.toml"), NO_AGENTS).expect("written");
-        let mut app =
-            App::with_runner(Layout::rooted_at(root), quiet_runner("app-long-name-runner"));
+        let mut app = App::with_runner(
+            Layout::rooted_at(root),
+            quiet_runner("app-long-name-runner"),
+        );
         app.show_acknowledgment = false;
         app.on_key(key(KeyCode::Char('n')));
         for _ in 0..200 {
             app.on_key(key(KeyCode::Char('a')));
         }
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert!(app.status.starts_with("cannot use that name"), "{}", app.status);
+        assert!(app.status.starts_with("cannot use `"), "{}", app.status);
+        assert!(app.status.contains('…'), "{}", app.status);
         assert!(app.status.contains("longer than 32"), "{}", app.status);
-        assert!(!app.status.contains("aaaa"), "{}", app.status);
+        assert!(app.status.chars().count() < 140, "{}", app.status);
     }
 
     /// w46 F1/w47 F2's enumeration: every refusal the add-agent form can show carries

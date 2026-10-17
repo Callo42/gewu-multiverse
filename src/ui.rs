@@ -280,6 +280,19 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             Style::new().fg(Color::Red),
         )));
     }
+    // C-3: the acknowledgment record is a fact a second person needs before anything
+    // else on this screen, so it is drawn near the top, where a short note area cannot
+    // hide it below the fold. A first user who answered the overlay never thinks about
+    // it again; the person who inherits the directory must be able to read what was
+    // agreed, when and under which version.
+    if !app.ack_confirmed() {
+        lines.push(Line::from(Span::styled(
+            "The risk of running an agent is not acknowledged: starting one is refused — press R to read the terms, then y to record the acknowledgment.",
+            Style::new().fg(Color::Yellow),
+        )));
+    } else if let Some(record) = app.ack_record_line() {
+        lines.push(Line::from(Span::styled(record, Style::new().fg(Color::DarkGray))));
+    }
     if let Some(note) = &app.config_note {
         lines.push(Line::from(Span::styled(
             note.clone(),
@@ -293,19 +306,6 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
              and the product writes both files for you.",
             Style::new().fg(Color::Yellow),
         )));
-    }
-    // C-3: the acknowledgment record is a fact a second person needs before anything
-    // else on this screen, so it is drawn near the top, where a short note area cannot
-    // hide it below the fold. A first user who answered the overlay never thinks about
-    // it again; the person who inherits the directory must be able to read what was
-    // agreed, when and under which version.
-    if !app.ack_confirmed() {
-        lines.push(Line::from(Span::styled(
-            "The risk of running an agent is not acknowledged: starting one is refused.",
-            Style::new().fg(Color::Yellow),
-        )));
-    } else if let Some(record) = app.ack_record_line() {
-        lines.push(Line::from(Span::styled(record, Style::new().fg(Color::DarkGray))));
     }
     // U3: a build older than the configuration's own data must say so, not run it
     // silently. Drawn high in the note area, above the standing prose.
@@ -1530,9 +1530,11 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
             };
             // R-5: a record whose agent the configuration no longer lists is marked
             // `*` in the two-character marker column, so the list and the count agree
-            // and its transcript and log stay reachable.
-            let unlisted = !app.agents().iter().any(|agent| agent.name == run.agent);
-            let marker = match (at == app.run_selected, unlisted) {
+            // and its transcript and log stay reachable. The same marker says a record
+            // predates the agent now configured under that name: a reused name is not
+            // an inherited history.
+            let earlier = !app.run_is_current(run);
+            let marker = match (at == app.run_selected, earlier) {
                 (true, true) => ">*",
                 (true, false) => "> ",
                 (false, true) => " *",
@@ -1605,36 +1607,46 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             footprint.records,
             crate::app::filesize_text(footprint.bytes)
         )));
-        if footprint.unconfigured_records > 0 {
+        let earlier_on_disk = app.earlier_records_on_disk();
+        let not_current = footprint.unconfigured_records + earlier_on_disk;
+        if not_current > 0 {
             // R-5: these records are now listed and marked, not only counted. W36-3:
-            // "the list above" is a window of the newest fifty, so an unconfigured
-            // record older than the window is *not* marked there — the sentence must
-            // not point at a row the list does not carry. The count and the marker's
-            // presence are stated separately, and the marker is named only for the
-            // records actually inside the window.
-            let total = footprint.unconfigured_records;
+            // "the list above" is a window of the newest fifty, so a record older than
+            // the window is *not* marked there — the sentence must not point at a row
+            // the list does not carry. The count and the marker's presence are stated
+            // separately, and the marker is named only for the records actually inside
+            // the window. A reused name is covered by the same rule: the record belongs
+            // to an earlier agent, not to the one configured now.
+            let total = not_current;
             let listed = app
                 .recent
                 .iter()
-                .filter(|run| !app.agents().iter().any(|agent| agent.name == run.agent))
+                .filter(|run| !app.run_is_current(run))
                 .count();
+            let belongs_to = "an agent the configuration no longer lists, or to an earlier agent with the same name";
             let noun = if total == 1 { "record belongs" } else { "records belong" };
             let text = if listed == 0 {
+                // Two logical rows: the count and the marker's absence are separate
+                // facts, and a wrapped line must not split the sentence that says the
+                // marker is not on this window's rows.
+                lines.push(Line::from(format!("{total} {noun} to {belongs_to}.")));
                 format!(
-                    "{total} {noun} to an agent the configuration no longer lists; none is among the newest {} listed above, so none carries the `*` marker here — they stay on disk until they are deleted.",
+                    "none is among the newest {} listed above, so none carries the `*` marker here — they stay on disk until they are deleted.",
                     app.recent.len()
                 )
             } else if listed == total {
                 if total == 1 {
-                    "1 record belongs to an agent the configuration no longer lists and is marked `*` in the list above; it stays on disk until it is deleted.".to_owned()
+                    format!(
+                        "1 record belongs to {belongs_to}, and is marked `*` in the list above; it stays on disk until it is deleted."
+                    )
                 } else {
                     format!(
-                        "{total} records belong to an agent the configuration no longer lists and are marked `*` in the list above; they stay on disk until they are deleted."
+                        "{total} records belong to {belongs_to}, and are marked `*` in the list above; they stay on disk until they are deleted."
                     )
                 }
             } else {
                 format!(
-                    "{total} {noun} to an agent the configuration no longer lists; the {listed} among the newest {} listed above are marked `*`, and the rest stay on disk until they are deleted.",
+                    "{total} {noun} to {belongs_to}; the {listed} among the newest {} listed above are marked `*`, and the rest stay on disk until they are deleted.",
                     app.recent.len()
                 )
             };
@@ -1682,7 +1694,7 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from(format!(
                 "outcome: {} — {}",
                 app.run_state_word(run),
-                app.reason_with_history(&run.agent, reason)
+                app.reason_for_run(run, reason)
             )));
         } else if let Some(error) = run.read_error.as_deref() {
             // C-2: the reason for an unreadable record is the read error, and it is
@@ -2886,7 +2898,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
     );
     let lines: Vec<Line> = HELP_LINES[first..first + shown]
         .iter()
-        .map(|line| Line::from(*line))
+        .map(|line| Line::from(help_line(app, line)))
         .collect();
     let title = if total > shown {
         format!(" keys {} ", list_title("", first, shown, total).trim())
@@ -2902,6 +2914,20 @@ fn draw_help(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: true }),
         popup,
     );
+}
+
+/// One help line, with the risk line matched to whether a record exists.
+///
+/// With no record, `R` opens the ordinary `y`/`n` modal, so the line must say how the
+/// acknowledgment is read and recorded. With a record, `R` only reviews it. The two
+/// states must not share the words `acknowledged terms again`, which are false when
+/// nothing has been acknowledged.
+fn help_line(app: &App, line: &str) -> String {
+    if line.starts_with("Risk:") && !app.ack_confirmed() {
+        return "Risk:      R reads the terms; y records the acknowledgment, and starting is refused until it is recorded"
+            .to_owned();
+    }
+    line.to_owned()
 }
 
 /// Every key the product binds, with one line of what it does.

@@ -149,6 +149,16 @@ pub const PLAN_FILE: &str = "plan.json";
 /// The log file's name.
 pub const LOG_FILE: &str = "run.log";
 
+/// The note, in an agent's state directory, that lists the run records which existed
+/// before the current agent was created under that name.
+///
+/// A run record names its agent by name. When an agent is removed and a new agent is
+/// created with the same name, the old records are still on disk but they are not the
+/// new agent's history. This note is the boundary: it holds run ids only, it is not a
+/// run record, and it never changes a record. An agent created before this note
+/// existed has no note, so its records stay its own as before.
+pub const PREVIOUS_RUNS_FILE: &str = "previous-runs";
+
 /// Parse a steps document: one shell command per line, comments and blanks skipped.
 pub fn parse_steps(text: &str) -> Vec<String> {
     text.lines()
@@ -354,6 +364,49 @@ pub fn unconfigured_agents(state_root: &Path, configured: &[String]) -> Vec<Stri
     }
     names.sort();
     names
+}
+
+/// The run ids the agent's state directory calls earlier agents' records.
+///
+/// The file holds one run id per line. Anything that is not a run id is ignored, so a
+/// hand-edited or partly written note cannot make a directory look like a run.
+pub fn previous_run_ids(state_dir: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(state_dir.join(PREVIOUS_RUNS_FILE)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| looks_like_run_id(line))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Write, beside an agent's state directory, the run records that predate this agent.
+///
+/// Called when an agent is created. Every run directory already under the name is
+/// added to the note, together with any ids the note already carries, so removing a
+/// record and creating the name again does not lose the boundary. No run record is
+/// read, rewritten or created; the note is the product's own small identity file.
+pub fn mark_existing_runs_previous(state_dir: &Path) -> io::Result<()> {
+    let mut ids = previous_run_ids(state_dir);
+    if let Ok(entries) = fs::read_dir(state_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(run_id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if path.is_dir() && looks_like_run_id(run_id) {
+                ids.push(run_id.to_owned());
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    let mut text = ids.join("\n");
+    if !ids.is_empty() {
+        text.push('\n');
+    }
+    crate::mode::write_private(state_dir.join(PREVIOUS_RUNS_FILE), text.as_bytes())
 }
 
 /// Every run recorded for one agent, in no particular order.
