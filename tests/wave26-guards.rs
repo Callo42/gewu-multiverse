@@ -14,7 +14,7 @@
 //! private return value.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -109,6 +109,56 @@ fn quiet_runner() -> PathBuf {
     fs::write(&path, "#!/bin/sh\nexit 0\n").expect("the runner is written");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("runnable");
     path
+}
+
+/// Owns the app so any exit, including a panic, still stops what the test started.
+///
+/// The supervisor does not stop its children when it is dropped, so a failing
+/// assertion before the test's final `shutdown()` would leave the gated shell
+/// alive. The guard shuts the app down on drop and then releases both gates, so
+/// the child has a second way out even if its first stop never returned. It is
+/// dereferenced as the app, so the test reads like the others.
+struct OwnedApp {
+    app: Option<App>,
+    gate: PathBuf,
+}
+
+impl OwnedApp {
+    fn new(app: App, gate: PathBuf) -> Self {
+        Self {
+            app: Some(app),
+            gate,
+        }
+    }
+}
+
+impl std::ops::Deref for OwnedApp {
+    type Target = App;
+
+    fn deref(&self) -> &App {
+        self.app
+            .as_ref()
+            .expect("the app is held until the guard drops")
+    }
+}
+
+impl std::ops::DerefMut for OwnedApp {
+    fn deref_mut(&mut self) -> &mut App {
+        self.app
+            .as_mut()
+            .expect("the app is held until the guard drops")
+    }
+}
+
+impl Drop for OwnedApp {
+    fn drop(&mut self) {
+        if let Some(app) = self.app.as_mut() {
+            app.shutdown();
+        }
+        for name in ["one-go", "two-go"] {
+            let _ = fs::write(self.gate.join(name), b"released\n");
+        }
+    }
 }
 
 /// A runner held open by the test, so a second start queues behind the first.
@@ -381,13 +431,134 @@ fn a_reused_name_does_not_inherit_state_or_history() {
     );
 }
 
+/// 2b. A refused add writes no creation boundary, so a later hand re-add of the old
+///     agent still owns its earlier records.
+#[test]
+fn a_failed_add_leaves_no_earlier_runs_boundary() {
+    let root = scratch("failed-add");
+    let readonly = root.with_extension("readonly.toml");
+    fs::write(&readonly, TWO_ONLY).expect("the read-only configuration target");
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o444))
+        .expect("the target is read-only");
+    // The product can read the configuration through the symlink, and its own
+    // private-tree pass skips symlinks, so the add form's write is the failing step.
+    symlink(&readonly, root.join("config.toml")).expect("the configuration symlink");
+
+    let mut app = App::with_runner(Layout::rooted_at(root.clone()), quiet_runner());
+    app.show_acknowledgment = false;
+    confirm_risk(&root, &mut app);
+    write_run(
+        app.state_root(),
+        "gone",
+        "run-100-0001-1",
+        RunOutcome::Succeeded,
+        None,
+    );
+    app.reload();
+    let boundary = app.state_root().join("gone").join("previous-runs");
+    assert!(!boundary.exists(), "the fixture starts with no boundary");
+
+    fill_form(
+        &mut app,
+        [
+            "gone",
+            "https://model.example.org/v1",
+            "example-model",
+            "gw-fixture-key",
+            "",
+            "",
+        ],
+    );
+    app.on_key(ctrl_s());
+    assert!(
+        app.adding_agent(),
+        "the add form closed although the configuration was not written"
+    );
+    assert!(
+        app.status.contains("config.toml cannot be written"),
+        "the refused add gives no write failure: {}",
+        app.status
+    );
+    assert!(
+        !boundary.exists(),
+        "a refused add left a `previous-runs` boundary under the name"
+    );
+    app.on_key(key(KeyCode::Esc));
+
+    // Put the old agent back by hand, the path where no creation event runs. The
+    // failed add must not have classified the agent's own record as an earlier
+    // agent's.
+    let readded = format!(
+        "{TWO_ONLY}\n[[agents]]\nname = \"gone\"\nmodel = \"example-model\"\nendpoint = \"https://model.example.org/v1\"\ninstruction = \"agents/gone/instruction.md\"\nconcurrency = 1\n"
+    );
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o600))
+        .expect("the target is writable again");
+    fs::write(&readonly, readded).expect("the old agent is hand-readded");
+    app.reload();
+    assert_eq!(
+        app.supervisor.state("gone").word_with_reason(),
+        "succeeded",
+        "the old agent's own record was presented as an earlier agent's"
+    );
+    assert!(
+        !boundary.exists(),
+        "the hand re-add found a boundary written by the refused add"
+    );
+
+    // The same name can still be created through the product. That successful add
+    // must write the boundary for the record that is still there, so the new agent
+    // starts idle and the old record stays the earlier agent's. If no boundary were
+    // written, the new agent would inherit the old record's `succeeded` here.
+    app.selected = app
+        .agents()
+        .iter()
+        .position(|agent| agent.name == "gone")
+        .expect("the hand-readded agent is selectable");
+    app.on_key(key(KeyCode::Char('d')));
+    app.on_key(key(KeyCode::Char('y')));
+    assert!(
+        !app.agents().iter().any(|agent| agent.name == "gone"),
+        "the hand-readded agent was not removed: {}",
+        app.status
+    );
+    fill_form(
+        &mut app,
+        [
+            "gone",
+            "https://model.example.org/v2",
+            "example-model-v2",
+            "gw-fixture-key-new",
+            "",
+            "",
+        ],
+    );
+    app.on_key(ctrl_s());
+    assert!(
+        app.agents().iter().any(|agent| agent.name == "gone"),
+        "the same name could not be created again: {}",
+        app.status
+    );
+    assert_eq!(
+        app.supervisor.state("gone").word_with_reason(),
+        "idle",
+        "a successful add under the old name inherited the old run state"
+    );
+    let note = fs::read_to_string(&boundary).expect("the successful add writes the boundary");
+    assert!(
+        note.contains("run-100-0001-1"),
+        "the successful add's boundary does not name the earlier run: {note:?}"
+    );
+}
+
 /// 3. Leaving with one run in flight and one start waiting names both, and the exit
 ///    path still calls the waiting start off without writing a run record for it.
 #[test]
 fn leaving_with_a_waiting_start_names_it_in_the_warning() {
     let root = scratch("waiting-quit");
     let (runner, gate) = gated_runner();
-    let mut app = app_with_runner(&root, ONE_SLOT, runner);
+    // The guard stops the app on any exit; a failed warning assertion must not leave
+    // the gated runner waiting for a gate that the test will never touch.
+    let mut app = OwnedApp::new(app_with_runner(&root, ONE_SLOT, runner), gate.clone());
     for name in ["one", "two"] {
         let paths = app.ensure_agent(name).expect("the agent is prepared");
         fs::write(paths.instruction(), format!("do something for {name}\n"))
@@ -471,12 +642,44 @@ fn enter_on_a_run_never_opens_a_different_agent() {
         Screen::Runs,
         "enter on a removed agent's run left Runs for another agent"
     );
-    assert!(
-        app.status.contains("`one`")
-            && app.status.contains("press T")
-            && app.status.contains("or o its log"),
-        "enter on a removed agent's run names no route to its history: {}",
-        app.status
+    // The whole sentence, not shared substrings: a removed name is not configured,
+    // so a "not to the configured" contrast would be false here.
+    assert_eq!(
+        app.status,
+        "run run-100-0001-1 belongs to an agent the configuration no longer lists; press T to read its transcript or o its log, or 1 to choose a configured agent",
+        "enter on a removed agent's run gives the wrong sentence"
+    );
+
+    // The same contrast is true when the configuration does list the name and the
+    // record predates the agent now under it.
+    let root = scratch("earlier-run-enter");
+    let root = &root;
+    let mut app = app_with(root, GONE_AND_KEEP);
+    write_run(
+        app.state_root(),
+        "gone",
+        "run-300-0001-1",
+        RunOutcome::Succeeded,
+        None,
+    );
+    fs::write(
+        app.state_root().join("gone").join("previous-runs"),
+        "run-300-0001-1\n",
+    )
+    .expect("the creation boundary is written");
+    app.reload();
+    app.show(Screen::Runs);
+    app.run_selected = app
+        .recent
+        .iter()
+        .position(|run| run.agent == "gone" && run.run_id == "run-300-0001-1")
+        .expect("the earlier run is listed");
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::Runs);
+    assert_eq!(
+        app.status,
+        "run run-300-0001-1 belongs to an earlier agent with that name, not to the configured `gone`; press T to read its transcript or o its log, or 1 to choose a configured agent",
+        "enter on an earlier agent's run gives the wrong sentence"
     );
 
     // A configured run opens the run's own agent even when the Agents selection is

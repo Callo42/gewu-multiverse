@@ -381,32 +381,61 @@ pub fn previous_run_ids(state_dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Write, beside an agent's state directory, the run records that predate this agent.
+/// The note a new agent's creation would write, read from the state directory.
 ///
-/// Called when an agent is created. Every run directory already under the name is
-/// added to the note, together with any ids the note already carries, so removing a
-/// record and creating the name again does not lose the boundary. No run record is
-/// read, rewritten or created; the note is the product's own small identity file.
-pub fn mark_existing_runs_previous(state_dir: &Path) -> io::Result<()> {
+/// Every run directory already under the name is added to the note, together with
+/// any ids the note already carries, so removing a record and creating the name
+/// again does not lose the boundary. No run record is read, rewritten or created;
+/// the note is the product's own small identity file. `None` means there is nothing
+/// to record: the name has no earlier run records and no note yet.
+///
+/// This only reads. The caller writes the returned note after the new agent's
+/// configuration and key are saved, so a refused add leaves no boundary behind.
+pub fn previous_runs_note(state_dir: &Path) -> io::Result<Option<String>> {
     let mut ids = previous_run_ids(state_dir);
-    if let Ok(entries) = fs::read_dir(state_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(run_id) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            if path.is_dir() && looks_like_run_id(run_id) {
-                ids.push(run_id.to_owned());
-            }
+    let entries = match fs::read_dir(state_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(run_id) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() && looks_like_run_id(run_id) {
+            ids.push(run_id.to_owned());
         }
     }
     ids.sort();
     ids.dedup();
-    let mut text = ids.join("\n");
-    if !ids.is_empty() {
-        text.push('\n');
+    if ids.is_empty() {
+        return Ok(None);
     }
-    crate::mode::write_private(state_dir.join(PREVIOUS_RUNS_FILE), text.as_bytes())
+    Ok(Some(format!("{}\n", ids.join("\n"))))
+}
+
+/// Write the creation boundary in one step, so it is never left half-written.
+///
+/// The note replaces an older note only after the complete new text is on disk: the
+/// text goes to a temporary file beside it and is renamed into place. A failure
+/// before the rename leaves the old note exactly as it was.
+pub fn write_previous_runs(state_dir: &Path, text: &str) -> io::Result<()> {
+    let path = state_dir.join(PREVIOUS_RUNS_FILE);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let temporary = state_dir.join(format!(
+        ".{PREVIOUS_RUNS_FILE}.tmp-{}-{nanos}",
+        std::process::id()
+    ));
+    crate::mode::write_private(&temporary, text.as_bytes())?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Every run recorded for one agent, in no particular order.

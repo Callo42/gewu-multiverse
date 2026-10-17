@@ -2273,11 +2273,36 @@ impl App {
         )
     }
 
-/// Write `config.toml` and `credentials.toml` for a new agent.
+    /// Put a file back the way it was before a failed add.
+    ///
+    /// The add writes the configuration, then the credentials, then the boundary
+    /// note. If a later step fails, the earlier files are restored from the bytes
+    /// read before the first write, so a refused add does not leave half a new agent
+    /// on disk. A path that did not exist before is removed only when it is a plain
+    /// file; a path that was already a symlink or a directory is never deleted.
+    fn restore_file(path: &Path, before: Option<&[u8]>, existed: bool) -> bool {
+        match before {
+            Some(bytes) => crate::mode::write_private(path, bytes).is_ok(),
+            // A file that did not exist before can be removed. A file that existed
+            // but could not be read cannot be restored: leave it alone and say so.
+            None if !existed => match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    std::fs::remove_file(path).is_ok()
+                }
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Write `config.toml` and `credentials.toml` for a new agent.
     ///
     /// The configuration is validated before it is written, so a file the product
     /// would refuse never reaches disk. A secret value is written but never returned or
-    /// shown.
+    /// shown. The creation boundary note is written last: if the configuration or the
+    /// key cannot be saved, no boundary is left under the name.
     fn write_new_agent(&self, form: &NewAgentForm) -> Result<String, (Option<usize>, String)> {
         let name = form.fields[0].trim().to_owned();
         let endpoint = form.fields[1].trim().to_owned();
@@ -2331,11 +2356,10 @@ impl App {
                 ),
             ));
         };
-        // A name is a directory, not an identity. Before the new agent's
-        // configuration is written, record which run directories already exist under
-        // that name, so the new agent starts with no inherited state and the earlier
-        // records stay the earlier agent's. The note holds run ids only: no run
-        // record is created, read or rewritten.
+        // A name is a directory, not an identity. Read which run directories already
+        // exist under that name, so the new agent starts with no inherited state and
+        // the earlier records stay the earlier agent's. The note holds run ids only:
+        // no run record is created, read or rewritten.
         let paths = self
             .layout
             .agent(&name)
@@ -2343,11 +2367,11 @@ impl App {
         paths
             .ensure_state_dir()
             .map_err(|error| (None, error.to_string()))?;
-        crate::run::mark_existing_runs_previous(paths.state_dir()).map_err(|error| {
+        let previous_runs = crate::run::previous_runs_note(paths.state_dir()).map_err(|error| {
             (
                 None,
                 format!(
-                    "the run records already under {} could not be set apart from the new agent, so nothing was written: {error}",
+                    "the run records already under {} could not be read, so nothing was written: {error}",
                     paths.state_dir().display()
                 ),
             )
@@ -2359,19 +2383,76 @@ impl App {
         };
         let text = render_config(&existing, &url, &name, &endpoint, &model);
         Config::from_text(&self.config_path(), &text).map_err(|error| (None, error.to_string()))?;
-        crate::mode::write_private(self.config_path(), text.as_bytes()).map_err(|error| {
-            (
+        // The three writes are one add. The configuration and key are written first
+        // and the boundary note last; if a later write fails, the earlier ones are
+        // put back, so a refused add leaves neither an agent nor a boundary.
+        let config_existed = self.config_path().exists();
+        let credentials_existed = self.credentials_path.exists();
+        let config_before = std::fs::read(self.config_path()).ok();
+        let credentials_before = std::fs::read(&self.credentials_path).ok();
+        if let Err(error) = crate::mode::write_private(self.config_path(), text.as_bytes()) {
+            Self::restore_file(
+                &self.config_path(),
+                config_before.as_deref(),
+                config_existed,
+            );
+            return Err((
                 None,
-                format!("{} cannot be written: {error}", self.config_path().display()),
-            )
-        })?;
-        credentials::record_form_secrets(
+                format!(
+                    "{} cannot be written: {error}",
+                    self.config_path().display()
+                ),
+            ));
+        }
+        if let Err(error) = credentials::record_form_secrets(
             &self.credentials_path,
             &name,
             (!model_key.is_empty()).then_some(model_key.as_str()),
             (!forgejo_token.is_empty()).then_some(forgejo_token.as_str()),
-        )
-        .map_err(|error| (None, error.to_string()))?;
+        ) {
+            let config_restored = Self::restore_file(
+                &self.config_path(),
+                config_before.as_deref(),
+                config_existed,
+            );
+            let credentials_restored = Self::restore_file(
+                &self.credentials_path,
+                credentials_before.as_deref(),
+                credentials_existed,
+            );
+            let outcome = if config_restored && credentials_restored {
+                "the agent was not added"
+            } else {
+                "the agent was not added, but the files could not be fully restored"
+            };
+            return Err((None, format!("{outcome}: {error}")));
+        }
+        if let Some(note) = previous_runs {
+            if let Err(error) = crate::run::write_previous_runs(paths.state_dir(), &note) {
+                let config_restored = Self::restore_file(
+                    &self.config_path(),
+                    config_before.as_deref(),
+                    config_existed,
+                );
+                let credentials_restored = Self::restore_file(
+                    &self.credentials_path,
+                    credentials_before.as_deref(),
+                    credentials_existed,
+                );
+                let outcome = if config_restored && credentials_restored {
+                    "the agent was not added"
+                } else {
+                    "the agent was not added, but the files could not be fully restored"
+                };
+                return Err((
+                    None,
+                    format!(
+                        "the run records already under {} could not be set apart from the new agent: {error}; {outcome}",
+                        paths.state_dir().display()
+                    ),
+                ));
+            }
+        }
         Ok(name)
     }
 
@@ -4908,14 +4989,22 @@ impl App {
             };
             if !self.run_is_current(&run) {
                 let listed = self.agents().iter().any(|agent| agent.name == run.agent);
+                // The `not to the configured …` clause is a contrast with a name the
+                // configuration lists. A record of a removed agent has no configured
+                // name to contrast with, so it gets the unlisted sentence alone.
+                let configured = if listed {
+                    format!(", not to the configured `{}`", run.agent)
+                } else {
+                    String::new()
+                };
                 let belongs_to = if listed {
                     "an earlier agent with that name"
                 } else {
                     "an agent the configuration no longer lists"
                 };
                 self.status = format!(
-                    "run {} belongs to {belongs_to}, not to the configured `{}`; press T to read its transcript or o its log, or 1 to choose a configured agent",
-                    run.run_id, run.agent
+                    "run {} belongs to {belongs_to}{configured}; press T to read its transcript or o its log, or 1 to choose a configured agent",
+                    run.run_id
                 );
                 return;
             }
