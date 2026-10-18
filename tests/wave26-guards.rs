@@ -594,9 +594,19 @@ fn leaving_with_a_waiting_start_names_it_in_the_warning() {
         "the leave warning lost the running run: {}",
         app.status
     );
+    assert!(
+        app.status.contains("`two`"),
+        "the leave warning names only a count, not the waiting agent: {}",
+        app.status
+    );
 
     app.on_key(key(KeyCode::Char('q')));
-    app.shutdown();
+    let report = app.shutdown();
+    let receipt = report.describe().unwrap_or_default();
+    assert!(
+        receipt.contains("`two`"),
+        "the receipt names only a count, not the waiting agent: {receipt}"
+    );
     assert!(matches!(
         app.supervisor.state("two"),
         gewu_multiverse::supervisor::State::CalledOff { .. }

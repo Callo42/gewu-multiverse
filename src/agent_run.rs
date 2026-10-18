@@ -405,12 +405,23 @@ fn run_declared_step(
         )));
     }
     if outcome.signal.is_some() || outcome.exit_code != Some(0) {
+        // A failure that says only `declared step 1 exit 128` hides the command, the
+        // directory and git's own `fatal:` line behind `o`. Put all three in the
+        // reason the note area draws (w52 F3).
+        let excerpt = outcome.excerpt.trim();
+        let output = if excerpt.is_empty() {
+            "no output".to_owned()
+        } else {
+            crate::model::excerpt(excerpt, 400)
+        };
         return Err(RunEnd {
             exit_code: outcome
                 .exit_code
                 .filter(|code| (1..=125).contains(code))
                 .unwrap_or(1),
-            reason: Some(format!("declared step {index} {end}")),
+            reason: Some(format!(
+                "declared step {index} {end} — command `{command}` in {workspace} — output: {output}"
+            )),
         });
     }
     Ok(())
@@ -530,7 +541,23 @@ fn model_loop(
         )) {
             return RunEnd::failed(format!("the transcript cannot be written: {error}"));
         }
-        log.line(&format!("[turn {turn}] the model {}", reply.summary()));
+        // The final reply is shown in full, as text, in the log; the raw body stays in
+        // the transcript. An 80-byte excerpt of the one thing the person came for is
+        // not a result view (w52 F1). Usage, when the endpoint reports it, is a line
+        // of its own so the text below is untouched.
+        match reply.content.as_deref().filter(|text| !text.trim().is_empty()) {
+            Some(text) => {
+                log.line(&format!("[turn {turn}] the model replied:"));
+                log.block(&format!("{text}\n"));
+                if let Some(usage) = reply.usage {
+                    log.line(&format!(
+                        "[turn {turn}] {} used",
+                        words::counted(usage.total_tokens as usize, "token", "tokens")
+                    ));
+                }
+            }
+            None => log.line(&format!("[turn {turn}] the model {}", reply.summary())),
+        }
 
         messages.push(Message::assistant(
             reply.content.clone(),

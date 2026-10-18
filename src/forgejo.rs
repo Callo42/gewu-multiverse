@@ -222,6 +222,17 @@ impl RoleCheck {
     /// The role comes first, so a narrow footer clips the counts rather than the word
     /// that says which view this is.
     pub fn summary(&self) -> String {
+        self.summary_with_admin(true)
+    }
+
+    /// The same summary, knowing whether an administrator token exists.
+    ///
+    /// A successful check with an ordinary role token can reveal that the token
+    /// belongs to an administrator. Naming `C` is only true when an administrator
+    /// token is configured; without one the product says what the token is and names
+    /// the route that can supply it (`A`/the add form), instead of a dead key
+    /// (w53 F8).
+    pub fn summary_with_admin(&self, admin_token_present: bool) -> String {
         // The word for the view leads, so a narrow footer clips the counts rather than
         // the word that says which view this is; the counts are compact so the checked
         // panel still gives the repository list more than one row at 80×24 even when
@@ -240,12 +251,19 @@ impl RoleCheck {
         // The label comes from the configured role, but the token may belong to an
         // administrator. Saying only "ordinary member" beside an administrator's name
         // is a contradiction the user cannot resolve; say what the token actually is
-        // and name the key that shows the other view (W-8).
+        // and name the key that shows the other view only when that key can work.
         if self.viewer.is_admin && !self.administrative() {
-            text.push_str(&format!(
-                "; `{}` is an administrator — press C for that view",
-                self.viewer.login
-            ));
+            if admin_token_present {
+                text.push_str(&format!(
+                    "; `{}` is an administrator — press C for that view",
+                    self.viewer.login
+                ));
+            } else {
+                text.push_str(&format!(
+                    "; `{}` is an administrator — press A on the Credentials screen to add that token for the administrative view",
+                    self.viewer.login
+                ));
+            }
         }
         text
     }

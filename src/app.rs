@@ -150,8 +150,8 @@ pub struct FormRefusal {
 /// never drawn as their value: `ui` masks them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAgentForm {
-    /// name, endpoint, model, model key, Forgejo URL, Forgejo role token.
-    pub fields: [String; 6],
+    /// name, endpoint, model, model key, Forgejo URL, Forgejo role token, token role.
+    pub fields: [String; 7],
     /// Which field the next key types into.
     pub cursor: usize,
     /// Why the last attempt to create the agent did not work, and the field it names.
@@ -160,13 +160,14 @@ pub struct NewAgentForm {
 
 impl NewAgentForm {
     /// The field labels, in order, and whether a field holds a secret.
-    pub const FIELDS: [(&'static str, bool); 6] = [
+    pub const FIELDS: [(&'static str, bool); 7] = [
         ("agent name", false),
         ("model endpoint", false),
         ("model id", false),
         ("model key", true),
         ("Forgejo URL", false),
-        ("Forgejo role token", true),
+        ("Forgejo token", true),
+        ("token role (member/admin)", false),
     ];
 
     /// A blank form, ready at the first field.
@@ -387,10 +388,16 @@ pub struct EndpointFailure {
 
 impl EndpointTest {
     /// One line for the status bar and the agent screen.
+    ///
+    /// The endpoint, the model and the time are all part of the result: a bare `ok`
+    /// cannot tell a person which address answered or whether the answer is current
+    /// (w52 F9).
     pub fn describe(&self) -> String {
         format!(
-            "{} — tested {}",
+            "{} — endpoint {} — model {} — tested {}",
             failure_recovery(&self.agent, &describe_endpoint_result(&self.result)),
+            self.endpoint,
+            self.model,
             tested_age(self.tested_at_ms)
         )
     }
@@ -748,7 +755,7 @@ impl ProbeWhat {
     /// The in-flight sentence for this check, naming the machine when it is known.
     pub fn in_flight(&self, machine: Option<&str>) -> String {
         let here = match machine {
-            Some(mark) => format!(" on {mark}"),
+            Some(_) => " on this machine".to_owned(),
             None => String::new(),
         };
         match self {
@@ -909,6 +916,14 @@ fn failure_recovery(agent: &str, reason: &str) -> String {
             "press 1 and use up/down to select `{agent}`, then press s to try again or p to test the endpoint — {reason}"
         );
     }
+    if reason.contains("(transport)") || reason.contains("(bad_url)") {
+        // The reason names the endpoint URL. The address is the thing to correct; the
+        // product's own route is to remove and re-add the agent with the right one,
+        // or to fix the configuration and re-read it.
+        return format!(
+            "{reason} — check the endpoint address; press 1 and use up/down to select `{agent}`, then d to remove it and n to add it again with the right address, or fix the configuration and press r"
+        );
+    }
     reason.to_owned()
 }
 
@@ -935,12 +950,14 @@ fn run_ended_sentence(
 ///
 /// A `tui` run is stopped; a start that never occupied a slot is called off. Both are
 /// work this UI had in flight, and the receipt names both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShutdownReport {
     /// Runs that were running and were stopped.
     pub stopped: usize,
     /// Starts that were waiting for a slot when the UI left.
     pub called_off: usize,
+    /// The agents whose waiting starts were called off, so the receipt names them.
+    pub waiting_agents: Vec<String>,
 }
 
 impl ShutdownReport {
@@ -954,10 +971,25 @@ impl ShutdownReport {
             ));
         }
         if self.called_off > 0 {
-            parts.push(format!(
-                "called off {}",
-                words::counted(self.called_off, "waiting start", "waiting starts")
-            ));
+            let named = self
+                .waiting_agents
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if named.is_empty() {
+                parts.push(format!(
+                    "called off {}",
+                    words::counted(self.called_off, "waiting start", "waiting starts")
+                ));
+            } else if self.called_off == 1 {
+                parts.push(format!("called off the waiting start of {named}"));
+            } else {
+                parts.push(format!(
+                    "called off the {} waiting starts of {named}",
+                    self.called_off
+                ));
+            }
         }
         if parts.is_empty() {
             None
@@ -2310,6 +2342,7 @@ impl App {
         let model_key = form.fields[3].trim().to_owned();
         let forgejo_url = form.fields[4].trim().to_owned();
         let forgejo_token = form.fields[5].trim().to_owned();
+        let token_role = form.fields[6].trim().to_ascii_lowercase();
         if name.is_empty() {
             return Err((Some(0), "the agent needs a name".to_owned()));
         }
@@ -2381,7 +2414,24 @@ impl App {
         } else {
             forgejo_url
         };
-        let text = render_config(&existing, &url, &name, &endpoint, &model);
+        // The form asks which role the supplied token is. An administrator token is
+        // stored once, under both names, so the product never asks for the same token
+        // again with `A` (w53 F9). A blank answer preserves the configured role.
+        let role = match token_role.as_str() {
+            "" => existing.forgejo.role,
+            "member" => crate::config::Role::Member,
+            "admin" => crate::config::Role::Admin,
+            _ => {
+                return Err((
+                    Some(6),
+                    "the Forgejo token role is `member` or `admin`; leave it blank to keep the configured role"
+                        .to_owned(),
+                ));
+            }
+        };
+        let admin_token = (role == crate::config::Role::Admin && !forgejo_token.is_empty())
+            .then_some(forgejo_token.as_str());
+        let text = render_config(&existing, &url, &name, &endpoint, &model, role);
         Config::from_text(&self.config_path(), &text).map_err(|error| (None, error.to_string()))?;
         // The three writes are one add. The configuration and key are written first
         // and the boundary note last; if a later write fails, the earlier ones are
@@ -2409,6 +2459,7 @@ impl App {
             &name,
             (!model_key.is_empty()).then_some(model_key.as_str()),
             (!forgejo_token.is_empty()).then_some(forgejo_token.as_str()),
+            admin_token,
         ) {
             let config_restored = Self::restore_file(
                 &self.config_path(),
@@ -2783,7 +2834,19 @@ impl App {
             consequences.push(format!("stops the {live} {run_noun} this UI started"));
         }
         if waiting > 0 {
-            consequences.push(format!("calls off the {waiting} {waiting_noun}"));
+            let waiting_agents = self.supervisor.waiting_agents();
+            let named = waiting_agents
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if named.is_empty() {
+                consequences.push(format!("calls off the {waiting} {waiting_noun}"));
+            } else if waiting == 1 {
+                consequences.push(format!("calls off the waiting start of {named}"));
+            } else {
+                consequences.push(format!("calls off the {waiting} waiting starts of {named}"));
+            }
         }
         let advice = match (live, waiting) {
             (0, _) => format!("call {waiting_pronoun} off"),
@@ -3373,7 +3436,11 @@ impl App {
                     // line the refusal is drawn, not only in the help.
                     Err(_) => failure_recovery(&agent, &describe_endpoint_result(&result)),
                 };
-                self.status = format!("endpoint test for `{agent}`: {short}");
+                // The result itself carries the endpoint, model and time, so a person
+                // can tell which address answered and whether the answer is current.
+                self.status = format!(
+                    "endpoint test for `{agent}`: {short} — endpoint {endpoint} — model {model} — tested just now"
+                );
                 let test = EndpointTest {
                     agent,
                     endpoint,
@@ -3428,9 +3495,13 @@ impl App {
             }
         };
         Some(match &machine {
-            Some(mark) => format!("checked {} on {mark}", tested_age(at)),
+            Some(mark) => format!(
+                "checked {} on {}",
+                tested_age(at),
+                crate::machine::label(Some(mark))
+            ),
             None => format!(
-                "checked {}; this machine's own name cannot be read",
+                "checked {}; the record does not name the machine",
                 tested_age(at)
             ),
         })
@@ -3460,7 +3531,10 @@ impl App {
         self.role_checked_at_ms = Some(at);
         self.role_check_machine = mark.clone();
         self.status = match &result {
-            Ok(check) => format!("role check: {}", check.summary()),
+            Ok(check) => format!(
+                "role check: {}",
+                check.summary_with_admin(self.forgejo_tokens_present().1)
+            ),
             // The configured URL leads the refusal: a mistyped path is the common
             // cause, and the API path alone does not connect the failure to what the
             // user typed (P-7).
@@ -3477,7 +3551,10 @@ impl App {
     /// Apply the administrator role check's result, keeping the last good view.
     fn apply_admin_role_check(&mut self, result: Result<RoleCheck, ForgejoFailure>) {
         self.status = match &result {
-            Ok(check) => format!("role check (administrator token): {}", check.summary()),
+            Ok(check) => format!(
+                "role check (administrator token): {}",
+                check.summary_with_admin(true)
+            ),
             Err(failure) => format!(
                 "role check with the administrator token failed ({}): {}",
                 failure.class, failure.message
@@ -4561,6 +4638,28 @@ impl App {
         }
     }
 
+    /// A read-only preview of the instruction a run sends, line by line.
+    ///
+    /// The Instruction screen draws this without opening the editor, so a returning
+    /// user can read what the agent was told. A file that is absent or unreadable has
+    /// no preview; the screen's own three-case sentence already says why.
+    pub fn instruction_preview(&self) -> Option<Vec<String>> {
+        let paths = self.selected_paths()?;
+        let bytes = std::fs::read(paths.instruction()).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        Some(text.lines().map(str::to_owned).collect())
+    }
+
+    /// The declared steps commands, for the Instruction screen's read-only preview.
+    pub fn steps_commands(&self) -> Vec<String> {
+        let Some(paths) = self.selected_paths() else {
+            return Vec::new();
+        };
+        std::fs::read_to_string(paths.steps_file())
+            .map(|text| crate::run::parse_steps(&text))
+            .unwrap_or_default()
+    }
+
     /// The instruction's size on disk, the size a run sends, and whether the difference
     /// is the product's guidance line.
     ///
@@ -4778,11 +4877,16 @@ impl App {
     /// must name the starts it called off, not only the runs it stopped. A waiting
     /// start writes no run record, before or after this.
     pub fn shutdown(&mut self) -> ShutdownReport {
-        let called_off = self.supervisor.waiting_count();
+        let waiting_agents = self.supervisor.waiting_agents();
+        let called_off = waiting_agents.len();
         let stopped = self
             .supervisor
             .stop_all(Duration::from_secs(STOP_ALL_BUDGET_SECS));
-        ShutdownReport { stopped, called_off }
+        ShutdownReport {
+            stopped,
+            called_off,
+            waiting_agents,
+        }
     }
 
     /// Move a step along the tab bar.
@@ -4836,7 +4940,7 @@ impl App {
         let total = crate::ui::panel_total_lines(self);
         if total == 0 {
             self.status =
-                "this screen's content is a list: up/down move it, and the panel below is declared — enlarge the window to read it"
+                "this screen's content is a list: up/down move it, and the panel below is declared — press ] to reach it"
                     .to_owned();
             return;
         }
@@ -4861,7 +4965,7 @@ impl App {
         let total = crate::ui::panel_total_lines(self);
         if total == 0 {
             self.status =
-                "this screen's content is a list: up/down move it, and the panel below is declared — enlarge the window to read it"
+                "this screen's content is a list: up/down move it, and the panel below is declared — press ] to reach it"
                     .to_owned();
             return;
         }
@@ -5510,9 +5614,17 @@ const STOP_ALL_BUDGET_SECS: u64 = 10;
 ///
 /// The configuration has no comments of its own to keep once the tool writes it; the
 /// file it produces is valid, checked by the caller, and holds no secret.
-fn render_config(existing: &Config, url: &str, name: &str, endpoint: &str, model: &str) -> String {
+fn render_config(
+    existing: &Config,
+    url: &str,
+    name: &str,
+    endpoint: &str,
+    model: &str,
+    role: crate::config::Role,
+) -> String {
     let mut with_url = existing.clone();
     with_url.forgejo.url = url.to_owned();
+    with_url.forgejo.role = role;
     let added = AgentConfig {
         name: name.to_owned(),
         model: model.to_owned(),
@@ -5588,8 +5700,11 @@ fn editable_template(target: EditTarget, agent: &str) -> String {
         EditTarget::Steps => format!(
             "# Declared shell steps for one run of `{agent}`, one command per line.\n\
              # Blank lines and lines starting with # are skipped.\n\
-             # These commands run first, in the agent's workspace, before the model is\n\
-             # called. Remove the file to declare no steps.\n"
+             # These commands run first, before the model is called, with the agent's\n\
+             # workspace as their working directory. `g` clones a repository one level\n\
+             # below that directory, at workspace/<repository>; use `git -C\n\
+             # <repository> ...` in a step, not a bare `git` at the root. Remove the\n\
+             # file to declare no steps.\n"
         ),
         EditTarget::Skills => format!(
             "# A skill for the agent `{agent}`.\n\
@@ -6875,6 +6990,7 @@ role = "member"
             duration_ms: Some(0),
             started_at: None,
             read_error: None,
+            final_reply: None,
             log: PathBuf::from("/l"),
             dir: PathBuf::from("/d"),
         };
@@ -6886,6 +7002,7 @@ role = "member"
             duration_ms: Some(10),
             started_at: None,
             read_error: None,
+            final_reply: None,
             log: PathBuf::from("/l"),
             dir: PathBuf::from("/d"),
         };
@@ -6965,6 +7082,7 @@ role = "member"
             duration_ms: Some(1),
             started_at: None,
             read_error: None,
+            final_reply: None,
             log: run_dir.join(crate::run::LOG_FILE),
             dir: run_dir,
         }];
@@ -7614,6 +7732,7 @@ concurrency = 3
             "gw-throwaway-key",
             "http://127.0.0.1:39999",
             "",
+            "",
         ];
         for (at, value) in fields.iter().enumerate() {
             if at > 0 {
@@ -7705,7 +7824,7 @@ concurrency = 3
     fn every_add_agent_refusal_names_the_field_it_is_about() {
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
-        let attempt = |app: &App, fields: [&str; 6]| {
+        let attempt = |app: &App, fields: [&str; 7]| {
             app.write_new_agent(&NewAgentForm {
                 fields: fields.map(str::to_owned),
                 cursor: 0,
@@ -7717,6 +7836,7 @@ concurrency = 3
             "https://m.example.org/v1",
             "m",
             "gw-throwaway-key",
+            "",
             "",
             "",
         ];
@@ -7894,6 +8014,7 @@ concurrency = 3
             duration_ms: None,
             started_at: Some("2026-10-15T00:00:00Z".to_owned()),
             read_error: None,
+            final_reply: None,
             log: std::path::PathBuf::new(),
             dir: std::path::PathBuf::new(),
         }];

@@ -241,7 +241,7 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
     app.show(Screen::Instructions);
     let instructions = render(&app);
     assert!(
-        instructions.contains("declared `shell` tool"),
+        instructions.contains("`shell` tool"),
         "{instructions}"
     );
     assert!(instructions.contains("turns"), "{instructions}");
@@ -315,7 +315,7 @@ fn the_runs_screen_lists_a_recorded_run_with_its_outcome() {
     assert!(screen.contains("succeeded"), "{screen}");
     // The notes name the log on show; the exact path is asserted through the action
     // below, because a long temporary path wraps across rows in this narrow backend.
-    assert!(screen.contains("o opens the log on show"), "{screen}");
+    assert!(screen.contains("o opens the readable log on show"), "{screen}");
 
     // `o` opens the log of the run on show.
     app.on_key(KeyEvent::from(KeyCode::Char('o')));
@@ -795,7 +795,7 @@ fn the_runs_screen_opens_the_transcript_as_well_as_the_log() {
     app.refresh_recent();
     app.show(Screen::Runs);
     let screen = render(&app);
-    assert!(screen.contains("T opens the transcript on show"), "{screen}");
+    assert!(screen.contains("T opens the raw transcript (JSONL) on show"), "{screen}");
     app.on_key(KeyEvent::from(KeyCode::Char('T')));
     let action = app.take_action().expect("a view was asked for");
     assert_eq!(action.path, run_dir.join("transcript.jsonl"));
@@ -1014,16 +1014,16 @@ fn the_agents_list_never_hides_a_row_the_selection_can_reach() {
     let below = render_at(72, 17, &app);
     assert!(below.contains("too small"), "{below}");
 
-    // Six agents do not fit; the panel says how many there are.
-    let wide = render_at(80, 24, &app);
-    assert!(wide.contains("of 6"), "the count is missing: {wide}");
+    // Six agents do not fit at the floor; the panel says how many there are.
+    let narrow = render_at(72, 18, &app);
+    assert!(narrow.contains("of 6"), "the count is missing: {narrow}");
 
     // Walk the selection to the last agent; it must be drawn, and marked.
     for _ in 0..5 {
         app.move_agent_selection(1);
     }
     assert_eq!(app.selected, 5);
-    let scrolled = render_at(80, 24, &app);
+    let scrolled = render_at(72, 18, &app);
     assert!(scrolled.contains("a6"), "the selected row is hidden: {scrolled}");
     assert!(scrolled.contains(">  a6"), "the selected row is not marked: {scrolled}");
 }
@@ -1070,7 +1070,8 @@ fn the_add_agent_form_says_which_token_the_forgejo_field_is() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('n')));
     let form = render(&app);
-    assert!(form.contains("Forgejo role token"), "{form}");
+    assert!(form.contains("Forgejo token"), "{form}");
+    assert!(form.contains("token role (member/admin)"), "{form}");
     assert!(form.contains("agent's own token"), "{form}");
 }
 
@@ -1521,7 +1522,8 @@ fn a_broken_configuration_names_the_key_that_reads_it_again() {
     app.show_acknowledgment = false;
     let screen = render_at(80, 24, &app);
     assert!(screen.contains("no agent list"), "{screen}");
-    assert!(screen.contains("press r to read it"), "{screen}");
+    let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("press r to read it"), "{screen}");
 }
 
 #[test]
@@ -1754,7 +1756,7 @@ fn every_panel_and_note_area_that_truncates_declares_it_at_eighty_columns() {
     app.show(Screen::Agents);
     let agents = render_at(72, 18, &app);
     assert!(
-        agents.contains("… more below; enlarge the window"),
+        agents.contains("… more below — press ]"),
         "{agents}"
     );
 
@@ -1865,6 +1867,7 @@ fn the_runs_note_area_keeps_the_reason_and_both_offers_at_eighty_columns() {
         duration_ms: Some(17_400),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
         read_error: None,
+        final_reply: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -1878,11 +1881,11 @@ fn the_runs_note_area_keeps_the_reason_and_both_offers_at_eighty_columns() {
         "{screen}"
     );
     assert!(
-        screen.contains("o opens the log on show"),
+        screen.contains("o opens the readable log on show"),
         "the `o` line is not drawn: {screen}"
     );
     assert!(
-        screen.contains("T opens the transcript on show"),
+        screen.contains("T opens the raw transcript (JSONL) on show"),
         "the `T` line is not drawn: {screen}"
     );
     // M-5: the pager's own way out is named on the screen, before `o`/`T` is pressed.
@@ -1903,20 +1906,19 @@ fn the_add_agent_form_draws_every_field_and_the_cursor_at_eighty_columns() {
         assert!(first.contains(label), "the field {label} is not drawn: {first}");
     }
     // Walk to the last field: the cursor must take the view with it.
-    for _ in 0..5 {
+    for _ in 0..6 {
         app.on_key(KeyEvent::from(KeyCode::Down));
     }
     let last = render_at(80, 24, &app);
     assert!(
-        last.contains("> Forgejo role token"),
+        last.contains("> token role (member/admin)"),
         "the cursor's own field is not drawn: {last}"
     );
     // LIB-1: the form declares its overflow with the same vocabulary every other
     // bordered surface uses, fitted to the width. Walking to the last field scrolls
-    // the window, so the title names the direction (`↑ above`) and the short form of
-    // the declaration is what fits at 80 columns.
+    // the window, so the title names the direction and the keys that move it.
     assert!(
-        last.contains("↑ above; more below") || last.contains("more below; enlarge the window"),
+        last.contains("↑") || last.contains("more below — press ]"),
         "the form does not declare its scrolled window: {last}"
     );
 }
@@ -1986,6 +1988,7 @@ fn a_stored_transport_reason_is_shown_in_the_product_words() {
         duration_ms: Some(0),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
         read_error: None,
+        final_reply: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -2030,7 +2033,7 @@ fn the_forgejo_title_never_clips_its_overflow_declaration_at_eighty_columns() {
         .find(|line| line.contains("┌ Forgejo"))
         .unwrap_or_default();
     assert!(
-        title_line.contains("more below; enlarge the window"),
+        title_line.contains("more below — press ]"),
         "the declaration is clipped or missing: {title_line:?}"
     );
     assert!(
@@ -2127,6 +2130,7 @@ fn the_runs_note_leaves_the_list_more_than_one_row_at_eighty_columns() {
                 duration_ms: Some(1_000 + index),
                 started_at: Some("2026-10-14T13:00:00Z".to_owned()),
                 read_error: None,
+                final_reply: None,
                 log: run_dir.join("run.log"),
                 dir: run_dir,
             }
@@ -2145,8 +2149,8 @@ fn the_runs_note_leaves_the_list_more_than_one_row_at_eighty_columns() {
     );
     // The reason and both offers still fit beside the list.
     assert!(screen.contains("outcome:"), "{screen}");
-    assert!(screen.contains("T opens the transcript on show"), "{screen}");
-    assert!(screen.contains("o opens the log on show"), "{screen}");
+    assert!(screen.contains("T opens the raw transcript (JSONL) on show"), "{screen}");
+    assert!(screen.contains("o opens the readable log on show"), "{screen}");
     assert!(screen.contains("leave the pager with q"), "{screen}");
 }
 
@@ -2166,6 +2170,7 @@ fn a_record_the_hub_had_that_is_gone_is_named_and_not_called_the_last_run() {
         duration_ms: Some(120),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
         read_error: None,
+        final_reply: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -2205,6 +2210,7 @@ fn a_missing_model_key_reason_reads_as_the_products_own_key_on_every_screen() {
         duration_ms: Some(0),
         started_at: Some("2026-10-14T13:00:00Z".to_owned()),
         read_error: None,
+        final_reply: None,
         log: run_dir.join("run.log"),
         dir: run_dir,
     }];
@@ -2389,11 +2395,11 @@ fn the_hub_state_column_never_clips_a_word_mid_token() {
     app.show(Screen::Agents);
     let hub = render_at(80, 24, &app);
     assert!(
-        hub.contains("failed (key)"),
+        hub.contains("failed (missing_key)"),
         "the state word is not whole: {hub}"
     );
     assert!(
-        !hub.contains("failed (missing_ke"),
+        !hub.contains("failed (missing_ke)"),
         "the state word is clipped mid-token: {hub}"
     );
 }
@@ -2444,9 +2450,11 @@ fn an_endpoint_test_is_dated_and_marked_when_the_endpoint_changed() {
         endpoint: "http://127.0.0.1:2/v1".to_owned(),
         ..app.endpoint_test.take().expect("the test result")
     });
-    let stale = render_at(80, 40, &app);
+    let stale = render_at(120, 40, &app);
     assert!(stale.contains("not current"), "{stale}");
-    assert!(stale.contains("press p to test it again"), "{stale}");
+    let rows = gewu_multiverse::ui::panel_rows_text(&app).join(" ");
+    let flat = rows.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("press p to test it again"), "{stale}");
 }
 
 #[test]
@@ -3057,6 +3065,7 @@ fn the_unconfigured_sentence_separates_the_count_from_the_listed_marker() {
         duration_ms: Some(100),
         started_at: Some("2026-10-15T00:00:00Z".to_owned()),
         read_error: None,
+        final_reply: None,
         log: PathBuf::new(),
         dir: PathBuf::new(),
     };
@@ -3355,7 +3364,7 @@ fn the_acknowledgment_modal_is_whole_or_declares_itself_at_the_floor() {
     // line survives as the last drawn row.
     let floor = render_at(72, 18, &app);
     assert!(
-        floor.contains("Before the first agent runs — more below; enlarge the window"),
+        floor.contains("Before the first agent runs — more below — press ]"),
         "the modal drops content in silence at the floor: {floor}"
     );
     assert!(

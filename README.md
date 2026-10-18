@@ -18,7 +18,7 @@ You install it, open the terminal UI, and it lets you:
 - point it at **one Forgejo** you already have (URL + token, and which role to act as — an admin token can see
   administrative views, an ordinary one cannot);
 - define **how many agents** you want, each with its **own model endpoint, key and instructions**;
-- use the agent identities and tokens so that an agent's commits are attributed to that agent, never to you;
+- use the agent identities and tokens so that an agent's commits, pull requests and issues are attributed to that agent, never to you;
 - start, stop and watch agents, with a log and a transcript for every run — as children
   of the UI by default, or as **user units** that outlive the window, when you ask for
   that per agent;
@@ -114,6 +114,11 @@ This mode needs a **user session** (a systemd instance running as you), and
 is a convenience, **not a security boundary**: a unit runs as you, with your rights,
 exactly like the default. [Two ways an agent can be supervised](docs/systemd-mode.md)
 says all of this at length, including what the machine must have.
+
+**There is no scheduler.** A run starts when you press `s`, or when you start its user
+unit; the `systemd` mode keeps a run alive after the window closes, but it does not
+start one on a timer. A recurring run needs your own cron job or systemd timer, and the
+product says this on the Agents screen rather than leaving you to discover it.
 
 ## Connecting a Forgejo
 
@@ -219,24 +224,11 @@ latest release and installing into `~/.local/bin` (override with `INSTALL_DIR`):
 curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
 ```
 
-**Or by hand** — the tarball holds the binary (`gewu-multiverse`), this README and both licences. Its
-name records the revision it was built from:
-
-```sh
-# 1. download the tarball and its checksum (replace the tag if you use another release)
-base=https://github.com/Callo42/gewu-multiverse/releases/download/v0.1.24
-name=gewu-multiverse-8594ff672d49-x86_64-linux.tar.gz
-curl -LO "$base/$name"
-curl -LO "$base/$name.sha256"
-
-# 2. verify the checksum
-sha256sum -c "$name.sha256"
-
-# 3. unpack and put the binary on your PATH
-mkdir -p "$HOME/.local/bin"
-tar xzf "$name"
-install -m 0755 "${name%.tar.gz}/gewu-multiverse" "$HOME/.local/bin/"
-```
+**Or by hand** — open the [release page](https://github.com/Callo42/gewu-multiverse/releases)
+and choose the current release. It names the x86_64 Linux tarball and its `.sha256`
+file for that release; download both, run `sha256sum -c`, unpack the tarball and put the
+binary on your `PATH`. The one-liner above does exactly this and is the supported path,
+so there is no release-specific tag or file name to copy from this README and go stale.
 
 If `~/.local/bin` is not on your `PATH` yet, add it:
 
@@ -319,8 +311,10 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
 
 3. **Add your first agent in the product.** On the Agents screen press `n` (or `a`, or
    `enter` on the empty list). A short form collects an agent name, the model endpoint
-   and id, the model key, and — if you have one — the Forgejo URL and token. Press
-   `enter` and the product writes both files for you and lists the agent. This is the
+   and id, the model key, and — if you have one — the Forgejo URL, token and whether
+   that token is a `member` or an `admin`. Press `enter` and the product writes both
+   files for you and lists the agent; an administrator token is recorded once, so the
+   product does not ask for it again. This is the
    path the product offers first; nothing here needs a text editor.
 
    If you would rather edit by hand, the form writes exactly this to
@@ -374,10 +368,12 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
 7. **Run it**: choose the agent and press `s`, or press `p` first to test the model
    endpoint on its own. The Agents screen moves the agent from `running` to `exited`.
 
-8. **Read the result**: press `o` to open the newest `run.log` in your own `$PAGER`, or
-   `T` for the append-only transcript beside it, at
-   `~/.local/state/gewu-multiverse/<name>/<run-id>/transcript.jsonl`. The Runs screen
-   (`6`) lists recent runs with their outcome and the failure reason.
+8. **Read the result**: the Runs screen (`6`) lists recent runs with their outcome and
+   the failure reason, and draws the model's final reply in full as readable text. Press
+   `o` to open the newest `run.log` in your own `$PAGER`; the log carries the full reply,
+   not an excerpt. `T` opens the append-only `transcript.jsonl` beside it — the raw,
+   machine-readable record — at
+   `~/.local/state/gewu-multiverse/<name>/<run-id>/transcript.jsonl`.
 
 One already-prepared run can be executed without the UI, which is also how the UI starts
 an agent — as a child process of itself:

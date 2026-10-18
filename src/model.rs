@@ -316,8 +316,10 @@ pub enum ModelError {
         secs: u64,
     },
     /// The request could not be sent at all.
-    #[error("the request could not be sent: {message}")]
+    #[error("the endpoint at {endpoint} could not be reached: {message}")]
     Transport {
+        /// The endpoint the request was sent to.
+        endpoint: String,
         /// What the transport said.
         message: String,
     },
@@ -372,6 +374,7 @@ pub fn chat(
         }
     }
     let request_body = serde_json::to_string(&body).map_err(|error| ModelError::Transport {
+        endpoint: config.endpoint.clone(),
         message: format!("the request cannot be written as JSON: {error}"),
     })?;
 
@@ -405,6 +408,7 @@ pub fn chat(
         Ok(text) => text,
         Err(error) => {
             return Err(ModelError::Transport {
+                endpoint: config.endpoint.clone(),
                 message: config
                     .api_key
                     .redact(&format!("the reply body cannot be read: {error}")),
@@ -536,6 +540,7 @@ fn transport_error(config: &ModelConfig, error: ureq::Error) -> ModelError {
             message: "the endpoint answered with an error status".to_owned(),
         },
         other => ModelError::Transport {
+            endpoint: config.endpoint.clone(),
             message: config.api_key.redact(&other.to_string()),
         },
     }
