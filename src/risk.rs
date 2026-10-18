@@ -285,9 +285,9 @@ fn machine_clause(machine: Option<&str>) -> String {
             crate::machine::Relation::Here => {
                 "this configuration's record was made on this machine".to_owned()
             }
-            crate::machine::Relation::Elsewhere => format!(
-                "this configuration's record was made on another machine ({mark}) — this machine has not recorded a confirmation"
-            ),
+            crate::machine::Relation::Elsewhere => {
+                "this configuration's record was made on another machine — this machine has not recorded a confirmation".to_owned()
+            }
             crate::machine::Relation::Unnamed | crate::machine::Relation::Undecidable => {
                 "the record does not name the machine it was made on".to_owned()
             }

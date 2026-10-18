@@ -662,6 +662,7 @@ pub fn record_form_secrets(
     agent: &str,
     model_key: Option<&str>,
     forgejo_token: Option<&str>,
+    forgejo_admin_token: Option<&str>,
 ) -> Result<(), CredentialsError> {
     let mut value = value_for_write(path)?;
     let table = value
@@ -673,6 +674,12 @@ pub fn record_form_secrets(
     if let Some(token) = forgejo_token.map(str::trim).filter(|text| !text.is_empty()) {
         table.insert(
             "forgejo_token".to_owned(),
+            toml::Value::String(token.to_owned()),
+        );
+    }
+    if let Some(token) = forgejo_admin_token.map(str::trim).filter(|text| !text.is_empty()) {
+        table.insert(
+            "forgejo_admin_token".to_owned(),
             toml::Value::String(token.to_owned()),
         );
     }
@@ -1291,7 +1298,7 @@ mod tests {
         let path = root.join("credentials.toml");
         CredentialsFile::prepare(&path).expect("the file is prepared");
         fs::remove_file(&path).expect("the test deletes the file");
-        record_form_secrets(&path, "scribe", Some("sk-form"), Some("role-token"))
+        record_form_secrets(&path, "scribe", Some("sk-form"), Some("role-token"), None)
             .expect("the form puts the file back");
         assert_eq!(
             model_key(&path, "scribe").expect("the key").expose(),
@@ -1360,7 +1367,7 @@ mod form_tests {
         let root = scratch_root("credentials-form");
         let path = root.join("credentials.toml");
         CredentialsFile::prepare(&path).expect("the file is prepared");
-        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"))
+        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"), None)
             .expect("the form's secrets are written");
         // The token and the key are there.
         assert_eq!(
@@ -1372,7 +1379,7 @@ mod form_tests {
             "sk-form-key"
         );
         // A second call preserves what the first wrote.
-        record_form_secrets(&path, "other", Some("sk-other"), None)
+        record_form_secrets(&path, "other", Some("sk-other"), None, None)
             .expect("a second agent is written");
         assert_eq!(
             forgejo_token(&path).expect("a token").expose(),
@@ -1389,7 +1396,7 @@ mod form_tests {
         let root = scratch_root("credentials-present");
         let path = root.join("credentials.toml");
         CredentialsFile::prepare(&path).expect("the file is prepared");
-        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"))
+        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"), None)
             .expect("the form's secrets are written");
         let names = present_secret_names(&path);
         assert!(names.iter().any(|name| name == "model key for `scribe`"));

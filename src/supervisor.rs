@@ -173,13 +173,12 @@ impl State {
         }
     }
 
-    /// One word for a table cell on the hub, where the column is narrow.
+    /// One word for a table cell on the hub.
     ///
-    /// The failure class is shortened to a word that fits whole — the page map's own
-    /// rule for a state column — rather than ellipsised into a fragment
-    /// (`failed (s…er_error)`, L-6). `missing_key` already became `key`; every class
-    /// the model and Forgejo clients produce now has a whole word too. The Agent
-    /// screen keeps the long form, which fits there (E-7, P-5).
+    /// The failure class is kept whole (`failed (server_error)`): the table has the
+    /// width for it, and a shortened class is a different word that sends a person
+    /// looking for a different failure. The column is sized to the longest state word;
+    /// spare width stays outside the row rather than shortening the class (w53 F5).
     pub fn cell_word(&self) -> String {
         match self {
             State::Finished {
@@ -187,7 +186,7 @@ impl State {
                 reason: Some(reason),
                 ..
             } => match failure_class(reason) {
-                Some(class) => format!("failed ({})", short_failure_class(class)),
+                Some(class) => format!("failed ({class})"),
                 None => "failed".to_owned(),
             },
             _ => self.word(),
@@ -229,26 +228,6 @@ fn failure_class(reason: &str) -> Option<&str> {
     let rest = &reason[start..];
     let end = rest.find(')')?;
     Some(&rest[..end])
-}
-
-/// A failure class as one whole word for the hub's narrow state column (L-6).
-///
-/// A class the map has not seen is returned unchanged: it is still a word, and the
-/// state column's own width rule ellipsises only what genuinely cannot fit.
-fn short_failure_class(class: &str) -> &str {
-    match class {
-        "missing_key" => "key",
-        "bad_key" => "bad key",
-        "malformed_reply" => "reply",
-        "model_not_found" => "no model",
-        "rate_limited" => "rate",
-        "server_error" => "server",
-        "timeout" => "timeout",
-        "transport" => "transport",
-        "bad_url" => "bad url",
-        "missing_token" => "token",
-        other => other,
-    }
 }
 
 /// What happened when a start was asked for.
@@ -558,7 +537,7 @@ impl Supervisor {
         if target == Mode::Systemd {
             if let Err(reason) = self.systemd.available() {
                 return Err(format!(
-                    "refused: `{name}` cannot be supervised by systemd here: {reason}. Nothing was changed: it is still supervised by this UI (tui); a systemd switch needs a reachable user manager"
+                    "refused: `{name}` cannot be supervised by systemd here: {reason}. Nothing was changed: it is still supervised by this UI (tui); a systemd switch needs a reachable user manager — start a login user session, or run `loginctl enable-linger $USER` on a systemd host, then press m again"
                 ));
             }
         }
@@ -634,6 +613,14 @@ impl Supervisor {
     /// How many starts are waiting for a free slot.
     pub fn waiting_count(&self) -> usize {
         self.queue.len()
+    }
+
+    /// The agents whose starts are waiting for a free slot, in line order.
+    ///
+    /// The quit warning and the receipt name these agents, not only their count, so a
+    /// person leaving can tell which work was called off (w53 F2).
+    pub fn waiting_agents(&self) -> Vec<String> {
+        self.queue.iter().map(|queued| queued.name.clone()).collect()
     }
 
     /// What the screens should show for one agent.
@@ -1663,17 +1650,17 @@ mod tests {
 
     #[test]
     fn a_failure_class_is_a_whole_word_on_the_hub() {
-        // L-6: `failed (server_error)` was ellipsised to `failed (s…er_error)` on the
-        // hub — not a word. Every class the model and Forgejo clients produce now
-        // shortens to a whole word, and the column width accommodates them.
+        // w53 F5: the class is kept whole. A shortened class (`failed (server)`) was
+        // a different word from the one the failure named, and the table has room for
+        // the whole class at the advertised sizes.
         let cases = [
-            ("the model call failed (server_error): the endpoint answered 500", "failed (server)"),
-            ("the model call failed (malformed_reply): no choices", "failed (reply)"),
-            ("the model call failed (model_not_found): no such model", "failed (no model)"),
-            ("the model call failed (rate_limited): slow down", "failed (rate)"),
+            ("the model call failed (server_error): the endpoint answered 500", "failed (server_error)"),
+            ("the model call failed (malformed_reply): no choices", "failed (malformed_reply)"),
+            ("the model call failed (model_not_found): no such model", "failed (model_not_found)"),
+            ("the model call failed (rate_limited): slow down", "failed (rate_limited)"),
             ("the model call failed (transport): the connection dropped", "failed (transport)"),
             ("the model call failed (timeout): too slow", "failed (timeout)"),
-            ("the model call failed (bad_key): the endpoint refused it", "failed (bad key)"),
+            ("the model call failed (bad_key): the endpoint refused it", "failed (bad_key)"),
         ];
         for (reason, expected) in cases {
             let state = State::Finished {

@@ -150,8 +150,8 @@ pub struct FormRefusal {
 /// never drawn as their value: `ui` masks them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAgentForm {
-    /// name, endpoint, model, model key, Forgejo URL, Forgejo role token.
-    pub fields: [String; 6],
+    /// name, endpoint, model, model key, Forgejo URL, Forgejo role token, token role.
+    pub fields: [String; 7],
     /// Which field the next key types into.
     pub cursor: usize,
     /// Why the last attempt to create the agent did not work, and the field it names.
@@ -160,13 +160,14 @@ pub struct NewAgentForm {
 
 impl NewAgentForm {
     /// The field labels, in order, and whether a field holds a secret.
-    pub const FIELDS: [(&'static str, bool); 6] = [
+    pub const FIELDS: [(&'static str, bool); 7] = [
         ("agent name", false),
         ("model endpoint", false),
         ("model id", false),
         ("model key", true),
         ("Forgejo URL", false),
-        ("Forgejo role token", true),
+        ("Forgejo token", true),
+        ("token role (member/admin)", false),
     ];
 
     /// A blank form, ready at the first field.
@@ -387,10 +388,16 @@ pub struct EndpointFailure {
 
 impl EndpointTest {
     /// One line for the status bar and the agent screen.
+    ///
+    /// The endpoint, the model and the time are all part of the result: a bare `ok`
+    /// cannot tell a person which address answered or whether the answer is current
+    /// (w52 F9).
     pub fn describe(&self) -> String {
         format!(
-            "{} — tested {}",
+            "{} — endpoint {} — model {} — tested {}",
             failure_recovery(&self.agent, &describe_endpoint_result(&self.result)),
+            self.endpoint,
+            self.model,
             tested_age(self.tested_at_ms)
         )
     }
@@ -748,7 +755,7 @@ impl ProbeWhat {
     /// The in-flight sentence for this check, naming the machine when it is known.
     pub fn in_flight(&self, machine: Option<&str>) -> String {
         let here = match machine {
-            Some(mark) => format!(" on {mark}"),
+            Some(_) => " on this machine".to_owned(),
             None => String::new(),
         };
         match self {
@@ -909,6 +916,14 @@ fn failure_recovery(agent: &str, reason: &str) -> String {
             "press 1 and use up/down to select `{agent}`, then press s to try again or p to test the endpoint — {reason}"
         );
     }
+    if reason.contains("(transport)") || reason.contains("(bad_url)") {
+        // The reason names the endpoint URL. The address is the thing to correct; the
+        // product's own route is to remove and re-add the agent with the right one,
+        // or to fix the configuration and re-read it.
+        return format!(
+            "{reason} — check the endpoint address; press 1 and use up/down to select `{agent}`, then d to remove it and n to add it again with the right address, or fix the configuration and press r"
+        );
+    }
     reason.to_owned()
 }
 
@@ -935,12 +950,14 @@ fn run_ended_sentence(
 ///
 /// A `tui` run is stopped; a start that never occupied a slot is called off. Both are
 /// work this UI had in flight, and the receipt names both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShutdownReport {
     /// Runs that were running and were stopped.
     pub stopped: usize,
     /// Starts that were waiting for a slot when the UI left.
     pub called_off: usize,
+    /// The agents whose waiting starts were called off, so the receipt names them.
+    pub waiting_agents: Vec<String>,
 }
 
 impl ShutdownReport {
@@ -954,10 +971,25 @@ impl ShutdownReport {
             ));
         }
         if self.called_off > 0 {
-            parts.push(format!(
-                "called off {}",
-                words::counted(self.called_off, "waiting start", "waiting starts")
-            ));
+            let named = self
+                .waiting_agents
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if named.is_empty() {
+                parts.push(format!(
+                    "called off {}",
+                    words::counted(self.called_off, "waiting start", "waiting starts")
+                ));
+            } else if self.called_off == 1 {
+                parts.push(format!("called off the waiting start of {named}"));
+            } else {
+                parts.push(format!(
+                    "called off the {} waiting starts of {named}",
+                    self.called_off
+                ));
+            }
         }
         if parts.is_empty() {
             None
@@ -996,8 +1028,8 @@ pub struct App {
     /// Whether the first-run acknowledgment is on screen now.
     pub show_acknowledgment: bool,
     /// Whether the acknowledgment is on screen in **review** mode: a second person
-    /// asked to read the terms again with `R`, so no key records anything and every
-    /// key simply closes it (C-3).
+    /// asked to read the terms again with `R`, so no key records anything; `[`/`]`
+    /// scroll the terms and any other key closes it (C-3).
     pub ack_review: bool,
     /// The in-TUI add-agent form, when it is open.
     pub add_agent: Option<NewAgentForm>,
@@ -1139,6 +1171,18 @@ pub struct App {
     /// wrapped rows without the terminal size being threaded through every key
     /// (W36-1). Before the first frame it is the floor's own body width.
     pub panel_width: std::cell::Cell<usize>,
+    /// How far the current modal's body has been scrolled, in wrapped rows.
+    ///
+    /// A modal that names `[`/`]` in its title must move its own body, not answer or
+    /// type the key. The offset is reset whenever an overlay opens or closes, so one
+    /// confirmation never inherits another's window.
+    pub modal_scroll: usize,
+    /// The furthest row the current modal's body can be scrolled, as last drawn.
+    ///
+    /// The renderer owns the wrapping and the window height, so it stores the limit
+    /// here; the key handler clamps to it and can say truthfully whether the body is
+    /// at its top or its end.
+    pub modal_scroll_max: std::cell::Cell<usize>,
     /// The one line under the screens.
     pub status: String,
     /// Work the terminal loop has to carry out.
@@ -1226,6 +1270,8 @@ impl App {
             forgejo_note: None,
             last_scan: None,
             panel_width: std::cell::Cell::new(70),
+            modal_scroll: 0,
+            modal_scroll_max: std::cell::Cell::new(0),
             status: String::new(),
             pending: None,
             should_quit: false,
@@ -1762,6 +1808,7 @@ impl App {
 
     /// Ask to delete the secrets left by agents that are not configured any more.
     pub fn request_forget_secrets(&mut self) {
+        self.reset_modal_scroll();
         let agents = self.leftover_secret_agents();
         if agents.is_empty() {
             self.status =
@@ -2006,6 +2053,7 @@ impl App {
         // The confirm path is reached only from the first-run modal, which never has
         // `ack_review` set.
         self.ack_review = false;
+        self.reset_modal_scroll();
         match risk::record(&self.ack_path) {
             Ok(state) => {
                 self.ack_state = state;
@@ -2031,6 +2079,7 @@ impl App {
     pub fn decline_acknowledgment(&mut self) {
         self.show_acknowledgment = false;
         self.ack_review = false;
+        self.reset_modal_scroll();
         self.status =
             "the risk was not acknowledged, so starting an agent is refused — press R to read the terms, then y to record the acknowledgment"
                 .to_owned();
@@ -2043,6 +2092,7 @@ impl App {
     /// When no record exists this is the ordinary first-run modal, which does record.
     pub fn review_acknowledgment(&mut self) {
         self.show_acknowledgment = true;
+        self.reset_modal_scroll();
         if self.ack_state.is_confirmed() {
             self.ack_review = true;
             self.status =
@@ -2056,12 +2106,14 @@ impl App {
     fn close_ack_review(&mut self) {
         self.show_acknowledgment = false;
         self.ack_review = false;
+        self.reset_modal_scroll();
         self.status = "the terms were read; the record was not changed".to_owned();
     }
 
     /// Open the add-agent form. `n` and `a` both reach it, and `enter` on an empty
     /// list reaches it too: the product itself must get a first user to an agent.
     pub fn request_new_agent(&mut self) {
+        self.reset_modal_scroll();
         self.add_agent = Some(NewAgentForm::new());
         self.status =
             "add an agent: name it, give it an endpoint and a model, then press ctrl-s (or walk to the last field and press enter) to write it"
@@ -2310,6 +2362,7 @@ impl App {
         let model_key = form.fields[3].trim().to_owned();
         let forgejo_url = form.fields[4].trim().to_owned();
         let forgejo_token = form.fields[5].trim().to_owned();
+        let token_role = form.fields[6].trim().to_ascii_lowercase();
         if name.is_empty() {
             return Err((Some(0), "the agent needs a name".to_owned()));
         }
@@ -2381,7 +2434,24 @@ impl App {
         } else {
             forgejo_url
         };
-        let text = render_config(&existing, &url, &name, &endpoint, &model);
+        // The form asks which role the supplied token is. An administrator token is
+        // stored once, under both names, so the product never asks for the same token
+        // again with `A` (w53 F9). A blank answer preserves the configured role.
+        let role = match token_role.as_str() {
+            "" => existing.forgejo.role,
+            "member" => crate::config::Role::Member,
+            "admin" => crate::config::Role::Admin,
+            _ => {
+                return Err((
+                    Some(6),
+                    "the Forgejo token role is `member` or `admin`; leave it blank to keep the configured role"
+                        .to_owned(),
+                ));
+            }
+        };
+        let admin_token = (role == crate::config::Role::Admin && !forgejo_token.is_empty())
+            .then_some(forgejo_token.as_str());
+        let text = render_config(&existing, &url, &name, &endpoint, &model, role);
         Config::from_text(&self.config_path(), &text).map_err(|error| (None, error.to_string()))?;
         // The three writes are one add. The configuration and key are written first
         // and the boundary note last; if a later write fails, the earlier ones are
@@ -2409,6 +2479,7 @@ impl App {
             &name,
             (!model_key.is_empty()).then_some(model_key.as_str()),
             (!forgejo_token.is_empty()).then_some(forgejo_token.as_str()),
+            admin_token,
         ) {
             let config_restored = Self::restore_file(
                 &self.config_path(),
@@ -2464,6 +2535,7 @@ impl App {
     /// be removed and added again. It asks first, because it is destructive, and the
     /// confirmation says what is left on disk.
     pub fn request_remove_agent(&mut self) {
+        self.reset_modal_scroll();
         let Some(name) = self.selected_name() else {
             self.status = "there is no agent to remove".to_owned();
             return;
@@ -2783,7 +2855,19 @@ impl App {
             consequences.push(format!("stops the {live} {run_noun} this UI started"));
         }
         if waiting > 0 {
-            consequences.push(format!("calls off the {waiting} {waiting_noun}"));
+            let waiting_agents = self.supervisor.waiting_agents();
+            let named = waiting_agents
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if named.is_empty() {
+                consequences.push(format!("calls off the {waiting} {waiting_noun}"));
+            } else if waiting == 1 {
+                consequences.push(format!("calls off the waiting start of {named}"));
+            } else {
+                consequences.push(format!("calls off the {waiting} waiting starts of {named}"));
+            }
         }
         let advice = match (live, waiting) {
             (0, _) => format!("call {waiting_pronoun} off"),
@@ -3373,7 +3457,11 @@ impl App {
                     // line the refusal is drawn, not only in the help.
                     Err(_) => failure_recovery(&agent, &describe_endpoint_result(&result)),
                 };
-                self.status = format!("endpoint test for `{agent}`: {short}");
+                // The result itself carries the endpoint, model and time, so a person
+                // can tell which address answered and whether the answer is current.
+                self.status = format!(
+                    "endpoint test for `{agent}`: {short} — endpoint {endpoint} — model {model} — tested just now"
+                );
                 let test = EndpointTest {
                     agent,
                     endpoint,
@@ -3428,9 +3516,13 @@ impl App {
             }
         };
         Some(match &machine {
-            Some(mark) => format!("checked {} on {mark}", tested_age(at)),
+            Some(mark) => format!(
+                "checked {} on {}",
+                tested_age(at),
+                crate::machine::label(Some(mark))
+            ),
             None => format!(
-                "checked {}; this machine's own name cannot be read",
+                "checked {}; the record does not name the machine",
                 tested_age(at)
             ),
         })
@@ -3460,7 +3552,10 @@ impl App {
         self.role_checked_at_ms = Some(at);
         self.role_check_machine = mark.clone();
         self.status = match &result {
-            Ok(check) => format!("role check: {}", check.summary()),
+            Ok(check) => format!(
+                "role check: {}",
+                check.summary_with_admin(self.forgejo_tokens_present().1)
+            ),
             // The configured URL leads the refusal: a mistyped path is the common
             // cause, and the API path alone does not connect the failure to what the
             // user typed (P-7).
@@ -3477,7 +3572,10 @@ impl App {
     /// Apply the administrator role check's result, keeping the last good view.
     fn apply_admin_role_check(&mut self, result: Result<RoleCheck, ForgejoFailure>) {
         self.status = match &result {
-            Ok(check) => format!("role check (administrator token): {}", check.summary()),
+            Ok(check) => format!(
+                "role check (administrator token): {}",
+                check.summary_with_admin(true)
+            ),
             Err(failure) => format!(
                 "role check with the administrator token failed ({}): {}",
                 failure.class, failure.message
@@ -4206,6 +4304,7 @@ impl App {
 
     /// Ask to edit one of the selected agent's files. The terminal loop carries it out.
     pub fn request_edit(&mut self, target: EditTarget) {
+        self.reset_modal_scroll();
         let Some(name) = self.selected_name() else {
             self.status = "the configuration lists no agent to edit".to_owned();
             return;
@@ -4561,6 +4660,28 @@ impl App {
         }
     }
 
+    /// A read-only preview of the instruction a run sends, line by line.
+    ///
+    /// The Instruction screen draws this without opening the editor, so a returning
+    /// user can read what the agent was told. A file that is absent or unreadable has
+    /// no preview; the screen's own three-case sentence already says why.
+    pub fn instruction_preview(&self) -> Option<Vec<String>> {
+        let paths = self.selected_paths()?;
+        let bytes = std::fs::read(paths.instruction()).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        Some(text.lines().map(str::to_owned).collect())
+    }
+
+    /// The declared steps commands, for the Instruction screen's read-only preview.
+    pub fn steps_commands(&self) -> Vec<String> {
+        let Some(paths) = self.selected_paths() else {
+            return Vec::new();
+        };
+        std::fs::read_to_string(paths.steps_file())
+            .map(|text| crate::run::parse_steps(&text))
+            .unwrap_or_default()
+    }
+
     /// The instruction's size on disk, the size a run sends, and whether the difference
     /// is the product's guidance line.
     ///
@@ -4778,11 +4899,16 @@ impl App {
     /// must name the starts it called off, not only the runs it stopped. A waiting
     /// start writes no run record, before or after this.
     pub fn shutdown(&mut self) -> ShutdownReport {
-        let called_off = self.supervisor.waiting_count();
+        let waiting_agents = self.supervisor.waiting_agents();
+        let called_off = waiting_agents.len();
         let stopped = self
             .supervisor
             .stop_all(Duration::from_secs(STOP_ALL_BUDGET_SECS));
-        ShutdownReport { stopped, called_off }
+        ShutdownReport {
+            stopped,
+            called_off,
+            waiting_agents,
+        }
     }
 
     /// Move a step along the tab bar.
@@ -4836,7 +4962,7 @@ impl App {
         let total = crate::ui::panel_total_lines(self);
         if total == 0 {
             self.status =
-                "this screen's content is a list: up/down move it, and the panel below is declared — enlarge the window to read it"
+                "this screen's content is a list: up/down move it, and the panel below is declared — press ] to reach it"
                     .to_owned();
             return;
         }
@@ -4856,12 +4982,64 @@ impl App {
         }
     }
 
+    /// Return the current modal's body to its first row.
+    ///
+    /// Every overlay that owns a scrollable body calls this when it opens or closes,
+    /// so a confirmation never opens halfway down and the next screen never inherits
+    /// an offset it did not make.
+    pub fn reset_modal_scroll(&mut self) {
+        self.modal_scroll = 0;
+        self.modal_scroll_max.set(0);
+    }
+
+    /// Scroll the current modal's body by `steps` wrapped rows.
+    ///
+    /// The renderer stores the limit it actually drew; a key that cannot move says so
+    /// instead of being swallowed. The answer line is drawn outside this window, so
+    /// scrolling can never hide the key that answers the overlay.
+    pub fn scroll_modal(&mut self, steps: isize) {
+        let last = self.modal_scroll_max.get();
+        if last == 0 {
+            self.status = "the whole text is already on screen".to_owned();
+            return;
+        }
+        let before = self.modal_scroll.min(last);
+        let after = (before as isize + steps).clamp(0, last as isize) as usize;
+        self.modal_scroll = after;
+        if after == before {
+            self.status = if steps < 0 {
+                "the text is at its top".to_owned()
+            } else {
+                "the text is at its end".to_owned()
+            };
+        } else {
+            let back = if steps < 0 { "]" } else { "[" };
+            self.status = format!("the text scrolled — press {back} to go back");
+        }
+    }
+
+    /// Handle the two modal scroll keys, so every overlay that advertises them behaves
+    /// the same way. Returns whether the key was one of them.
+    fn scroll_modal_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('[') => {
+                self.scroll_modal(-1);
+                true
+            }
+            KeyCode::Char(']') => {
+                self.scroll_modal(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Move the panel on show to its first or last line.
     pub fn scroll_panel_edge(&mut self, last: bool) {
         let total = crate::ui::panel_total_lines(self);
         if total == 0 {
             self.status =
-                "this screen's content is a list: up/down move it, and the panel below is declared — enlarge the window to read it"
+                "this screen's content is a list: up/down move it, and the panel below is declared — press ] to reach it"
                     .to_owned();
             return;
         }
@@ -5036,7 +5214,7 @@ impl App {
         // is not lost without a word (F4). `on_key` says the same for a key.
         if self.show_acknowledgment {
             self.status = if self.ack_review {
-                "this is the acknowledged terms, read-only — any key closes it, then paste where a field is open"
+                "this is the acknowledged terms, read-only — esc closes it and [ and ] scroll, then paste where a field is open"
                     .to_owned()
             } else {
                 "answer this screen first: y to acknowledge, or n for not now".to_owned()
@@ -5220,6 +5398,9 @@ impl App {
             return;
         }
         if self.editor_confirm.is_some() {
+            if self.scroll_modal_key(key) {
+                return;
+            }
             match key.code {
                 KeyCode::Enter => {
                     self.pending = self.editor_confirm.take();
@@ -5244,6 +5425,9 @@ impl App {
             return;
         }
         if self.confirm_remove.is_some() {
+            if self.scroll_modal_key(key) {
+                return;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm_remove_agent();
@@ -5262,6 +5446,9 @@ impl App {
             return;
         }
         if self.confirm_forget.is_some() {
+            if self.scroll_modal_key(key) {
+                return;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm_forget_secrets();
@@ -5278,7 +5465,14 @@ impl App {
             return;
         }
         if self.show_acknowledgment {
-            // A review is read-only: every key closes it and nothing is recorded.
+            // The terms scroll on every acknowledgment surface — the first run and the
+            // read-only review alike. Without this branch the title's `]` answered the
+            // modal (or, in the review, closed it) and the dropped bullets stayed
+            // unreachable.
+            if self.scroll_modal_key(key) {
+                return;
+            }
+            // A review is read-only: every other key closes it and nothing is recorded.
             if self.ack_review {
                 self.close_ack_review();
                 return;
@@ -5510,9 +5704,17 @@ const STOP_ALL_BUDGET_SECS: u64 = 10;
 ///
 /// The configuration has no comments of its own to keep once the tool writes it; the
 /// file it produces is valid, checked by the caller, and holds no secret.
-fn render_config(existing: &Config, url: &str, name: &str, endpoint: &str, model: &str) -> String {
+fn render_config(
+    existing: &Config,
+    url: &str,
+    name: &str,
+    endpoint: &str,
+    model: &str,
+    role: crate::config::Role,
+) -> String {
     let mut with_url = existing.clone();
     with_url.forgejo.url = url.to_owned();
+    with_url.forgejo.role = role;
     let added = AgentConfig {
         name: name.to_owned(),
         model: model.to_owned(),
@@ -5588,8 +5790,11 @@ fn editable_template(target: EditTarget, agent: &str) -> String {
         EditTarget::Steps => format!(
             "# Declared shell steps for one run of `{agent}`, one command per line.\n\
              # Blank lines and lines starting with # are skipped.\n\
-             # These commands run first, in the agent's workspace, before the model is\n\
-             # called. Remove the file to declare no steps.\n"
+             # These commands run first, before the model is called, with the agent's\n\
+             # workspace as their working directory. `g` clones a repository one level\n\
+             # below that directory, at workspace/<repository>; use `git -C\n\
+             # <repository> ...` in a step, not a bare `git` at the root. Remove the\n\
+             # file to declare no steps.\n"
         ),
         EditTarget::Skills => format!(
             "# A skill for the agent `{agent}`.\n\
@@ -5693,6 +5898,24 @@ mod tests {
         std::fs::write(root.join("config.toml"), config)
             .expect("the test writes the configuration");
         App::with_runner(Layout::rooted_at(root), quiet_runner("app-runner"))
+    }
+
+    /// A `systemctl` stand-in that answers the version probe the mode switch makes.
+    ///
+    /// The test suite may run without a reachable user manager, so a test that reached
+    /// the real one would fail for a reason outside the product. The switch logic under
+    /// test is the same client either way; the stand-in reports the user manager
+    /// reachable and records nothing on the host.
+    fn ok_systemctl(tag: &str) -> PathBuf {
+        let path = scratch_root(tag).join("ok-systemctl.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$*\" in *'show -p Version --value'*) echo 255.4 ;; esac\nexit 0\n",
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is runnable");
+        path
     }
 
     #[test]
@@ -6280,6 +6503,13 @@ concurrency = 1
     fn moving_an_agent_between_supervision_modes_is_reported_and_recorded() {
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
+        // The suite must be green without a reachable user manager. Inject the
+        // stand-in the other mode tests already use rather than depending on the
+        // host's user manager; the record/report path under test is unchanged.
+        app.supervisor
+            .set_systemctl(crate::systemd::Systemctl::with_binary(ok_systemctl(
+                "app-move-systemd",
+            )));
         app.on_key(key(KeyCode::Char('m')));
         eprintln!("after m (tui -> systemd): {}", app.status);
         assert!(app.status.contains("systemd"), "{}", app.status);
@@ -6875,6 +7105,7 @@ role = "member"
             duration_ms: Some(0),
             started_at: None,
             read_error: None,
+            final_reply: None,
             log: PathBuf::from("/l"),
             dir: PathBuf::from("/d"),
         };
@@ -6886,6 +7117,7 @@ role = "member"
             duration_ms: Some(10),
             started_at: None,
             read_error: None,
+            final_reply: None,
             log: PathBuf::from("/l"),
             dir: PathBuf::from("/d"),
         };
@@ -6965,6 +7197,7 @@ role = "member"
             duration_ms: Some(1),
             started_at: None,
             read_error: None,
+            final_reply: None,
             log: run_dir.join(crate::run::LOG_FILE),
             dir: run_dir,
         }];
@@ -7614,6 +7847,7 @@ concurrency = 3
             "gw-throwaway-key",
             "http://127.0.0.1:39999",
             "",
+            "",
         ];
         for (at, value) in fields.iter().enumerate() {
             if at > 0 {
@@ -7705,7 +7939,7 @@ concurrency = 3
     fn every_add_agent_refusal_names_the_field_it_is_about() {
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
-        let attempt = |app: &App, fields: [&str; 6]| {
+        let attempt = |app: &App, fields: [&str; 7]| {
             app.write_new_agent(&NewAgentForm {
                 fields: fields.map(str::to_owned),
                 cursor: 0,
@@ -7717,6 +7951,7 @@ concurrency = 3
             "https://m.example.org/v1",
             "m",
             "gw-throwaway-key",
+            "",
             "",
             "",
         ];
@@ -7894,6 +8129,7 @@ concurrency = 3
             duration_ms: None,
             started_at: Some("2026-10-15T00:00:00Z".to_owned()),
             read_error: None,
+            final_reply: None,
             log: std::path::PathBuf::new(),
             dir: std::path::PathBuf::new(),
         }];

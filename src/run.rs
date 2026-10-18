@@ -251,6 +251,12 @@ pub struct RunSummary {
     /// The reason the run's own transcript could not be read, when it is present but
     /// unreadable — as distinct from a file that is not there (W38-1).
     pub read_error: Option<String>,
+    /// The model's final reply, as text, when the record holds one.
+    ///
+    /// This is the thing a person came to read; the screens draw it in full and the
+    /// raw JSONL stays the secondary record. `None` means the run wrote no reply text
+    /// (a declared-step failure, a transport failure, or an empty answer).
+    pub final_reply: Option<String>,
     /// The run's log file.
     pub log: PathBuf,
     /// The run's directory.
@@ -494,6 +500,15 @@ fn summarise(agent: &str, run_id: &str, run_dir: &Path) -> RunSummary {
         }) => (RunOutcome::parse(&outcome), reason, Some(duration_ms)),
         _ => (None, None, None),
     };
+    let final_reply = file.as_ref().and_then(|file| {
+        file.records.iter().rev().find_map(|record| match record {
+            Record::ModelReply {
+                content: Some(content),
+                ..
+            } if !content.trim().is_empty() => Some(content.clone()),
+            _ => None,
+        })
+    });
     RunSummary {
         agent: agent.to_owned(),
         run_id: run_id.to_owned(),
@@ -502,6 +517,7 @@ fn summarise(agent: &str, run_id: &str, run_dir: &Path) -> RunSummary {
         duration_ms,
         started_at,
         read_error,
+        final_reply,
         log,
         dir: run_dir.to_path_buf(),
     }
@@ -848,6 +864,7 @@ mod tests {
             duration_ms: None,
             started_at: Some(crate::time::rfc3339(1_000_000)),
             read_error: None,
+            final_reply: None,
             log: PathBuf::from("/tmp/run.log"),
             dir: PathBuf::from("/tmp/run"),
         };
@@ -889,6 +906,7 @@ mod tests {
                 duration_ms: None,
                 started_at: None,
                 read_error: None,
+                final_reply: None,
                 log: PathBuf::new(),
                 dir: PathBuf::new(),
             };
@@ -940,6 +958,7 @@ mod tests {
                 duration_ms: None,
                 started_at: Some(crate::time::rfc3339(now.saturating_sub(elapsed))),
                 read_error: None,
+                final_reply: None,
                 log: PathBuf::new(),
                 dir: PathBuf::new(),
             };

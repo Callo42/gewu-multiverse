@@ -502,7 +502,7 @@ concurrency = 1
     app.reload();
 
     app.show(Screen::AgentConfig);
-    let agent = render_at(100, 30, &app);
+    let agent = render_at(100, 50, &app);
     assert!(
         !agent.contains("KiB") || !agent.contains("run.log"),
         "the Agent screen drew the directory as a readable file with a size:\n{agent}"

@@ -40,6 +40,23 @@ pub fn mark() -> Option<String> {
     }
 }
 
+/// A short, neutral label for a record's machine.
+///
+/// The full mark stays in the private record; a screen says only whether the fact was
+/// made here, elsewhere, or cannot be compared. A host name or machine id is never
+/// printed on a product screen (w52 F12).
+pub fn label(record: Option<&str>) -> &'static str {
+    match record.map(str::trim).filter(|mark| !mark.is_empty()) {
+        None => "a machine it does not name",
+        Some(mark) => match relation(mark) {
+            Relation::Here => "this machine",
+            Relation::Elsewhere => "another machine",
+            Relation::Unnamed => "a machine it does not name",
+            Relation::Undecidable => "a machine it cannot compare",
+        },
+    }
+}
+
 /// How a record's machine relates to the machine reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relation {

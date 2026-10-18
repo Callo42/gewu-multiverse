@@ -338,8 +338,9 @@ fn a_record_made_on_another_machine_says_what_to_do() {
     );
     app.show(Screen::Agents);
     let hub = render_at(160, 60, &app);
+    let flat = hub.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        hub.contains("start again"),
+        flat.contains("start again"),
         "the hub sentence does not carry the way back:\n{hub}"
     );
     app.shutdown();

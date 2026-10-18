@@ -369,6 +369,12 @@ mod tests {
             status.success(),
             "the child finished; if this line ran, the product survived the SIGINT"
         );
+        // The signal is delivered asynchronously; give the handler a moment rather
+        // than racing the child's exit.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !guard.interrupted() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             guard.interrupted(),
             "the product caught the SIGINT the hand-off's `^C` delivered"
