@@ -5013,7 +5013,7 @@ impl App {
                 "the text is at its end".to_owned()
             };
         } else {
-            let back = if steps < 0 { "PageDown or ]" } else { "PageUp or [" };
+            let back = if steps < 0 { "]" } else { "[" };
             self.status = format!("the text scrolled — press {back} to go back");
         }
     }
