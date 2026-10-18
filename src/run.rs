@@ -149,6 +149,16 @@ pub const PLAN_FILE: &str = "plan.json";
 /// The log file's name.
 pub const LOG_FILE: &str = "run.log";
 
+/// The note, in an agent's state directory, that lists the run records which existed
+/// before the current agent was created under that name.
+///
+/// A run record names its agent by name. When an agent is removed and a new agent is
+/// created with the same name, the old records are still on disk but they are not the
+/// new agent's history. This note is the boundary: it holds run ids only, it is not a
+/// run record, and it never changes a record. An agent created before this note
+/// existed has no note, so its records stay its own as before.
+pub const PREVIOUS_RUNS_FILE: &str = "previous-runs";
+
 /// Parse a steps document: one shell command per line, comments and blanks skipped.
 pub fn parse_steps(text: &str) -> Vec<String> {
     text.lines()
@@ -354,6 +364,78 @@ pub fn unconfigured_agents(state_root: &Path, configured: &[String]) -> Vec<Stri
     }
     names.sort();
     names
+}
+
+/// The run ids the agent's state directory calls earlier agents' records.
+///
+/// The file holds one run id per line. Anything that is not a run id is ignored, so a
+/// hand-edited or partly written note cannot make a directory look like a run.
+pub fn previous_run_ids(state_dir: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(state_dir.join(PREVIOUS_RUNS_FILE)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| looks_like_run_id(line))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The note a new agent's creation would write, read from the state directory.
+///
+/// Every run directory already under the name is added to the note, together with
+/// any ids the note already carries, so removing a record and creating the name
+/// again does not lose the boundary. No run record is read, rewritten or created;
+/// the note is the product's own small identity file. `None` means there is nothing
+/// to record: the name has no earlier run records and no note yet.
+///
+/// This only reads. The caller writes the returned note after the new agent's
+/// configuration and key are saved, so a refused add leaves no boundary behind.
+pub fn previous_runs_note(state_dir: &Path) -> io::Result<Option<String>> {
+    let mut ids = previous_run_ids(state_dir);
+    let entries = match fs::read_dir(state_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(run_id) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() && looks_like_run_id(run_id) {
+            ids.push(run_id.to_owned());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!("{}\n", ids.join("\n"))))
+}
+
+/// Write the creation boundary in one step, so it is never left half-written.
+///
+/// The note replaces an older note only after the complete new text is on disk: the
+/// text goes to a temporary file beside it and is renamed into place. A failure
+/// before the rename leaves the old note exactly as it was.
+pub fn write_previous_runs(state_dir: &Path, text: &str) -> io::Result<()> {
+    let path = state_dir.join(PREVIOUS_RUNS_FILE);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let temporary = state_dir.join(format!(
+        ".{PREVIOUS_RUNS_FILE}.tmp-{}-{nanos}",
+        std::process::id()
+    ));
+    crate::mode::write_private(&temporary, text.as_bytes())?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Every run recorded for one agent, in no particular order.
