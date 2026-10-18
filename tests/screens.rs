@@ -1914,11 +1914,11 @@ fn the_add_agent_form_draws_every_field_and_the_cursor_at_eighty_columns() {
         last.contains("> token role (member/admin)"),
         "the cursor's own field is not drawn: {last}"
     );
-    // LIB-1: the form declares its overflow with the same vocabulary every other
-    // bordered surface uses, fitted to the width. Walking to the last field scrolls
-    // the window, so the title names the direction and the keys that move it.
+    // The form's overflow key is `tab`/`↑`/`↓`, not `[`/`]`: a bracket is data in
+    // these fields. Walking to the last field windows the body, and the title says
+    // which way the dropped fields lie and which keys move there.
     assert!(
-        last.contains("↑") || last.contains("more below — press ]"),
+        last.contains("fields — tab/"),
         "the form does not declare its scrolled window: {last}"
     );
 }
@@ -3381,13 +3381,13 @@ fn the_acknowledgment_modal_is_whole_or_declares_itself_at_the_floor() {
         "the review modal drops content in silence at the floor: {review}"
     );
     assert!(
-        review.contains("any key closes this; the record is unchanged"),
+        review.contains("esc closes this; [ and ] scroll; the record is unchanged"),
         "the review modal has no visible way out at the floor: {review}"
     );
     // V-2: the footer agrees with the body — `esc` is not the only key that closes it,
     // so the surface and the footer no longer make two different claims.
     assert!(
-        review.contains("any key closes this overlay; the record is unchanged"),
+        review.contains("esc closes this overlay; [ and ] scroll; the record is unchanged"),
         "the review modal's footer disagrees with its own close line: {review}"
     );
 }

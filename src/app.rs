@@ -1028,8 +1028,8 @@ pub struct App {
     /// Whether the first-run acknowledgment is on screen now.
     pub show_acknowledgment: bool,
     /// Whether the acknowledgment is on screen in **review** mode: a second person
-    /// asked to read the terms again with `R`, so no key records anything and every
-    /// key simply closes it (C-3).
+    /// asked to read the terms again with `R`, so no key records anything; `[`/`]`
+    /// scroll the terms and any other key closes it (C-3).
     pub ack_review: bool,
     /// The in-TUI add-agent form, when it is open.
     pub add_agent: Option<NewAgentForm>,
@@ -1171,6 +1171,18 @@ pub struct App {
     /// wrapped rows without the terminal size being threaded through every key
     /// (W36-1). Before the first frame it is the floor's own body width.
     pub panel_width: std::cell::Cell<usize>,
+    /// How far the current modal's body has been scrolled, in wrapped rows.
+    ///
+    /// A modal that names `[`/`]` in its title must move its own body, not answer or
+    /// type the key. The offset is reset whenever an overlay opens or closes, so one
+    /// confirmation never inherits another's window.
+    pub modal_scroll: usize,
+    /// The furthest row the current modal's body can be scrolled, as last drawn.
+    ///
+    /// The renderer owns the wrapping and the window height, so it stores the limit
+    /// here; the key handler clamps to it and can say truthfully whether the body is
+    /// at its top or its end.
+    pub modal_scroll_max: std::cell::Cell<usize>,
     /// The one line under the screens.
     pub status: String,
     /// Work the terminal loop has to carry out.
@@ -1258,6 +1270,8 @@ impl App {
             forgejo_note: None,
             last_scan: None,
             panel_width: std::cell::Cell::new(70),
+            modal_scroll: 0,
+            modal_scroll_max: std::cell::Cell::new(0),
             status: String::new(),
             pending: None,
             should_quit: false,
@@ -1794,6 +1808,7 @@ impl App {
 
     /// Ask to delete the secrets left by agents that are not configured any more.
     pub fn request_forget_secrets(&mut self) {
+        self.reset_modal_scroll();
         let agents = self.leftover_secret_agents();
         if agents.is_empty() {
             self.status =
@@ -2038,6 +2053,7 @@ impl App {
         // The confirm path is reached only from the first-run modal, which never has
         // `ack_review` set.
         self.ack_review = false;
+        self.reset_modal_scroll();
         match risk::record(&self.ack_path) {
             Ok(state) => {
                 self.ack_state = state;
@@ -2063,6 +2079,7 @@ impl App {
     pub fn decline_acknowledgment(&mut self) {
         self.show_acknowledgment = false;
         self.ack_review = false;
+        self.reset_modal_scroll();
         self.status =
             "the risk was not acknowledged, so starting an agent is refused — press R to read the terms, then y to record the acknowledgment"
                 .to_owned();
@@ -2075,6 +2092,7 @@ impl App {
     /// When no record exists this is the ordinary first-run modal, which does record.
     pub fn review_acknowledgment(&mut self) {
         self.show_acknowledgment = true;
+        self.reset_modal_scroll();
         if self.ack_state.is_confirmed() {
             self.ack_review = true;
             self.status =
@@ -2088,12 +2106,14 @@ impl App {
     fn close_ack_review(&mut self) {
         self.show_acknowledgment = false;
         self.ack_review = false;
+        self.reset_modal_scroll();
         self.status = "the terms were read; the record was not changed".to_owned();
     }
 
     /// Open the add-agent form. `n` and `a` both reach it, and `enter` on an empty
     /// list reaches it too: the product itself must get a first user to an agent.
     pub fn request_new_agent(&mut self) {
+        self.reset_modal_scroll();
         self.add_agent = Some(NewAgentForm::new());
         self.status =
             "add an agent: name it, give it an endpoint and a model, then press ctrl-s (or walk to the last field and press enter) to write it"
@@ -2515,6 +2535,7 @@ impl App {
     /// be removed and added again. It asks first, because it is destructive, and the
     /// confirmation says what is left on disk.
     pub fn request_remove_agent(&mut self) {
+        self.reset_modal_scroll();
         let Some(name) = self.selected_name() else {
             self.status = "there is no agent to remove".to_owned();
             return;
@@ -4283,6 +4304,7 @@ impl App {
 
     /// Ask to edit one of the selected agent's files. The terminal loop carries it out.
     pub fn request_edit(&mut self, target: EditTarget) {
+        self.reset_modal_scroll();
         let Some(name) = self.selected_name() else {
             self.status = "the configuration lists no agent to edit".to_owned();
             return;
@@ -4960,6 +4982,58 @@ impl App {
         }
     }
 
+    /// Return the current modal's body to its first row.
+    ///
+    /// Every overlay that owns a scrollable body calls this when it opens or closes,
+    /// so a confirmation never opens halfway down and the next screen never inherits
+    /// an offset it did not make.
+    pub fn reset_modal_scroll(&mut self) {
+        self.modal_scroll = 0;
+        self.modal_scroll_max.set(0);
+    }
+
+    /// Scroll the current modal's body by `steps` wrapped rows.
+    ///
+    /// The renderer stores the limit it actually drew; a key that cannot move says so
+    /// instead of being swallowed. The answer line is drawn outside this window, so
+    /// scrolling can never hide the key that answers the overlay.
+    pub fn scroll_modal(&mut self, steps: isize) {
+        let last = self.modal_scroll_max.get();
+        if last == 0 {
+            self.status = "the whole text is already on screen".to_owned();
+            return;
+        }
+        let before = self.modal_scroll.min(last);
+        let after = (before as isize + steps).clamp(0, last as isize) as usize;
+        self.modal_scroll = after;
+        if after == before {
+            self.status = if steps < 0 {
+                "the text is at its top".to_owned()
+            } else {
+                "the text is at its end".to_owned()
+            };
+        } else {
+            let back = if steps < 0 { "PageDown or ]" } else { "PageUp or [" };
+            self.status = format!("the text scrolled — press {back} to go back");
+        }
+    }
+
+    /// Handle the two modal scroll keys, so every overlay that advertises them behaves
+    /// the same way. Returns whether the key was one of them.
+    fn scroll_modal_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('[') => {
+                self.scroll_modal(-1);
+                true
+            }
+            KeyCode::Char(']') => {
+                self.scroll_modal(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Move the panel on show to its first or last line.
     pub fn scroll_panel_edge(&mut self, last: bool) {
         let total = crate::ui::panel_total_lines(self);
@@ -5140,7 +5214,7 @@ impl App {
         // is not lost without a word (F4). `on_key` says the same for a key.
         if self.show_acknowledgment {
             self.status = if self.ack_review {
-                "this is the acknowledged terms, read-only — any key closes it, then paste where a field is open"
+                "this is the acknowledged terms, read-only — esc closes it and [ and ] scroll, then paste where a field is open"
                     .to_owned()
             } else {
                 "answer this screen first: y to acknowledge, or n for not now".to_owned()
@@ -5324,6 +5398,9 @@ impl App {
             return;
         }
         if self.editor_confirm.is_some() {
+            if self.scroll_modal_key(key) {
+                return;
+            }
             match key.code {
                 KeyCode::Enter => {
                     self.pending = self.editor_confirm.take();
@@ -5348,6 +5425,9 @@ impl App {
             return;
         }
         if self.confirm_remove.is_some() {
+            if self.scroll_modal_key(key) {
+                return;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm_remove_agent();
@@ -5366,6 +5446,9 @@ impl App {
             return;
         }
         if self.confirm_forget.is_some() {
+            if self.scroll_modal_key(key) {
+                return;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm_forget_secrets();
@@ -5382,7 +5465,14 @@ impl App {
             return;
         }
         if self.show_acknowledgment {
-            // A review is read-only: every key closes it and nothing is recorded.
+            // The terms scroll on every acknowledgment surface — the first run and the
+            // read-only review alike. Without this branch the title's `]` answered the
+            // modal (or, in the review, closed it) and the dropped bullets stayed
+            // unreachable.
+            if self.scroll_modal_key(key) {
+                return;
+            }
+            // A review is read-only: every other key closes it and nothing is recorded.
             if self.ack_review {
                 self.close_ack_review();
                 return;
@@ -5808,6 +5898,24 @@ mod tests {
         std::fs::write(root.join("config.toml"), config)
             .expect("the test writes the configuration");
         App::with_runner(Layout::rooted_at(root), quiet_runner("app-runner"))
+    }
+
+    /// A `systemctl` stand-in that answers the version probe the mode switch makes.
+    ///
+    /// The test suite may run without a reachable user manager, so a test that reached
+    /// the real one would fail for a reason outside the product. The switch logic under
+    /// test is the same client either way; the stand-in reports the user manager
+    /// reachable and records nothing on the host.
+    fn ok_systemctl(tag: &str) -> PathBuf {
+        let path = scratch_root(tag).join("ok-systemctl.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncase \"$*\" in *'show -p Version --value'*) echo 255.4 ;; esac\nexit 0\n",
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in is runnable");
+        path
     }
 
     #[test]
@@ -6395,6 +6503,13 @@ concurrency = 1
     fn moving_an_agent_between_supervision_modes_is_reported_and_recorded() {
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
+        // The suite must be green without a reachable user manager. Inject the
+        // stand-in the other mode tests already use rather than depending on the
+        // host's user manager; the record/report path under test is unchanged.
+        app.supervisor
+            .set_systemctl(crate::systemd::Systemctl::with_binary(ok_systemctl(
+                "app-move-systemd",
+            )));
         app.on_key(key(KeyCode::Char('m')));
         eprintln!("after m (tui -> systemd): {}", app.status);
         assert!(app.status.contains("systemd"), "{}", app.status);

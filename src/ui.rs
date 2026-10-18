@@ -1137,12 +1137,23 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
         None => head.push(Line::from(no_agent_text(app))),
         Some(config) => {
             head.push(field("url", &config.forgejo.url));
+            let (_, admin) = app.forgejo_tokens_present();
+            // The role label follows the token that actually produced this view. A
+            // successful administrative check is an administrator even while the
+            // configuration still says `member`; a member check whose account is an
+            // administrator says so, and names `C` only when that key can work. Without
+            // an administrator token it names the route that can supply one (`A`),
+            // exactly as the summary line does.
             let role = match &app.role_check {
-                Some(Ok(check)) if check.viewer.is_admin && !check.administrative() => {
-                    format!(
-                        "{} — the token in use is an administrator's; C shows that view",
-                        config.forgejo.role.as_str()
-                    )
+                Some(Ok(check)) if check.administrative() => "administrator".to_owned(),
+                Some(Ok(check)) if check.viewer.is_admin => {
+                    if admin {
+                        "administrator account — checked as an ordinary member; C shows that view"
+                            .to_owned()
+                    } else {
+                        "administrator account — checked as an ordinary member; press A on the Credentials screen to add the administrator token"
+                            .to_owned()
+                    }
                 }
                 _ => config.forgejo.role.as_str().to_owned(),
             };
@@ -1920,12 +1931,13 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
     lines
 }/// The widths of the hub's five data columns.
 ///
-/// The name column is widened to the shortest width that keeps every configured name
-/// distinct, up to the room the window has; the state column is given the room for its
-/// longest word; the model column is as wide as the longest model id needs and **no
-/// wider**. When the window is too narrow for all of them, the state gives ground
-/// first, then the name falls back to its comfortable minimum, so identity outlives
-/// the labels.
+/// The state column is given the room its longest word needs **first**, so a failure
+/// class is always whole (`failed (server_error)`). The name column then gets the
+/// shortest width that keeps every configured name distinct, up to the room that is
+/// left; the model column is as wide as the longest model id needs and **no wider**.
+/// At the 72-column floor the state class wins over the name column's full distinct
+/// width: the name is shortened with its middle ellipsis, while the class keeps every
+/// character.
 ///
 /// Z-2: the model column used to take all the slack, so at 200 columns the `state`
 /// cell sat ~180 columns from the agent name and a row stopped reading as a row. The
@@ -1941,11 +1953,6 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
     let inner = (area.width as usize).saturating_sub(2);
     let available = inner.saturating_sub(GAPS);
     let names: Vec<&str> = app.agents().iter().map(|agent| agent.name.as_str()).collect();
-    // The name may use whatever is left once the other columns have their minimums.
-    let name_budget = available
-        .saturating_sub(MARKER + CONCURRENCY + SUPERVISION + STATE_COLUMN_MIN + MODEL_MIN)
-        .max(NAME_COLUMN_MIN);
-    let name = name_column_width(&names, name_budget);
     let state_wanted = app
         .agents()
         .iter()
@@ -1953,13 +1960,20 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
         .max()
         .unwrap_or(0)
         .clamp(STATE_COLUMN_MIN, STATE_COLUMN_MAX);
-    let state = state_wanted
-        .min(available.saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + MODEL_MIN))
-        .max(STATE_COLUMN_MIN.min(available));
-    // The model column asks for the width of the longest model id it must draw (at
-    // least the minimum), and is then given whatever of that the row has room for.
+    // The state column is paid first, up to the room that still leaves the name at its
+    // comfortable minimum. Then the name may use what is left, and the model column
+    // asks for the width of the longest model id it must draw (at least the minimum).
     // The leftover stays outside the table, so one row's fields stay together at any
     // width.
+    let state = state_wanted
+        .min(available.saturating_sub(
+            MARKER + NAME_COLUMN_MIN + CONCURRENCY + SUPERVISION + MODEL_MIN,
+        ))
+        .max(STATE_COLUMN_MIN.min(available));
+    let name_budget = available
+        .saturating_sub(MARKER + CONCURRENCY + SUPERVISION + state + MODEL_MIN)
+        .max(NAME_COLUMN_MIN);
+    let name = name_column_width(&names, name_budget);
     let model_content = app
         .agents()
         .iter()
@@ -2043,10 +2057,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     // The legend is the product's own key list. Under an overlay that owns the plain
     // keys, `q` is a letter in a field or a cancel, never `quit`, so the line is
     // replaced with the one thing that is true there (E-2). The read-only
-    // acknowledgment review closes on **any** key, so its footer says so instead of
-    // naming `esc` as if the two disagreed (V-2).
+    // acknowledgment review scrolls with `[`/`]` and closes on any other key, so its
+    // footer names both instead of saying only `any key` (V-2).
     let legend = if app.show_acknowledgment && app.ack_review {
-        "any key closes this overlay; the record is unchanged"
+        "esc closes this overlay; [ and ] scroll; the record is unchanged"
     } else if app.overlay_owns_keys() {
         "esc closes this overlay"
     } else {
@@ -2593,18 +2607,25 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     let below = pushed_rows(&lines[first..], inner) > content_height;
     // The action line lives in the title as well as the body: at 80x24 the intro
     // prose pushes the body's last line off, and the key that submits the form must
-    // never be the line that disappears (P-3). LIB-1: the declaration is the same one
-    // every other bordered surface uses, fitted to the width, and it names the
-    // direction the window has moved in (above and/or below) instead of the one-off
-    // phrase this form used to carry.
-    let (title, _) = fit_title(
-        popup.width as usize,
-        "add an agent — ctrl-s writes it, esc cancels",
-        None,
-        None,
-        above,
-        below,
-    );
+    // never be the line that disappears (P-3). The form types every ordinary
+    // character into its fields, `[`/`]` included (an IPv6 URL or a bracketed paste is
+    // data), so its declaration names the keys that really move between the dropped
+    // fields: tab and the arrows.
+    let declaration = match (above, below) {
+        (true, true) => "↑↓ fields — tab/↑↓",
+        (true, false) => "↑ fields — tab/↑",
+        (false, true) => "↓ more fields — tab/↓",
+        (false, false) => "",
+    };
+    let title = if declaration.is_empty() {
+        " add an agent — ctrl-s writes it, esc cancels ".to_owned()
+    } else {
+        form_title(
+            popup.width as usize,
+            "add an agent — ctrl-s writes it, esc cancels",
+            declaration,
+        )
+    };
     let block = Block::bordered()
         .title(title)
         .border_style(Style::new().fg(Color::Cyan));
@@ -2776,7 +2797,7 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
             "Remove `{name}` from the configuration? It has no files under {config_dir} yet, and no run records."
         )
     };
-    let mut body: Vec<Line> = vec![
+    let body: Vec<Line> = vec![
         Line::from(question),
         Line::from(format!(
             "Its secret in {} is left too, marked on the Credentials screen; press D there to delete a secret whose agent is gone.",
@@ -2807,27 +2828,15 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
         },
     );
     let inner_height = popup.height.saturating_sub(2) as usize;
-    let mut dropped = false;
-    // Reserve the answer row plus one row of safety: the estimate and the terminal's
-    // own wrapping can differ by a row at the floor, and the answer is the row that
-    // must never be the one clipped.
-    while !body.is_empty()
-        && pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 1
-            > inner_height
-    {
-        body.pop();
-        dropped = true;
-    }
-    let title = if dropped {
-        fit_title(width as usize, "remove an agent", None, None, false, true).0
+    let (lines, above, below) = window_modal(app, &body, &answer, inner_width, inner_height);
+    let title = if above || below {
+        fit_title(width as usize, "remove an agent", None, None, above, below).0
     } else {
         " remove an agent ".to_owned()
     };
     let block = Block::bordered()
         .title(title)
         .border_style(error_border_style());
-    let mut lines = body;
-    lines.extend(answer);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2852,7 +2861,7 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
         .map(|agent| format!("`{agent}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut body: Vec<Line> = vec![
+    let body: Vec<Line> = vec![
         Line::from(format!(
             "Delete the leftover secrets for {names} from {}?",
             breakable_path(&app.credentials_path.display().to_string())
@@ -2880,27 +2889,15 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
         },
     );
     let inner_height = popup.height.saturating_sub(2) as usize;
-    let mut dropped = false;
-    // Reserve the answer row plus one row of safety: the estimate and the terminal's
-    // own wrapping can differ by a row at the floor, and the answer is the row that
-    // must never be the one clipped.
-    while !body.is_empty()
-        && pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 1
-            > inner_height
-    {
-        body.pop();
-        dropped = true;
-    }
-    let title = if dropped {
-        fit_title(width as usize, "delete leftover secrets", None, None, false, true).0
+    let (lines, above, below) = window_modal(app, &body, &answer, inner_width, inner_height);
+    let title = if above || below {
+        fit_title(width as usize, "delete leftover secrets", None, None, above, below).0
     } else {
         " delete leftover secrets ".to_owned()
     };
     let block = Block::bordered()
         .title(title)
         .border_style(error_border_style());
-    let mut lines = body;
-    lines.extend(answer);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2998,17 +2995,6 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width);
     let height = (wanted as u16 + 2).min(screen.height);
     let inner_height = height.saturating_sub(2) as usize;
-    let mut dropped = false;
-    // Reserve the answer row plus one row of safety: the estimate and the terminal's
-    // own wrapping can differ by a row at the floor, and the answer is the row that
-    // must never be the one clipped.
-    while !body.is_empty()
-        && pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 1
-            > inner_height
-    {
-        body.pop();
-        dropped = true;
-    }
     let popup = centered(screen, width, height);
     frame.render_widget(
         Clear,
@@ -3019,13 +3005,12 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
-    let title = if dropped {
-        fit_title(width as usize, "open an editor", None, None, false, true).0
+    let (lines, above, below) = window_modal(app, &body, &answer, inner_width, inner_height);
+    let title = if above || below {
+        fit_title(width as usize, "open an editor", None, None, above, below).0
     } else {
         " open an editor ".to_owned()
     };
-    let mut lines = body;
-    lines.extend(answer);
     let block = Block::bordered()
         .title(title)
         .border_style(warning_border_style());
@@ -3146,7 +3131,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         // Read-only: the record exists and a second person is reading it. Nothing
         // here writes, so nothing here may look like it does (C-3).
         answer.push(Line::from(Span::styled(
-            "  any key closes this; the record is unchanged",
+            "  esc closes this; [ and ] scroll; the record is unchanged",
             selection_style(),
         )));
         if let Some(record) = app.ack_record_line() {
@@ -3201,19 +3186,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     // when anything was dropped (`more below — press ]`). A person at the
     // floor therefore never reads a sentence that stops mid-thought in silence.
     let inner_height = popup.height.saturating_sub(2) as usize;
-    let mut dropped = false;
-    while answer.len() > 1 && pushed_rows(&answer, inner_width) > inner_height {
-        answer.pop();
-        dropped = true;
-    }
-    while !prose.is_empty()
-        && pushed_rows(&prose, inner_width) + pushed_rows(&answer, inner_width) > inner_height
-    {
-        prose.pop();
-        dropped = true;
-    }
-    let mut lines = prose;
-    lines.extend(answer);
+    let (lines, above, below) = window_modal(app, &prose, &answer, inner_width, inner_height);
 
     // w44 F3: the read-only review is not the first run. A record already exists and
     // the acknowledgment is on file, so the overlay is titled for the state it is in;
@@ -3224,10 +3197,10 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     } else {
         risk::TITLE
     };
-    let title = if dropped {
+    let title = if above || below {
         // The declaration is the part that must survive, so it is fitted to the box
         // before it is drawn (Y-1).
-        fit_title(popup.width as usize, base, None, None, false, true).0
+        fit_title(popup.width as usize, base, None, None, above, below).0
     } else {
         format!(" {base} ")
     };
@@ -3334,6 +3307,83 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// The window of a modal whose body may be longer than the box.
+///
+/// The body rows scroll; the answer rows are pinned at the bottom, because the key
+/// that answers the overlay must never be the row that scrolls away. If the answer
+/// itself is long (the review's record facts), only its first row is pinned and the
+/// rest scroll with the body, so the close line still stays visible. The furthest
+/// offset is stored on the app, so `[`/`]` can clamp and report truthfully.
+fn window_modal(
+    app: &App,
+    body: &[Line<'static>],
+    answer: &[Line<'static>],
+    width: usize,
+    height: usize,
+) -> (Vec<Line<'static>>, bool, bool) {
+    let body_rows = panel_rows(body, width);
+    let answer_rows = panel_rows(answer, width);
+    // A short answer (the ordinary y/n line, or the first-run record path) is pinned
+    // whole; a long one keeps its first row pinned and lets the rest scroll with the
+    // body, so the primary answer is always on the screen.
+    let half = (height / 2).max(1);
+    let keep = if answer_rows.len() <= half {
+        answer_rows.len()
+    } else {
+        answer_rows.len().min(1)
+    };
+    let (pinned, rest) = answer_rows.split_at(keep);
+    let content_len = body_rows.len() + rest.len();
+    let visible = height.saturating_sub(pinned.len());
+    let max_scroll = content_len.saturating_sub(visible);
+    app.modal_scroll_max.set(max_scroll);
+    let offset = app.modal_scroll.min(max_scroll);
+    let mut lines = Vec::with_capacity(height.max(1));
+    let mut taken = 0usize;
+    for row in body_rows.iter().skip(offset) {
+        if taken >= visible {
+            break;
+        }
+        lines.push(row.clone());
+        taken += 1;
+    }
+    if taken < visible {
+        let rest_offset = offset.saturating_sub(body_rows.len());
+        for row in rest.iter().skip(rest_offset) {
+            if taken >= visible {
+                break;
+            }
+            lines.push(row.clone());
+            taken += 1;
+        }
+    }
+    lines.extend(pinned.iter().cloned());
+    (lines, offset > 0, offset + visible < content_len)
+}
+
+/// A title for the windowed add-agent form, whose overflow key is `tab`/`↑`/`↓`, not
+/// `[`/`]`: a bracket typed in a field is data, so the title names only keys the form
+/// really handles.
+fn form_title(width: usize, base: &str, declaration: &str) -> String {
+    let room = width.saturating_sub(2).max(1);
+    let candidates = [
+        compose_title(base, None, Some(declaration)),
+        compose_title(
+            "add an agent — ctrl-s writes, esc cancels",
+            None,
+            Some(declaration),
+        ),
+        compose_title("add an agent", None, Some(declaration)),
+        compose_title("add an agent", None, Some("more fields")),
+    ];
+    for candidate in candidates {
+        if candidate.chars().count() <= room {
+            return candidate;
+        }
+    }
+    " add an agent ".to_owned()
 }
 
 /// A line naming a field and its value.
