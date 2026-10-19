@@ -207,7 +207,14 @@ pub fn execute(run_dir: &Path) -> RunEnd {
     };
 
     let started = Instant::now();
+    // The before-picture of the workspace's remote-tracking refs. The push witness is
+    // written only when git's reflog records a push, during the run, that moved a ref
+    // to its local commit; command text and ref equality alone are never the evidence.
+    let push_watch = crate::workspace::watch_push(&plan.workspace);
     let end = run(&plan, run_dir, &mut transcript, &mut log);
+    if let Some((branch, remote_ref)) = crate::workspace::pushed_during(&push_watch) {
+        let _ = crate::run::write_push_witness(run_dir, &branch, &remote_ref);
+    }
     if let Some(reason) = &end.reason {
         log.line(reason);
     }
@@ -491,7 +498,13 @@ fn model_loop(
             Ok(exchange) => exchange,
             Err(error) => {
                 let class = error.class();
-                let reason = format!("the model call failed ({class}): {error}");
+                // Every failure class names the endpoint and the model in the same
+                // phrase, so a person with two agents knows which address answered
+                // (K-7/F14). The screen adds the recovery route; the log keeps this.
+                let reason = format!(
+                    "the model call failed ({class}) at endpoint {} — model {}: {error}",
+                    plan.endpoint, plan.model
+                );
                 // Written once, by `execute`, from the run's own reason.
                 let _ = transcript.append(&Record::model_call_failed(
                     &plan.run_id,

@@ -38,11 +38,8 @@ const RECENT_RUNS_REFRESH: Duration = Duration::from_secs(1);
 /// How many runs the runs screen lists.
 const RECENT_RUNS_LIMIT: usize = 50;
 
-/// How many rows one page key moves a list, and the help overlay.
-const LIST_PAGE: isize = 5;
+/// How many rows one page key moves the help overlay.
 const HELP_PAGE: usize = 5;
-/// How many logical lines `PageDown`/`PageUp` move a panel's own scroll.
-const PANEL_PAGE: isize = 5;
 
 /// The screens of the terminal UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,10 +277,55 @@ impl SecretPrompt {
 /// an agent, which silently re-pointed every existing agent at once (W32-1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlPrompt {
-    /// What has been typed so far, drawn as itself.
+    /// What has been typed so far, drawn as itself. It starts empty: the old address
+    /// is a placeholder, never text the person did not put there (K-2).
     pub value: String,
+    /// The address in force, shown dim behind an empty field.
+    pub placeholder: String,
     /// Why the last attempt to write it did not work.
     pub error: Option<String>,
+}
+
+/// The small editor `E` opens on the Agent screen.
+///
+/// The endpoint, model id and model key were previously editable only by removing the
+/// agent and creating it again (F14/K-7). All three fields start empty; the configured
+/// endpoint and model are dim placeholders, and the key is never read back. A blank
+/// field keeps the value in force, so a person can change one thing without retyping
+/// the others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditAgentForm {
+    /// endpoint, model id, model key.
+    pub fields: [String; 3],
+    /// Which field the next key types into.
+    pub cursor: usize,
+    /// Why the last write was refused. The value stays in the field.
+    pub error: Option<String>,
+}
+
+impl EditAgentForm {
+    /// The field labels, in order, and whether a field holds a secret.
+    pub const FIELDS: [(&'static str, bool); 3] = [
+        ("model endpoint", false),
+        ("model id", false),
+        ("model key", true),
+    ];
+
+    /// An empty editor. The configured endpoint and model are drawn as placeholders
+    /// from the agent, never copied into these fields.
+    pub fn new() -> Self {
+        Self {
+            fields: [String::new(), String::new(), String::new()],
+            cursor: 0,
+            error: None,
+        }
+    }
+}
+
+impl Default for EditAgentForm {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A cheap fingerprint of a file: its size and its modification time.
@@ -446,7 +488,11 @@ impl EndpointTestRecord {
     fn of(test: &EndpointTest) -> Self {
         let (answered, failed_class, failed_message) = match &test.result {
             Ok(summary) => (Some(summary.clone()), None, None),
-            Err(failure) => (None, Some(failure.class.clone()), Some(failure.message.clone())),
+            Err(failure) => (
+                None,
+                Some(failure.class.clone()),
+                Some(failure.message.clone()),
+            ),
         };
         Self {
             agent: test.agent.clone(),
@@ -505,7 +551,10 @@ pub fn read_endpoint_tests(path: &Path) -> Vec<EndpointTest> {
     let Ok(file) = toml::from_str::<EndpointTestFile>(&text) else {
         return Vec::new();
     };
-    file.tests.into_iter().map(EndpointTestRecord::into_test).collect()
+    file.tests
+        .into_iter()
+        .map(EndpointTestRecord::into_test)
+        .collect()
 }
 
 /// Write one test into the record, replacing that agent's previous one.
@@ -542,6 +591,11 @@ pub struct RoleCheckStamp {
     pub checked_at_ms: u64,
     /// The machine that ran it, when the record names one.
     pub machine: Option<String>,
+    /// What the check found: `administrator`, `member`, or `failed (<class>)`.
+    ///
+    /// The time alone let a reopened screen say a check had run without saying what
+    /// it found, so the configured default read as the result (K-14).
+    pub outcome: Option<String>,
 }
 
 /// One role-check stamp as it is written down. It holds no secret.
@@ -550,6 +604,8 @@ struct RoleCheckRecord {
     checked_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     machine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
 }
 
 /// The shape of the role-check record on disk.
@@ -569,6 +625,7 @@ pub fn read_role_check_stamp(path: &Path) -> Option<RoleCheckStamp> {
     file.check.map(|record| RoleCheckStamp {
         checked_at_ms: record.checked_at_ms,
         machine: record.machine,
+        outcome: record.outcome,
     })
 }
 
@@ -583,6 +640,7 @@ pub fn write_role_check_stamp(path: &Path, stamp: &RoleCheckStamp) -> std::io::R
         check: Some(RoleCheckRecord {
             checked_at_ms: stamp.checked_at_ms,
             machine: stamp.machine.clone(),
+            outcome: stamp.outcome.clone(),
         }),
     };
     let text = toml::to_string(&file)
@@ -904,24 +962,32 @@ struct PendingStart {
 /// prints no value, starts nothing, and claims nothing about whether the stored
 /// complaint still holds — so a historical failure stays history.
 fn failure_recovery(agent: &str, reason: &str) -> String {
+    // `press 1` used to be printed on screen 1 itself, where it does nothing. The
+    // sentence names the screen without pretending the key is the next act there.
     if reason.contains("(bad_key)") {
+        // Lead with the two steps, so a wrapped reason cannot separate `press 5` from
+        // `and k`; the historical reason follows after the route.
         return format!(
-            "{reason} — if the model key is no longer current, press 1 and use up/down to select `{agent}`, then press 5 and k on the Credentials screen to replace its model key"
+            "select `{agent}` at 1, then press 5 and k on the Credentials screen to replace its model key — {reason}"
         );
     }
     if reason.contains("(server_error)") {
         // The endpoint's own answer can be long. Put the next step first, so a short
         // panel or a note area still shows it before the answer's body.
         return format!(
-            "press 1 and use up/down to select `{agent}`, then press s to try again or p to test the endpoint — {reason}"
+            "select `{agent}` on the Agents screen (1), then press s to try again or p to test the endpoint — {reason}"
         );
     }
     if reason.contains("(transport)") || reason.contains("(bad_url)") {
-        // The reason names the endpoint URL. The address is the thing to correct; the
-        // product's own route is to remove and re-add the agent with the right one,
-        // or to fix the configuration and re-read it.
+        // The address is the thing to correct; `E` edits it without removing the
+        // agent, and a hand-fixed configuration is re-read with `r`.
         return format!(
-            "{reason} — check the endpoint address; press 1 and use up/down to select `{agent}`, then d to remove it and n to add it again with the right address, or fix the configuration and press r"
+            "{reason} — check the endpoint address; select `{agent}` on the Agents screen (1), then press E to edit the endpoint, model and key, or fix the configuration and press r"
+        );
+    }
+    if reason.contains("(route_not_found)") || reason.contains("(model_not_found)") {
+        return format!(
+            "{reason} — select `{agent}` on the Agents screen (1), then press E and set the full completions path including /v1, for example https://host/v1/chat/completions; press p to test it"
         );
     }
     reason.to_owned()
@@ -1037,6 +1103,8 @@ pub struct App {
     pub secret_prompt: Option<SecretPrompt>,
     /// A one-field prompt for the Forgejo address, when one is open (W32-1).
     pub url_prompt: Option<UrlPrompt>,
+    /// The endpoint/model/key editor `E` opens, when it is open.
+    pub edit_agent: Option<EditAgentForm>,
     /// An agent waiting on the "remove it?" confirmation, when one is open.
     pub confirm_remove: Option<String>,
     /// The leftover per-agent secrets (agents no longer configured) waiting on a delete
@@ -1104,6 +1172,13 @@ pub struct App {
     pub run_selected: usize,
     /// The recent runs, read from the records on disk.
     pub recent: Vec<RunSummary>,
+    /// The newest run id the list showed last refresh, so a newly terminal record is
+    /// allowed to move the Runs selection to the top without stealing it on every tick.
+    newest_seen_run: Option<String>,
+    /// Whether that newest record had a terminal outcome at the last refresh. A run
+    /// whose record is already on disk as `running` does not change its id when it
+    /// ends; this is what tells the screen the record it was showing has just closed.
+    newest_seen_terminal: Option<bool>,
     /// How many run records the configured agents have on disk, of which `recent`
     /// holds the newest [`RECENT_RUNS_LIMIT`]. The difference is what the list and the
     /// footer count must declare rather than hide (L-1, L-5).
@@ -1171,6 +1246,12 @@ pub struct App {
     /// wrapped rows without the terminal size being threaded through every key
     /// (W36-1). Before the first frame it is the floor's own body width.
     pub panel_width: std::cell::Cell<usize>,
+    /// The body rows the current panel or note area was last drawn with, so a page
+    /// key moves a viewport rather than a line (K-11).
+    pub panel_height: std::cell::Cell<usize>,
+    /// The furthest first row the current panel can show at that height, stored by
+    /// the renderer so a resize clamps the offset instead of leaving it past the end.
+    pub panel_scroll_limit: std::cell::Cell<usize>,
     /// How far the current modal's body has been scrolled, in wrapped rows.
     ///
     /// A modal that names `[`/`]` in its title must move its own body, not answer or
@@ -1234,6 +1315,7 @@ impl App {
             add_agent: None,
             secret_prompt: None,
             url_prompt: None,
+            edit_agent: None,
             confirm_remove: None,
             confirm_forget: None,
             editor_confirm: None,
@@ -1251,6 +1333,8 @@ impl App {
             selected: 0,
             run_selected: 0,
             recent: Vec::new(),
+            newest_seen_run: None,
+            newest_seen_terminal: None,
             recent_total: 0,
             footprint: crate::run::RunFootprint::default(),
             endpoint_test: None,
@@ -1270,6 +1354,8 @@ impl App {
             forgejo_note: None,
             last_scan: None,
             panel_width: std::cell::Cell::new(70),
+            panel_height: std::cell::Cell::new(10),
+            panel_scroll_limit: std::cell::Cell::new(0),
             modal_scroll: 0,
             modal_scroll_max: std::cell::Cell::new(0),
             status: String::new(),
@@ -1393,7 +1479,11 @@ impl App {
     /// while it ran left the run counted but invisible and unstoppable — the W-2
     /// orphan shape through the reload door.
     fn stop_unconfigured_runs(&mut self) {
-        let names: Vec<String> = self.agents().iter().map(|agent| agent.name.clone()).collect();
+        let names: Vec<String> = self
+            .agents()
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
         let stopped = self.supervisor.stop_unlisted(&names);
         if !stopped.is_empty() {
             let listed = stopped.join(", ");
@@ -1471,7 +1561,8 @@ impl App {
                         if finished {
                             self.supervisor.forget_state(&name);
                         }
-                        self.unreadable_runs.push((name.clone(), source.to_string()));
+                        self.unreadable_runs
+                            .push((name.clone(), source.to_string()));
                     }
                 }
             }
@@ -1487,9 +1578,7 @@ impl App {
             // newest record for the agent is on disk and its error is known; the hub
             // says the same word Runs does, and the note area gives the reason.
             if let Some(reason) = newest.and_then(|run| run.read_error.clone()) {
-                let run_id = newest
-                    .map(|run| run.run_id.clone())
-                    .unwrap_or_default();
+                let run_id = newest.map(|run| run.run_id.clone()).unwrap_or_default();
                 self.unreadable_runs.push((name.clone(), reason.clone()));
                 self.supervisor.note_unreadable(&name, run_id, reason);
                 continue;
@@ -1523,7 +1612,11 @@ impl App {
     /// process is no longer alive is closed here, as `stopped`, with a reason. A run
     /// whose process *is* alive is left alone: it is genuinely in progress.
     fn reconcile_abandoned_runs(&mut self) {
-        let names: Vec<String> = self.agents().iter().map(|agent| agent.name.clone()).collect();
+        let names: Vec<String> = self
+            .agents()
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect();
         for name in names {
             if self.supervisor.mode(&name) != Mode::Tui {
                 continue;
@@ -1547,8 +1640,7 @@ impl App {
             if crate::supervisor::process_alive(pid) {
                 continue;
             }
-            self.supervisor
-                .note_abandoned(&name, &run.dir, &run.run_id);
+            self.supervisor.note_abandoned(&name, &run.dir, &run.run_id);
         }
     }
 
@@ -1628,6 +1720,44 @@ impl App {
         // population (R-5).
         self.recent_total = self.footprint.records;
         self.last_scan = Some(Instant::now());
+        let newest = self.recent.first().map(|run| run.run_id.clone());
+        let newest_terminal = self.recent.first().is_some_and(|run| run.outcome.is_some());
+        if newest != self.newest_seen_run {
+            if self.newest_seen_run.is_some() {
+                // A new record appeared: the outcome the person just produced is the
+                // one the records panel should show (K-6), from the top.
+                self.run_selected = 0;
+                self.panel_scroll = 0;
+                // The "view moved to the run that just ended" sentence names the run
+                // that was newest; a newer record makes it false, so it is withdrawn
+                // rather than left under a different selection.
+                if self
+                    .status
+                    .starts_with("the view moved to the run that just ended")
+                {
+                    self.status.clear();
+                }
+            }
+            self.newest_seen_run = newest;
+        } else if newest_terminal && self.newest_seen_terminal == Some(false) {
+            // The record already on disk as running has become terminal. Its id did
+            // not change, so this transition — not a new run id — is what moves the
+            // view. The sentence says where the view went, and why (the run-end
+            // rule); it is not written over another screen's status.
+            self.run_selected = 0;
+            self.panel_scroll = 0;
+            if self.screen == Screen::Runs && !self.overlay_owns_screen() {
+                if let Some(run) = self.recent.first() {
+                    self.status = format!(
+                        "the view moved to the run that just ended: `{}` {} — {}",
+                        run.agent,
+                        run.run_id,
+                        run.describe()
+                    );
+                }
+            }
+        }
+        self.newest_seen_terminal = Some(newest_terminal);
         if self.run_selected >= self.recent.len() {
             self.run_selected = self.recent.len().saturating_sub(1);
         }
@@ -1769,7 +1899,11 @@ impl App {
     /// sentence says both, so an unrelated write does not silently restate what the
     /// note seems to measure: it measures the file, and the note says so.
     pub fn present_secret_labels(&self) -> Vec<String> {
-        let configured: Vec<&str> = self.agents().iter().map(|agent| agent.name.as_str()).collect();
+        let configured: Vec<&str> = self
+            .agents()
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
         // The credentials file's own modification time is the only time the file
         // carries: the secret itself has none.
         let age = file_age(&self.credentials_path);
@@ -1793,7 +1927,11 @@ impl App {
     /// These are exactly the entries a removal leaves behind. Naming them is what lets
     /// the Credentials screen offer to delete them instead of only marking them (Y-6).
     pub fn leftover_secret_agents(&self) -> Vec<String> {
-        let configured: Vec<&str> = self.agents().iter().map(|agent| agent.name.as_str()).collect();
+        let configured: Vec<&str> = self
+            .agents()
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
         let mut agents: Vec<String> = Vec::new();
         for name in crate::credentials::present_secret_names(&self.credentials_path) {
             if let Some(agent) = backticked_agent(&name) {
@@ -1856,7 +1994,10 @@ impl App {
         self.recent
             .iter()
             .filter(|run| {
-                let Some(started) = run.started_at.as_deref().and_then(crate::time::parse_rfc3339)
+                let Some(started) = run
+                    .started_at
+                    .as_deref()
+                    .and_then(crate::time::parse_rfc3339)
                 else {
                     return false;
                 };
@@ -2016,6 +2157,28 @@ impl App {
         self.ack_state.record_line_with(Some(&extra))
     }
 
+    /// The compact acknowledgment line the hub draws.
+    ///
+    /// It carries the two facts a returning person needs at a glance — what the record
+    /// proves (`a plain file, not signed`) and whether a newer build has used the
+    /// configuration — while the long machine, digest and copy clauses stay behind
+    /// `R` (F6/K-20).
+    pub fn ack_record_compact_line(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(clause) = self.ack_version_clause() {
+            parts.push(clause);
+        }
+        // A record from another machine says what to do about it: starting is still
+        // allowed under it, and removing the record and starting again records this
+        // machine's own confirmation.
+        if let Some(action) = self.ack_state.elsewhere_action(&self.ack_path) {
+            parts.push(action);
+        }
+        parts.push("it is a plain file, not signed".to_owned());
+        let extra = parts.join("; ");
+        self.ack_state.record_line_with(Some(&extra))
+    }
+
     /// The `used by version X since <date>` clause, when this build is older than the
     /// configuration's own `last-seen` record (U3).
     fn ack_version_clause(&self) -> Option<String> {
@@ -2136,13 +2299,15 @@ impl App {
             || self.editor_confirm.is_some()
             || self.secret_prompt.is_some()
             || self.url_prompt.is_some()
+            || self.edit_agent.is_some()
             || self.confirm_remove.is_some()
             || self.confirm_forget.is_some()
             || self.show_help
-            // A review of the acknowledgment owns every key too: `q` closes the
-            // review there, it does not quit the product, so the footer must not
-            // advertise `q quit` under it.
-            || (self.show_acknowledgment && self.ack_review)
+            // The first-run acknowledgment owns its keys too. It used to be excluded
+            // because `q` quit the product there, and the footer advertised that under
+            // the modal as if the underlying screen still had the keys (K-26). The
+            // product no longer advertises `q` or a screen key under it.
+            || self.show_acknowledgment
     }
 
     /// Whether an overlay is drawn over the body and so owns the note area behind it.
@@ -2307,7 +2472,13 @@ impl App {
     fn quoted_name(name: &str) -> String {
         let cleaned: String = name
             .chars()
-            .map(|character| if character.is_control() { '?' } else { character })
+            .map(|character| {
+                if character.is_control() {
+                    '?'
+                } else {
+                    character
+                }
+            })
             .collect();
         let characters: Vec<char> = cleaned.chars().collect();
         if characters.len() <= crate::config::MAX_AGENT_NAME_LEN {
@@ -2381,6 +2552,24 @@ impl App {
         }
         if endpoint.is_empty() {
             return Err((Some(1), "the agent needs a model endpoint".to_owned()));
+        }
+        if let Some(problem) = crate::config::url_problem(&endpoint) {
+            return Err((
+                Some(1),
+                format!(
+                    "the model endpoint `{endpoint}` {problem}; use the full URL a run POSTs to, for example https://host/v1/chat/completions"
+                ),
+            ));
+        }
+        if !forgejo_url.is_empty() {
+            if let Some(problem) = crate::config::url_problem(&forgejo_url) {
+                return Err((
+                    Some(4),
+                    format!(
+                        "the Forgejo URL `{forgejo_url}` {problem}; use an address such as https://forgejo.example.org"
+                    ),
+                ));
+            }
         }
         if model.is_empty() {
             return Err((Some(2), "the agent needs a model id".to_owned()));
@@ -2551,9 +2740,7 @@ impl App {
             return;
         }
         self.confirm_remove = Some(name.clone());
-        self.status = format!(
-            "press y to remove `{name}` from the configuration, or n to keep it"
-        );
+        self.status = format!("press y to remove `{name}` from the configuration, or n to keep it");
     }
 
     /// Remove the agent the confirmation is about, and write the configuration back.
@@ -2562,9 +2749,8 @@ impl App {
             return;
         };
         let Some(existing) = self.config.clone() else {
-            self.status = format!(
-                "the configuration file cannot be read, so `{name}` cannot be removed"
-            );
+            self.status =
+                format!("the configuration file cannot be read, so `{name}` cannot be removed");
             return;
         };
         let kept: Vec<AgentConfig> = existing
@@ -2601,9 +2787,7 @@ impl App {
                 "removed `{name}` from the configuration; its files under {left} were left on disk"
             )
         } else {
-            format!(
-                "removed `{name}` from the configuration; it had no files under {left} yet"
-            )
+            format!("removed `{name}` from the configuration; it had no files under {left} yet")
         };
     }
 
@@ -2717,6 +2901,187 @@ impl App {
         }
     }
 
+    /// Open the endpoint/model/key editor for the selected agent (`E`).
+    pub fn request_endpoint_edit(&mut self) {
+        self.reset_modal_scroll();
+        let Some(agent) = self.selected_agent().cloned() else {
+            self.status = "there is no agent whose endpoint could be edited".to_owned();
+            return;
+        };
+        self.status = format!(
+            "edit `{}`: the endpoint must be the full URL a run POSTs to, for example https://host/v1/chat/completions; blank keeps a value",
+            agent.name
+        );
+        self.edit_agent = Some(EditAgentForm::new());
+    }
+
+    /// One key while the endpoint/model/key editor is open.
+    fn on_edit_agent_key(&mut self, key: KeyEvent) {
+        let count = EditAgentForm::FIELDS.len();
+        match key.code {
+            KeyCode::Enter => {
+                let last = count.saturating_sub(1);
+                if let Some(form) = self.edit_agent.as_mut() {
+                    form.error = None;
+                    if form.cursor < last {
+                        form.cursor += 1;
+                    } else {
+                        self.submit_edit_agent();
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.edit_agent = None;
+                self.status = "the endpoint, model and key were not changed".to_owned();
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(form) = self.edit_agent.as_mut() {
+                    form.error = None;
+                    form.cursor = (form.cursor + 1) % count;
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(form) = self.edit_agent.as_mut() {
+                    form.error = None;
+                    form.cursor = (form.cursor + count - 1) % count;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = self.edit_agent.as_mut() {
+                    form.error = None;
+                    form.fields[form.cursor].pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(form) = self.edit_agent.as_mut() {
+                    form.error = None;
+                    form.fields[form.cursor].clear();
+                }
+            }
+            KeyCode::Char(character) => {
+                if let Some(form) = self.edit_agent.as_mut() {
+                    form.error = None;
+                    form.fields[form.cursor].push(character);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Write the endpoint/model/key editor's values, keeping every blank field.
+    fn submit_edit_agent(&mut self) {
+        let Some(form) = self.edit_agent.clone() else {
+            return;
+        };
+        let Some(agent) = self.selected_agent().cloned() else {
+            self.edit_agent = None;
+            self.status = "the agent is no longer configured".to_owned();
+            return;
+        };
+        let typed_endpoint = form.fields[0].trim();
+        let endpoint = if typed_endpoint.is_empty() {
+            agent.endpoint.clone()
+        } else {
+            typed_endpoint.to_owned()
+        };
+        if let Some(problem) = crate::config::url_problem(&endpoint) {
+            let message = format!(
+                "not written: the model endpoint `{endpoint}` {problem}; it must be the full URL, for example https://host/v1/chat/completions"
+            );
+            self.status = message.clone();
+            if let Some(open) = self.edit_agent.as_mut() {
+                open.cursor = 0;
+                open.error = Some(message);
+            }
+            return;
+        }
+        let typed_model = form.fields[1].trim();
+        let model = if typed_model.is_empty() {
+            agent.model.clone()
+        } else {
+            typed_model.to_owned()
+        };
+        if model.is_empty() {
+            let message = "not written: the model id cannot be empty".to_owned();
+            self.status = message.clone();
+            if let Some(open) = self.edit_agent.as_mut() {
+                open.cursor = 1;
+                open.error = Some(message);
+            }
+            return;
+        }
+        let key = form.fields[2].trim().to_owned();
+        let Some(mut updated) = self.config.clone() else {
+            self.status = "the configuration could not be read".to_owned();
+            return;
+        };
+        let Some(target) = updated
+            .agents
+            .iter_mut()
+            .find(|candidate| candidate.name == agent.name)
+        else {
+            self.edit_agent = None;
+            self.status = "the agent is no longer configured".to_owned();
+            return;
+        };
+        target.endpoint = endpoint.clone();
+        target.model = model.clone();
+        let text = render_full_config(&updated, &updated.agents);
+        if let Err(error) = Config::from_text(&self.config_path(), &text) {
+            let message = error.to_string();
+            self.status = message.clone();
+            if let Some(open) = self.edit_agent.as_mut() {
+                open.error = Some(message);
+            }
+            return;
+        }
+        let before = std::fs::read(self.config_path()).ok();
+        let existed = self.config_path().exists();
+        if let Err(error) = crate::mode::write_private(self.config_path(), text.as_bytes()) {
+            let message = format!(
+                "{} cannot be written: {error}",
+                self.config_path().display()
+            );
+            self.status = message.clone();
+            if let Some(open) = self.edit_agent.as_mut() {
+                open.error = Some(message);
+            }
+            return;
+        }
+        if !key.is_empty() {
+            if let Err(error) = credentials::record_secret(
+                &self.credentials_path,
+                Some("model_keys"),
+                &agent.name,
+                &key,
+            ) {
+                let restored = Self::restore_file(&self.config_path(), before.as_deref(), existed);
+                let outcome = if restored {
+                    "the change was not written"
+                } else {
+                    "the configuration could not be restored"
+                };
+                let message = format!("{outcome}: {error}");
+                self.status = message.clone();
+                if let Some(open) = self.edit_agent.as_mut() {
+                    open.error = Some(message);
+                }
+                return;
+            }
+        }
+        self.edit_agent = None;
+        self.reload();
+        self.status = format!(
+            "edited `{}`: endpoint {endpoint} — model {model}{}",
+            agent.name,
+            if key.is_empty() {
+                ""
+            } else {
+                "; the model key was replaced and is never shown"
+            }
+        );
+    }
+
     /// Open the one-field prompt that edits the configured Forgejo address (W32-1).
     ///
     /// The address was settable only by adding an agent, whose writer silently moved
@@ -2725,15 +3090,16 @@ impl App {
     /// and its own sentence saying that every agent in this configuration follows it.
     pub fn request_url_edit(&mut self) {
         let Some(settings) = self.forgejo_settings() else {
-            self.status = "the configuration could not be read, so the address cannot be edited"
-                .to_owned();
+            self.status =
+                "the configuration could not be read, so the address cannot be edited".to_owned();
             return;
         };
         self.status =
             "type the Forgejo address and press enter; it applies to every agent in this configuration"
                 .to_owned();
         self.url_prompt = Some(UrlPrompt {
-            value: settings.url,
+            value: String::new(),
+            placeholder: settings.url,
             error: None,
         });
     }
@@ -2749,6 +3115,11 @@ impl App {
             KeyCode::Backspace => {
                 if let Some(prompt) = self.url_prompt.as_mut() {
                     prompt.value.pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(prompt) = self.url_prompt.as_mut() {
+                    prompt.value.clear();
                 }
             }
             KeyCode::Char(character) => {
@@ -2773,6 +3144,16 @@ impl App {
             }
             return;
         }
+        if let Some(problem) = crate::config::url_problem(&url) {
+            let message = format!(
+                "not written: `{url}` {problem}; use a full address such as https://forgejo.example.org"
+            );
+            self.status = message.clone();
+            if let Some(open) = self.url_prompt.as_mut() {
+                open.error = Some(message);
+            }
+            return;
+        }
         let Some(existing) = self.config.clone() else {
             self.status = format!(
                 "the configuration file cannot be read, so the address cannot be written; fix {} first",
@@ -2791,7 +3172,10 @@ impl App {
             return;
         }
         if let Err(error) = crate::mode::write_private(self.config_path(), text.as_bytes()) {
-            let message = format!("{} cannot be written: {error}", self.config_path().display());
+            let message = format!(
+                "{} cannot be written: {error}",
+                self.config_path().display()
+            );
             self.status = message.clone();
             if let Some(open) = self.url_prompt.as_mut() {
                 open.error = Some(message);
@@ -2799,11 +3183,16 @@ impl App {
             return;
         }
         self.url_prompt = None;
-        self.reload();
         // The old address may have been another machine's instance; the view from it
-        // is not this address's view, so no stale repository list is kept. The new
-        // address must be checked on its own (`c`).
+        // is not this address's view, so no stale repository list is kept. The same is
+        // true of the check's stamp: it names the old address, so it must not survive
+        // the change and read as a result for the new one (the role-history rule).
+        let _ = std::fs::remove_file(self.layout.role_checks_file());
+        self.reload();
         self.role_check = None;
+        self.role_checked_at_ms = None;
+        self.role_check_machine = None;
+        self.persisted_role_check_stamp = None;
         self.repo_selected = 0;
         self.status = format!(
             "the Forgejo address is now {url} — it applies to every agent in this configuration; press c to check the role against it"
@@ -2832,7 +3221,8 @@ impl App {
     /// what `q` does — leave and stop the runs this UI started. It therefore asks the
     /// same one question rather than leaving in silence (C-1).
     fn ask_to_leave(&mut self, chord: &str) {
-        let live = self.supervisor.running_count();
+        let live_agents = self.supervisor.running_agents();
+        let live = live_agents.len();
         let waiting = self.supervisor.waiting_count();
         if (live == 0 && waiting == 0) || self.confirm_quit.is_some() {
             self.should_quit = true;
@@ -2852,7 +3242,20 @@ impl App {
         let waiting_pronoun = if waiting == 1 { "it" } else { "them" };
         let mut consequences: Vec<String> = Vec::new();
         if live > 0 {
-            consequences.push(format!("stops the {live} {run_noun} this UI started"));
+            let named = live_agents
+                .iter()
+                .map(|(name, run_id, elapsed_ms)| {
+                    format!("`{name}` ({run_id}, {} s)", elapsed_ms / 1000)
+                })
+                .collect::<Vec<_>>();
+            let listed = match named.as_slice() {
+                [] => String::new(),
+                [one] => one.clone(),
+                [head @ .., last] => format!("{} and {last}", head.join(", ")),
+            };
+            consequences.push(format!(
+                "stops the {live} {run_noun} this UI started: {listed}"
+            ));
         }
         if waiting > 0 {
             let waiting_agents = self.supervisor.waiting_agents();
@@ -3528,11 +3931,45 @@ impl App {
         })
     }
 
+    /// The reopened screen's truthful role line.
+    ///
+    /// `None` means this session has no result; the caller says `not checked this
+    /// session` rather than printing the configured default as if it were a result.
+    /// A persisted outcome and its age are the fact a restart can still carry.
+    pub fn last_check_line(&self) -> Option<String> {
+        let (at, outcome) = match self.role_checked_at_ms {
+            // The session's own result is the only truth while a check has run. With
+            // no result (the state a URL change leaves) there is nothing to print:
+            // the configured default is not a check result (K-14).
+            Some(at) => (
+                at,
+                match &self.role_check {
+                    Some(Ok(check)) if check.administrative() => Some("administrator".to_owned()),
+                    Some(Ok(_)) => Some("member".to_owned()),
+                    Some(Err(failure)) => Some(format!("failed ({})", failure.class)),
+                    None => return None,
+                },
+            ),
+            None => {
+                let stamp = self.persisted_role_check_stamp.as_ref()?;
+                (stamp.checked_at_ms, stamp.outcome.clone())
+            }
+        };
+        let outcome = outcome?;
+        Some(format!("last check: {outcome} ({})", tested_age(at)))
+    }
+
     /// Write the role check's stamp down beside the endpoint-test record (W37-1).
-    fn persist_role_check_stamp(&mut self, at: u64, machine: Option<String>) {
+    fn persist_role_check_stamp(
+        &mut self,
+        at: u64,
+        machine: Option<String>,
+        outcome: Option<String>,
+    ) {
         let stamp = RoleCheckStamp {
             checked_at_ms: at,
             machine,
+            outcome,
         };
         if let Err(error) = write_role_check_stamp(&self.layout.role_checks_file(), &stamp) {
             // Say the stamp could not be saved on the status line rather than hiding
@@ -3564,9 +4001,17 @@ impl App {
                 failure.class, url, failure.message
             ),
         };
+        let outcome = match &result {
+            Ok(check) => Some(if check.administrative() {
+                "administrator".to_owned()
+            } else {
+                "member".to_owned()
+            }),
+            Err(failure) => Some(format!("failed ({})", failure.class)),
+        };
         self.role_check = Some(result);
         self.repo_selected = 0;
-        self.persist_role_check_stamp(at, mark);
+        self.persist_role_check_stamp(at, mark, outcome);
     }
 
     /// Apply the administrator role check's result, keeping the last good view.
@@ -3591,7 +4036,7 @@ impl App {
                 self.role_checked_at_ms = Some(at);
                 self.role_check_machine = mark.clone();
                 self.repo_selected = 0;
-                self.persist_role_check_stamp(at, mark);
+                self.persist_role_check_stamp(at, mark, Some("administrator".to_owned()));
             }
             Err(failure) => {
                 let keep = matches!(self.role_check, Some(Ok(_)));
@@ -3606,11 +4051,12 @@ impl App {
                 } else {
                     let at = crate::time::now_unix_ms();
                     let mark = crate::machine::mark();
+                    let outcome = Some(format!("failed ({})", failure.class));
                     self.role_check = Some(Err(failure));
                     self.role_checked_at_ms = Some(at);
                     self.role_check_machine = mark.clone();
                     self.repo_selected = 0;
-                    self.persist_role_check_stamp(at, mark);
+                    self.persist_role_check_stamp(at, mark, outcome);
                 }
             }
         }
@@ -3688,8 +4134,8 @@ impl App {
     /// from inside the app instead of by editing the credentials file and restarting.
     pub fn request_admin_role_check(&mut self) {
         let Some(settings) = self.forgejo_settings() else {
-            self.status = "the configuration could not be read, so no Forgejo can be checked"
-                .to_owned();
+            self.status =
+                "the configuration could not be read, so no Forgejo can be checked".to_owned();
             return;
         };
         if let Some(sentence) = self.probe_sentence() {
@@ -3932,7 +4378,10 @@ impl App {
             count => format!("{count} changed paths"),
         };
         if state.commit.is_empty() {
-            return format!("an empty repository on {} (no commit yet), {changed} — {whose}", state.branch);
+            return format!(
+                "an empty repository on {} (no commit yet), {changed} — {whose}",
+                state.branch
+            );
         }
         let age = tested_age(state.committed_at.saturating_mul(1000));
         format!(
@@ -3972,14 +4421,16 @@ impl App {
                 None => format!("{} (the repository could not be read)", clone.name),
             })
             .collect();
-        let noun = if clones.len() == 1 {
-            "repository"
+        // The clone leads: its name, branch, commit and clean/changed state are the
+        // facts a person needed after `g`. The workspace root's own status is a
+        // trailing placement note, never the opening verdict (R-2/K-22).
+        let label = if clones.len() == 1 {
+            "the clone"
         } else {
-            "repositories"
+            "the clones"
         };
         format!(
-            "not a git repository; it holds {} cloned {noun}: {}",
-            clones.len(),
+            "{label} {} — the workspace root is the directory around the clone, not itself a repository",
             listed.join(", ")
         )
     }
@@ -4278,6 +4729,42 @@ impl App {
         }
     }
 
+    /// The newest run's final reply, as a pull request title and body.
+    ///
+    /// The first non-empty line is the title (bounded so the Forgejo form stays a
+    /// title), and the whole reply is the body. Only a run of the configured agent
+    /// under the current name counts, so a removed or earlier agent's history cannot
+    /// become today's pull request.
+    fn run_reply_pull_request(&self, agent: &str) -> Option<(String, String)> {
+        let run = self
+            .recent
+            .iter()
+            .find(|run| run.agent == agent && self.run_is_current(run))?;
+        let reply = run.final_reply.as_deref()?.trim();
+        if reply.is_empty() {
+            return None;
+        }
+        let mut title = reply
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(72)
+            .collect::<String>();
+        if reply
+            .lines()
+            .next()
+            .is_some_and(|first| first.trim().chars().count() > 72)
+        {
+            title.push('…');
+        }
+        if title.is_empty() {
+            return None;
+        }
+        Some((title, reply.to_owned()))
+    }
+
     /// The title and body of a pull request, from the agent's own file when it has one.
     fn pull_request_text(&self, agent: &str, branch: &str) -> (String, String) {
         let title = format!("Work by the agent `{agent}`");
@@ -4288,8 +4775,14 @@ impl App {
             return (title, body);
         };
         let path = paths.config_dir().join("pull-request.txt");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return (title, body);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // No hand-written file: the run's own final reply is the useful default
+            // title and body, not the product's generic sentence (K-8).
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return self.run_reply_pull_request(agent).unwrap_or((title, body));
+            }
+            Err(_) => return (title, body),
         };
         let mut lines = text.lines();
         let first = lines.next().unwrap_or("").trim().to_owned();
@@ -4620,8 +5113,7 @@ impl App {
                 } else {
                     ""
                 };
-                self.status =
-                    format!("your editor could not be started: {error}{created}");
+                self.status = format!("your editor could not be started: {error}{created}");
             }
             (ActionKind::View, Ok(_)) => {
                 self.status = format!("{} was shown{KEYS_BACK}", action.label);
@@ -4712,10 +5204,7 @@ impl App {
         let Ok(text) = std::fs::read_to_string(paths.instruction()) else {
             return false;
         };
-        let mut lines = text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty());
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
         match lines.next() {
             Some(line) => {
                 line == crate::agent_run::INSTRUCTION_PLACEHOLDER && lines.next().is_none()
@@ -4827,9 +5316,8 @@ impl App {
         ) || (self.supervisor.mode(&name) == Mode::Systemd
             && !self.supervisor.state(&name).is_live());
         if proven {
-            self.status = format!(
-                "stopped `{name}`: its process group was signalled and is proven gone"
-            );
+            self.status =
+                format!("stopped `{name}`: its process group was signalled and is proven gone");
             self.pending_stop = None;
         }
     }
@@ -4867,12 +5355,8 @@ impl App {
             } if *run_id == pending.run_id => {
                 // The run is over: the outcome is the truth, and there is nothing
                 // left to watch.
-                self.status = run_ended_sentence(
-                    &pending.agent,
-                    *outcome,
-                    reason.as_deref(),
-                    *duration_ms,
-                );
+                self.status =
+                    run_ended_sentence(&pending.agent, *outcome, reason.as_deref(), *duration_ms);
                 self.pending_start = None;
             }
             State::Starting { run_id, pid } | State::Running { run_id, pid, .. }
@@ -4925,6 +5409,14 @@ impl App {
             self.clear_screen_status();
         }
         self.screen = screen;
+        if self.screen == Screen::Runs {
+            // Entering the screen always shows the run that just happened, not the one
+            // a previous visit happened to leave selected (K-6).
+            self.run_selected = 0;
+        }
+        if self.screen == Screen::AgentConfig {
+            self.refresh_workspace_note();
+        }
     }
 
     /// Drop the status sentence made on the screen being left.
@@ -4966,7 +5458,16 @@ impl App {
                     .to_owned();
             return;
         }
-        let last = total.saturating_sub(1);
+        let viewport = self.panel_height.get().max(1);
+        let last = total.saturating_sub(viewport);
+        // The renderer stores the limit it last drew; a window that grew can lower it
+        // before the next key, and the offset is clamped here as well as on screen.
+        let drawn_limit = self.panel_scroll_limit.get();
+        let last = if drawn_limit > 0 {
+            last.min(drawn_limit)
+        } else {
+            last
+        };
         let before = self.panel_scroll.min(last);
         let after = (before as isize + steps).clamp(0, last as isize) as usize;
         self.panel_scroll = after;
@@ -4977,9 +5478,21 @@ impl App {
                 "the panel is at its end".to_owned()
             };
         } else {
-            let back = if steps < 0 { "PageDown or ]" } else { "PageUp or [" };
+            let back = if steps < 0 {
+                "PageDown or ]"
+            } else {
+                "PageUp or ["
+            };
             self.status = format!("the panel scrolled — press {back} to go back");
         }
+    }
+
+    /// Move a panel or note area by one viewport (K-11): `]`/PageDown forward, `[`/
+    /// PageUp back. The viewport is what the renderer last drew, so the step follows a
+    /// resize instead of a constant that could be longer than the window.
+    pub fn scroll_panel_page(&mut self, direction: isize) {
+        let viewport = self.panel_height.get().max(1) as isize;
+        self.scroll_panel(viewport * direction.signum());
     }
 
     /// Return the current modal's body to its first row.
@@ -5044,7 +5557,10 @@ impl App {
             return;
         }
         if last {
-            self.panel_scroll = total.saturating_sub(1);
+            let viewport = self.panel_height.get().max(1);
+            self.panel_scroll = total
+                .saturating_sub(viewport)
+                .min(self.panel_scroll_limit.get());
             self.status = "the panel is at its end".to_owned();
         } else {
             self.panel_scroll = 0;
@@ -5114,6 +5630,10 @@ impl App {
         }
         let last = count as isize - 1;
         self.selected = (self.selected as isize + steps).clamp(0, last) as usize;
+        if self.screen == Screen::AgentConfig {
+            self.workspace_note = None;
+            self.refresh_workspace_note();
+        }
     }
 
     /// Move the run selection, stopping at the ends.
@@ -5262,12 +5782,17 @@ impl App {
             self.status = note.to_owned();
             return;
         }
+        if let Some(form) = self.edit_agent.as_mut() {
+            form.fields[form.cursor] = first.to_owned();
+            form.error = None;
+            self.status = note.to_owned();
+            return;
+        }
         // The remaining overlays own the keys, so the generic `press n … or k/f/v/A`
         // advice would be false under them. Each names what answers it instead.
         if self.editor_confirm.is_some() {
             self.status =
-                "the editor confirmation is open — enter opens it, esc cancels"
-                    .to_owned();
+                "the editor confirmation is open — enter opens it, esc cancels".to_owned();
             return;
         }
         if self.confirm_remove.is_some() {
@@ -5316,6 +5841,9 @@ impl App {
                     prompt.value.clear();
                 } else if let Some(prompt) = self.url_prompt.as_mut() {
                     prompt.value.clear();
+                } else if let Some(form) = self.edit_agent.as_mut() {
+                    form.fields[form.cursor].clear();
+                    form.error = None;
                 }
             }
             // C-1: the add-agent form's explicit submit key. `enter` writes it from
@@ -5323,8 +5851,12 @@ impl App {
             // so a person who has filled the required fields does not have to walk
             // through the optional ones — and a stray `enter` in a middle field can
             // no longer submit an incomplete form (the finding).
-            if key.code == KeyCode::Char('s') && self.add_agent.is_some() {
-                self.submit_new_agent();
+            if key.code == KeyCode::Char('s') {
+                if self.add_agent.is_some() {
+                    self.submit_new_agent();
+                } else if self.edit_agent.is_some() {
+                    self.submit_edit_agent();
+                }
             }
             return;
         }
@@ -5370,10 +5902,10 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.help_offset = self.help_offset.saturating_sub(1);
                 }
-                KeyCode::PageDown => {
+                KeyCode::PageDown | KeyCode::Char(']') => {
                     self.help_offset = self.help_offset.saturating_add(HELP_PAGE);
                 }
-                KeyCode::PageUp => {
+                KeyCode::PageUp | KeyCode::Char('[') => {
                     self.help_offset = self.help_offset.saturating_sub(HELP_PAGE);
                 }
                 KeyCode::Home | KeyCode::Char('g') => self.help_offset = 0,
@@ -5424,6 +5956,10 @@ impl App {
             self.on_url_key(key);
             return;
         }
+        if self.edit_agent.is_some() {
+            self.on_edit_agent_key(key);
+            return;
+        }
         if self.confirm_remove.is_some() {
             if self.scroll_modal_key(key) {
                 return;
@@ -5435,10 +5971,7 @@ impl App {
                 // `q` is the product's quit key, but under a destructive confirmation
                 // it is never the destructive one: it keeps the agent, like `n` and
                 // `esc` (E-2). A swallowed key that the footer advertises is worse.
-                KeyCode::Char('n')
-                | KeyCode::Char('N')
-                | KeyCode::Char('q')
-                | KeyCode::Esc => {
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
                     self.cancel_remove_agent();
                 }
                 _ => {}
@@ -5453,10 +5986,7 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.confirm_forget_secrets();
                 }
-                KeyCode::Char('n')
-                | KeyCode::Char('N')
-                | KeyCode::Char('q')
-                | KeyCode::Esc => {
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
                     self.confirm_forget = None;
                     self.status = "the leftover secrets were kept".to_owned();
                 }
@@ -5532,27 +6062,17 @@ impl App {
                     self.scroll_panel(1);
                 }
             }
-            // Page, home and end motion on every windowed list and on the help overlay:
-            // the conventions a person brings from any other list (C-4). `g` is the
+            // Page, home and end motion: `PageDown`/`PageUp` are the same one-viewport
+            // move as `]`/`[` on **every** screen, including the list screens, where
+            // they move the note or panel below the list rather than the selection.
+            // Lists move with up/down (and j/k), so a person paging a reply never
+            // changes which run is selected (the one-paging rule). `g` is the
             // same "top" key everywhere except the Forgejo screen, where it is the
             // clone key the page map names; it never acts on a repository from another
-            // screen (C-6). On a screen whose content is a panel, the same keys move
-            // the panel instead of a selection that is not there, so no key is
-            // swallowed without a word or an effect (Y-2).
-            KeyCode::PageDown => {
-                if self.screen_has_list() {
-                    self.move_selection(LIST_PAGE);
-                } else {
-                    self.scroll_panel(PANEL_PAGE);
-                }
-            }
-            KeyCode::PageUp => {
-                if self.screen_has_list() {
-                    self.move_selection(-LIST_PAGE);
-                } else {
-                    self.scroll_panel(-PANEL_PAGE);
-                }
-            }
+            // screen (C-6). On a screen whose content is a panel, the arrows move the
+            // panel too, so no key is swallowed without a word or an effect (Y-2).
+            KeyCode::PageDown => self.scroll_panel_page(1),
+            KeyCode::PageUp => self.scroll_panel_page(-1),
             KeyCode::Home => {
                 if self.screen_has_list() {
                     self.select_edge(false);
@@ -5569,8 +6089,8 @@ impl App {
             }
             // `[` and `]` scroll the panel or note area on every screen, including the
             // ones where the arrows and page keys belong to the list (Y-2).
-            KeyCode::Char('[') => self.scroll_panel(-1),
-            KeyCode::Char(']') => self.scroll_panel(1),
+            KeyCode::Char('[') => self.scroll_panel_page(-1),
+            KeyCode::Char(']') => self.scroll_panel_page(1),
             KeyCode::Enter => self.open_selected_agent(),
             KeyCode::Esc => self.show(Screen::Agents),
             KeyCode::Char('s') => self.request_agent_start(),
@@ -5592,6 +6112,9 @@ impl App {
             }
             KeyCode::Char('U') if self.screen == Screen::Forgejo => {
                 self.request_update_pull_request();
+            }
+            KeyCode::Char('E') if self.screen == Screen::AgentConfig => {
+                self.request_endpoint_edit();
             }
             KeyCode::Char('e') => self.request_edit(EditTarget::Instruction),
             KeyCode::Char('t') => self.request_edit(EditTarget::Steps),
@@ -5623,9 +6146,7 @@ impl App {
             KeyCode::Char('u') if self.screen == Screen::Forgejo => {
                 self.request_url_edit();
             }
-            KeyCode::Char('A')
-                if matches!(self.screen, Screen::Credentials | Screen::Forgejo) =>
-            {
+            KeyCode::Char('A') if matches!(self.screen, Screen::Credentials | Screen::Forgejo) => {
                 self.request_secret(SecretTarget::ForgejoAdminToken);
             }
             // `R` reads the acknowledged terms again without changing the record, so
@@ -5672,21 +6193,18 @@ impl App {
 /// footer legend lists only keys that act on every screen.
 fn key_elsewhere(code: KeyCode) -> Option<&'static str> {
     match code {
+        KeyCode::Char('E') => {
+            Some("`E` edits the selected agent's endpoint, model and key on the Agent screen (2)")
+        }
         KeyCode::Char('u') => {
             Some("`u` sets the Forgejo instance address on the Forgejo screen (4)")
         }
         KeyCode::Char('v') => {
             Some("`v` sets the agent's own Forgejo token on the Forgejo screen (4)")
         }
-        KeyCode::Char('P') => {
-            Some("`P` opens a pull request on the Forgejo screen (4)")
-        }
-        KeyCode::Char('U') => {
-            Some("`U` updates the newest pull request on the Forgejo screen (4)")
-        }
-        KeyCode::Char('f') => {
-            Some("`f` sets the role token on the Credentials screen (5)")
-        }
+        KeyCode::Char('P') => Some("`P` opens a pull request on the Forgejo screen (4)"),
+        KeyCode::Char('U') => Some("`U` updates the newest pull request on the Forgejo screen (4)"),
+        KeyCode::Char('f') => Some("`f` sets the role token on the Credentials screen (5)"),
         KeyCode::Char('D') => {
             Some("`D` deletes the leftover secrets of removed agents on the Credentials screen (5)")
         }
@@ -5738,7 +6256,10 @@ fn render_full_config(existing: &Config, agents: &[AgentConfig]) -> String {
     text.push_str("# gewu-multiverse configuration (written by the tool)\n\n");
     text.push_str("[forgejo]\n");
     text.push_str(&format!("url = {}\n", quote(&existing.forgejo.url)));
-    text.push_str(&format!("role = {}\n\n", quote(existing.forgejo.role.as_str())));
+    text.push_str(&format!(
+        "role = {}\n\n",
+        quote(existing.forgejo.role.as_str())
+    ));
     text.push_str("[limits]\n");
     text.push_str(&format!(
         "run_timeout_secs = {}\n",
@@ -5783,10 +6304,11 @@ fn editable_template(target: EditTarget, agent: &str) -> String {
         // run drops this text from the document's first content line before it sends
         // the document, so a person who types below the guidance — or into the line the
         // editor opens on — never sends the guidance itself (T-1).
-        EditTarget::Instruction => format!(
-            "{}\n",
-            crate::agent_run::INSTRUCTION_PLACEHOLDER
-        ),
+        // No developer sentence is written into a new instruction. The run refuses an
+        // empty document; the screen says so and `e` is the way to write one. This is
+        // deliberately empty rather than a placeholder a person could type into and
+        // send to the model (K-3).
+        EditTarget::Instruction => String::new(),
         EditTarget::Steps => format!(
             "# Declared shell steps for one run of `{agent}`, one command per line.\n\
              # Blank lines and lines starting with # are skipped.\n\
@@ -6077,7 +6599,10 @@ concurrency = 1
             .expect("the derived paths")
             .instruction()
             .to_path_buf();
-        assert_ne!(derived, configured, "the probe must not be the derived default");
+        assert_ne!(
+            derived, configured,
+            "the probe must not be the derived default"
+        );
         let summary = app
             .instruction_summary()
             .expect("the selected agent has an instruction");
@@ -6162,7 +6687,10 @@ concurrency = 1
 
         app.confirm_forget = Some(vec!["ghost".to_owned()]);
         app.on_key(key(KeyCode::Char('q')));
-        assert!(app.confirm_forget.is_none(), "the leftover confirmation stayed");
+        assert!(
+            app.confirm_forget.is_none(),
+            "the leftover confirmation stayed"
+        );
         assert!(
             app.status.contains("leftover secrets were kept"),
             "{}",
@@ -6297,7 +6825,10 @@ concurrency = 1
         app.on_key(key(KeyCode::Enter));
         let action = app.take_action().expect("a skills edit");
         // `K` opens a scratch `SKILL.md`, never a directory.
-        assert_eq!(action.path, paths.skills_dir().join("new-skill").join("SKILL.md"));
+        assert_eq!(
+            action.path,
+            paths.skills_dir().join("new-skill").join("SKILL.md")
+        );
         assert!(action.created, "the hand-off created the skill");
         assert!(action.path.is_file());
         assert!(paths.skills_dir().is_dir());
@@ -6374,14 +6905,10 @@ concurrency = 1
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         app.request_url_edit();
-        assert!(
-            !app.url_prompt
-                .as_ref()
-                .expect("the address prompt")
-                .value
-                .is_empty(),
-            "the address prompt is prefilled"
-        );
+        let prompt = app.url_prompt.as_ref().expect("the address prompt");
+        assert!(prompt.value.is_empty(), "the address prompt is not empty");
+        assert_eq!(prompt.placeholder, "https://forgejo.example.org");
+        app.on_key(key(KeyCode::Char('x')));
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(
             app.url_prompt.as_ref().expect("the address prompt").value,
@@ -6418,7 +6945,10 @@ concurrency = 1
         app.editor_configured = false;
         let paths = app.selected_paths().expect("paths");
         for (keycode, path) in [
-            (KeyCode::Char('K'), paths.skills_dir().join("new-skill").join("SKILL.md")),
+            (
+                KeyCode::Char('K'),
+                paths.skills_dir().join("new-skill").join("SKILL.md"),
+            ),
             (KeyCode::Char('t'), paths.steps_file().to_path_buf()),
             (KeyCode::Char('e'), paths.instruction().to_path_buf()),
         ] {
@@ -6439,7 +6969,10 @@ concurrency = 1
         let cases = [
             (KeyCode::Char('K'), "created as a template (SKILL.md)"),
             (KeyCode::Char('t'), "the template (steps.txt) was created"),
-            (KeyCode::Char('e'), "the template (instruction.md) was created"),
+            (
+                KeyCode::Char('e'),
+                "the template (instruction.md) was created",
+            ),
         ];
         for (keycode, expected) in cases {
             let mut app = app_with(GOOD);
@@ -6451,7 +6984,11 @@ concurrency = 1
             assert!(action.created, "the hand-off created the file");
             // The editor ran and saved nothing: the fingerprint is unchanged.
             app.note_action(&action, Ok(success()));
-            assert!(app.status.contains(expected), "{} for {keycode:?}", app.status);
+            assert!(
+                app.status.contains(expected),
+                "{} for {keycode:?}",
+                app.status
+            );
             assert!(
                 !app.status.contains("not changed"),
                 "a created file was called unchanged: {}",
@@ -6529,7 +7066,10 @@ concurrency = 1
     fn a_supervision_mode_change_is_refused_while_the_agent_runs() {
         let mut app = app_with_sleeping_runner("app-switch-live", GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction is written");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -6538,7 +7078,10 @@ concurrency = 1
             app.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        assert!(
+            app.supervisor.state("one").is_live(),
+            "the agent is running"
+        );
         app.on_key(key(KeyCode::Char('m')));
         assert!(app.status.contains("refused"), "{}", app.status);
         assert!(app.status.contains("stop it first"), "{}", app.status);
@@ -6674,7 +7217,10 @@ role = "member"
         // N-8: `p` knows the key is missing; `s` must know too.
         let mut app = app_with(GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.status.contains("model key"), "{}", app.status);
@@ -6823,7 +7369,10 @@ role = "member"
         {
             let mut app = app_with(GOOD);
             app.on_key(key(KeyCode::Char('y')));
-            let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+            let paths = app
+                .layout
+                .ensure_agent("one")
+                .expect("the agent is prepared");
             std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
             app.on_key(key(KeyCode::Char('s')));
             produced.push(Refusal {
@@ -6907,7 +7456,9 @@ role = "member"
         let mut transcript =
             crate::transcript::Transcript::open(&dir).expect("a transcript is opened");
         transcript
-            .append(&crate::transcript::Record::run_started(run_id, "one", 1, "/w"))
+            .append(&crate::transcript::Record::run_started(
+                run_id, "one", 1, "/w",
+            ))
             .expect("a record is appended");
         transcript
             .append(&crate::transcript::Record::run_finished(
@@ -6937,7 +7488,10 @@ role = "member"
         // with the ledger, not leave it claiming an outcome no record holds.
         let mut app = app_with(GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -6986,7 +7540,11 @@ role = "member"
             tested_at_ms: crate::time::now_unix_ms(),
             machine: None,
         };
-        assert!(test.describe().contains("tested just now"), "{}", test.describe());
+        assert!(
+            test.describe().contains("tested just now"),
+            "{}",
+            test.describe()
+        );
         let same = AgentConfig {
             name: "one".to_owned(),
             model: "m".to_owned(),
@@ -7047,7 +7605,11 @@ role = "member"
         assert_eq!(back, vec![retested, two]);
         // A file the product writes is held to its one custody.
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).expect("the record").permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&path)
+            .expect("the record")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "the endpoint record is not private");
     }
 
@@ -7070,7 +7632,9 @@ role = "member"
         )
         .expect("the test is written");
         let app = App::with_runner(Layout::rooted_at(root), quiet_runner("endpoint-restart"));
-        let test = app.endpoint_test_for("one").expect("the record is read back");
+        let test = app
+            .endpoint_test_for("one")
+            .expect("the record is read back");
         assert!(test.result.is_ok());
         assert!(app.endpoint_test_for("two").is_none());
     }
@@ -7140,10 +7704,11 @@ role = "member"
     }
 
     #[test]
-    fn page_and_edge_keys_move_the_selection_on_every_list() {
-        // C-4: PageDown/PageUp/Home/End/G are the list conventions a person brings
-        // from anywhere, and an unbound key inside the help overlay speaks instead of
-        // vanishing into it.
+    fn page_keys_scroll_the_panel_while_edge_keys_move_the_selection_on_every_list() {
+        // C-4: Home/End/G are the list conventions a person brings from anywhere. The
+        // page keys are the panel keys on every screen now, including a list screen:
+        // they never move the selection, and an unbound key inside the help overlay
+        // speaks instead of vanishing into it.
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         app.on_key(key(KeyCode::End));
@@ -7152,14 +7717,20 @@ role = "member"
         assert_eq!(app.selected, 0);
         app.on_key(key(KeyCode::Char('G')));
         assert_eq!(app.selected, app.agents().len() - 1);
+        let selected = app.selected;
         app.on_key(key(KeyCode::PageUp));
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, selected, "PageUp moved the list selection");
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.selected, selected, "PageDown moved the list selection");
 
         app.on_key(key(KeyCode::Char('?')));
         app.on_key(key(KeyCode::PageDown));
         assert!(app.help_offset > 0, "PageDown did not page the help");
         app.on_key(key(KeyCode::Home));
         assert_eq!(app.help_offset, 0);
+        app.on_key(key(KeyCode::Char(']')));
+        assert!(app.help_offset > 0, "] did not page the help");
+        app.on_key(key(KeyCode::Home));
         app.on_key(key(KeyCode::Char('z')));
         assert!(app.status.contains("help scrolls"), "{}", app.status);
     }
@@ -7204,11 +7775,7 @@ role = "member"
         app.run_selected = 0;
         app.show(Screen::Runs);
         app.request_view_log();
-        assert!(
-            app.status.contains("leave it with q"),
-            "{}",
-            app.status
-        );
+        assert!(app.status.contains("leave it with q"), "{}", app.status);
     }
 
     #[test]
@@ -7276,7 +7843,10 @@ role = "member"
         // removal is refused now, the agent stays, and the count does not move.
         let mut app = app_with_sleeping_runner("app-remove-live", GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -7285,7 +7855,10 @@ role = "member"
             app.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        assert!(
+            app.supervisor.state("one").is_live(),
+            "the agent is running"
+        );
         let running_before = app.supervisor.running_count();
         assert_eq!(running_before, 1);
 
@@ -7331,7 +7904,10 @@ concurrency = 3
 "#;
         let mut app = app_with_sleeping_runner("app-reload-orphan", GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -7340,7 +7916,10 @@ concurrency = 3
             app.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        assert!(
+            app.supervisor.state("one").is_live(),
+            "the agent is running"
+        );
 
         std::fs::write(app.config_path(), only_two).expect("the file is hand-edited");
         app.reload();
@@ -7396,7 +7975,10 @@ concurrency = 3
         // W-11: the refusal must lead with the state, not the run id.
         let mut app = app_with_sleeping_runner("app-start-live", GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -7405,7 +7987,10 @@ concurrency = 3
             app.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        assert!(
+            app.supervisor.state("one").is_live(),
+            "the agent is running"
+        );
         app.on_key(key(KeyCode::Char('s')));
         assert!(app.status.contains("already running"), "{}", app.status);
         assert!(app.status.contains("press x"), "{}", app.status);
@@ -7417,7 +8002,10 @@ concurrency = 3
         // W-10: `q` used to end a run without a word.
         let mut app = app_with_sleeping_runner("app-quit-live", GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -7426,7 +8014,10 @@ concurrency = 3
             app.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        assert!(
+            app.supervisor.state("one").is_live(),
+            "the agent is running"
+        );
 
         app.on_key(key(KeyCode::Char('q')));
         assert!(!app.should_quit, "the first q asks, it does not leave");
@@ -7461,7 +8052,10 @@ concurrency = 3
         // the same question. C-8: one run is `it`, not `them`.
         let mut app = app_with_sleeping_runner("app-ctrl-c-live", GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -7470,16 +8064,15 @@ concurrency = 3
             app.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        assert!(
+            app.supervisor.state("one").is_live(),
+            "the agent is running"
+        );
 
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         app.on_key(ctrl_c);
         assert!(!app.should_quit, "the first ^C asks, it does not leave");
-        assert!(
-            app.status.contains("press ctrl-c again"),
-            "{}",
-            app.status
-        );
+        assert!(app.status.contains("press ctrl-c again"), "{}", app.status);
         assert!(app.status.contains("stop it"), "{}", app.status);
 
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -7573,9 +8166,18 @@ concurrency = 3
         // The token begins with `g` (a clone binding) and contains `t` (the editor
         // binding) and `a` (the form binding); none of them may fire.
         app.on_paste("ga-fixture-token-abcd");
-        assert!(app.add_agent.is_none(), "the paste opened the add-agent form");
-        assert!(app.secret_prompt.is_none(), "the paste opened a secret prompt");
-        assert!(app.editor_confirm.is_none(), "the paste asked to open an editor");
+        assert!(
+            app.add_agent.is_none(),
+            "the paste opened the add-agent form"
+        );
+        assert!(
+            app.secret_prompt.is_none(),
+            "the paste opened a secret prompt"
+        );
+        assert!(
+            app.editor_confirm.is_none(),
+            "the paste asked to open an editor"
+        );
         assert_eq!(
             app.status,
             "there is no one-line field here to take a paste; press n for the form, or k/f/v/A for a secret"
@@ -7584,7 +8186,10 @@ concurrency = 3
         app.show(Screen::Credentials);
         app.on_key(key(KeyCode::Char('k')));
         app.on_paste("secret");
-        assert_eq!(app.secret_prompt.as_ref().expect("a prompt").value, "secret");
+        assert_eq!(
+            app.secret_prompt.as_ref().expect("a prompt").value,
+            "secret"
+        );
     }
 
     #[test]
@@ -7614,7 +8219,11 @@ concurrency = 3
         app.show_acknowledgment = false;
         app.confirm_remove = Some("one".to_owned());
         app.on_paste("token");
-        assert!(app.status.contains("removal confirmation"), "{}", app.status);
+        assert!(
+            app.status.contains("removal confirmation"),
+            "{}",
+            app.status
+        );
         app.confirm_remove = None;
         app.confirm_forget = Some(vec!["ghost".to_owned()]);
         app.on_paste("token");
@@ -7627,7 +8236,10 @@ concurrency = 3
         app.editor_configured = false;
         app.show(Screen::Instructions);
         app.on_key(key(KeyCode::Char('t')));
-        assert!(app.editor_confirm.is_some(), "the editor confirmation is up");
+        assert!(
+            app.editor_confirm.is_some(),
+            "the editor confirmation is up"
+        );
         app.on_paste("token");
         assert!(app.status.contains("editor confirmation"), "{}", app.status);
     }
@@ -7674,7 +8286,10 @@ concurrency = 3
             .to_string();
         let stored = "the instruction document /old/place/agents/one/instruction.md is still the placeholder; write what the agent should do".to_string();
         let drawn = app.reason_with_history("one", &stored);
-        assert!(drawn.contains("/old/place/agents/one/instruction.md"), "{drawn}");
+        assert!(
+            drawn.contains("/old/place/agents/one/instruction.md"),
+            "{drawn}"
+        );
         assert!(drawn.contains("from when that run ran"), "{drawn}");
         assert!(drawn.contains(&live), "{drawn}");
         // A reason that names the file in use gains no clause.
@@ -7708,7 +8323,10 @@ concurrency = 3
         assert!(!form.fields[0].contains('\n'));
         assert!(app.status.contains("first line"), "{}", app.status);
         app.on_paste("scribe");
-        assert_eq!(app.add_agent.as_ref().expect("the form").fields[0], "scribe");
+        assert_eq!(
+            app.add_agent.as_ref().expect("the form").fields[0],
+            "scribe"
+        );
         app.on_key(key(KeyCode::Esc));
 
         app.show(Screen::Credentials);
@@ -7716,7 +8334,10 @@ concurrency = 3
         app.on_paste("secret-one\nsecret-two");
         app.on_paste("secret-two");
         assert_eq!(
-            app.secret_prompt.as_ref().expect("the prompt is open").value,
+            app.secret_prompt
+                .as_ref()
+                .expect("the prompt is open")
+                .value,
             "secret-two"
         );
     }
@@ -7760,8 +8381,10 @@ concurrency = 3
         // answer, so the footer and the box agree.
         let root = scratch_root("refused-secret-status");
         std::fs::write(root.join("config.toml"), GOOD).expect("the configuration");
-        let mut app =
-            App::with_runner(Layout::rooted_at(root), quiet_runner("refused-secret-status"));
+        let mut app = App::with_runner(
+            Layout::rooted_at(root),
+            quiet_runner("refused-secret-status"),
+        );
         app.show_acknowledgment = false;
         app.show(Screen::Credentials);
         // Widen the file so the write itself is refused for its mode.
@@ -7789,7 +8412,10 @@ concurrency = 3
             .error
             .clone()
             .expect("the refusal is in the prompt");
-        assert!(app.status.contains(&error), "the box and the footer disagree");
+        assert!(
+            app.status.contains(&error),
+            "the box and the footer disagree"
+        );
         // An empty secret is the second refusal path, and it replaces the status too.
         app.secret_prompt.as_mut().expect("open").value.clear();
         app.on_key(key(KeyCode::Enter));
@@ -7811,9 +8437,8 @@ concurrency = 3
         app.show(Screen::Forgejo);
         app.on_key(key(KeyCode::Char('u')));
         let prompt = app.url_prompt.as_ref().expect("the address prompt is open");
-        assert_eq!(prompt.value, "https://forgejo.example.org");
-        // The prompt is prefilled, so a person can correct one character.
-        app.url_prompt.as_mut().expect("open").value.clear();
+        assert!(prompt.value.is_empty(), "the address prompt is not empty");
+        assert_eq!(prompt.placeholder, "https://forgejo.example.org");
         for character in "http://127.0.0.1:39634".chars() {
             app.on_key(key(KeyCode::Char(character)));
         }
@@ -8008,7 +8633,10 @@ concurrency = 3
         // C-11: `the declared steps … were not changed`.
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.steps_file(), "echo one\n").expect("the steps file");
         let action = PendingAction {
             kind: ActionKind::Edit,
@@ -8073,8 +8701,10 @@ concurrency = 3
         // is gone.
         let root = scratch_root("role-stamp");
         std::fs::write(root.join("config.toml"), GOOD).expect("the configuration is written");
-        let mut app =
-            App::with_runner(Layout::rooted_at(root.clone()), quiet_runner("role-stamp-1"));
+        let mut app = App::with_runner(
+            Layout::rooted_at(root.clone()),
+            quiet_runner("role-stamp-1"),
+        );
         app.show_acknowledgment = false;
         app.apply_role_check(
             "https://forgejo.example.org".to_owned(),
@@ -8089,8 +8719,7 @@ concurrency = 3
         let text = std::fs::read_to_string(&record).expect("the record is read");
         assert!(text.contains("checked_at_ms"), "{text}");
 
-        let reopened =
-            App::with_runner(Layout::rooted_at(root), quiet_runner("role-stamp-2"));
+        let reopened = App::with_runner(Layout::rooted_at(root), quiet_runner("role-stamp-2"));
         assert!(
             reopened.role_check.is_none(),
             "a new session has no role view of its own"
@@ -8159,7 +8788,9 @@ concurrency = 3
         let mut transcript =
             crate::transcript::Transcript::open(&dir).expect("a transcript is opened");
         transcript
-            .append(&crate::transcript::Record::run_started(run_id, agent, 1, "/w"))
+            .append(&crate::transcript::Record::run_started(
+                run_id, agent, 1, "/w",
+            ))
             .expect("a record is appended");
         transcript
             .append(&crate::transcript::Record::run_finished(
@@ -8203,7 +8834,10 @@ concurrency = 3
     fn an_instruction_holding_only_the_placeholder_is_reported_as_empty() {
         // I-4: a byte count is not content; the template is the empty state.
         let app = app_with(GOOD);
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(
             paths.instruction(),
             format!("{}\n", crate::agent_run::INSTRUCTION_PLACEHOLDER),
@@ -8220,7 +8854,10 @@ concurrency = 3
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         app.editor_configured = true;
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "the placeholder was overwritten\n")
             .expect("the instruction is written");
         let backup = paths.instruction().with_extension("md.save");
@@ -8228,11 +8865,7 @@ concurrency = 3
         assert_eq!(app.instruction_backup(), Some(backup.clone()));
         app.on_key(key(KeyCode::Char('e')));
         assert!(app.status.contains("not saved"), "{}", app.status);
-        assert!(
-            app.status.contains("instruction.md.save"),
-            "{}",
-            app.status
-        );
+        assert!(app.status.contains("instruction.md.save"), "{}", app.status);
     }
 
     #[test]
@@ -8261,7 +8894,14 @@ concurrency = 3
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         app.started_ms = 0;
-        write_finished_run(&app, "one", "run-100-0002-1", RunOutcome::Succeeded, 5, None);
+        write_finished_run(
+            &app,
+            "one",
+            "run-100-0002-1",
+            RunOutcome::Succeeded,
+            5,
+            None,
+        );
         app.refresh_recent();
         assert_eq!(app.runs_finished_since_start(), 1);
         // A run that ended before this UI started is not "since".
@@ -8274,7 +8914,10 @@ concurrency = 3
         // X-7: the row reads `stopped` while the status said `stopping`.
         let mut app = app_with_sleeping_runner("app-stop-status", GOOD);
         app.on_key(key(KeyCode::Char('y')));
-        let paths = app.layout.ensure_agent("one").expect("the agent is prepared");
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
         std::fs::write(paths.instruction(), "do something\n").expect("the instruction");
         give_key(&app, "one");
         app.on_key(key(KeyCode::Char('s')));
@@ -8283,7 +8926,10 @@ concurrency = 3
             app.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.supervisor.state("one").is_live(), "the agent is running");
+        assert!(
+            app.supervisor.state("one").is_live(),
+            "the agent is running"
+        );
         app.on_key(key(KeyCode::Char('x')));
         assert!(app.status.contains("stopping"), "{}", app.status);
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -8338,7 +8984,10 @@ concurrency = 3
 
         let note = app.workspace_note_for("one");
         assert!(note.contains("no Forgejo identity is recorded"), "{note}");
-        assert!(note.contains("cannot say whether it is the agent's"), "{note}");
+        assert!(
+            note.contains("cannot say whether it is the agent's"),
+            "{note}"
+        );
         assert!(!note.contains("not the agent's"), "{note}");
 
         // A recorded, matching identity makes the true claim.
@@ -8375,24 +9024,25 @@ concurrency = 3
         std::fs::create_dir_all(&clone).expect("the clone directory");
         git(&clone, &["init", "-q", "-b", "main"]);
         git(&clone, &["config", "user.name", "gewu-one"]);
-        git(
-            &clone,
-            &["config", "user.email", "gewu-one@agents.invalid"],
-        );
+        git(&clone, &["config", "user.email", "gewu-one@agents.invalid"]);
         std::fs::write(clone.join("README"), "hello\n").expect("a file");
         git(&clone, &["add", "README"]);
         git(&clone, &["commit", "-q", "-m", "first"]);
 
         let note = app.workspace_note_for("one");
-        assert!(note.contains("not a git repository"), "{note}");
-        assert!(note.contains("holds 1 cloned repository"), "{note}");
+        assert!(note.starts_with("the clone"), "{note}");
+        assert!(!note.contains("not a git repository"), "{note}");
         assert!(note.contains("notes"), "{note}");
         assert!(note.contains("on main"), "{note}");
+        assert!(note.contains("clean"), "{note}");
         // A workspace with no clone keeps the plain sentence.
         let empty = paths.workspace().join("empty");
         std::fs::create_dir_all(&empty).expect("an empty workspace");
         let note = app.workspace_note_for("one");
-        assert!(note.contains("notes"), "the clone is still the one on show: {note}");
+        assert!(
+            note.contains("notes"),
+            "the clone is still the one on show: {note}"
+        );
     }
 
     #[test]
@@ -8417,5 +9067,48 @@ concurrency = 3
         assert!(note.contains("no commit yet"), "{note}");
         assert!(!note.contains("fatal"), "{note}");
         assert!(note.contains("main"), "{note}");
+    }
+    #[test]
+    fn the_pull_request_defaults_to_the_newest_runs_final_reply() {
+        // K-8: the generic "Work by the agent" title/body is not what a person wrote
+        // the run for. With no `pull-request.txt`, the newest run's final reply is the
+        // title (first line) and the body (whole reply).
+        let mut app = app_with(GOOD);
+        app.show_acknowledgment = false;
+        let run_dir = app.root().join("state").join("one").join("run-1");
+        app.recent = vec![RunSummary {
+            agent: "one".to_owned(),
+            run_id: "run-1".to_owned(),
+            outcome: Some(RunOutcome::Succeeded),
+            reason: None,
+            duration_ms: Some(1_000),
+            started_at: Some("2026-10-14T13:00:00Z".to_owned()),
+            read_error: None,
+            final_reply: Some(
+                "Weekly changelog\n\n## Added\n- the dashboard remembers its filter".to_owned(),
+            ),
+            log: run_dir.join(crate::run::LOG_FILE),
+            dir: run_dir,
+        }];
+        let (title, body) = app.pull_request_text("one", "changelog/weekly");
+        assert_eq!(title, "Weekly changelog");
+        assert!(
+            body.contains("- the dashboard remembers its filter"),
+            "{body}"
+        );
+
+        // A hand-written file still wins when it is there.
+        let paths = app
+            .layout
+            .ensure_agent("one")
+            .expect("the agent is prepared");
+        std::fs::write(
+            paths.config_dir().join("pull-request.txt"),
+            "Hand-written title\nHand-written body\n",
+        )
+        .expect("the file is written");
+        let (title, body) = app.pull_request_text("one", "changelog/weekly");
+        assert_eq!(title, "Hand-written title");
+        assert_eq!(body, "Hand-written body");
     }
 }

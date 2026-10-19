@@ -18,6 +18,7 @@
 //! writes nothing and fails, so a wrong setup is an authentication failure rather
 //! than a leaked secret.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -374,6 +375,166 @@ pub fn push(repository: &Path, credential: &GitCredential<'_>) -> Result<(), Wor
     Ok(())
 }
 
+/// A read-only snapshot of the remote-tracking refs a run can move.
+///
+/// The product offers `P` (open the pull request) only when the run really pushed a
+/// branch, and a command's text is not evidence: `echo git push` is a successful tool
+/// call that pushed nothing. The evidence is the repository's own state — the
+/// remote-tracking refs read before and after the run, and git's reflog for the ref,
+/// which records whether the update was a push or a fetch (the push-is-a-fact rule).
+/// A repository that cannot be read is simply absent from the watch, so the screen
+/// makes no push claim rather than guessing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushWatch {
+    repositories: Vec<PushSnapshot>,
+    /// The instant the before-picture was read, in seconds since the Unix epoch.
+    ///
+    /// A reflog entry written before the run says nothing about the run, so the
+    /// witness accepts only an entry stamped at or after this instant.
+    started_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushSnapshot {
+    root: PathBuf,
+    remotes: BTreeMap<String, String>,
+}
+
+/// The repositories a run may use: the workspace itself and the clones one level
+/// below it (the layout `g` creates).
+fn push_repositories(workspace: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if workspace.join(".git").exists() {
+        found.push(workspace.to_path_buf());
+    }
+    if let Ok(entries) = std::fs::read_dir(workspace) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') || !path.is_dir() {
+                continue;
+            }
+            if path.join(".git").exists() {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Read a repository's local branches and remote-tracking refs.
+fn refs_of(repository: &Path) -> Option<(BTreeMap<String, String>, BTreeMap<String, String>)> {
+    let text = run_git(
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+        repository,
+        None,
+    )
+    .ok()?;
+    let mut heads = BTreeMap::new();
+    let mut remotes = BTreeMap::new();
+    for line in text.lines() {
+        let Some((name, object)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        if name.starts_with("refs/heads/") {
+            heads.insert(name.to_owned(), object.to_owned());
+        } else if name.starts_with("refs/remotes/") {
+            remotes.insert(name.to_owned(), object.to_owned());
+        }
+    }
+    Some((heads, remotes))
+}
+
+/// Take the before-picture of every repository a run can touch.
+pub fn watch_push(workspace: &Path) -> PushWatch {
+    let mut repositories = Vec::new();
+    for root in push_repositories(workspace) {
+        if let Some((_, remotes)) = refs_of(&root) {
+            repositories.push(PushSnapshot { root, remotes });
+        }
+    }
+    PushWatch {
+        repositories,
+        started_unix: (crate::time::now_unix_ms() / 1000) as i64,
+    }
+}
+
+/// The branch a run pushed, when git's own record proves the direction.
+///
+/// A push and a fetch both move a remote-tracking ref, and a pull or fetch can land
+/// that ref on the local branch's commit without pushing anything. Object equality
+/// is therefore not evidence. Git writes the reason for each ref update into the
+/// ref's reflog: a push records exactly `update by push`, while a fetch or pull
+/// records its own action and status. The witness accepts the latest update of a
+/// changed remote-tracking ref only when that update's message is exactly
+/// `update by push`, its new object is the local branch's commit, and it is stamped
+/// at or after the watch. The entry's old object is not compared with the
+/// before-picture: a pull or an earlier push in the same run may precede the push
+/// that produced the current object. A reflog that is absent or unreadable leaves no
+/// evidence, so no claim is made.
+pub fn pushed_during(watch: &PushWatch) -> Option<(String, String)> {
+    for snapshot in &watch.repositories {
+        let Some((heads, remotes)) = refs_of(&snapshot.root) else {
+            continue;
+        };
+        for (refname, object) in &remotes {
+            if snapshot.remotes.get(refname) == Some(object) {
+                continue;
+            }
+            let Some(short) = refname.strip_prefix("refs/remotes/") else {
+                continue;
+            };
+            let Some((_remote, branch)) = short.split_once('/') else {
+                continue;
+            };
+            if branch == "HEAD" {
+                continue;
+            }
+            if heads.get(&format!("refs/heads/{branch}")) != Some(object) {
+                continue;
+            }
+            if reflog_records_push(&snapshot.root, refname, object, watch.started_unix) {
+                return Some((branch.to_owned(), refname.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Whether git's reflog for `refname` says the run pushed it.
+///
+/// Only the last entry can describe the update that produced the ref's current
+/// object. It must name that object, have exactly `update by push` as its message,
+/// and be stamped at or after `started_unix`. A missing, unreadable or unparsable
+/// reflog is not evidence.
+fn reflog_records_push(repository: &Path, refname: &str, object: &str, started_unix: i64) -> bool {
+    let Ok(git_dir) = run_git(&["rev-parse", "--absolute-git-dir"], repository, None) else {
+        return false;
+    };
+    let log = Path::new(git_dir.trim()).join("logs").join(refname);
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return false;
+    };
+    let Some(line) = text.lines().next_back() else {
+        return false;
+    };
+    let Some((header, message)) = line.split_once('\t') else {
+        return false;
+    };
+    let fields: Vec<&str> = header.split_whitespace().collect();
+    if fields.len() < 4 {
+        return false;
+    }
+    let new = fields[1];
+    let stamp = fields[fields.len() - 2].parse::<i64>().ok();
+    new == object && message == "update by push" && stamp.is_some_and(|stamp| stamp >= started_unix)
+}
+
 /// The environment git is given so it authenticates as the agent.
 ///
 /// The values are a path, a name and a login. The token is not among them; the
@@ -548,9 +709,7 @@ mod tests {
         std::fs::write(repository.join("README"), "mine\n").expect("a file");
         git(&repository, &["add", "."]);
         git(&repository, &["commit", "-q", "-m", "mine"]);
-        let state = inspect(&repository)
-            .expect("git runs")
-            .expect("a repository");
+        let state = inspect(&repository).expect("git runs").expect("a repository");
         assert_eq!(state.branch, "main");
         assert!(!state.commit.is_empty(), "the commit is named");
         assert!(state.committed_at > 0, "the commit has a time");

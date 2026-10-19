@@ -191,7 +191,12 @@ fn write_run(
     fs::create_dir_all(&dir).expect("the run directory is created");
     let mut transcript = Transcript::open(&dir).expect("the transcript is opened");
     transcript
-        .append(&Record::run_started(run_id, agent, 4242, "/fixture/workspace"))
+        .append(&Record::run_started(
+            run_id,
+            agent,
+            4242,
+            "/fixture/workspace",
+        ))
         .expect("the opening record is written");
     transcript
         .append(&Record::run_finished(
@@ -231,7 +236,11 @@ fn wait_for_file(path: &Path) {
     while !path.exists() && Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(path.exists(), "the runner never started: {}", path.display());
+    assert!(
+        path.exists(),
+        "the runner never started: {}",
+        path.display()
+    );
 }
 
 /// A queued fixture: two agents under a limit of one, each with a prior successful
@@ -502,7 +511,11 @@ fn a_later_message_survives_a_called_off_start() {
     app.on_key(key(KeyCode::Char('j')));
     app.on_key(key(KeyCode::Char('s')));
     app.on_key(key(KeyCode::Char('x')));
-    assert!(app.status.contains("called off while it waited"), "{}", app.status);
+    assert!(
+        app.status.contains("called off while it waited"),
+        "{}",
+        app.status
+    );
 
     app.on_key(key(KeyCode::Char('z')));
     assert!(
