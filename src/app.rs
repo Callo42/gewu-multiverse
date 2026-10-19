@@ -14,6 +14,7 @@
 //!   loop is the part that can step out of the UI and put it back.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -426,6 +427,90 @@ pub struct EndpointFailure {
     pub class: String,
     /// The message, which never holds the key.
     pub message: String,
+}
+
+/// A cheap fingerprint of the refs the pull-request gate reads.
+///
+/// The gate's answer depends on three git facts: the checked-out branch, the local
+/// commits it has beyond the base, and whether its remote-tracking ref still exists.
+/// All three can change outside the UI (a commit, a reset, a prune, a fetch). Running
+/// `git` on every frame to ask would make an idle screen busy, so the cache key hashes
+/// git's own small ref files instead: `packed-refs`, `HEAD`, the loose files below
+/// `refs/remotes`, and the loose files for the local heads named here — the
+/// checked-out branch and the base the gate measures against. The hash changes when a
+/// ref is added, moved or removed, packed or loose; a local branch move is a gate
+/// input even when every remote-tracking ref is byte-identical.
+fn clone_refs_fingerprint(git_dir: &Path, heads: &[&str]) -> u64 {
+    fn walk(dir: &Path, hasher: &mut std::collections::hash_map::DefaultHasher) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(&path, hasher);
+            } else if kind.is_file() {
+                path.hash(hasher);
+                std::fs::read(&path).ok().hash(hasher);
+            }
+        }
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
+        packed.hash(&mut hasher);
+    }
+    if let Ok(head) = std::fs::read(git_dir.join("HEAD")) {
+        b"HEAD".hash(&mut hasher);
+        head.hash(&mut hasher);
+    }
+    walk(&git_dir.join("refs/remotes"), &mut hasher);
+    for head in heads {
+        head.hash(&mut hasher);
+        // A packed ref's current tip is covered by `packed-refs` above; a move writes
+        // a loose file, which is hashed here, and an absent file is a distinct state.
+        match std::fs::read(git_dir.join("refs/heads").join(head)) {
+            Ok(bytes) => {
+                1u8.hash(&mut hasher);
+                bytes.hash(&mut hasher);
+            }
+            Err(_) => 0u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
+/// A proposed pull request, shown before anything is written.
+///
+/// The gate reads the repository, the branch and the newest run first; only when all
+/// three prove there is something to open does `P` build this proposal. It names the
+/// exact title, body and branch pair the person is about to send, so the write is
+/// never blind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestPreview {
+    /// The configured agent acting on the repository.
+    pub agent: String,
+    /// The Forgejo login the run recorded for that agent.
+    pub login: String,
+    /// `namespace/name` of the repository.
+    pub repository: String,
+    /// The repository's namespace.
+    pub namespace: String,
+    /// The repository's own name.
+    pub name: String,
+    /// The branch the pull request would come from.
+    pub branch: String,
+    /// The branch it would go into.
+    pub base: String,
+    /// The proposed title.
+    pub title: String,
+    /// The proposed body, whole; the overlay draws its beginning and scrolls.
+    pub body: String,
 }
 
 impl EndpointTest {
@@ -979,15 +1064,25 @@ fn failure_recovery(agent: &str, reason: &str) -> String {
         );
     }
     if reason.contains("(transport)") || reason.contains("(bad_url)") {
-        // The address is the thing to correct; `E` edits it without removing the
-        // agent, and a hand-fixed configuration is re-read with `r`.
+        // The address is the thing to correct; `E` acts on the Agent screen (2),
+        // never on the Agents screen, and a hand-fixed configuration is re-read with
+        // `r`.
         return format!(
-            "{reason} — check the endpoint address; select `{agent}` on the Agents screen (1), then press E to edit the endpoint, model and key, or fix the configuration and press r"
+            "{reason} — check the endpoint address; select `{agent}` on the Agents screen (1), then press 2 and E to edit the endpoint, model and key, or fix the configuration and press r"
         );
     }
-    if reason.contains("(route_not_found)") || reason.contains("(model_not_found)") {
+    if reason.contains("(model_not_found)") {
+        // The class is right and the model id is the field to change. Repeating the
+        // completions-path correction here was the wrong instruction (F3).
         return format!(
-            "{reason} — select `{agent}` on the Agents screen (1), then press E and set the full completions path including /v1, for example https://host/v1/chat/completions; press p to test it"
+            "select `{agent}` on the Agents screen (1), then press 2 and E to change the model id; press p to test it — {reason}"
+        );
+    }
+    if reason.contains("(route_not_found)") {
+        // The class names the path, and the correction names the screen where `E`
+        // really acts once: the Agents screen alone has no `E`.
+        return format!(
+            "select `{agent}` on the Agents screen (1), then press 2 and E to set the full completions path; press p to test it — {reason}"
         );
     }
     reason.to_owned()
@@ -1110,6 +1205,16 @@ pub struct App {
     /// The leftover per-agent secrets (agents no longer configured) waiting on a delete
     /// confirmation, when one is open (Y-6).
     pub confirm_forget: Option<Vec<String>>,
+    /// A pull request proposal waiting for `y`/`enter`, when one is open.
+    ///
+    /// `P` builds this from the repository state and shows it; nothing is pushed or
+    /// opened until the person confirms. `None` means no proposal is on screen.
+    pub confirm_pull_request: Option<PullRequestPreview>,
+    /// The last answer to "may the Forgejo legend name `P`?", with the state it was
+    /// computed from. The gate runs git, and the screen redraws many times a second;
+    /// the answer is reused until the repository, agent, newest run or clone note
+    /// changes.
+    pull_request_cache: std::cell::RefCell<Option<(String, bool)>>,
     /// An edit waiting on the no-editor confirmation, when `$EDITOR` is unset.
     pub editor_confirm: Option<PendingAction>,
     /// Whether the user set `$EDITOR`/`$VISUAL`. Read once, so tests can vary it.
@@ -1318,6 +1423,8 @@ impl App {
             edit_agent: None,
             confirm_remove: None,
             confirm_forget: None,
+            confirm_pull_request: None,
+            pull_request_cache: std::cell::RefCell::new(None),
             editor_confirm: None,
             editor_configured: crate::editor::editor_is_configured(),
             show_help: false,
@@ -1371,6 +1478,9 @@ impl App {
 
     /// Re-read the files, and apply the limits they carry. Run at start and on `r`.
     pub fn reload(&mut self) {
+        // Every re-read can change the configuration, the selected agent or the
+        // credentials file; the pull-request legend is not allowed to outlive them.
+        self.clear_pull_request_cache();
         // A screen change or an edit can change which workspace is on show; the
         // cache is keyed by agent name and a time, so the next tick re-reads it.
         match self.layout.ensure_root() {
@@ -1974,6 +2084,9 @@ impl App {
                 self.status = "the leftover secrets were already gone".to_owned();
             }
             Ok(removed) => {
+                // Deleting an agent token is a change to a gate input; the legend is
+                // recomputed rather than left on the old answer.
+                self.clear_pull_request_cache();
                 self.status = format!(
                     "deleted from the credentials file: {} — the values were never shown",
                     removed.join(", ")
@@ -2157,26 +2270,23 @@ impl App {
         self.ack_state.record_line_with(Some(&extra))
     }
 
-    /// The compact acknowledgment line the hub draws.
+    /// The one line the hub draws for the acknowledged risk.
     ///
-    /// It carries the two facts a returning person needs at a glance — what the record
-    /// proves (`a plain file, not signed`) and whether a newer build has used the
-    /// configuration — while the long machine, digest and copy clauses stay behind
-    /// `R` (F6/K-20).
+    /// The hub stays quiet: the date and the key that shows the record, and nothing
+    /// else. The record's versions, machine, plain-file limit and digest check live in
+    /// the read-only overlay `R` opens, where the record is actually read.
     pub fn ack_record_compact_line(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(clause) = self.ack_version_clause() {
-            parts.push(clause);
-        }
-        // A record from another machine says what to do about it: starting is still
-        // allowed under it, and removing the record and starting again records this
-        // machine's own confirmation.
-        if let Some(action) = self.ack_state.elsewhere_action(&self.ack_path) {
-            parts.push(action);
-        }
-        parts.push("it is a plain file, not signed".to_owned());
-        let extra = parts.join("; ");
-        self.ack_state.record_line_with(Some(&extra))
+        let AckState::Recorded {
+            acknowledged_at_unix,
+            ..
+        } = &self.ack_state
+        else {
+            return None;
+        };
+        Some(format!(
+            "risk recorded on {} — R shows the record",
+            crate::time::compact_utc(acknowledged_at_unix.saturating_mul(1000))
+        ))
     }
 
     /// The `used by version X since <date>` clause, when this build is older than the
@@ -2290,37 +2400,56 @@ impl App {
 
     /// Whether an overlay is up and owns the plain keys.
     ///
-    /// The footer's key legend is the product's own list. Under one of these overlays
-    /// `q` is not `quit` — it is a letter in a field, a cancel, or a keep — so the
-    /// legend must not advertise `q quit` there. The first-run acknowledgment is not
-    /// in this set: `q` really does quit it, so its legend stays as it was (E-2).
+    /// The overlay set is single-sourced: this is exactly the set whose footer legend
+    /// [`App::overlay_footer_keys`] returns. Under one of these overlays `q` is not
+    /// `quit` — it is a letter in a field, a cancel, or a keep — so the legend must not
+    /// advertise `q quit` or a screen key there. The first-run acknowledgment is in the
+    /// set too: the product no longer advertises `q` or a screen key under it (K-26).
     pub fn overlay_owns_keys(&self) -> bool {
-        self.add_agent.is_some()
-            || self.editor_confirm.is_some()
-            || self.secret_prompt.is_some()
-            || self.url_prompt.is_some()
-            || self.edit_agent.is_some()
-            || self.confirm_remove.is_some()
-            || self.confirm_forget.is_some()
-            || self.show_help
-            // The first-run acknowledgment owns its keys too. It used to be excluded
-            // because `q` quit the product there, and the footer advertised that under
-            // the modal as if the underlying screen still had the keys (K-26). The
-            // product no longer advertises `q` or a screen key under it.
-            || self.show_acknowledgment
+        self.overlay_footer_keys().is_some()
+    }
+
+    /// The keys the topmost overlay accepts, for the footer legend.
+    ///
+    /// While an overlay owns the screen, the footer must not advertise a screen key
+    /// (`1-6 screen`, `s start`, `x stop`, `p endpoint`): those keys do not act there.
+    /// `None` means no overlay, so the ordinary product legend is drawn.
+    pub fn overlay_footer_keys(&self) -> Option<&'static str> {
+        if self.show_acknowledgment {
+            if self.ack_review {
+                Some("esc closes this overlay; [ and ] scroll; the record is unchanged")
+            } else {
+                Some("y records it once   n not now   esc not now")
+            }
+        } else if self.confirm_pull_request.is_some() {
+            Some("y or enter opens it   n, esc or q writes nothing")
+        } else if self.add_agent.is_some() || self.edit_agent.is_some() {
+            Some("tab/up/down move   ctrl-s writes it   esc cancels")
+        } else if self.editor_confirm.is_some() {
+            Some("enter opens it   esc cancels")
+        } else if self.secret_prompt.is_some() || self.url_prompt.is_some() {
+            Some("enter writes it   ctrl-u clears it   esc cancels")
+        } else if self.confirm_remove.is_some() {
+            Some("y or enter remove it   n, esc or q keep it")
+        } else if self.confirm_forget.is_some() {
+            Some("y or enter delete them   n, esc or q keep them")
+        } else if self.show_help {
+            Some("up/down scroll   PageDown/PageUp page   esc closes it")
+        } else {
+            None
+        }
     }
 
     /// Whether an overlay is drawn over the body and so owns the note area behind it.
     ///
     /// F-1's class, generalized by enumeration: a bordered overlay can cover the head
     /// of a wrapped note-area sentence and leave its tail (`writes both files for
-    /// you.`) as the first thing a zero-knowledge user reads. The acknowledgment is
-    /// the topmost overlay and is not in `overlay_owns_keys` (it does not own `q`),
-    /// so it is added here; every other overlay is the same set. One predicate governs
-    /// the note area, and a new overlay added to `overlay_owns_keys` is covered
-    /// without a second list.
+    /// you.`) as the first thing a zero-knowledge user reads. One predicate governs the
+    /// note area, the action row and the footer, and its overlay set is the one
+    /// [`App::overlay_footer_keys`] returns; a new overlay cannot be added to one list
+    /// and missed by another.
     pub fn overlay_owns_screen(&self) -> bool {
-        self.overlay_owns_keys() || self.show_acknowledgment
+        self.overlay_owns_keys()
     }
 
     /// Drop the add-agent form's standing refusal, and the status sentence that
@@ -3862,8 +3991,10 @@ impl App {
                 };
                 // The result itself carries the endpoint, model and time, so a person
                 // can tell which address answered and whether the answer is current.
+                // The facts lead, so a floor-width footer keeps `endpoint … — model
+                // …` while the prose wraps or is shortened after them (F4).
                 self.status = format!(
-                    "endpoint test for `{agent}`: {short} — endpoint {endpoint} — model {model} — tested just now"
+                    "endpoint {endpoint} — model {model} — endpoint test for `{agent}`: {short} — tested just now"
                 );
                 let test = EndpointTest {
                     agent,
@@ -3899,6 +4030,9 @@ impl App {
                 }
             }
             ProbeDone::Identity { agent, result } => {
+                // Settling an identity writes (or changes) the login, email and token
+                // the pull-request gate reads; the cached answer must not survive it.
+                self.clear_pull_request_cache();
                 self.status = identity_receipt(&agent, &result);
                 self.identity_report = Some(IdentityReport { agent, result });
             }
@@ -3984,6 +4118,9 @@ impl App {
 
     /// Apply the role check's result, in the sentence the Forgejo screen made before.
     fn apply_role_check(&mut self, url: String, result: Result<RoleCheck, ForgejoFailure>) {
+        // The check can change the repository list, its default branch and the
+        // selection; a cached `P` answer from before it is no longer the gate's.
+        self.clear_pull_request_cache();
         let at = crate::time::now_unix_ms();
         let mark = crate::machine::mark();
         self.role_checked_at_ms = Some(at);
@@ -4016,6 +4153,9 @@ impl App {
 
     /// Apply the administrator role check's result, keeping the last good view.
     fn apply_admin_role_check(&mut self, result: Result<RoleCheck, ForgejoFailure>) {
+        // A check — even a failed administrator one that keeps the old view — is a
+        // fresh answer about the connection; do not let the previous `P` stand on it.
+        self.clear_pull_request_cache();
         self.status = match &result {
             Ok(check) => format!(
                 "role check (administrator token): {}",
@@ -4552,72 +4692,248 @@ impl App {
         }
     }
 
-    /// Push the workspace's current branch and open a pull request as the agent.
-    pub fn request_pull_request(&mut self) {
+    /// Check what `P` would open, without writing anything.
+    ///
+    /// The gate is the page map's three facts: the branch is not the base, it has
+    /// commits the base lacks, and the branch is on the remote (its remote-tracking ref
+    /// exists in this clone). A run's push witness drives the Runs note, never this
+    /// gate: a witness belongs to a run, and a selected clone's remote-tracking ref is
+    /// the evidence that this clone's branch is actually on the remote. A failing check
+    /// is one sentence in the status line, and no push, no pull request and no file is
+    /// written.
+    fn pull_request_preview(&self) -> Result<PullRequestPreview, String> {
         let Some(repository) = self.selected_repository().cloned() else {
-            self.status =
-                "no repository is on show: press c to run the role check first".to_owned();
-            return;
+            return Err("no repository is on show: press c to run the role check first".to_owned());
         };
         let Some(name) = self.selected_name() else {
-            self.status = "the configuration lists no agent to open a pull request for".to_owned();
+            return Err("the configuration lists no agent to open a pull request for".to_owned());
+        };
+        if self.forgejo_settings().is_none() {
+            return Err("the configuration could not be read".to_owned());
+        }
+        let paths = self
+            .layout
+            .agent(&name)
+            .map_err(|error| format!("`{name}` cannot be prepared: {error}"))?;
+        let destination = workspace::clone_destination(paths.workspace(), &repository.full_name);
+        if !destination.join(".git").is_dir() {
+            return Err(format!(
+                "`P` refused: {} has not been cloned into `{name}`'s workspace yet; press g first",
+                repository.full_name
+            ));
+        }
+        let branch = workspace::current_branch(&destination).map_err(|error| {
+            format!(
+                "`P` refused: the workspace branch could not be read ({}): {error}",
+                error.class()
+            )
+        })?;
+        let base = repository
+            .default_branch
+            .clone()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| "main".to_owned());
+        if branch == base {
+            return Err(format!(
+                "`P` refused: `{branch}` is the base branch, so there is nothing to open as a pull request"
+            ));
+        }
+        let (ahead, measured_base) =
+            workspace::commits_ahead_against(&destination, &branch, &base).map_err(|error| {
+                format!(
+                    "`P` refused: the commits `{branch}` has beyond `{base}` could not be read ({}): {}",
+                    error.class(),
+                    error.detail()
+                )
+            })?;
+        if ahead == 0 {
+            return Err(format!(
+                "`P` refused: `{branch}` has no commits `{measured_base}` lacks, so there is nothing to open"
+            ));
+        }
+        // The selected clone's own remote-tracking ref is the evidence that the branch
+        // is on the remote. A run's push witness is about the run's workspace, not this
+        // clone: a sibling clone's push must not stand for this branch.
+        if !workspace::branch_on_remote(&destination, &branch) {
+            return Err(format!(
+                "`P` refused: `{branch}` is not on the remote — push it first"
+            ));
+        }
+        // Identity and the agent's token are needed only for the act that follows the
+        // preview (the commit identity's login, the push credential and the receipt);
+        // the gate's content checks come first, so a branch with nothing to open is
+        // named as that, not as a missing identity.
+        let identity = match self.recorded_git_identity(&name) {
+            Ok(identity) => identity,
+            Err(failure) => return Err(format!("`P` refused: {}", failure.message)),
+        };
+        // The action writes a pull request with the agent's own token. A legend that
+        // offered `P` without it would name a key whose write cannot be made.
+        if let Err(error) = credentials::forgejo_agent_token(&self.credentials_path, &name) {
+            return Err(format!(
+                "`P` refused: {}",
+                missing_agent_token_status(&name, &error)
+            ));
+        }
+        let (title, body) = self.pull_request_text(&name, &branch);
+        Ok(PullRequestPreview {
+            agent: name,
+            login: identity.login,
+            repository: repository.full_name,
+            namespace: repository.namespace,
+            name: repository.name,
+            branch,
+            base,
+            title,
+            body,
+        })
+    }
+
+    /// Whether the Forgejo screen may name `P` in its key legend.
+    ///
+    /// The gate's answer is cached for the state it was computed from: the legend is
+    /// drawn on every frame, and running `git` several times per frame to answer the
+    /// same question would make an idle screen busy. The key carries every gate input
+    /// that can be read without running `git`: the selected repository and its default
+    /// branch, the agent, the recorded identity and agent-token presence, the
+    /// checked-out branch and its local tip, the local base's tip, and a fingerprint of
+    /// the clone's remote-tracking refs. The cache is also cleared when a role check is
+    /// applied and when an identity or token changes, so the legend follows a local
+    /// commit or reset, a pruned remote-tracking ref, and a changed default branch after
+    /// `c`.
+    pub fn can_open_pull_request(&self) -> bool {
+        let key = self.pull_request_cache_key();
+        if let Some((cached, ready)) = self.pull_request_cache.borrow().as_ref() {
+            if cached == &key {
+                return *ready;
+            }
+        }
+        let ready = self.pull_request_preview().is_ok();
+        *self.pull_request_cache.borrow_mut() = Some((key, ready));
+        ready
+    }
+
+    /// Forget the cached pull-request answer.
+    ///
+    /// Called whenever a fact the gate reads can have changed without the cheap cache
+    /// key seeing it: a role check (the repository list and the default branch), a
+    /// settled identity, or a secret written or deleted.
+    fn clear_pull_request_cache(&self) {
+        *self.pull_request_cache.borrow_mut() = None;
+    }
+
+    fn pull_request_cache_key(&self) -> String {
+        let repository = self.selected_repository();
+        let full_name = repository
+            .map(|repository| repository.full_name.clone())
+            .unwrap_or_default();
+        let base = repository
+            .and_then(|repository| repository.default_branch.clone())
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| "main".to_owned());
+        let agent = self.selected_name().unwrap_or_default();
+        // The preview needs the recorded identity and the write needs the agent's own
+        // token. Both are read from the credentials file on the frame that draws the
+        // legend, so removing either while the screen is open changes the key and the
+        // answer is recomputed instead of standing stale.
+        let login = credentials::recorded_login(&self.credentials_path, &agent)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let email = credentials::recorded_email(&self.credentials_path, &agent)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let token = credentials::forgejo_agent_token(&self.credentials_path, &agent).is_ok();
+        // The checked-out branch and the local base can move outside this UI; read
+        // git's own small files rather than running `git` on every frame. The
+        // fingerprint covers every remote-tracking ref and the local tips of the
+        // checked-out branch and the base, because the gate's answer depends on both
+        // the branch's commits beyond the base and whether the branch is on the remote.
+        // The local base is the measured base when the clone has no remote-tracking
+        // base; hashing it even when one exists only costs a recheck.
+        let git_dir =
+            self.layout.agent(&agent).ok().map(|paths| {
+                workspace::clone_destination(paths.workspace(), &full_name).join(".git")
+            });
+        let branch = git_dir
+            .as_ref()
+            .and_then(|git_dir| std::fs::read_to_string(git_dir.join("HEAD")).ok())
+            .map(|head| {
+                head.trim()
+                    .strip_prefix("ref: refs/heads/")
+                    .unwrap_or(head.trim())
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let refs = git_dir
+            .as_deref()
+            .map(|git_dir| clone_refs_fingerprint(git_dir, &[&branch, &base]))
+            .unwrap_or(0);
+        format!(
+            "{full_name}\u{1f}{agent}\u{1f}{base}\u{1f}{login}\u{1f}{email}\u{1f}{token}\u{1f}{branch}\u{1f}{refs:016x}\u{1f}{}",
+            self.role_check.is_some()
+        )
+    }
+
+    /// `P`: show the proposed pull request, or refuse with one reason and no write.
+    pub fn request_pull_request(&mut self) {
+        match self.pull_request_preview() {
+            Ok(preview) => {
+                self.reset_modal_scroll();
+                self.status = format!(
+                    "pull request `{}` -> `{}`: press y or enter to open it, n or esc to write nothing",
+                    preview.branch, preview.base
+                );
+                self.confirm_pull_request = Some(preview);
+            }
+            Err(refusal) => {
+                self.confirm_pull_request = None;
+                self.status = refusal;
+            }
+        }
+    }
+
+    /// The confirmed half of `P`: push the branch, then open the previewed request.
+    ///
+    /// Nothing before the confirmation writes; this method is reached only from the
+    /// overlay's `y`/`enter`.
+    pub fn confirm_pull_request(&mut self) {
+        let Some(preview) = self.confirm_pull_request.take() else {
             return;
         };
         let Some(settings) = self.forgejo_settings() else {
             self.status = "the configuration could not be read".to_owned();
             return;
         };
-        let paths = match self.layout.agent(&name) {
+        let paths = match self.layout.agent(&preview.agent) {
             Ok(paths) => paths,
             Err(error) => {
-                self.status = format!("`{name}` cannot be prepared: {error}");
+                self.status = format!("`{}` cannot be prepared: {error}", preview.agent);
                 return;
             }
         };
-        let destination = workspace::clone_destination(paths.workspace(), &repository.full_name);
-        if !destination.join(".git").is_dir() {
-            self.status = format!(
-                "{} has not been cloned into `{name}`'s workspace yet; press g first",
-                repository.full_name
-            );
-            return;
-        }
-        let identity = match self.recorded_git_identity(&name) {
-            Ok(identity) => identity,
-            Err(failure) => {
-                self.status = failure.message;
-                return;
-            }
-        };
+        let destination = workspace::clone_destination(paths.workspace(), &preview.repository);
         let askpass = std::env::current_exe().unwrap_or_default();
         let credential = GitCredential {
             askpass: &askpass,
             credentials: &self.credentials_path,
-            agent: &name,
-            login: &identity.login,
-        };
-        let branch = match workspace::current_branch(&destination) {
-            Ok(branch) => branch,
-            Err(error) => {
-                self.status = format!(
-                    "the workspace branch cannot be read ({}): {error}",
-                    error.class()
-                );
-                return;
-            }
+            agent: &preview.agent,
+            login: &preview.login,
         };
         if let Err(error) = workspace::push(&destination, &credential) {
             self.status = format!(
-                "pushing `{branch}` failed ({}): {}",
+                "pushing `{}` failed ({}): {}",
+                preview.branch,
                 error.class(),
                 error.detail()
             );
             return;
         }
-        let token = match credentials::forgejo_agent_token(&self.credentials_path, &name) {
+        let token = match credentials::forgejo_agent_token(&self.credentials_path, &preview.agent) {
             Ok(token) => token,
             Err(error) => {
-                self.status = missing_agent_token_status(&name, &error);
+                self.status = missing_agent_token_status(&preview.agent, &error);
                 return;
             }
         };
@@ -4631,28 +4947,29 @@ impl App {
                 return;
             }
         };
-        let base = repository
-            .default_branch
-            .clone()
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| "main".to_owned());
-        let (title, body) = self.pull_request_text(&name, &branch);
         match client.open_pull_request(
-            &repository.namespace,
-            &repository.name,
-            &title,
-            &body,
-            &branch,
-            &base,
+            &preview.namespace,
+            &preview.name,
+            &preview.title,
+            &preview.body,
+            &preview.branch,
+            &preview.base,
         ) {
             Ok(pull) => {
-                let note = format!("opened {} as {}", pull.line(), identity.login);
+                let note = format!("opened {} as {}", pull.line(), preview.login);
                 self.status = note.clone();
                 self.forgejo_note = Some(note);
             }
             Err(error) => {
                 self.status = format!("opening a pull request failed ({}): {error}", error.class());
             }
+        }
+    }
+
+    /// `n`/`esc` on the proposal: close it and say plainly that nothing was written.
+    pub fn cancel_pull_request(&mut self) {
+        if self.confirm_pull_request.take().is_some() {
+            self.status = "no pull request was opened and nothing was written".to_owned();
         }
     }
 
@@ -5922,6 +6239,21 @@ impl App {
                         "the help scrolls with up/down or a page with PageDown/PageUp; esc closes it"
                             .to_owned();
                 }
+            }
+            return;
+        }
+        if self.confirm_pull_request.is_some() {
+            if self.scroll_modal_key(key) {
+                return;
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_pull_request();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') | KeyCode::Esc => {
+                    self.cancel_pull_request();
+                }
+                _ => {}
             }
             return;
         }

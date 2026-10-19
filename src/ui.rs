@@ -176,7 +176,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     draw_footer(frame, app, areas[3]);
 
-    if app.adding_agent() {
+    if app.confirm_pull_request.is_some() {
+        draw_pull_request(frame, app);
+    } else if app.adding_agent() {
         draw_add_agent_form(frame, app);
     } else if app.edit_agent.is_some() {
         draw_edit_agent(frame, app);
@@ -230,8 +232,8 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
 /// This is not the full key list (that stays one `?` away): it is the next actions a
 /// person on this screen reaches for, and it never pays for the footer's running
 /// count. The footer remains the product-wide line.
-fn draw_screen_actions(frame: &mut Frame, app: &App, area: Rect) {
-    let actions = match app.screen {
+fn screen_actions(app: &App) -> &'static str {
+    match app.screen {
         Screen::Agents => "n new agent   s start   x stop   e instruction   ? all keys",
         Screen::AgentConfig => {
             "E edit endpoint   e instruction   p test   s start   m mode   ? all keys"
@@ -246,7 +248,21 @@ fn draw_screen_actions(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
         Screen::Runs => "o log   T transcript   up/down run   [ ] page   enter open   ? all keys",
-    };
+    }
+}
+
+/// Which of `s start` and `x stop` the global footer still has to name.
+///
+/// The global legend reads the same action-row string, so it cannot repeat a key the
+/// row above it already names, and cannot omit one the row leaves out (F12, N3). The
+/// flags are per key: the Agent screen names `s` but not `x`.
+fn footer_start_stop(app: &App) -> (bool, bool) {
+    let actions = screen_actions(app);
+    (!actions.contains("s start"), !actions.contains("x stop"))
+}
+
+fn draw_screen_actions(frame: &mut Frame, app: &App, area: Rect) {
+    let actions = screen_actions(app);
     frame.render_widget(
         Paragraph::new(actions)
             .style(muted_style())
@@ -494,10 +510,11 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             )));
         }
     }
-    // The product has no scheduler. Say so before a person plans around one; the
-    // README states the same boundary, and `m` is the way to keep a run alive.
+    // The product has no scheduler. The hub keeps one line for it; the full
+    // explanation (a run starts with `s`, `m` keeps it alive as a user unit, and a
+    // recurring run needs the person's own timer) lives behind `?`.
     lines.push(Line::from(Span::styled(
-        "There is no scheduler: a run starts when you press s, or is kept alive as a user unit with m; a recurring run needs your own timer.",
+        "no scheduler — runs start with s",
         muted_style(),
     )));
     if let Some(note) = &app.config_note {
@@ -939,10 +956,11 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
                             "  declared",
                             &format!("{count} shell {noun} is run in the workspace at"),
                         ));
-                        lines.push(field(
-                            "",
-                            &format!("g clones to workspace/<repository>; {workspace}"),
-                        ));
+                        // Keep the must-offer phrase on its own short logical line:
+                        // the long workspace path is the row that may fall below the
+                        // 80×24 fold, not the fact that `g` clones one level down.
+                        lines.push(field("", "g clones to workspace/<repository>"));
+                        lines.push(field("  workspace", &workspace));
                     } else {
                         lines.push(field(
                             "  declared",
@@ -997,9 +1015,18 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     let (mut head, all_repos) = forgejo_head_and_repos(app);
     let (tail, legend) = forgejo_frame(app);
     let tail_rows = pushed_rows(&tail, inner) + pushed_rows(&legend, inner);
-    let long_name = "Forgejo connection and role check";
-    let short_name = "Forgejo";
     let total = all_repos.len();
+    // The windowed title tells the same truth as the scrollable one: a reopened
+    // screen with no list this session says so, and a check that found none says
+    // `no repositories`. Only a populated checked list uses the neutral name with
+    // its range.
+    let (long_name, short_name) = match &app.role_check {
+        Some(Ok(check)) if !check.repositories.is_empty() => (
+            "Forgejo connection and role check".to_owned(),
+            "Forgejo".to_owned(),
+        ),
+        _ => forgejo_scrolled_title(app, total),
+    };
 
     // The windowed form gives the repository list the rows the head and tail do not
     // need. Its range is the range actually drawn; when only one row fits, it says
@@ -1017,8 +1044,8 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     if !overflows && app.panel_scroll == 0 {
         let (mut title, dropped) = fit_title(
             area.width as usize,
-            long_name,
-            Some(short_name),
+            &long_name,
+            Some(&short_name),
             range.as_deref(),
             false,
             false,
@@ -1038,8 +1065,8 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
             }
             title = fit_title(
                 area.width as usize,
-                long_name,
-                Some(short_name),
+                &long_name,
+                Some(&short_name),
                 None,
                 false,
                 false,
@@ -1048,6 +1075,26 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
         }
         let repo_rows: Vec<Line> = all_repos[first..first + shown].to_vec();
         let lines = assemble(head, repo_rows, tail, legend);
+        let width = (area.width as usize).saturating_sub(2);
+        let height = (area.height as usize).saturating_sub(2);
+        let (rows, owners) = panel_rows_owned(&lines, width);
+        let visible = whole_line_window(&rows, &owners, 0, height);
+        if rows.len() > height || visible.len() < rows.len().min(height) {
+            // Dropping the partial logical line leaves the row-counted window with
+            // unused rows; use the scrollable form so `]` can reach the dropped line
+            // and the title declares where it is.
+            let lines = forgejo_scrolled_lines(app);
+            let (range_title, short_title) = forgejo_scrolled_title(app, total);
+            draw_scrolled_panel(
+                frame,
+                app,
+                lines,
+                &range_title,
+                Some(&short_title),
+                area,
+            );
+            return;
+        }
         draw_panel(frame, lines, title, area);
         return;
     }
@@ -1055,31 +1102,126 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     // The scrollable form: every repository is drawn, and the title carries the whole
     // list's range so the range itself is never scrolled away. `[`/`]` reach the
     // identity tail and the legend.
-    let lines = forgejo_scrolled_lines(app);
-    let range_title = if total == 0 {
-        // A range cannot exist when the check listed no repository; `1–0 of 0` was a
-        // claim the repository list could not support (the empty-range rule). The
-        // short name leaves room for `line n of m` and the scroll declaration at the
-        // floor.
-        "Forgejo — no repositories".to_owned()
+    let (range_title, short_title) = forgejo_scrolled_title(app, total);
+    if app.forgejo_note.is_some() {
+        // After a clone the note is one of the facts a person needs, and the key
+        // legend's second row must not be what it pushes off. The legend is pinned as
+        // two whole rows; the content above it scrolls with `[`/`]`.
+        let mut content = head;
+        if total > 0 {
+            content.push(note_marker(&format!("repositories 1–{total} of {total}")));
+        }
+        content.extend(all_repos);
+        content.extend(tail);
+        draw_forgejo_pinned_legend(frame, app, content, legend, &range_title, &short_title, area);
     } else {
-        format!("Forgejo repositories 1–{total} of {total}")
+        let lines = forgejo_scrolled_lines(app);
+        draw_scrolled_panel(frame, app, lines, &range_title, Some(&short_title), area);
+    }
+}
+
+/// The Forgejo panel's title for the list state this session actually holds.
+///
+/// `no repositories` is reserved for a check that listed none. A reopened screen or
+/// an address change has no list this session, so presenting an unknown as zero is a
+/// false fact; it says `not checked this session` (or the last check's result and
+/// age) instead.
+fn forgejo_scrolled_title(app: &App, total: usize) -> (String, String) {
+    match &app.role_check {
+        Some(Ok(check)) if check.repositories.is_empty() => (
+            "Forgejo — no repositories".to_owned(),
+            "Forgejo — no repositories".to_owned(),
+        ),
+        Some(Ok(_)) => (
+            format!("Forgejo repositories 1–{total} of {total}"),
+            "Forgejo".to_owned(),
+        ),
+        Some(Err(_)) => (
+            "Forgejo — role check failed".to_owned(),
+            "Forgejo — failed".to_owned(),
+        ),
+        None => match app.last_check_line() {
+            // The short form keeps the result and age whole: at the floor the product
+            // name may be shortened, but what the last check found must not be.
+            Some(line) => (format!("Forgejo — {line}"), line),
+            None => (
+                "Forgejo — not checked this session — press c".to_owned(),
+                "Forgejo — not checked this session".to_owned(),
+            ),
+        },
+    }
+}
+
+/// Draw the Forgejo scrolled form with its two-row legend pinned inside the border.
+fn draw_forgejo_pinned_legend(
+    frame: &mut Frame,
+    app: &App,
+    content: Vec<Line<'static>>,
+    legend: Vec<Line<'static>>,
+    base: &str,
+    short: &str,
+    area: Rect,
+) {
+    let width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let legend_rows = panel_rows(&legend, width);
+    // Keep at least one content row even if a window is absurdly short; the floor is
+    // guarded before this function is reached.
+    let legend_height = legend_rows.len().min(inner_height.saturating_sub(1));
+    let body_height = inner_height.saturating_sub(legend_height).max(1);
+    let (rows, owners) = panel_rows_owned(&content, width);
+    let total = rows.len().max(1);
+    let limit = rows.len().saturating_sub(body_height);
+    let offset = app.panel_scroll.min(limit);
+    app.panel_height.set(body_height.max(1));
+    app.panel_scroll_limit.set(limit);
+    let line = format!("line {} of {total}", offset + 1);
+    let above = offset > 0;
+    let below = offset + body_height < rows.len();
+    let (title, _) = fit_title(area.width as usize, base, Some(short), Some(&line), above, below);
+    let window = whole_line_window(&rows, &owners, offset, body_height);
+    let block = Block::bordered().title(title).style(base_style());
+    frame.render_widget(block, area);
+    let body_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: body_height as u16,
     };
-    draw_scrolled_panel(frame, app, lines, &range_title, None, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(window)).style(base_style()),
+        body_area,
+    );
+    let legend_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1 + inner_height.saturating_sub(legend_height) as u16,
+        width: area.width.saturating_sub(2),
+        height: legend_height as u16,
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(legend_rows)).style(muted_style()),
+        legend_area,
+    );
 }
 
 /// The Forgejo key legend, two compact rows.
 ///
 /// Each phrase keeps its object: `v agent token` says what `v` sets, and the panel
 /// clips whole rows, never half a sentence (Y-8). Keeping it to two rows is also what
-/// leaves the repository list more than one row at 80×24.
-fn forgejo_legend() -> Vec<Line<'static>> {
+/// leaves the repository list more than one row at 80×24. `P` is named only while the
+/// pull-request gate passes, so the legend never offers a key that would refuse.
+fn forgejo_legend(app: &App) -> Vec<Line<'static>> {
+    let mut second = "up/down choose one   g clone".to_owned();
+    if app.can_open_pull_request() {
+        second.push_str("   P pull request");
+    }
+    second.push_str("   U update the newest");
     [
-        "u url   c role   C admin role   v agent token   A admin token   i identity",
-        "up/down choose one   g clone   P pull request   U update the newest",
+        "u url   c role   C admin role   v agent token   A admin token   i identity".to_owned(),
+        second,
     ]
-    .iter()
-    .map(|line| Line::from(Span::styled((*line).to_owned(), muted_style())))
+    .into_iter()
+    .map(|line| Line::from(Span::styled(line, muted_style())))
     .collect()
 }
 
@@ -1210,12 +1352,15 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
             // W37-1: the stamp is persisted, so even a session that has not run a
             // check can say when the last one ran; the fact does not vanish with the
             // session that learned it.
-            match app.role_check_stamp() {
-                Some(stamp) => head.push(placeholder(&format!(
-                    "no role check has been run in this session — {stamp} — press c to check again"
+            match (app.last_check_line(), app.role_check_stamp()) {
+                (Some(line), _) => head.push(placeholder(&format!(
+                    "not checked this session — {line} — press c to check again"
                 ))),
-                None => head.push(placeholder(
-                    "no role check has been run yet — press c to list what the configured token can see",
+                (None, Some(stamp)) => head.push(placeholder(&format!(
+                    "not checked this session — {stamp} — press c to check again"
+                ))),
+                (None, None) => head.push(placeholder(
+                    "not checked this session — press c to list what the configured token can see",
                 )),
             }
         }
@@ -1339,7 +1484,7 @@ fn forgejo_frame(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     if let Some(note) = &app.forgejo_note {
         tail.push(Line::from(note.clone()));
     }
-    (tail, forgejo_legend())
+    (tail, forgejo_legend(app))
 }
 
 /// The one sentence that explains what a role is and what an identity is.
@@ -1451,7 +1596,19 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     // Split into words at ordinary spaces. A no-break space (U+00A0) stays inside its
     // word, so the login and the email it joins move together (N-2).
     let mut words: Vec<Vec<(char, Style)>> = Vec::new();
+    // Leading spaces are part of the line's own shape (a bullet's indent, a preview's
+    // two-space inset), not separators to lose. Seed the first word with them so a
+    // wrapped line keeps the indent on its first row.
+    let mut chars = chars.into_iter().peekable();
     let mut word: Vec<(char, Style)> = Vec::new();
+    while let Some((ch, style)) = chars.peek().copied() {
+        if ch == ' ' {
+            word.push((ch, style));
+            chars.next();
+        } else {
+            break;
+        }
+    }
     for (ch, style) in chars {
         if ch == ' ' {
             if !word.is_empty() {
@@ -1543,6 +1700,61 @@ fn panel_rows(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
         rows.extend(wrap_line(line, width));
     }
     rows
+}
+
+/// [`panel_rows`] with the index of the logical line every wrapped row came from.
+fn panel_rows_owned(
+    lines: &[Line<'static>],
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut rows = Vec::new();
+    let mut owners = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        for row in wrap_line(line, width) {
+            rows.push(row);
+            owners.push(index);
+        }
+    }
+    (rows, owners)
+}
+
+/// The rows a window draws, with a trailing partial logical line dropped.
+///
+/// The map's rule for a bordered surface: a sentence never ends at the bottom border
+/// because only its first wrapped rows fit. Whole logical lines are dropped until the
+/// remaining rows fit, and `more below — press ]` carries the rest. The one exception
+/// is a logical line taller than the body: it is drawn row by row, or it could never be
+/// reached (W36-1). The scroll offset still counts wrapped rows.
+fn whole_line_window(
+    rows: &[Line<'static>],
+    owners: &[usize],
+    offset: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    if rows.is_empty() || height == 0 {
+        return Vec::new();
+    }
+    let end = (offset + height).min(rows.len());
+    if end == rows.len() {
+        return rows[offset..end].to_vec();
+    }
+    let last = owners[end - 1];
+    // The first row of the logical line the window ends inside, and the first row of
+    // the next line after it.
+    let group_start = owners[..end]
+        .iter()
+        .rposition(|owner| *owner != last)
+        .map_or(0, |at| at + 1);
+    let group_end = owners[end..]
+        .iter()
+        .position(|owner| *owner != last)
+        .map_or(rows.len(), |at| end + at);
+    let group_len = group_end - group_start;
+    if group_start >= offset && group_end > end && group_len <= height {
+        rows[offset..group_start].to_vec()
+    } else {
+        rows[offset..end].to_vec()
+    }
 }
 
 /// Where the credentials file is, and the mode it has.
@@ -1774,10 +1986,17 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(STARTED as u16),
         Constraint::Length(outcome_w as u16),
     ];
+    // F11: a bare `*` is not a legend. When a listed record belongs to a removed or
+    // earlier agent, the list's own header names the marker once with one word.
+    let list_base = if app.recent.iter().any(|run| !app.run_is_current(run)) {
+        "recent runs — * earlier"
+    } else {
+        "recent runs"
+    };
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::bordered().title(list_title_with_total(
-            "recent runs",
+            list_base,
             first,
             shown,
             app.recent.len(),
@@ -1829,7 +2048,7 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         }
         if crate::run::run_pushed(run) {
             lines.push(Line::from(Span::styled(
-                "next step: the run pushed its branch — press P on the Forgejo screen (4) to open the pull request.",
+                "next step: the run pushed its branch — press P on the Forgejo screen (4); it checks the branch before it opens anything.",
                 warning_style(),
             )));
         }
@@ -2016,21 +2235,16 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
         .max()
         .unwrap_or(0)
         .clamp(STATE_COLUMN_MIN, STATE_COLUMN_MAX);
-    // The state column is paid first, up to the room that still leaves the name at its
-    // comfortable minimum. Then the name may use what is left, and the model column
-    // asks for the width of the longest model id it must draw (at least the minimum).
-    // The leftover stays outside the table, so one row's fields stay together at any
-    // width.
+    // The state column is paid first. The model column is paid next, before a long
+    // name is shown whole: at 80×24 a row must still say which model it uses, so the
+    // name is shortened first. If a shortened name would collide with another legal
+    // name, the model yields its remaining room (never below its minimum) rather than
+    // letting two rows read identically.
+    let state_room = available
+        .saturating_sub(MARKER + CONCURRENCY + SUPERVISION + MODEL_MIN + NAME_COLUMN_MIN);
     let state = state_wanted
-        .min(
-            available
-                .saturating_sub(MARKER + NAME_COLUMN_MIN + CONCURRENCY + SUPERVISION + MODEL_MIN),
-        )
+        .min(state_room)
         .max(STATE_COLUMN_MIN.min(available));
-    let name_budget = available
-        .saturating_sub(MARKER + CONCURRENCY + SUPERVISION + state + MODEL_MIN)
-        .max(NAME_COLUMN_MIN);
-    let name = name_column_width(&names, name_budget);
     let model_content = app
         .agents()
         .iter()
@@ -2038,11 +2252,21 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
         .max()
         .unwrap_or(0)
         .clamp(MODEL_MIN, FLEX_COLUMN_MAX);
-    let room_for_model =
-        available.saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + state);
-    let model = model_content
-        .min(room_for_model)
+    let model_room =
+        available.saturating_sub(MARKER + CONCURRENCY + SUPERVISION + state + NAME_COLUMN_MIN);
+    let mut model = model_content
+        .min(model_room)
         .max(MODEL_MIN.min(available));
+    let mut name_budget = available
+        .saturating_sub(MARKER + CONCURRENCY + SUPERVISION + state + model)
+        .max(NAME_COLUMN_MIN);
+    let need = smallest_distinct_width(&names, FLEX_COLUMN_MAX);
+    if need > name_budget {
+        let give = (need - name_budget).min(model.saturating_sub(MODEL_MIN));
+        model -= give;
+        name_budget += give;
+    }
+    let name = name_column_width(&names, name_budget);
     [
         name as u16,
         model as u16,
@@ -2050,6 +2274,29 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
         SUPERVISION as u16,
         state as u16,
     ]
+}
+
+/// The smallest column width at which every distinct legal name still renders
+/// differently, capped by `cap`.
+fn smallest_distinct_width(names: &[&str], cap: usize) -> usize {
+    let longest = names
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let cap = cap.clamp(NAME_COLUMN_MIN, FLEX_COLUMN_MAX).min(longest.max(NAME_COLUMN_MIN));
+    let mut distinct: Vec<&str> = names.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    for width in NAME_COLUMN_MIN..=cap {
+        let mut rendered: Vec<String> = distinct.iter().map(|name| ellipsise(name, width)).collect();
+        rendered.sort();
+        rendered.dedup();
+        if rendered.len() == distinct.len() {
+            return width;
+        }
+    }
+    cap
 }
 
 /// The width of a column of agent names.
@@ -2125,20 +2372,23 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         parts[0],
     );
     // The legend is the product's own key list. Under an overlay that owns the plain
-    // keys, `q` is a letter in a field or a cancel, never `quit`, so the line is
-    // replaced with the one thing that is true there (E-2). The read-only
-    // acknowledgment review scrolls with `[`/`]` and closes on any other key, so its
-    // footer names both instead of saying only `any key` (V-2).
-    let legend = if app.show_acknowledgment && app.ack_review {
-        "esc closes this overlay; [ and ] scroll; the record is unchanged"
-    } else if app.show_acknowledgment {
-        // The first-run modal's own keys. `q` and the screen keys are not advertised
-        // while it owns the screen (K-26).
-        "y records it once   n not now   esc not now"
-    } else if app.overlay_owns_keys() {
-        "esc closes this overlay"
-    } else {
-        "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open   r re-read"
+    // keys, the footer lists **only that overlay's keys**: `q` is a letter in a field
+    // or a cancel, and `1-6 screen`, `s start`, `x stop` and `p endpoint` do not act
+    // there (E-2). The running clause still fits under it, without key names.
+    let (legend, running) = match app.overlay_footer_keys() {
+        Some(keys) => (keys.to_owned(), running_clause(app)),
+        None => {
+            let (include_start, include_stop) = footer_start_stop(app);
+            (
+                "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open   r re-read".to_owned(),
+                key_legend(
+                    area.width as usize,
+                    &running_clause(app),
+                    include_start,
+                    include_stop,
+                ),
+            )
+        }
     };
     frame.render_widget(
         Paragraph::new(legend)
@@ -2147,7 +2397,9 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new(key_legend(area.width as usize, &running_clause(app))).style(muted_style()),
+        Paragraph::new(running)
+            .style(muted_style())
+            .wrap(Wrap { trim: true }),
         parts[2],
     );
 }
@@ -2387,7 +2639,7 @@ fn draw_scrolled_panel(
 ) {
     let width = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
-    let rows = panel_rows(&lines, width);
+    let (rows, owners) = panel_rows_owned(&lines, width);
     let total = rows.len().max(1);
     let limit = rows.len().saturating_sub(height);
     let offset = app.panel_scroll.min(limit);
@@ -2399,11 +2651,7 @@ fn draw_scrolled_panel(
     let above = offset > 0;
     let below = offset + height < rows.len();
     let (title, _) = fit_title(area.width as usize, base, short, Some(&line), above, below);
-    let window: Vec<Line<'static>> = if rows.is_empty() {
-        Vec::new()
-    } else {
-        rows[offset..].iter().take(height).cloned().collect()
-    };
+    let window = whole_line_window(&rows, &owners, offset, height);
     frame.render_widget(
         Paragraph::new(Text::from(window))
             .style(base_style())
@@ -2420,8 +2668,8 @@ fn draw_scrolled_panel(
 fn draw_panel(frame: &mut Frame, lines: Vec<Line<'static>>, title: String, area: Rect) {
     let width = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
-    let rows = panel_rows(&lines, width);
-    let window: Vec<Line<'static>> = rows.into_iter().take(height).collect();
+    let (rows, owners) = panel_rows_owned(&lines, width);
+    let window = whole_line_window(&rows, &owners, 0, height);
     frame.render_widget(
         Paragraph::new(Text::from(window))
             .style(base_style())
@@ -2514,11 +2762,11 @@ fn running_clause(app: &App) -> String {
 /// key fits and the line ends with `? all keys`; when the running count is long enough
 /// that they cannot, the tail says which part is not drawn (Z-4). The `prefix` is the
 /// running count, which is rendered here so that it is on screen wherever the user is,
-/// not only on the Agents screen.
-fn key_legend(width: usize, prefix: &str) -> String {
+/// not only on the Agents screen. `s start` and `x stop` are included only when this
+/// screen's own action row does not already name them, so the footer never repeats a
+/// key above it and never hides one the row leaves out (F12, N3).
+fn key_legend(width: usize, prefix: &str, include_start: bool, include_stop: bool) -> String {
     const KEYS: &[&str] = &[
-        "s start",
-        "x stop",
         "p endpoint",
         "m supervision",
         "c role",
@@ -2532,6 +2780,14 @@ fn key_legend(width: usize, prefix: &str) -> String {
         "n new agent",
         "d remove",
     ];
+    let mut keys: Vec<&str> = Vec::with_capacity(KEYS.len() + 2);
+    if include_start {
+        keys.push("s start");
+    }
+    if include_stop {
+        keys.push("x stop");
+    }
+    keys.extend_from_slice(KEYS);
     let tail = "… more — ? all keys";
     let all = "? all keys";
     // If the count would crowd out even the full-list hint, the hint wins: it is the
@@ -2543,12 +2799,12 @@ fn key_legend(width: usize, prefix: &str) -> String {
         return tail.to_owned();
     }
     let mut line = prefix.to_owned();
-    for (index, key) in KEYS.iter().enumerate() {
+    for (index, key) in keys.iter().enumerate() {
         let candidate = format!("{line}{key}   ");
         // Z-4: while keys remain, the tail is what will end the line; for the **last**
         // key the line ends with `? all keys` instead, and reserving the longer tail
         // there dropped `d remove` at 200 columns even though all fourteen fit.
-        let reserve = if index + 1 == KEYS.len() {
+        let reserve = if index + 1 == keys.len() {
             all.chars().count()
         } else {
             tail.chars().count()
@@ -2566,6 +2822,63 @@ fn key_legend(width: usize, prefix: &str) -> String {
         line.push_str(tail);
         line
     }
+}
+
+/// The pull-request proposal `P` shows before any write.
+///
+/// The title, the beginning of the body and the branch pair are the whole decision:
+/// `y`/`enter` writes, `n`/`esc` writes nothing. The body scrolls with `[`/`]` so a
+/// long reply is still readable here rather than only after it was sent.
+fn draw_pull_request(frame: &mut Frame, app: &App) {
+    let Some(preview) = &app.confirm_pull_request else {
+        return;
+    };
+    let screen = overlay_area(frame.area());
+    let width = (screen.width.saturating_sub(2)).min(76);
+    let mut body: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("head -> base   {} -> {}", preview.branch, preview.base),
+            muted_style(),
+        )),
+        Line::from(vec![
+            Span::styled("title  ", muted_style()),
+            Span::raw(preview.title.clone()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("body", muted_style())),
+    ];
+    for line in preview.body.lines() {
+        body.push(Line::from(line.to_owned()));
+    }
+    if preview.body.trim().is_empty() {
+        body.push(Line::from(Span::styled(
+            "(the run's reply held no text to use as a body)",
+            muted_style(),
+        )));
+    }
+    let answer: Vec<Line> = vec![Line::from(Span::styled(
+        "y or enter opens it        n, esc or q writes nothing",
+        selection_style(),
+    ))];
+    let inner = width.saturating_sub(2) as usize;
+    let wanted = pushed_rows(&body, inner) + pushed_rows(&answer, inner) + 2;
+    let height = (wanted as u16).min(screen.height).max(6);
+    let popup = centered(screen, width, height);
+    clear_overlay_band(frame, screen);
+    let inner_height = popup.height.saturating_sub(2) as usize;
+    let (lines, above, below) = window_modal(app, &body, &answer, inner, inner_height);
+    let title = if above || below {
+        fit_title(width as usize, "open the pull request?", None, None, above, below).0
+    } else {
+        " open the pull request? ".to_owned()
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(overlay_border_style());
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(block),
+        popup,
+    );
 }
 
 /// The add-agent form, over the Agents screen.
@@ -2640,21 +2953,15 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     ));
 
     let inner = width.saturating_sub(2) as usize;
-    let rows = panel_rows(&body, inner);
+    let (rows, owners) = panel_rows_owned(&body, inner);
     let body_rows = rows.len();
     let action_rows = 1usize;
     let wanted = (body_rows + action_rows + 2) as u16;
     let height = wanted.min(screen.height).max(6);
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let content_height = popup.height.saturating_sub(2) as usize;
     let body_height = content_height.saturating_sub(action_rows).max(1);
     // Keep the cursor's row and the reason's row drawn together, measured in the
@@ -2688,7 +2995,10 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     };
     // Draw only the body rows that fit, then the pinned action. The panel never draws
     // past its own bottom border, and the action is part of the box at every size.
-    let mut shown: Vec<Line<'static>> = rows[first..].iter().take(body_height).cloned().collect();
+    let mut shown = whole_line_window(&rows, &owners, first, body_height);
+    while shown.len() < body_height {
+        shown.push(Line::from(""));
+    }
     shown.push(action);
     let block = Block::bordered()
         .title(title)
@@ -2696,8 +3006,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(Text::from(shown))
             .style(base_style())
-            .block(block)
-            .wrap(Wrap { trim: true }),
+            .block(block),
         popup,
     );
 }
@@ -2781,19 +3090,13 @@ fn draw_edit_agent(frame: &mut Frame, app: &App) {
         muted_style(),
     ));
     let inner = width.saturating_sub(2) as usize;
-    let rows = panel_rows(&body, inner);
+    let (rows, owners) = panel_rows_owned(&body, inner);
     let wanted = (rows.len() + 3) as u16;
     let height = wanted.min(screen.height).max(6);
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let content_height = popup.height.saturating_sub(2) as usize;
     let body_height = content_height.saturating_sub(1).max(1);
     let cursor_row = pushed_rows(&body[..cursor_line], inner);
@@ -2829,7 +3132,10 @@ fn draw_edit_agent(frame: &mut Frame, app: &App) {
         .find(|candidate| candidate.chars().count() <= room)
         .unwrap_or_else(|| " edit ".to_owned())
     };
-    let mut shown: Vec<Line<'static>> = rows[first..].iter().take(body_height).cloned().collect();
+    let mut shown = whole_line_window(&rows, &owners, first, body_height);
+    while shown.len() < body_height {
+        shown.push(Line::from(""));
+    }
     shown.push(action);
     let block = Block::bordered()
         .title(title)
@@ -2837,8 +3143,7 @@ fn draw_edit_agent(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(Text::from(shown))
             .style(base_style())
-            .block(block)
-            .wrap(Wrap { trim: true }),
+            .block(block),
         popup,
     );
 }
@@ -2883,15 +3188,9 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     let rows = pushed_rows(&lines, inner) + 2;
     let height = (rows as u16).min(screen.height).max(5);
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let block = Block::bordered()
         .title(format!(" set the {} ", prompt.subject()))
         .border_style(overlay_border_style());
@@ -2948,15 +3247,9 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
     let rows = pushed_rows(&lines, inner) + 2;
     let height = (rows as u16).min(screen.height).max(5);
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let block = Block::bordered()
         .title(" set the Forgejo instance address ")
         .border_style(overlay_border_style());
@@ -3028,15 +3321,9 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 2;
     let height = (wanted as u16).min(screen.height).max(6);
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let inner_height = popup.height.saturating_sub(2) as usize;
     let (lines, above, below) = window_modal(app, &body, &answer, inner_width, inner_height);
     let title = if above || below {
@@ -3048,9 +3335,7 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
         .title(title)
         .border_style(overlay_border_style());
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(Text::from(lines)).block(block),
         popup,
     );
 }
@@ -3089,15 +3374,9 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
     let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 2;
     let height = (wanted as u16).min(screen.height).max(6);
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let inner_height = popup.height.saturating_sub(2) as usize;
     let (lines, above, below) = window_modal(app, &body, &answer, inner_width, inner_height);
     let title = if above || below {
@@ -3117,9 +3396,7 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
         .title(title)
         .border_style(overlay_border_style());
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(Text::from(lines)).block(block),
         popup,
     );
 }
@@ -3218,15 +3495,9 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     let height = (wanted as u16 + 2).min(screen.height);
     let inner_height = height.saturating_sub(2) as usize;
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let (lines, above, below) = window_modal(app, &body, &answer, inner_width, inner_height);
     let title = if above || below {
         fit_title(width as usize, "open an editor", None, None, above, below).0
@@ -3237,9 +3508,7 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
         .title(title)
         .border_style(overlay_border_style());
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(Text::from(lines)).block(block),
         popup,
     );
 }
@@ -3276,15 +3545,9 @@ fn draw_help(frame: &mut Frame, app: &App) {
     let shown = total_rows.saturating_sub(first).min(height);
     let height = (shown as u16 + 2).min(screen.height);
     let popup = centered(screen, width, height);
-    clear_overlay_band(
-        frame,
-        Rect {
-            x: 0,
-            y: popup.y,
-            width: screen.width,
-            height: popup.height,
-        },
-    );
+    // One overlay treatment: paint the whole body band, so a centred box never cuts
+    // through the border of the panel behind it.
+    clear_overlay_band(frame, screen);
     let title = if total_rows > shown {
         let first_key = owners.get(first).copied().unwrap_or(0) + 1;
         let last_key = owners
@@ -3300,7 +3563,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
         .title(title)
         .border_style(overlay_border_style());
     frame.render_widget(
-        Paragraph::new(Text::from(rows[first..first + shown].to_vec()))
+        Paragraph::new(Text::from(whole_line_window(&rows, &owners, first, shown)))
             .style(base_style())
             .block(block),
         popup,
@@ -3341,6 +3604,7 @@ const HELP_LINES: &[&str] = &[
     "           D delete the leftover secrets of agents no longer configured (Credentials)",
     "Risk:      R read the acknowledged terms again; the record is not changed",
     "Files:     r re-read config.toml and credentials.toml   q quit   ^C quit and stop runs",
+    "Scheduler: none — a run starts when you press s; m keeps one alive as a user unit, and a recurring run needs your own timer",
     "Supervision: tui is a child of this UI; systemd is a user unit that keeps running when the UI exits and needs loginctl enable-linger to outlive a logout",
     "Custody:   the configuration and credentials files are 0600, every directory the product makes is 0700, and the one systemd unit is 0644 because it holds no secret",
     "Copying:   this configuration, its credentials, the acknowledgment and the endpoint test belong to the machine they were made on; run records do not travel with the configuration",
@@ -3351,23 +3615,11 @@ const HELP_LINES: &[&str] = &[
 
 /// The first-run risk acknowledgment, over everything else.
 fn draw_acknowledgment(frame: &mut Frame, app: &App) {
-    let screen = frame.area();
-    // The overlay may use the body and the action row, but never the footer: the
-    // status sentence and the overlay's own key line stay visible. At 80×24 this is
-    // 19 rows, enough for the eight terms and the record facts; at 72×18 the body
-    // scrolls and only the answer row is pinned (w44 F2, M1).
-    // Leave the footer's status rows visible, and at the floor leave enough of the
-    // body for the terms to be a real scrolling surface; at 80×24 the shorter inset
-    // still holds every bullet and the record path.
-    // At 80×24 the full read-only record fits in the taller inset; at the 72×18 floor
-    // the smaller inset keeps the terms a real scrolling surface.
-    let footer = if screen.height >= 24 { 5 } else { 7 };
-    let available = Rect {
-        x: screen.x,
-        y: screen.y,
-        width: screen.width,
-        height: screen.height.saturating_sub(footer).max(3),
-    };
+    // The overlay owns the body only: the product's title, tab bar, status row and
+    // footer stay drawn at every size. At 80×24 and 72×18 the body scrolls with the
+    // answer row pinned; at 120×40 the centred box sits inside one full-width painted
+    // band, so no panel border is cut through.
+    let available = overlay_area(frame.area());
     let width = (available.width.saturating_sub(2)).min(78);
     let inner_width = width.saturating_sub(2) as usize;
 
@@ -3440,18 +3692,11 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let block = Block::bordered()
         .title(title)
         .border_style(overlay_border_style());
-    let owned = Rect {
-        x: 0,
-        y: popup.y,
-        width: available.width,
-        height: popup.height,
-    };
-    clear_overlay_band(frame, owned);
+    clear_overlay_band(frame, available);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .style(base_style())
-            .block(block)
-            .wrap(Wrap { trim: true }),
+            .block(block),
         popup,
     );
 }
@@ -3570,7 +3815,7 @@ fn window_modal(
     width: usize,
     height: usize,
 ) -> (Vec<Line<'static>>, bool, bool) {
-    let body_rows = panel_rows(body, width);
+    let (body_rows, body_owners) = panel_rows_owned(body, width);
     let answer_rows = panel_rows(answer, width);
     // A short answer (the ordinary y/n line, or the first-run record path) is pinned
     // whole; a long one keeps its first row pinned and lets the rest scroll with the
@@ -3587,15 +3832,8 @@ fn window_modal(
     let max_scroll = content_len.saturating_sub(visible);
     app.modal_scroll_max.set(max_scroll);
     let offset = app.modal_scroll.min(max_scroll);
-    let mut lines = Vec::with_capacity(height.max(1));
-    let mut taken = 0usize;
-    for row in body_rows.iter().skip(offset) {
-        if taken >= visible {
-            break;
-        }
-        lines.push(row.clone());
-        taken += 1;
-    }
+    let mut lines = whole_line_window(&body_rows, &body_owners, offset, visible);
+    let mut taken = lines.len();
     if taken < visible {
         let rest_offset = offset.saturating_sub(body_rows.len());
         for row in rest.iter().skip(rest_offset) {
@@ -3605,6 +3843,12 @@ fn window_modal(
             lines.push(row.clone());
             taken += 1;
         }
+    }
+    // The answer row is pinned to the bottom of the box, not merely placed after
+    // whatever body happens to fit: dropping a partial logical line must leave the
+    // blank above the answer, never move the answer up into the body's last row.
+    while lines.len() + pinned.len() < height {
+        lines.push(Line::from(""));
     }
     lines.extend(pinned.iter().cloned());
     (lines, offset > 0, offset + visible < content_len)

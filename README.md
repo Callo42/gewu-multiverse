@@ -117,8 +117,9 @@ says all of this at length, including what the machine must have.
 
 **There is no scheduler.** A run starts when you press `s`, or when you start its user
 unit; the `systemd` mode keeps a run alive after the window closes, but it does not
-start one on a timer. A recurring run needs your own cron job or systemd timer, and the
-product says this on the Agents screen rather than leaving you to discover it.
+start one on a timer. A recurring run needs your own cron job or systemd timer. The
+Agents screen says `no scheduler — runs start with s`, and the full explanation is
+behind `?` rather than left for you to discover.
 
 ## Connecting a Forgejo
 
@@ -171,11 +172,27 @@ that instead. Either way the result is the same: an agent whose commits are its 
 screen and press `g`: it is cloned into the agent's workspace under the repository's
 name, and the agent's git identity — the login and email recorded above — is written
 into the clone's local configuration. The agent works with the user's own `git`, so a
-commit made there is authored by the agent. `P` pushes the current branch and opens a
-pull request as the agent; `U` updates the newest open one. With no hand-written
-`<config dir>/agents/<agent>/pull-request.txt`, the newest run's final reply is used:
-its first line is the title and the whole reply is the body. A file, when present,
-still wins (first line the title, the rest the body).
+commit made there is authored by the agent.
+
+`P` opens a pull request as the agent only when there is something to open. It refuses
+with one sentence in the status line — and writes nothing — when the current branch is
+the base, when it has no commits the base lacks (measured against the clone's
+remote-tracking `origin/<base>` when it has one; the refusal names the base it
+measured), or when the branch is not on the remote (its remote-tracking
+`refs/remotes/origin/<branch>` does not exist in that clone). A run's push witness
+drives the Runs note's offer, not this gate: a witness from another clone is not proof
+that this clone's branch is on its remote, and the note says `P` checks the branch
+before it opens anything. When it can act, `P` first shows the
+proposed title, the beginning of the body and the branch pair (`head -> base`); only `y`
+or `enter` writes, and `n` or `esc` writes nothing. The Forgejo key legend offers `P`
+exactly while this gate passes; the answer is recomputed when the checked-out branch's
+tip, the local base's tip or the clone's remote-tracking refs change, and the cache is
+cleared when a role check is applied or an identity or token changes, so a local commit
+or reset, a changed default branch or a removed agent token cannot leave `P` behind.
+`U` updates the newest open one. With no
+hand-written `<config dir>/agents/<agent>/pull-request.txt`, the newest run's final
+reply is used: its first line is the title and the whole reply is the body. A file,
+when present, still wins (first line the title, the rest the body).
 
 **Every request carries a token.** There are no anonymous calls. A token is read from
 the credentials file and travels only in a request's `Authorization` header. Git is
@@ -282,8 +299,8 @@ supervision modes (`tui` and `systemd`), `p` tests its model endpoint,
 `c` checks the Forgejo role and `C` checks the same instance with the administrator token,
 `i` settles the chosen agent's Forgejo identity, `E` edits the selected agent's endpoint, model and
 key, `g`
-clones the chosen repository into its workspace, `P` opens a pull request as the agent,
-`U` updates the newest open one, `e` edits its instruction, `K`
+clones the chosen repository into its workspace, `P` shows the proposed pull request and
+opens it only after you confirm, `U` updates the newest open one, `e` edits its instruction, `K`
 starts a new skill, `t` edits its declared run steps, `o` opens its newest log,
 `T` opens its newest transcript,
 and `r` re-reads the files. Each agent's own files live under

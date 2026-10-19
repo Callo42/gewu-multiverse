@@ -672,7 +672,10 @@ fn a_real_push_to_a_loopback_bare_remote_offers_the_pull_request_step() {
     app.show(Screen::Runs);
     let screen = render_at(120, 40, &app);
     assert!(
-        screen.contains("pushed its branch") && screen.contains("pull request"),
+        screen.contains("pushed its branch")
+            && screen.contains("press P on the Forgejo screen (4)")
+            && screen.contains("checks the branch")
+            && !screen.contains("to open the pull request"),
         "the real push does not offer the next step:\n{screen}"
     );
 }
