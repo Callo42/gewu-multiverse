@@ -58,7 +58,8 @@ fn scratch(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    let root = std::env::temp_dir().join(format!("gewu-wave22-{tag}-{}-{nanos}", std::process::id()));
+    let root =
+        std::env::temp_dir().join(format!("gewu-wave22-{tag}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&root).expect("the scratch directory is created");
     root
 }
@@ -118,7 +119,11 @@ fn write_run(root: &Path, agent: &str, run_id: &str, outcome: RunOutcome, reason
         .expect("the opening record is appended");
     transcript
         .append(&gewu_multiverse::transcript::Record::run_finished(
-            run_id, outcome, Some(1), 1200, reason.map(str::to_owned),
+            run_id,
+            outcome,
+            Some(1),
+            1200,
+            reason.map(str::to_owned),
         ))
         .expect("the terminal record is appended");
 }
@@ -169,7 +174,11 @@ fn enter_advances_the_form_and_ctrl_s_submits_and_refusal_moves_the_cursor() {
         app.on_key(key(KeyCode::Char(character)));
     }
     app.on_key(ctrl_s());
-    assert!(!app.adding_agent(), "the complete form did not submit: {}", app.status);
+    assert!(
+        !app.adding_agent(),
+        "the complete form did not submit: {}",
+        app.status
+    );
     assert!(app.status.contains("created `writer`"), "{}", app.status);
 }
 
@@ -190,8 +199,7 @@ fn a_timed_out_or_stopped_run_names_its_reason_on_the_hub() {
     app.show(Screen::Agents);
     let hub = render_at(120, 40, &app);
     assert!(
-        hub.contains("the last run of `scribe` did not go well")
-            && hub.contains("timeout of 3 s"),
+        hub.contains("the last run of `scribe` did not go well") && hub.contains("timeout of 3 s"),
         "the hub does not name a timed-out run's reason:\n{hub}"
     );
 
@@ -251,7 +259,10 @@ fn the_consent_record_states_what_it_can_and_cannot_prove() {
 fn an_unreadable_record_names_its_reason_without_selection() {
     let root = scratch("u2");
     // scribe's record is present but cannot be read; checker is selected.
-    let run = root.join("state").join("scribe").join("run-1700000000000-0001");
+    let run = root
+        .join("state")
+        .join("scribe")
+        .join("run-1700000000000-0001");
     fs::create_dir_all(&run).expect("the run directory is created");
     fs::write(run.join("transcript.jsonl"), b"this line is not a record\n")
         .expect("a corrupt transcript is written");
@@ -291,8 +302,7 @@ fn an_older_build_against_newer_data_says_so() {
     app.show(Screen::Agents);
     let hub = render_at(140, 50, &app);
     assert!(
-        hub.contains("used by version 0.1.99")
-            && hub.contains("newer than this build"),
+        hub.contains("used by version 0.1.99") && hub.contains("newer than this build"),
         "an older build against newer data says nothing:\n{hub}"
     );
     // The acknowledgment line carries the same comparison in its own words.

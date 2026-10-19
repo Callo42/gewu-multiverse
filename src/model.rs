@@ -276,9 +276,22 @@ pub enum ModelError {
     /// The endpoint does not serve that model, or the configured address is a base
     /// rather than the completions path a run POSTs to.
     #[error(
-        "the endpoint does not serve the model {model:?} (HTTP {status}); if the configured address is a base URL, it may need the full completions path (usually /chat/completions)"
+        "the endpoint's models list does not include the model {model:?} (HTTP {status}); the request address must still be the full completions path, for example https://host/v1/chat/completions"
     )]
     ModelNotFound {
+        /// The model the agent asked for.
+        model: String,
+        /// The status the endpoint answered with.
+        status: u16,
+    },
+    /// The endpoint answered 404 at the configured path, and its models list did not
+    /// answer without the model — or did not answer at all. The path is what to fix.
+    #[error(
+        "the endpoint has no completions route at {endpoint} (HTTP {status}); the address must be the full completions URL, for example https://host/v1/chat/completions — if that path is right, the endpoint did not list the model {model:?} when asked"
+    )]
+    RouteNotFound {
+        /// The endpoint as configured.
+        endpoint: String,
         /// The model the agent asked for.
         model: String,
         /// The status the endpoint answered with.
@@ -333,6 +346,7 @@ impl ModelError {
             ModelError::MissingKey => "missing_key",
             ModelError::BadKey { .. } => "bad_key",
             ModelError::ModelNotFound { .. } => "model_not_found",
+            ModelError::RouteNotFound { .. } => "route_not_found",
             ModelError::RateLimited { .. } => "rate_limited",
             ModelError::Server { .. } => "server_error",
             ModelError::MalformedReply { .. } => "malformed_reply",
@@ -422,9 +436,20 @@ pub fn chat(
             return Err(ModelError::BadKey { status });
         }
         404 => {
-            return Err(ModelError::ModelNotFound {
-                model: config.model.clone(),
-                status,
+            // A 404 is not proof that the model is unknown: it is equally what a base
+            // URL or a missing `/v1` produces. Only say `model_not_found` when the
+            // endpoint's models list answers and does not contain the id. A list that
+            // cannot answer leaves the model unproved, so the route is the correction.
+            return Err(match model_list_answer(config) {
+                Some(false) => ModelError::ModelNotFound {
+                    model: config.model.clone(),
+                    status,
+                },
+                _ => ModelError::RouteNotFound {
+                    endpoint: config.endpoint.clone(),
+                    model: config.model.clone(),
+                    status,
+                },
             });
         }
         429 => {
@@ -519,6 +544,54 @@ struct WireMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// The models URL that belongs to a completions URL.
+///
+/// A base URL gets `/models` appended; a full path has its last `/chat/completions`
+/// replaced. Both are the same address family the configured endpoint names, so a
+/// 404 can be classified without inventing a second host.
+fn models_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    match trimmed.rfind("/chat/completions") {
+        Some(at) => format!("{}/models", &trimmed[..at]),
+        None => format!("{trimmed}/models"),
+    }
+}
+
+/// Ask the endpoint's models list whether it carries this model.
+///
+/// `Some(true)` / `Some(false)` mean the list answered and the id was present / absent;
+/// `None` means the list did not answer in a usable way, so `model_not_found` would be
+/// a claim the product cannot support. The request carries the key only in its header,
+/// and its body is never recorded.
+fn model_list_answer(config: &ModelConfig) -> Option<bool> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(config.timeout.min(Duration::from_secs(10))))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let response = agent
+        .get(&models_url(&config.endpoint))
+        .header("Authorization", format!("Bearer {}", config.api_key.expose()))
+        .call()
+        .ok()?;
+    if !(200..=299).contains(&response.status().as_u16()) {
+        return None;
+    }
+    let text = response.into_body().read_to_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let list = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())?;
+    Some(list.iter().any(|entry| {
+        entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == config.model)
+            || entry.as_str().is_some_and(|id| id == config.model)
+    }))
 }
 
 /// Turn a transport failure into a class, without ever naming the key.
@@ -716,15 +789,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_model_is_a_model_not_found() {
-        let stub = Stub::start(vec![StubReply::status(404, r#"{"error":"no such model"}"#)]);
+    fn an_unknown_model_is_a_model_not_found_only_when_the_models_list_answers_without_it() {
+        let stub = Stub::start(vec![
+            StubReply::status(404, r#"{"error":"no such model"}"#),
+            StubReply::json(r#"{"data":[{"id":"another-model"}]}"#),
+        ]);
         let error = chat(&config(&stub.url()), &[Message::user("hi")], &[], None)
             .expect_err("the model is refused");
         assert_eq!(error.class(), "model_not_found");
         assert!(error.to_string().contains("example-model"));
-        // D-3: a 404 is also what a base URL produces, so the sentence must say the
-        // path may be the problem, not only the model.
         assert!(error.to_string().contains("/chat/completions"), "{error}");
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method, "GET");
+        assert!(requests[1].path.ends_with("/models"));
+    }
+
+    #[test]
+    fn a_404_at_the_path_is_a_route_not_found_when_the_models_list_has_the_model() {
+        let stub = Stub::start(vec![
+            StubReply::status(404, r#"{"error":"no route"}"#),
+            StubReply::json(r#"{"data":[{"id":"example-model"}]}"#),
+        ]);
+        let error = chat(&config(&stub.url()), &[Message::user("hi")], &[], None)
+            .expect_err("the path is wrong");
+        assert_eq!(error.class(), "route_not_found");
+        assert!(error.to_string().contains("/v1/chat/completions"), "{error}");
     }
 
     #[test]

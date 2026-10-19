@@ -172,8 +172,10 @@ screen and press `g`: it is cloned into the agent's workspace under the reposito
 name, and the agent's git identity — the login and email recorded above — is written
 into the clone's local configuration. The agent works with the user's own `git`, so a
 commit made there is authored by the agent. `P` pushes the current branch and opens a
-pull request as the agent; `U` updates the newest open one. A title and body can be
-put in `<config dir>/agents/<agent>/pull-request.txt`, first line the title.
+pull request as the agent; `U` updates the newest open one. With no hand-written
+`<config dir>/agents/<agent>/pull-request.txt`, the newest run's final reply is used:
+its first line is the title and the whole reply is the body. A file, when present,
+still wins (first line the title, the rest the body).
 
 **Every request carries a token.** There are no anonymous calls. A token is read from
 the credentials file and travels only in a request's `Authorization` header. Git is
@@ -188,7 +190,7 @@ An agent's model is three things, and only one of them is a secret:
 
 | Thing | Where it comes from | What it is |
 |---|---|---|
-| **endpoint** | the configuration file, `endpoint = "…"` | the URL the run posts its chat request to, called directly, with no relay in between. `http://` and `https://` are both accepted; a local endpoint is a normal thing to use. |
+| **endpoint** | the configuration file, `endpoint = "…"` | the **full URL** the run posts its chat request to, called directly, with no relay in between — for example `https://host/v1/chat/completions`, not a provider base URL ending at `/v1`. `http://` and `https://` are both accepted; a local endpoint is a normal thing to use. |
 | **model** | the configuration file, `model = "…"` | the model id the request asks for. It is written into the request as `"model"`. |
 | **key** | the credentials file, under `[model_keys]` (or one top-level `model_key`) | the bearer key. It travels only in the request's `Authorization` header. |
 
@@ -262,10 +264,13 @@ your own configuration directory (`~/.config/gewu-multiverse` on Linux), and sho
 acknowledgment once. Press `y` to record it.
 
 **You do not have to edit a file to begin.** On the Agents screen press `n` (or `a`, or `enter` on
-the empty list) and fill in the form: an agent name, its model endpoint and model id, the model key,
-and, if you have one, your Forgejo URL and token. The product writes both files for you and lists the
-agent. Press `e` to write its instruction with your own `$EDITOR`, then `s` to start it. Both files
-are still plain, commented TOML, and `r` re-reads them if you prefer to edit by hand.
+the empty list) and fill in the form: an agent name, its **full model endpoint** (for example
+`https://host/v1/chat/completions`), model id, model key, and, if you have one, your Forgejo URL and
+token. A URL is checked for a scheme and a host before it is written. The product writes both files
+for you and lists the agent. Press `e` to write its instruction with your own `$EDITOR` (a new file
+starts empty), then `s` to start it. If one value is wrong, press `E` on the Agent screen to edit the
+endpoint, model and key without removing the agent. Both files are still plain, commented TOML, and
+`r` re-reads them if you prefer to edit by hand.
 `gewu-multiverse --config-dir <dir>` keeps the files somewhere else instead.
 
 Keys: `?` (or `h`, or `F1`) shows every key; `q` quits, `tab` or `left`/`right` (or `1`-`6`) switch
@@ -275,7 +280,8 @@ to the list, `n`/`a` open the add-agent form, `s` starts the chosen agent, `x` s
 between the two
 supervision modes (`tui` and `systemd`), `p` tests its model endpoint,
 `c` checks the Forgejo role and `C` checks the same instance with the administrator token,
-`i` settles the chosen agent's Forgejo identity, `g`
+`i` settles the chosen agent's Forgejo identity, `E` edits the selected agent's endpoint, model and
+key, `g`
 clones the chosen repository into its workspace, `P` opens a pull request as the agent,
 `U` updates the newest open one, `e` edits its instruction, `K`
 starts a new skill, `t` edits its declared run steps, `o` opens its newest log,
@@ -356,9 +362,9 @@ be local. No secret is ever a command-line argument: the tokens and the model ke
    ```
 
 5. **Write its instruction**: press `e` to write
-   `agents/scribe/instruction.md` through your own `$EDITOR`. The status line names the
-   editor; set `$EDITOR` to choose another, or `~/.config/gewu-multiverse/config.toml`
-   still works by hand.
+   `agents/scribe/instruction.md` through your own `$EDITOR`. A new file is empty — no
+   placeholder is sent to the model. The status line names the editor; set `$EDITOR` to
+   choose another, or `~/.config/gewu-multiverse/config.toml` still works by hand.
 
 6. **Check the Forgejo** with `c`, settle the agent's identity with `i`, and clone a
    repository with `g` (choose it with `up`/`down` on the Forgejo screen). With an

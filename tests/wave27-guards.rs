@@ -68,10 +68,7 @@ fn scratch(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    let root = std::env::temp_dir().join(format!(
-        "gewu-r27-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("gewu-r27-{tag}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&root).expect("the scratch directory is created");
     root
 }
@@ -85,7 +82,10 @@ fn quiet_runner(tag: &str) -> PathBuf {
 
 fn app_with(root: &Path, config: &str) -> App {
     fs::write(root.join("config.toml"), config).expect("the configuration is written");
-    let mut app = App::with_runner(Layout::rooted_at(root.to_path_buf()), quiet_runner("runner"));
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.to_path_buf()),
+        quiet_runner("runner"),
+    );
     app.show_acknowledgment = false;
     gewu_multiverse::risk::record(&root.join("risk-acknowledgment.toml"))
         .expect("the risk record is written");
@@ -165,7 +165,9 @@ fn write_run(root: &Path, content: &str, reason: Option<&str>) -> PathBuf {
 /// A ready agent: instruction, skills directory and model key.
 fn ready_agent(root: &Path) -> gewu_multiverse::paths::AgentPaths {
     let layout = Layout::rooted_at(root.to_path_buf());
-    let paths = layout.ensure_agent("scribe").expect("the agent is prepared");
+    let paths = layout
+        .ensure_agent("scribe")
+        .expect("the agent is prepared");
     fs::write(paths.instruction(), "do the thing\n").expect("the instruction is written");
     fs::create_dir_all(paths.skills_dir()).expect("the skills directory is created");
     gewu_multiverse::mode::write_private(
@@ -220,7 +222,10 @@ fn cell_style_after(app: &App, width: u16, height: u16, needle: &str) -> (Color,
             return (cell.fg, cell.bg, cell.modifier);
         }
     }
-    panic!("the needle {needle:?} is not drawn:\n{}", render_at(width, height, app));
+    panic!(
+        "the needle {needle:?} is not drawn:\n{}",
+        render_at(width, height, app)
+    );
 }
 
 // 1. Readable output -------------------------------------------------------
@@ -234,8 +239,14 @@ fn the_model_final_reply_is_readable_in_the_run_view_and_complete_in_the_log() {
     app.reload();
     app.show(Screen::Runs);
     let screen = render_at(120, 40, &app);
-    assert!(screen.contains("the model's final reply (readable, copyable)"), "{screen}");
-    assert!(screen.contains("THE-END-OF-THE-REPLY"), "the reply tail is not drawn:\n{screen}");
+    assert!(
+        screen.contains("the model's final reply (readable, copyable)"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("THE-END-OF-THE-REPLY"),
+        "the reply tail is not drawn:\n{screen}"
+    );
     assert!(screen.contains("raw transcript (JSONL)"), "{screen}");
 
     // The log of a real run carries the same text, not an 80-byte excerpt.
@@ -252,8 +263,14 @@ fn the_model_final_reply_is_readable_in_the_run_view_and_complete_in_the_log() {
     assert_eq!(end.exit_code, 0, "{:?}", end.reason);
     let log = fs::read_to_string(run_dir.join(gewu_multiverse::run::LOG_FILE))
         .expect("the log is readable");
-    assert!(log.contains("THE-END-OF-THE-REPLY"), "the log truncates the final reply:\n{log}");
-    assert!(!log.contains("80 of"), "the log still says how little it showed:\n{log}");
+    assert!(
+        log.contains("THE-END-OF-THE-REPLY"),
+        "the log truncates the final reply:\n{log}"
+    );
+    assert!(
+        !log.contains("80 of"),
+        "the log still says how little it showed:\n{log}"
+    );
 }
 
 // 2. Honest failures -------------------------------------------------------
@@ -261,7 +278,10 @@ fn the_model_final_reply_is_readable_in_the_run_view_and_complete_in_the_log() {
 #[test]
 fn a_transport_failure_names_the_endpoint_and_the_endpoint_test_names_its_facts() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a free port");
-    let endpoint = format!("http://{}/v1/chat/completions", listener.local_addr().expect("address"));
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().expect("address")
+    );
     drop(listener);
     let config = ModelConfig {
         endpoint: endpoint.clone(),
@@ -269,8 +289,13 @@ fn a_transport_failure_names_the_endpoint_and_the_endpoint_test_names_its_facts(
         api_key: gewu_multiverse::credentials::Secret::new("gw-fixture-key"),
         timeout: Duration::from_millis(500),
     };
-    let error = model::probe(&config).expect_err("a closed port refuses").to_string();
-    assert!(error.contains(&endpoint), "the endpoint is not named: {error}");
+    let error = model::probe(&config)
+        .expect_err("a closed port refuses")
+        .to_string();
+    assert!(
+        error.contains(&endpoint),
+        "the endpoint is not named: {error}"
+    );
     assert!(error.contains("refused"), "{error}");
 
     let test = EndpointTest {
@@ -300,7 +325,10 @@ fn a_failed_declared_step_names_its_command_directory_and_output() {
     let end = gewu_multiverse::agent_run::execute(&run_dir);
     let reason = end.reason.expect("the step ends the run");
     assert!(reason.contains("printf 'boom from the step"), "{reason}");
-    assert!(reason.contains(&paths.workspace().display().to_string()), "{reason}");
+    assert!(
+        reason.contains(&paths.workspace().display().to_string()),
+        "{reason}"
+    );
     assert!(reason.contains("boom from the step"), "{reason}");
 }
 
@@ -311,14 +339,23 @@ fn the_primary_actions_and_the_real_scroll_keys_are_visible_at_the_floor() {
     let root = scratch("floor-actions");
     let app = app_with(&root, EMPTY_CONFIG);
     let empty = render_at(72, 18, &app);
-    assert!(empty.contains("press n"), "the add action is below the fold:\n{empty}");
-    assert!(empty.contains("more below — press ]"), "the scroll key is not named:\n{empty}");
+    assert!(
+        empty.contains("press n"),
+        "the add action is below the fold:\n{empty}"
+    );
+    assert!(
+        empty.contains("more below — press ]"),
+        "the scroll key is not named:\n{empty}"
+    );
 
     let root = scratch("floor-forgejo");
     let mut app = app_with(&root, ONE_AGENT);
     app.show(Screen::Forgejo);
     let forgejo = render_at(72, 18, &app);
-    assert!(forgejo.contains("press c"), "the role check is below the fold:\n{forgejo}");
+    assert!(
+        forgejo.contains("press c"),
+        "the role check is below the fold:\n{forgejo}"
+    );
 }
 
 #[test]
@@ -326,18 +363,36 @@ fn the_instruction_screen_previews_the_document_and_the_steps_command() {
     let root = scratch("instruction-preview");
     let mut app = app_with(&root, ONE_AGENT);
     let paths = app.ensure_agent("scribe").expect("the agent is prepared");
-    fs::write(paths.instruction(), "Read the recent commits and draft release notes.\n")
-        .expect("the instruction is written");
-    fs::write(paths.steps_file(), "git -C release-notes log --oneline -12\n")
-        .expect("the steps file is written");
+    fs::write(
+        paths.instruction(),
+        "Read the recent commits and draft release notes.\n",
+    )
+    .expect("the instruction is written");
+    fs::write(
+        paths.steps_file(),
+        "git -C release-notes log --oneline -12\n",
+    )
+    .expect("the steps file is written");
     app.reload();
     app.show(Screen::Instructions);
     let screen = render_at(80, 24, &app);
-    assert!(screen.contains("preview"), "no read-only preview:\n{screen}");
+    assert!(
+        screen.contains("preview"),
+        "no read-only preview:\n{screen}"
+    );
     assert!(screen.contains("Read the recent commits"), "{screen}");
-    assert!(screen.contains("git -C release-notes log"), "the steps command is not previewed:\n{screen}");
-    assert!(screen.contains("run in the workspace at"), "the working directory is not explicit:\n{screen}");
-    assert!(screen.contains("workspace/<repository>"), "the clone position is not explained:\n{screen}");
+    assert!(
+        screen.contains("git -C release-notes log"),
+        "the steps command is not previewed:\n{screen}"
+    );
+    assert!(
+        screen.contains("run in the workspace at"),
+        "the working directory is not explicit:\n{screen}"
+    );
+    assert!(
+        screen.contains("workspace/<repository>"),
+        "the clone position is not explained:\n{screen}"
+    );
 }
 
 #[test]
@@ -354,7 +409,10 @@ fn the_hub_state_column_shows_the_failure_class_whole() {
     let screen = render_at(80, 24, &app);
     assert!(screen.contains("failed (server_error)"), "{screen}");
     let floor = render_at(72, 18, &app);
-    assert!(floor.contains("failed (server_error)"), "the state is shortened at the floor:\n{floor}");
+    assert!(
+        floor.contains("failed (server_error)"),
+        "the state is shortened at the floor:\n{floor}"
+    );
 }
 
 // 4. One colour scheme -----------------------------------------------------
@@ -363,35 +421,67 @@ fn the_hub_state_column_shows_the_failure_class_whole() {
 fn errors_warnings_information_and_selection_use_one_scheme() {
     let root = scratch("colour");
     fs::write(root.join("config.toml"), "[[agents]\n").expect("a broken file");
-    let mut app = App::with_runner(Layout::rooted_at(root.clone()), quiet_runner("colour-broken"));
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("colour-broken"),
+    );
     app.show_acknowledgment = false;
     let (fg, bg, modifier) = cell_style_after(&app, 160, 40, "no agent list");
-    assert_eq!(fg, Color::LightRed, "the error is not bright red");
-    assert_eq!(bg, Color::Black, "the error has no fixed background");
+    assert_eq!(
+        fg,
+        Color::Rgb(255, 95, 95),
+        "the error is not the measured red"
+    );
+    assert_eq!(
+        bg,
+        Color::Rgb(0, 0, 0),
+        "the error has no painted background"
+    );
     assert!(modifier.contains(Modifier::BOLD), "the error is not bold");
 
     let root = scratch("colour-warning");
     fs::write(root.join("config.toml"), EMPTY_CONFIG).expect("the configuration is written");
-    let mut app = App::with_runner(Layout::rooted_at(root.clone()), quiet_runner("colour-warning"));
+    let mut app = App::with_runner(
+        Layout::rooted_at(root.clone()),
+        quiet_runner("colour-warning"),
+    );
     app.show_acknowledgment = false;
     let (fg, bg, modifier) = cell_style_after(&app, 160, 40, "The risk of running an agent");
-    assert_eq!(fg, Color::LightYellow, "the warning is not bright yellow");
-    assert_eq!(bg, Color::Black, "the warning has no fixed background");
+    assert_eq!(
+        fg,
+        Color::Rgb(255, 215, 0),
+        "the warning is not the measured yellow"
+    );
+    assert_eq!(
+        bg,
+        Color::Rgb(0, 0, 0),
+        "the warning has no painted background"
+    );
     assert!(modifier.contains(Modifier::BOLD), "the warning is not bold");
 
     let root = scratch("colour-footer");
     let mut app = app_with(&root, EMPTY_CONFIG);
-    app.status = "endpoint test for `scribe`: failed (transport): the endpoint refused the connection".to_owned();
+    app.status =
+        "endpoint test for `scribe`: failed (transport): the endpoint refused the connection"
+            .to_owned();
     let (fg, bg, modifier) = cell_style_after(&app, 160, 40, "endpoint test for");
-    assert_eq!(fg, Color::LightRed, "a transport failure is uncoloured in the footer");
-    assert_eq!(bg, Color::Black);
+    assert_eq!(
+        fg,
+        Color::Rgb(255, 95, 95),
+        "a transport failure is uncoloured in the footer"
+    );
+    assert_eq!(bg, Color::Rgb(0, 0, 0));
     assert!(modifier.contains(Modifier::BOLD));
 
     app.status = "leaving stops the 1 run this UI started; press q again to quit".to_owned();
     app.confirm_quit = Some(1);
     let (fg, bg, modifier) = cell_style_after(&app, 160, 40, "leaving stops");
-    assert_eq!(fg, Color::LightYellow, "the quit warning is uncoloured in the footer");
-    assert_eq!(bg, Color::Black);
+    assert_eq!(
+        fg,
+        Color::Rgb(255, 215, 0),
+        "the quit warning is uncoloured in the footer"
+    );
+    assert_eq!(bg, Color::Rgb(0, 0, 0));
     assert!(modifier.contains(Modifier::BOLD));
 
     app.confirm_quit = None;
@@ -399,8 +489,15 @@ fn errors_warnings_information_and_selection_use_one_scheme() {
     let mut app = app_with(&root, ONE_AGENT);
     app.show(Screen::Agents);
     let (fg, bg, modifier) = cell_style_after(&app, 120, 40, ">  scribe");
-    assert_eq!((fg, bg), (Color::Black, Color::Cyan), "the selection cue changed");
-    assert!(modifier.contains(Modifier::BOLD), "the selection is not bold");
+    assert_eq!(
+        (fg, bg),
+        (Color::Black, Color::Rgb(0, 205, 205)),
+        "the selection cue changed"
+    );
+    assert!(
+        modifier.contains(Modifier::BOLD),
+        "the selection is not bold"
+    );
 }
 
 // 5. Role and identity truth ----------------------------------------------
@@ -423,12 +520,19 @@ fn an_administrator_token_supplied_in_the_form_is_not_demanded_again() {
         }
     }
     app.on_key(ctrl_s());
-    assert!(!app.adding_agent(), "the form did not write: {}", app.status);
+    assert!(
+        !app.adding_agent(),
+        "the form did not write: {}",
+        app.status
+    );
     let credentials = fs::read_to_string(&app.credentials_path).expect("credentials");
     assert!(credentials.contains("forgejo_admin_token"), "{credentials}");
     let config = fs::read_to_string(app.config_path()).expect("configuration");
     assert!(config.contains("role = \"admin\""), "{config}");
-    assert!(app.forgejo_tokens_present().1, "the administrator token is not seen");
+    assert!(
+        app.forgejo_tokens_present().1,
+        "the administrator token is not seen"
+    );
 }
 
 #[test]
@@ -449,8 +553,14 @@ fn the_role_check_does_not_offer_a_dead_c_and_the_identity_says_what_it_does() {
     }));
     app.show(Screen::Forgejo);
     let screen = render_at(120, 40, &app);
-    assert!(!screen.contains("press C for that view"), "a dead C is offered:\n{screen}");
-    assert!(screen.contains("press A on the Credentials screen"), "{screen}");
+    assert!(
+        !screen.contains("press C for that view"),
+        "a dead C is offered:\n{screen}"
+    );
+    assert!(
+        screen.contains("press A on the Credentials screen"),
+        "{screen}"
+    );
 
     gewu_multiverse::credentials::record_agent_identity(
         &app.credentials_path,
@@ -465,14 +575,19 @@ fn the_role_check_does_not_offer_a_dead_c_and_the_identity_says_what_it_does() {
     app.reload();
     app.show(Screen::AgentConfig);
     let screen = render_at(120, 40, &app);
-    assert!(screen.contains("commits, pull requests and issues"), "{screen}");
+    assert!(
+        screen.contains("commits, pull requests and issues"),
+        "{screen}"
+    );
 }
 
 #[test]
 fn the_systemd_refusal_names_the_route_to_a_reachable_user_manager() {
     let root = scratch("systemd-route");
     let layout = Layout::rooted_at(&root);
-    let agent = layout.ensure_agent("scribe").expect("the agent is prepared");
+    let agent = layout
+        .ensure_agent("scribe")
+        .expect("the agent is prepared");
     let mut supervisor = Supervisor::new(
         layout.state_root(),
         PathBuf::from("/usr/local/bin/gewu-multiverse"),
@@ -500,8 +615,14 @@ fn no_screen_prints_the_host_name_or_machine_id() {
     app.role_check_machine = Some(mark.clone());
     app.show(Screen::Forgejo);
     let screen = render_at(160, 50, &app);
-    assert!(!screen.contains(&mark), "the machine mark is on screen:\n{screen}");
-    assert!(screen.contains("this machine"), "the neutral label is missing:\n{screen}");
+    assert!(
+        !screen.contains(&mark),
+        "the machine mark is on screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("this machine"),
+        "the neutral label is missing:\n{screen}"
+    );
 }
 
 // 7. Docs and copy ---------------------------------------------------------
@@ -509,14 +630,29 @@ fn no_screen_prints_the_host_name_or_machine_id() {
 #[test]
 fn the_readme_has_no_stale_manual_release_and_says_there_is_no_scheduler() {
     let readme = include_str!("../README.md");
-    assert!(!readme.contains("v0.1.24"), "the README still names the old release");
-    assert!(!readme.contains("8594ff672d49"), "the README still names the old tarball");
+    assert!(
+        !readme.contains("v0.1.24"),
+        "the README still names the old release"
+    );
+    assert!(
+        !readme.contains("8594ff672d49"),
+        "the README still names the old tarball"
+    );
     assert!(
         readme.to_ascii_lowercase().contains("no scheduler"),
         "the README does not state the scheduler boundary"
     );
-    assert!(readme.contains("release page"), "the README does not point at the release page");
+    assert!(
+        readme.contains("release page"),
+        "the README does not point at the release page"
+    );
     let map = include_str!("../docs/page-map.md");
-    assert!(map.contains("press ]"), "the page map still names the wrong overflow advice");
-    assert!(map.contains("failed (server_error)"), "the page map does not keep the class whole");
+    assert!(
+        map.contains("press ]"),
+        "the page map still names the wrong overflow advice"
+    );
+    assert!(
+        map.contains("failed (server_error)"),
+        "the page map does not keep the class whole"
+    );
 }

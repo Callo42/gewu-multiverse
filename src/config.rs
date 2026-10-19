@@ -453,7 +453,11 @@ max_concurrent_agents = 10
 "#;
 
 /// What is wrong with a URL, if anything.
-fn url_problem(url: &str) -> Option<&'static str> {
+///
+/// The check is deliberately small and honest: a scheme, a host, and no whitespace.
+/// A second scheme glued into the host is the natural pasted-value mistake, so it is
+/// named as what it is instead of being written as an address (K-2).
+pub fn url_problem(url: &str) -> Option<&'static str> {
     let rest = match url.strip_prefix("https://") {
         Some(rest) => rest,
         None => match url.strip_prefix("http://") {
@@ -461,11 +465,18 @@ fn url_problem(url: &str) -> Option<&'static str> {
             None => return Some("is not a URL; it must start with http:// or https://"),
         },
     };
-    if rest.is_empty() {
-        return Some("names no host");
-    }
     if url.chars().any(char::is_whitespace) {
         return Some("holds whitespace");
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return Some("names no host");
+    }
+    if host.contains("://") || host.contains("http:") || host.contains("https:") {
+        return Some("holds a second URL where the host belongs");
+    }
+    if host == "." || host == ".." {
+        return Some("names no host");
     }
     None
 }

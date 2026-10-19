@@ -523,6 +523,50 @@ fn summarise(agent: &str, run_id: &str, run_dir: &Path) -> RunSummary {
     }
 }
 
+/// The file that records a branch the run actually pushed.
+///
+/// Written by the agent process from the repository's own state after the run, not
+/// from any command's text: the remote-tracking ref must have moved to the local
+/// branch's commit, and git's reflog for that ref must record the update as a push.
+/// A run whose only command is `echo git push` leaves no witness and therefore offers
+/// no pull-request step. A run recorded before this file existed has none either, so
+/// an old record makes no claim rather than guessing.
+pub const PUSH_FILE: &str = "push.json";
+
+/// What a run's push witness says: the branch and the remote-tracking ref that moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushWitness {
+    /// The local branch the pushed ref corresponds to.
+    pub branch: String,
+    /// The remote-tracking ref whose object changed during the run.
+    pub remote_ref: String,
+}
+
+/// Write the push witness into the run's directory, `0600` like every record.
+pub fn write_push_witness(run_dir: &Path, branch: &str, remote_ref: &str) -> io::Result<()> {
+    let witness = PushWitness {
+        branch: branch.to_owned(),
+        remote_ref: remote_ref.to_owned(),
+    };
+    let text = serde_json::to_string_pretty(&witness).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(PUSH_FILE), text.as_bytes())
+}
+
+/// Read a run's push witness, when one is there and readable.
+pub fn read_push_witness(run_dir: &Path) -> Option<PushWitness> {
+    let text = fs::read_to_string(run_dir.join(PUSH_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Whether the run really pushed a branch, as its own repository state showed.
+///
+/// The next step after a pushed changelog is the pull request, and the product names
+/// `P` only when the run pushed. The witness above is the fact; the transcript's
+/// command text is never consulted (the push-is-a-fact rule).
+pub fn run_pushed(run: &RunSummary) -> bool {
+    read_push_witness(&run.dir).is_some()
+}
+
 /// One wording for one fate of a file a run left behind (W38-1, W38-3).
 ///
 /// Three cases, three sentences, wherever the file is named:

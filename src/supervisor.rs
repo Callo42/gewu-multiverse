@@ -623,6 +623,27 @@ impl Supervisor {
         self.queue.iter().map(|queued| queued.name.clone()).collect()
     }
 
+    /// The `tui` runs this UI started, with their ids and elapsed milliseconds.
+    ///
+    /// A quit warning that says only "1 run" makes a person with two agents guess
+    /// which work will die. These are exactly the runs `stop_all` ends: a systemd unit
+    /// survives the UI and is deliberately not named here (F3/K-5).
+    pub fn running_agents(&self) -> Vec<(String, String, u64)> {
+        let mut running: Vec<(String, String, u64)> = self
+            .live
+            .iter()
+            .map(|(name, live)| {
+                (
+                    name.clone(),
+                    live.run_id.clone(),
+                    live.started.elapsed().as_millis() as u64,
+                )
+            })
+            .collect();
+        running.sort_by(|left, right| left.0.cmp(&right.0));
+        running
+    }
+
     /// What the screens should show for one agent.
     ///
     /// An agent in systemd mode is read from systemd, never from what this tool last

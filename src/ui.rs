@@ -16,7 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
-use crate::app::{App, NewAgentForm, Screen};
+use crate::app::{App, EditAgentForm, NewAgentForm, Screen};
 use crate::identity;
 use crate::risk;
 use crate::run::RunOutcome;
@@ -31,7 +31,10 @@ const LABEL_WIDTH: usize = 16;
 /// longer with no marker, so two legal names that shared a prefix read identically
 /// (P-2). The column now grows to the shortest width that keeps every configured name
 /// apart, and never falls below this.
-const NAME_COLUMN_MIN: usize = 14;
+const NAME_COLUMN_MIN: usize = 13;
+/// The most either flexible name/model column takes from a wide window. The remainder
+/// is trailing slack after `state`, never a gap inside a row (K-4).
+const FLEX_COLUMN_MAX: usize = 32;
 
 /// The room the hub's state column wants for the longest word it can show, and the
 /// least it is given before it ellipsizes (E-7, P-5).
@@ -40,43 +43,53 @@ const STATE_COLUMN_MIN: usize = 12;
 
 /// The one colour scheme, used by every surface.
 ///
-/// Errors are bright red plus bold, so the dark-red SGR-1 emphasis is gone; warnings
-/// are bright yellow plus bold; information keeps the terminal's own foreground and
-/// selection keeps black-on-cyan plus bold and the `>` marker. No meaning is carried
-/// by hue alone: every error and warning also carries its word, and the tables keep
-/// their state text. Muted/secondary text is dimmed rather than painted grey, so it
-/// adapts to a dark or a light terminal instead of disappearing on one of them.
+/// The product paints its own background and foreground instead of inheriting the
+/// terminal's, so the measured ratios hold on a dark and a light theme. No meaning is
+/// carried by hue alone: every error and warning also carries its word, the tables
+/// keep their state text, and the selection keeps `>`.
+const BASE_BG: Color = Color::Rgb(0, 0, 0);
+const BASE_FG: Color = Color::Rgb(230, 230, 230);
+const ERROR_FG: Color = Color::Rgb(255, 95, 95);
+const WARNING_FG: Color = Color::Rgb(255, 215, 0);
+/// Secondary text is a measured grey, never the terminal's `DIM`: a renderer may make
+/// `DIM` arbitrarily faint, while this foreground keeps 8.8:1 on the painted black.
+const MUTED_FG: Color = Color::Rgb(168, 168, 168);
+const SELECTION_BG: Color = Color::Rgb(0, 205, 205);
+
+fn base_style() -> Style {
+    Style::new().fg(BASE_FG).bg(BASE_BG)
+}
+
 fn error_style() -> Style {
     Style::new()
-        .fg(Color::LightRed)
-        .bg(Color::Black)
+        .fg(ERROR_FG)
+        .bg(BASE_BG)
         .add_modifier(Modifier::BOLD)
 }
 
 fn warning_style() -> Style {
     Style::new()
-        .fg(Color::LightYellow)
-        .bg(Color::Black)
+        .fg(WARNING_FG)
+        .bg(BASE_BG)
         .add_modifier(Modifier::BOLD)
 }
 
 fn muted_style() -> Style {
-    Style::new().add_modifier(Modifier::DIM)
+    Style::new().fg(MUTED_FG).bg(BASE_BG)
 }
 
 fn selection_style() -> Style {
     Style::new()
         .fg(Color::Black)
-        .bg(Color::Cyan)
+        .bg(SELECTION_BG)
         .add_modifier(Modifier::BOLD)
 }
 
-fn error_border_style() -> Style {
-    Style::new().fg(Color::LightRed).bg(Color::Black)
-}
-
-fn warning_border_style() -> Style {
-    Style::new().fg(Color::LightYellow).bg(Color::Black)
+/// One overlay treatment for terms, forms, prompts and confirmations: the same cyan
+/// border over the same painted background. Red and yellow still mark the words that
+/// mean error and warning inside the box; the box itself does not change shape.
+fn overlay_border_style() -> Style {
+    Style::new().fg(SELECTION_BG).bg(BASE_BG)
 }
 
 /// The footer's status line is classified by the sentence it holds: an error is
@@ -106,7 +119,7 @@ fn status_style(app: &App) -> Style {
     {
         return warning_style();
     }
-    Style::new()
+    base_style()
 }
 
 /// The smallest window the product will draw its panels into.
@@ -120,6 +133,10 @@ const MIN_HEIGHT: u16 = 18;
 /// Paint the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
     let full = frame.area();
+    // Paint the product's own background on every cell before anything else. The
+    // measured ratios in the page map are ratios against this background, not against
+    // whatever theme the terminal happens to use.
+    frame.render_widget(Block::default().style(base_style()), full);
     // W36-1: remember the body width so the scroll keys can count wrapped rows with
     // the same width the frame is drawn at.
     app.panel_width.set(full.width.saturating_sub(2) as usize);
@@ -128,6 +145,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Paragraph::new(format!(
                 "this window is too small to show the product; make it at least {MIN_WIDTH}×{MIN_HEIGHT}"
             ))
+            .style(base_style())
             .wrap(Wrap { trim: true }),
             full,
         );
@@ -143,16 +161,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
+        Constraint::Length(1),
         Constraint::Length(status + 2),
     ])
     .split(frame.area());
 
     draw_tabs(frame, app, areas[0]);
     draw_body(frame, app, areas[1]);
-    draw_footer(frame, app, areas[2]);
+    // An overlay owns the screen and its keys. The screen-specific action row is not
+    // drawn behind it: the first-run modal must not advertise `n`/`s`/screen keys, and
+    // every other overlay already says `esc closes this overlay` in the footer.
+    if !app.overlay_owns_screen() {
+        draw_screen_actions(frame, app, areas[2]);
+    }
+    draw_footer(frame, app, areas[3]);
 
     if app.adding_agent() {
         draw_add_agent_form(frame, app);
+    } else if app.edit_agent.is_some() {
+        draw_edit_agent(frame, app);
     } else if app.editor_confirm.is_some() {
         draw_editor_confirm(frame, app);
     } else if app.secret_prompt.is_some() {
@@ -188,11 +215,44 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
         // was what pushed `6 Runs` past 72 columns, clipping it to `6 Ru` at the
         // advertised floor (A-4). Every number keeps its whole name here.
         .padding("", "")
-        .highlight_style(
-            selection_style(),
-        )
-        .block(Block::bordered().title(" gewu-multiverse "));
+        .highlight_style(selection_style())
+        .style(base_style())
+        .block(
+            Block::bordered()
+                .title(" gewu-multiverse ")
+                .style(base_style()),
+        );
     frame.render_widget(tabs, area);
+}
+
+/// One line of the screen's own keys, always drawn at the advertised floor.
+///
+/// This is not the full key list (that stays one `?` away): it is the next actions a
+/// person on this screen reaches for, and it never pays for the footer's running
+/// count. The footer remains the product-wide line.
+fn draw_screen_actions(frame: &mut Frame, app: &App, area: Rect) {
+    let actions = match app.screen {
+        Screen::Agents => "n new agent   s start   x stop   e instruction   ? all keys",
+        Screen::AgentConfig => {
+            "E edit endpoint   e instruction   p test   s start   m mode   ? all keys"
+        }
+        Screen::Instructions => "e instruction   t edit steps   K skill   [ ] page   ? all keys",
+        Screen::Forgejo => "u url  c role  C admin  v token  A admin  i identity  ? all keys",
+        Screen::Credentials => {
+            if app.leftover_secret_agents().is_empty() {
+                "k model key   f role token   A admin token   ? all keys"
+            } else {
+                "k model key   f role token   A admin token   D leftover   ? all keys"
+            }
+        }
+        Screen::Runs => "o log   T transcript   up/down run   [ ] page   enter open   ? all keys",
+    };
+    frame.render_widget(
+        Paragraph::new(actions)
+            .style(muted_style())
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 /// The body of the screen on show.
@@ -226,9 +286,11 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     };
     let table_height = wanted.min(area.height.saturating_sub(4)).max(4);
     let notes_height = area.height.saturating_sub(table_height);
-    let parts =
-        Layout::vertical([Constraint::Length(table_height), Constraint::Length(notes_height)])
-            .split(area);
+    let parts = Layout::vertical([
+        Constraint::Length(table_height),
+        Constraint::Length(notes_height),
+    ])
+    .split(area);
 
     let capacity = parts[0].height.saturating_sub(3) as usize;
     let (first, shown) = visible_window(app.agents().len(), app.selected, capacity);
@@ -238,9 +300,7 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     let [name_w, model_w, concurrency_w, supervision_w, state_w] = hub_column_widths(app, parts[0]);
 
     let header = Row::new(["", "agent", "model", "concurrency", "supervision", "state"])
-        .style(
-            muted_style().add_modifier(Modifier::BOLD),
-        );
+        .style(muted_style().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = app
         .agents()
         .iter()
@@ -278,9 +338,9 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(supervision_w),
         Constraint::Length(state_w),
     ];
-    let table = Table::new(rows, widths).header(header).block(
-        Block::bordered().title(list_title("agents", first, shown, app.agents().len())),
-    );
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered().title(list_title("agents", first, shown, app.agents().len())));
     frame.render_widget(table, parts[0]);
 
     // A note area that runs out of rows declares its tail instead of dropping it
@@ -295,19 +355,30 @@ fn draw_agents(frame: &mut Frame, app: &App, area: Rect) {
     // screen — the acknowledgment, the add-agent form, a prompt, a confirmation, the
     // help — the note area behind it is not drawn at all, so a covered wrapped
     // sentence can never leave its tail as the first thing a person reads.
+    let note_width = parts[1].width as usize;
+    let note_height = parts[1].height as usize;
+    let all_notes = if app.overlay_owns_screen() {
+        Vec::new()
+    } else {
+        agent_notes(app)
+    };
+    // The limit counts every wrapped row the note area holds, not only the rows a
+    // previous window drew; a page key and the floor guard both read it.
+    let note_total = panel_rows(&all_notes, note_width).len();
+    app.panel_height.set(note_height.max(1));
+    // A scrolled note area spends its first row on the `↑ more above` marker and may
+    // spend its last on `… more below`; the last page therefore begins one row later
+    // than a bordered panel's. Without this, the final logical rows were declared but
+    // never reachable at 72×18.
+    app.panel_scroll_limit
+        .set(note_total.saturating_sub(note_height.saturating_sub(1)));
     let notes = if app.overlay_owns_screen() {
         Vec::new()
     } else {
-        note_window(
-            agent_notes(app),
-            area.width.saturating_sub(2) as usize,
-            parts[1].height as usize,
-            app.panel_scroll,
-            true,
-        )
+        note_window(all_notes, note_width, note_height, app.panel_scroll, true)
     };
     frame.render_widget(
-        Paragraph::new(Text::from(notes)).wrap(Wrap { trim: true }),
+        Paragraph::new(Text::from(notes)).style(base_style()),
         parts[1],
     );
 }
@@ -372,39 +443,12 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             "The risk of running an agent is not acknowledged: starting one is refused — press R to read the terms, then y to record the acknowledgment.",
             warning_style(),
         )));
+    } else if let Some(record) = app.ack_record_compact_line() {
+        // One compact record line: the date, the version it was made under, the
+        // running build and the key that reads the rest. The long plain-file and
+        // machine clauses stay behind `R` (F6/K-20).
+        lines.push(Line::from(Span::styled(record, muted_style())));
     }
-    // The product has no scheduler. Say so before a person plans around one; the
-    // README states the same boundary, and `m` is the way to keep a run alive.
-    lines.push(Line::from(Span::styled(
-        "There is no scheduler: a run starts when you press s, or is kept alive as a user unit with m; a recurring run needs your own timer.",
-        muted_style(),
-    )));
-    if app.ack_confirmed() {
-        if let Some(record) = app.ack_record_line() {
-            lines.push(Line::from(Span::styled(record, muted_style())));
-        }
-    }
-    if let Some(note) = &app.config_note {
-        lines.push(Line::from(Span::styled(
-            note.clone(),
-            warning_style(),
-        )));
-    }
-    // U3: a build older than the configuration's own data must say so, not run it
-    // silently. Drawn high in the note area, above the standing prose.
-    if let Some(note) = app.version_mismatch_note() {
-        lines.push(Line::from(Span::styled(
-            note,
-            warning_style(),
-        )));
-    }
-    let waiting = app.supervisor.waiting_count();
-    let waiting_noun = if waiting == 1 { "start" } else { "starts" };
-    lines.push(Line::from(format!(
-        "Running: {} of {} allowed by the configuration; {waiting} {waiting_noun} waiting for a slot.",
-        app.supervisor.running_count(),
-        app.supervisor.max_concurrent(),
-    )));
     // Why each agent's last run failed, on the screen the user looks at. A start that
     // never became a run is named as a start, not as a run (D-8). w45 F3: the sentence
     // is drawn for every row, naming the agent, exactly as the unreadable reason is —
@@ -440,9 +484,7 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
         // and is kept beside — not instead of — the agent's real last run. The row's
         // state word already says `start called off`; this gives the reason a short
         // note area cannot hide once the status line is gone.
-        if let crate::supervisor::State::CalledOff { reason, .. } =
-            app.supervisor.state(name)
-        {
+        if let crate::supervisor::State::CalledOff { reason, .. } = app.supervisor.state(name) {
             lines.push(Line::from(Span::styled(
                 format!(
                     "the last start of `{name}` was called off: {}",
@@ -451,6 +493,40 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
                 warning_style(),
             )));
         }
+    }
+    // The product has no scheduler. Say so before a person plans around one; the
+    // README states the same boundary, and `m` is the way to keep a run alive.
+    lines.push(Line::from(Span::styled(
+        "There is no scheduler: a run starts when you press s, or is kept alive as a user unit with m; a recurring run needs your own timer.",
+        muted_style(),
+    )));
+    if let Some(note) = &app.config_note {
+        lines.push(Line::from(Span::styled(note.clone(), warning_style())));
+    }
+    // U3: a build older than the configuration's own data must say so, not run it
+    // silently. Drawn high in the note area, above the standing prose.
+    if let Some(note) = app.version_mismatch_note() {
+        lines.push(Line::from(Span::styled(note, warning_style())));
+    }
+    let waiting = app.supervisor.waiting_count();
+    let waiting_noun = if waiting == 1 { "start" } else { "starts" };
+    // One status line, then the work. The concurrency/max-turns definitions, the
+    // acknowledgment record's long copy and the systemd custody prose now live in
+    // `?`; the working screen keeps the fact for this moment (F6/K-20).
+    lines.push(Line::from(format!(
+        "Running: {} of {}; {waiting} {waiting_noun} waiting — s starts a run, m keeps one alive; ? all keys.",
+        app.supervisor.running_count(),
+        app.supervisor.max_concurrent(),
+    )));
+    if app
+        .agents()
+        .iter()
+        .any(|agent| app.supervisor.mode(&agent.name) == Mode::Systemd)
+    {
+        lines.push(Line::from(Span::styled(
+            "systemd: this agent runs as a user unit and keeps running when this UI exits.",
+            muted_style(),
+        )));
     }
     if let Some(error) = app.supervisor.last_error() {
         lines.push(Line::from(Span::styled(
@@ -464,35 +540,6 @@ fn agent_notes(app: &App) -> Vec<Line<'static>> {
             error_style(),
         )));
     }
-    // The two numbers the list and the Agent screen show are defined where they first
-    // appear, so a zero-knowledge user is not left with an undefined word.
-    lines.push(Line::from(Span::styled(
-        "concurrency is how many model requests one agent may keep in flight at once; max turns is the most model turns one run may take.",
-        muted_style(),
-    )));
-    // Explain what `systemd` will change *before* `m` is pressed, not only in
-    // the receipt afterwards: whether any agent is in systemd mode or not.
-    let uses_systemd = app
-        .agents()
-        .iter()
-        .any(|agent| app.supervisor.mode(&agent.name) == Mode::Systemd);
-    lines.push(Line::from(Span::styled(
-        format!(
-            "The `tui` mode is an ordinary child process of this tool; `m` switches to `systemd`, a user unit that keeps running when this UI exits and needs `loginctl enable-linger` to outlive a logout. Your systemd directory is {}.",
-            breakable_path(&app.supervisor.unit_dir().display().to_string())
-        ),
-        muted_style(),
-    )));
-    if uses_systemd {
-        lines.push(Line::from(Span::styled(
-            "A `systemd` agent is supervised by your own systemd. It is a convenience, not a security boundary.",
-            muted_style(),
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        "Either way its workspace is a directory: a layout, not a sandbox.",
-        muted_style(),
-    )));
     lines
 }
 
@@ -503,8 +550,23 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
         None => lines.push(Line::from(no_agent_text(app))),
         Some(agent) => {
             lines.push(field("name", &agent.name));
+            // Lead with what the product made in the workspace, when it made a clone
+            // there. The old sentence opened with `not a git repository`, which read
+            // as a failure after a successful clone (K-22/R-2). A workspace that has
+            // no clone keeps its note lower, where the paths are explained.
+            let clone_note = app
+                .workspace_note()
+                .filter(|note| note.starts_with("the clone"))
+                .map(str::to_owned);
+            if let Some(note) = &clone_note {
+                lines.push(field("repository", note));
+            }
             lines.push(field("model", &agent.model));
             lines.push(field("endpoint", &agent.endpoint));
+            lines.push(field(
+                "endpoint shape",
+                "https://host/v1/chat/completions — the full URL a run POSTs to",
+            ));
             if let Some(sentence) = app.endpoint_probe_sentence(&agent.name) {
                 lines.push(field("endpoint test", &sentence));
             }
@@ -583,12 +645,12 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                 }
             }
             let mode = app.supervisor.mode(&agent.name);
-            lines.push(field("supervision", &format!("{} ({})", mode.label(), mode.as_str())));
+            lines.push(field(
+                "supervision",
+                &format!("{} ({})", mode.label(), mode.as_str()),
+            ));
             if mode == Mode::Systemd {
-                lines.push(field(
-                    "unit",
-                    &crate::systemd::unit_name(&agent.name),
-                ));
+                lines.push(field("unit", &crate::systemd::unit_name(&agent.name)));
                 lines.push(field(
                     "restarts",
                     &app.supervisor.restart_count(&agent.name).to_string(),
@@ -612,21 +674,14 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     &paths.config_dir().display().to_string(),
                 ));
                 lines.push(field("workspace", &paths.workspace().display().to_string()));
-                // W-2: a workspace that already has history is not only a path. The
-                // branch, the commit and its age, whether it is dirty and the
-                // repository's configured local git identity (what the next commit
-                // would carry, not the author of the commits already there) are read
-                // from the repository; what the product cannot read (no repository,
-                // no git) is said plainly.
-                if let Some(note) = app.workspace_note() {
-                    lines.push(field("repository", note));
+                if clone_note.is_none() {
+                    if let Some(note) = app.workspace_note() {
+                        lines.push(field("repository", note));
+                    }
                 }
             }
             if let Some(problem) = app.selected_paths_problem() {
-                lines.push(Line::from(Span::styled(
-                    problem,
-                    error_style(),
-                )));
+                lines.push(Line::from(Span::styled(problem, error_style())));
             }
             let newest_run = app.latest_run(&agent.name);
             let transcript_error = newest_run.and_then(|run| run.read_error.as_deref());
@@ -635,14 +690,14 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                 // readable; the file must be openable before its size is drawn. A path
                 // that exists but cannot be read now carries the reason, the same
                 // sentence the Runs note uses, and `o` says the same thing.
-                Some(log) if crate::run::is_readable_file(&log) => lines.push(field(
+                Some(log) if crate::run::is_readable_file(&log) => lines.extend(field_split(
                     "newest log",
                     &crate::run::file_sentence(&log, "log", None),
                 )),
                 // Y-7: a path to a file that is no longer there is not a thing. Mark it
                 // gone, rather than presenting it as if `o` would open it. W38-3: the
                 // word is the same one the Runs note uses for the same missing file.
-                Some(log) => lines.push(field(
+                Some(log) => lines.extend(field_split(
                     "newest log",
                     &crate::run::file_sentence(&log, "log", None),
                 )),
@@ -659,7 +714,7 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             // a transcript that is present but unreadable says so, with the reason,
             // rather than being left as a size a person would trust.
             if let Some(path) = app.latest_run_transcript(&agent.name) {
-                lines.push(field(
+                lines.extend(field_split(
                     "transcript",
                     &crate::run::file_sentence(&path, "transcript", transcript_error),
                 ));
@@ -688,7 +743,10 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
             if let crate::supervisor::State::CalledOff { reason, .. } = &run_state {
                 lines.push(field(
                     "last start",
-                    &format!("called off — {}", app.reason_with_history(&agent.name, reason)),
+                    &format!(
+                        "called off — {}",
+                        app.reason_with_history(&agent.name, reason)
+                    ),
                 ));
             }
             // LIB-2: the field is always drawn. A test whose stamp survived a restart
@@ -717,32 +775,23 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(""));
     lines.push(field("read from", &app.config_path().display().to_string()));
-    lines.push(Line::from(Span::styled(
-        "e edit the instruction   K start a new skill   t edit the declared steps   p test the endpoint   s start   x stop   m switch supervision mode   o open the log",
-        muted_style(),
-    )));
-    // A short window does not silently drop the fields below the fold: the panel says
-    // so in its title, which is always drawn (D-7); the same rule is applied to every
-    // sibling panel and note area (O-3).
+    // The screen-specific action row is drawn outside the panel at every size; the
+    // panel does not repeat it, so no action sentence is also an unreachable row.
     lines
 }
 
 /// Draw the Agent screen, windowed by the panel's own scroll key.
 fn draw_agent_config(frame: &mut Frame, app: &App, area: Rect) {
     let lines = agent_config_lines(app);
-    let above = app.panel_scroll > 0;
-    let below = panel_overflows_from(&lines, area, app.panel_scroll);
-    let (title, _) = fit_title(
-        area.width as usize,
+    draw_scrolled_panel(
+        frame,
+        app,
+        lines,
         "agent configuration",
-        None,
-        None,
-        above,
-        below,
+        Some("agent"),
+        area,
     );
-    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
 }
-
 
 /// An agent's instruction, its declared steps and its skills, as they are on disk.
 fn instruction_lines(app: &App) -> Vec<Line<'static>> {
@@ -753,7 +802,6 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(field("agent", &agent.name));
             match app.instruction_summary() {
                 Some((path, exists, bytes, read_error)) => {
-                    lines.push(field("instruction", &path.display().to_string()));
                     // The editing keys are above the preview and the prose, not at the
                     // bottom of a scrollable panel: at 72×18 the action must be one of
                     // the first rows a person sees (w52 F4).
@@ -761,6 +809,49 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
                         "e edit the instruction   K start a new skill   t edit the declared steps",
                         muted_style(),
                     )));
+                    // The preview starts directly under the action line and draws every
+                    // row the panel can scroll to. There is no arbitrary three-line cap
+                    // and therefore no `N more lines` sentence to miscount (F7/K-15).
+                    let instruction_written = app
+                        .instruction_summary()
+                        .is_some_and(|(_, exists, _, read_error)| exists && read_error.is_none())
+                        && !app.instruction_is_only_placeholder()
+                        && !app.instruction_is_blank();
+                    if instruction_written {
+                        if let Some(preview) = app.instruction_preview() {
+                            lines.push(field(
+                                "preview",
+                                &format!(
+                                    "A run sends this instruction ({} turns); read-only",
+                                    agent.max_turns
+                                ),
+                            ));
+                            for line in &preview {
+                                lines.push(Line::from(format!("  {line}")));
+                            }
+                        }
+                    }
+                    if !instruction_written {
+                        // The empty screen still says what a run can do, so a person
+                        // writing the first instruction knows the bound and the tool.
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "A run sends at most {} turns and the `shell` tool.",
+                                agent.max_turns
+                            ),
+                            muted_style(),
+                        )));
+                    }
+                    // What the instruction can ask the agent to do, before the person
+                    // writes one: one `shell` tool, no pull-request or issue tool.
+                    lines.push(Line::from(Span::styled(
+                        "The agent has the `shell` tool; it has no pull-request or issue tool.",
+                        muted_style(),
+                    )));
+                    // The path follows the preview: at 72×18 a long temporary path can
+                    // take three rows by itself, and the preview must be visible at
+                    // entry (F7). The path is still reachable by scrolling.
+                    lines.push(field("instruction", &path.display().to_string()));
                     if let Some(reason) = read_error {
                         // Z-3: a file that is there but cannot be read is not a file
                         // that is not there. The wording is the transcript's own
@@ -825,34 +916,6 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
             }
             // What a run will send, kept short enough to stay above the path detail
             // at 80×24: it is the page-map must-offer for this state.
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "A run sends this instruction and the `shell` tool; at most {} {}.",
-                    agent.max_turns,
-                    if agent.max_turns == 1 { "turn" } else { "turns" },
-                ),
-                muted_style(),
-            )));
-            // A read-only preview: the person can read what a run will send without
-            // opening the editor. The same preview is scrollable with `[`/`]`.
-            let instruction_written = app.instruction_summary().is_some_and(
-                |(_, exists, _, read_error)| exists && read_error.is_none(),
-            ) && !app.instruction_is_only_placeholder()
-                && !app.instruction_is_blank();
-            if instruction_written {
-                if let Some(preview) = app.instruction_preview() {
-                    lines.push(field("preview", "read-only — the instruction a run sends"));
-                    for line in preview.iter().take(3) {
-                        lines.push(Line::from(format!("  {line}")));
-                    }
-                    if preview.len() > 3 {
-                        lines.push(Line::from(format!(
-                            "  … {} more lines; press e to read the whole document",
-                            preview.len() - 3
-                        )));
-                    }
-                }
-            }
             match app.steps_summary() {
                 Some((path, exists, count, read_error)) => {
                     // The command itself comes before the path lines, so the thing a
@@ -864,31 +927,34 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
                         }
                     }
                     if exists && read_error.is_none() && count > 0 {
-                        // The steps run where the clone is *not*: `g` puts a repository
-                        // one level below the workspace. A short line here keeps both
-                        // the command and this fact on screen at 80×24 (w52 F3).
+                        let noun = if count == 1 { "step" } else { "steps" };
+                        let workspace = app
+                            .selected_paths()
+                            .map(|paths| paths.workspace().display().to_string())
+                            .unwrap_or_else(|| "the agent's workspace".to_owned());
+                        // Two logical rows: the explicit working directory first, then
+                        // where `g` places a clone. Both survive the 80×24 fold; a
+                        // single wrapped sentence put the second fact out of reach.
                         lines.push(field(
-                            "  clone",
-                            "g clones to workspace/<repository>; use git -C <repository>",
+                            "  declared",
+                            &format!("{count} shell {noun} is run in the workspace at"),
+                        ));
+                        lines.push(field(
+                            "",
+                            &format!("g clones to workspace/<repository>; {workspace}"),
+                        ));
+                    } else {
+                        lines.push(field(
+                            "  declared",
+                            &if let Some(ref reason) = read_error {
+                                // Z-3: `none` is the word for a file with no declared
+                                // steps; a file that cannot be read is a different fact.
+                                format!("— the record could not be read: {reason}")
+                            } else {
+                                "none — press t to declare some".to_owned()
+                            },
                         ));
                     }
-                    lines.push(field(
-                        "  declared",
-                        &if let Some(ref reason) = read_error {
-                            // Z-3: `none` is the word for a file with no declared
-                            // steps; a file that cannot be read is a different fact.
-                            format!("— the record could not be read: {reason}")
-                        } else if exists {
-                            let noun = if count == 1 { "step" } else { "steps" };
-                            let workspace = app
-                                .selected_paths()
-                                .map(|paths| paths.workspace().display().to_string())
-                                .unwrap_or_else(|| "the agent's workspace".to_owned());
-                            format!("{count} shell {noun}, run in the workspace at {workspace}")
-                        } else {
-                            "none — press t to declare some".to_owned()
-                        },
-                    ));
                     lines.push(field("steps", &path.display().to_string()));
                 }
                 None => lines.push(field("steps", "the name cannot be used")),
@@ -908,29 +974,20 @@ fn instruction_lines(app: &App) -> Vec<Line<'static>> {
             }
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "A skill is one directory under skills/, each holding a SKILL.md; `K` opens a scratch one \
-         you can keep or rename. A run installs the skills it finds into the run directory.",
-        muted_style(),
-    )));
     lines
 }
 
 /// Draw the Instruction screen, windowed by the panel's own scroll key.
 fn draw_instructions(frame: &mut Frame, app: &App, area: Rect) {
     let lines = instruction_lines(app);
-    let above = app.panel_scroll > 0;
-    let below = panel_overflows_from(&lines, area, app.panel_scroll);
-    let (title, _) = fit_title(
-        area.width as usize,
+    draw_scrolled_panel(
+        frame,
+        app,
+        lines,
         "instruction, steps and skills",
-        None,
-        None,
-        above,
-        below,
+        Some("instruction"),
+        area,
     );
-    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
 }
 
 /// The Forgejo connection, the role check and the repository list.
@@ -940,26 +997,25 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     let (mut head, all_repos) = forgejo_head_and_repos(app);
     let (tail, legend) = forgejo_frame(app);
     let tail_rows = pushed_rows(&tail, inner) + pushed_rows(&legend, inner);
-
     let long_name = "Forgejo connection and role check";
     let short_name = "Forgejo";
     let total = all_repos.len();
 
-    // The windowed form is what the title describes, and it is drawn whenever it fits
-    // and the user has not scrolled it: that is how the key legend stays on the panel
-    // at 80×24 (Y-8). When it does not fit, the same content is drawn whole and
-    // scrolled with `[`/`]` instead, so the list and the legend are reachable rather
-    // than only declared (A-3).
-    let (_first, _shown, overflows, range) = forgejo_window(
-        &head,
-        total,
-        app.repo_selected,
-        inner,
-        content_height,
-        tail_rows,
-    );
+    // The windowed form gives the repository list the rows the head and tail do not
+    // need. Its range is the range actually drawn; when only one row fits, it says
+    // `1–1 of N`, never `1–N of N` (K-12). If even one row does not fit, or the user
+    // has scrolled, the whole panel is drawn as one scrollable surface.
+    let head_rows = pushed_rows(&head, inner);
+    let capacity = content_height.saturating_sub(head_rows + tail_rows).max(1);
+    let (first, shown) = visible_window(total, app.repo_selected, capacity);
+    let range = (total > shown).then(|| {
+        list_title("repositories", first, shown, total)
+            .trim()
+            .to_owned()
+    });
+    let overflows = head_rows + shown + tail_rows > content_height;
     if !overflows && app.panel_scroll == 0 {
-        let (first_title, dropped) = fit_title(
+        let (mut title, dropped) = fit_title(
             area.width as usize,
             long_name,
             Some(short_name),
@@ -967,14 +1023,20 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
             false,
             false,
         );
-        let title = if dropped {
-            // The title cannot hold both the range and the declaration: the
-            // declaration wins, and the range moves to a line above the list, so
-            // neither is lost (Y-1).
+        let mut first = first;
+        let mut shown = shown;
+        if dropped {
+            // The title cannot hold both the range and the declaration: the range
+            // moves to a line above the list, and the window is re-counted with it.
             if let Some(range) = range {
                 head.push(note_marker(&range));
+                let head_rows = pushed_rows(&head, inner);
+                let capacity = content_height.saturating_sub(head_rows + tail_rows).max(1);
+                let window = visible_window(total, app.repo_selected, capacity);
+                first = window.0;
+                shown = window.1;
             }
-            fit_title(
+            title = fit_title(
                 area.width as usize,
                 long_name,
                 Some(short_name),
@@ -982,41 +1044,28 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
                 false,
                 false,
             )
-            .0
-        } else {
-            first_title
-        };
-        // The window the title has just described is the one drawn: the range line
-        // (when it moved to the body) is part of `head`, so it is counted here.
-        let (first, shown, _, _) = forgejo_window(
-            &head,
-            total,
-            app.repo_selected,
-            inner,
-            content_height,
-            tail_rows,
-        );
+            .0;
+        }
         let repo_rows: Vec<Line> = all_repos[first..first + shown].to_vec();
         let lines = assemble(head, repo_rows, tail, legend);
         draw_panel(frame, lines, title, area);
         return;
     }
 
-    // The scrollable form: every repository is drawn, the range is a line above the
-    // list, and the tail and legend end the panel. `[`/`]` (and the arrows, on this
-    // screen the list keeps them) move the window over it.
+    // The scrollable form: every repository is drawn, and the title carries the whole
+    // list's range so the range itself is never scrolled away. `[`/`]` reach the
+    // identity tail and the legend.
     let lines = forgejo_scrolled_lines(app);
-    let above = app.panel_scroll > 0;
-    let below = panel_overflows_from(&lines, area, app.panel_scroll);
-    let (title, _) = fit_title(
-        area.width as usize,
-        long_name,
-        Some(short_name),
-        None,
-        above,
-        below,
-    );
-    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
+    let range_title = if total == 0 {
+        // A range cannot exist when the check listed no repository; `1–0 of 0` was a
+        // claim the repository list could not support (the empty-range rule). The
+        // short name leaves room for `line n of m` and the scroll declaration at the
+        // floor.
+        "Forgejo — no repositories".to_owned()
+    } else {
+        format!("Forgejo repositories 1–{total} of {total}")
+    };
+    draw_scrolled_panel(frame, app, lines, &range_title, None, area);
 }
 
 /// The Forgejo key legend, two compact rows.
@@ -1030,12 +1079,7 @@ fn forgejo_legend() -> Vec<Line<'static>> {
         "up/down choose one   g clone   P pull request   U update the newest",
     ]
     .iter()
-    .map(|line| {
-        Line::from(Span::styled(
-            (*line).to_owned(),
-            muted_style(),
-        ))
-    })
+    .map(|line| Line::from(Span::styled((*line).to_owned(), muted_style())))
     .collect()
 }
 
@@ -1051,31 +1095,6 @@ fn assemble(
     lines.extend(tail);
     lines.extend(legend);
     lines
-}
-
-/// The repository window, with the rows above it and the tail below it both reserved.
-///
-/// Returns the first row, the number of rows and whether the panel's content overflows
-/// its window. Reserving the tail is what keeps the key legend on the panel instead of
-/// letting the repository list push it off (Y-8).
-fn forgejo_window(
-    head: &[Line<'static>],
-    total: usize,
-    selected: usize,
-    inner: usize,
-    content_height: usize,
-    tail_rows: usize,
-) -> (usize, usize, bool, Option<String>) {
-    let head_rows = pushed_rows(head, inner);
-    let capacity = content_height.saturating_sub(head_rows + tail_rows).max(1);
-    let (first, shown) = visible_window(total, selected, capacity);
-    let overflows = head_rows + shown + tail_rows > content_height;
-    let range = (total > shown).then(|| {
-        list_title("repositories", first, shown, total)
-            .trim()
-            .to_owned()
-    });
-    (first, shown, overflows, range)
 }
 
 /// Every repository as a drawn row, for both the windowed and the scrolled form.
@@ -1155,9 +1174,17 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                             .to_owned()
                     }
                 }
-                _ => config.forgejo.role.as_str().to_owned(),
+                Some(Ok(_)) => "member".to_owned(),
+                // No result this session (or a failed one): do not print the configured
+                // default as if the check had said it. The persisted stamp carries the
+                // last real result and its age (K-14).
+                Some(Err(failure)) => format!("last check failed ({})", failure.class),
+                None => app
+                    .last_check_line()
+                    .unwrap_or_else(|| "not checked this session".to_owned()),
             };
             head.push(field("role", &role));
+            let _ = config;
         }
     }
     let (member, admin) = app.forgejo_tokens_present();
@@ -1227,7 +1254,6 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                 summary = format!("{summary} — {stamp}");
             }
             head.push(Line::from(summary));
-            head.push(Line::from(""));
             if check.repositories.is_empty() {
                 head.push(Line::from(
                     "the token can see no repository on this instance",
@@ -1241,105 +1267,78 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
     // the check has run, the repositories are what the panel is for, and the list
     // gets the rows (T-12).
     if !matches!(app.role_check, Some(Ok(_))) {
-        head.push(Line::from(Span::styled(
-            ROLE_EXPLANATION,
-            muted_style(),
-        )));
-    }
-    if let Some(agent) = app.selected_agent() {
-        // W32-5: the settled sentence and the last failure were two fields with no
-        // word joining them, so a reader could not tell whether the identity was
-        // usable now. The failure is appended to the identity line itself, and the
-        // tail (`forgejo_frame`) no longer repeats it, so the panel has one verdict.
-        let last_identity_failure = app
-            .identity_report_for(&agent.name)
-            .and_then(|report| report.result.err());
-        let failure_clause = |failure: &crate::app::ForgejoFailure| {
-            format!(
-                " — the last check failed ({}): {}",
-                failure.class, failure.message
-            )
-        };
-        match app.recorded_identity(&agent.name) {
-            Some(identity) => {
-                // One shape on every surface, and it names the agent: the login, the
-                // email and the mode of the account a clone or a pull request acts as
-                // (F1, F6). A second person with several agents never has to guess
-                // whose identity is on show.
-                let mut line = format!(
-                    "{} — commits, pull requests and issues act as this account",
-                    identity.line()
-                );
-                if let Some(failure) = &last_identity_failure {
-                    line.push_str(&failure_clause(failure));
-                }
-                head.push(field("agent identity", &line));
-            }
-            None => {
-                // What `i` will do, before it does it: with an administrator token the
-                // tool creates and manages the account `gewu-<agent>`; without one, it
-                // checks the token the user supplies with `v` (D-4). The field names
-                // the agent, not only the account it would create (F1).
-                let login = identity::login_for(&agent.name)
-                    .unwrap_or_else(|_| format!("gewu-{}", agent.name));
-                let (_, admin) = app.forgejo_tokens_present();
-                // The field names the **agent** the identity would belong to, so a
-                // second person with several agents never has to guess whose
-                // selection the screen is showing (F1). The supplied path keeps the
-                // page map's `v supplies the token` clause whole at 80×24.
-                let mut sentence = if admin {
-                    format!(
-                        "not settled for `{}` — press i for `{login}`; the account is created and managed",
-                        agent.name
-                    )
-                } else {
-                    format!(
-                        "not settled for `{}` — press i; v supplies the token",
-                        agent.name
-                    )
-                };
-                if let Some(failure) = &last_identity_failure {
-                    sentence.push_str(&failure_clause(failure));
-                }
-                head.push(field("agent identity", &sentence));
-            }
-        }
+        head.push(Line::from(Span::styled(ROLE_EXPLANATION, muted_style())));
     }
     head.push(Line::from(""));
     (head, all_repos)
 }
 
-/// The rows after the repository list: the identity report and a clone note, then the
-/// key legend.
-///
-/// They are counted against the list's window, so the legend (which names `v`, the key
-/// that supplies the agent's own token) is never itself the content that falls off the
-/// panel at 80×24 (Y-8).
+/// The identity line, drawn once and placed after the repository list.
+fn forgejo_identity_line(app: &App) -> Option<Line<'static>> {
+    let agent = app.selected_agent()?;
+    // W32-5: the settled sentence and the last failure are joined so the panel has
+    // one verdict about whether the identity is usable now. A session failure is
+    // appended to the identity already recorded; it does not erase that identity.
+    let report = app.identity_report_for(&agent.name);
+    let failure = report
+        .as_ref()
+        .and_then(|report| report.result.as_ref().err());
+    let recorded = app.recorded_identity(&agent.name);
+    let failure_clause = |failure: &crate::app::ForgejoFailure| {
+        format!(
+            " — the last check failed ({}): {}",
+            failure.class, failure.message
+        )
+    };
+    let line = match (report.as_ref().map(|report| &report.result), recorded) {
+        (Some(Ok(_)), _) => format!(
+            "{} — commits, pull requests and issues act as this account",
+            report.as_ref().expect("the report was matched").describe()
+        ),
+        (_, Some(identity)) => {
+            let mut line = format!(
+                "{} — commits, pull requests and issues act as this account",
+                identity.line()
+            );
+            if let Some(failure) = failure {
+                line.push_str(&failure_clause(failure));
+            }
+            line
+        }
+        _ => {
+            let login =
+                identity::login_for(&agent.name).unwrap_or_else(|_| format!("gewu-{}", agent.name));
+            let (_, admin) = app.forgejo_tokens_present();
+            let mut sentence = if admin {
+                format!(
+                    "not settled for `{}` — press i for `{login}`; the account is created and managed",
+                    agent.name
+                )
+            } else {
+                format!(
+                    "not settled for `{}` — press i; v supplies the token",
+                    agent.name
+                )
+            };
+            if let Some(failure) = failure {
+                sentence.push_str(&failure_clause(failure));
+            }
+            sentence
+        }
+    };
+    Some(field("agent identity", &line))
+}
+
+/// The rows after the repository list: the identity report, a clone note, then the
+/// key legend. The report is one line and it is drawn once (W-3/K-23).
 fn forgejo_frame(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut tail: Vec<Line> = Vec::new();
-    // The report is drawn from the state that owns it: this session's result when
-    // there is one, otherwise the identity recorded in the credentials file once the
-    // role check has run, so a second person who restarts the product can still read
-    // it (H-3).
-    // W32-5: a **failure** is drawn on the identity line above, joined to the
-    // settled sentence; drawing it here too would be the two-verdicts defect again.
-    // The report (with its creation time) stays on the tail for a settled identity.
-    if let Some(report) = app
-        .selected_agent()
-        .and_then(|agent| app.identity_report_for(&agent.name))
-        .filter(|report| report.result.is_ok())
-    {
-        tail.push(Line::from(""));
-        tail.push(Line::from(format!(
-            "identity for `{}`: {}",
-            report.agent,
-            report.describe()
-        )));
+    if let Some(line) = forgejo_identity_line(app) {
+        tail.push(line);
     }
     if let Some(note) = &app.forgejo_note {
         tail.push(Line::from(note.clone()));
     }
-    tail.push(Line::from(""));
     (tail, forgejo_legend())
 }
 
@@ -1347,7 +1346,7 @@ fn forgejo_frame(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
 ///
 /// It is a constant because the repository window has to measure it: the rows this
 /// sentence wraps onto are rows the repository list cannot use (W-1).
-const ROLE_EXPLANATION: &str = "A role is which Forgejo account the check acts as: `c` checks the configured role, `C` checks the administrator token when one is present. An identity is the account an agent's own commits are authored by; `i` creates or records it.";
+const ROLE_EXPLANATION: &str = "A role is the Forgejo account `c` checks; an identity is the account an agent's commits, pull requests and issues act as — `i` settles it.";
 
 /// How many rows a single plain string needs when a panel wraps at `width`.
 ///
@@ -1392,6 +1391,24 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return vec![line.clone()];
     }
+    // A `field` starts with a padded muted label. Its wrapped values keep that
+    // label's indent, so a path or a sentence that continues on the next row still
+    // reads under the field it belongs to (K-16).
+    let hanging = line
+        .spans
+        .first()
+        .filter(|span| {
+            span.content.chars().count() == LABEL_WIDTH
+                && span.content.ends_with(' ')
+                && span.content.trim().len() < LABEL_WIDTH
+        })
+        .map(|_| LABEL_WIDTH)
+        .unwrap_or(0);
+    let label_style = line
+        .spans
+        .first()
+        .map(|span| span.style)
+        .unwrap_or_else(base_style);
     let chars: Vec<(char, Style)> = line
         .spans
         .iter()
@@ -1400,6 +1417,36 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     let visual: usize = chars.iter().filter(|(c, _)| *c != '\u{200b}').count();
     if visual <= width {
         return vec![line.clone()];
+    }
+    if hanging > 0 && line.spans.len() > 1 {
+        // Wrap the value in the **space left after the label**, then put the label on
+        // the first row and its indent on every continuation row. This reserves the
+        // indent before words are placed, so a continuation can never grow past the
+        // box by the width of the indent and be clipped.
+        let label: Vec<(char, Style)> = line.spans[0]
+            .content
+            .chars()
+            .map(|ch| (ch, line.spans[0].style))
+            .collect();
+        let value_line = Line::from(line.spans[1..].to_vec());
+        let value_rows = wrap_line(&value_line, width.saturating_sub(hanging).max(1));
+        return value_rows
+            .into_iter()
+            .enumerate()
+            .map(|(at, row)| {
+                let mut row_chars: Vec<(char, Style)> = if at == 0 {
+                    label.clone()
+                } else {
+                    vec![(' ', label_style); hanging]
+                };
+                row_chars.extend(
+                    row.spans
+                        .iter()
+                        .flat_map(|span| span.content.chars().map(|ch| (ch, span.style))),
+                );
+                spans_from_chars(row_chars)
+            })
+            .collect();
     }
     // Split into words at ordinary spaces. A no-break space (U+00A0) stays inside its
     // word, so the login and the email it joins move together (N-2).
@@ -1538,73 +1585,37 @@ fn credentials_lines(app: &App) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::from(""));
-    // The screen's own keys come first, before the prose: the page map requires this
-    // row at every size ("`k` sets a model key ...") and at 80x24 the tail of the
-    // prose used to be where they were dropped (O-3, P-M1).
-    lines.push(Line::from(Span::styled(
-        "k set the model key   f set the role token   A set the administrator token",
-        muted_style(),
-    )));
-    // The screen that shows a leftover secret is the screen that must offer its
-    // delete: when the file holds a key for an agent no longer configured, `D` joins
-    // the legend instead of living only on a help page (A-5).
+    // One status line, then the actions. The long custody and copy prose lives behind
+    // `?`; a screen a person checks quickly should not read like a policy page (F6).
     if !app.leftover_secret_agents().is_empty() {
         lines.push(Line::from(Span::styled(
-            "D delete the leftover secrets of agents no longer configured",
+            "D deletes the leftover secrets of agents no longer configured",
             muted_style(),
         )));
     }
-    lines.push(Line::from(""));
     match &app.credentials_error {
         None => lines.push(Line::from(
-            "The file is created with mode 0600 if it is absent, and held back to 0600 whenever the product re-reads the file; a file widened while the product is running is refused in the meantime.",
+            "Secrets are never printed; every log, transcript and error is redacted. The file is held to 0600. ? all keys explains custody and copying.",
         )),
         Some(error) => lines.push(Line::from(Span::styled(
             format!("the credentials file is not ready: {error}"),
             error_style(),
         ))),
     }
-    // F-2: the configuration file is written 0600 too, and every directory the
-    // product creates is 0700. The one exception is named, so the sentence is the
-    // whole custody and an auditor can check it against the filesystem.
-    lines.push(Line::from(
-        "The configuration file is written with mode 0600 too; every directory the product makes inside its own configuration and state directories is held to 0700, and the one systemd unit is 0644 because it holds no secret — it names paths only.",
-    ));
-    lines.push(Line::from(
-        "Its contents are never printed: nothing here is shown, logged or put on a command line.",
-    ));
-    // W32-6: the product never said it is one machine. The configuration directory,
-    // the credentials file, the acknowledgment record and the endpoint-test record
-    // belong to the machine they were made on, and a person who copies the directory
-    // to a second machine must be told what travels with it and what stays behind.
-    lines.push(Line::from(
-        "This configuration, its credentials, the acknowledgment and the endpoint-test record belong to the machine they were made on; copying the configuration directory to another machine carries the Forgejo address, the secrets and the endpoint test with it, but a record that names another machine is labelled as such where it is shown. The run records live under the state directory and do not travel with the configuration.",
-    ));
-    lines.push(Line::from(Span::styled(
-        "An agent runs as you, so it can read this file with your rights. The screen shows you where it is.",
-        muted_style(),
-    )));
-    lines.push(Line::from(Span::styled(
-        "The model key for an agent is read from this file at the point of a model call, and is redacted from every transcript, log and error the tool writes.",
-        muted_style(),
-    )));
     lines
 }
 
 /// Draw the Credentials screen, windowed by the panel's own scroll key.
 fn draw_credentials(frame: &mut Frame, app: &App, area: Rect) {
     let lines = credentials_lines(app);
-    let above = app.panel_scroll > 0;
-    let below = panel_overflows_from(&lines, area, app.panel_scroll);
-    let (title, _) = fit_title(
-        area.width as usize,
+    draw_scrolled_panel(
+        frame,
+        app,
+        lines,
         "credentials file",
-        None,
-        None,
-        above,
-        below,
+        Some("credentials"),
+        area,
     );
-    draw_scrolled_panel(frame, lines, app.panel_scroll, title, area);
 }
 
 /// The recent runs, read from the records on disk.
@@ -1622,6 +1633,44 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         run_notes(app)
     };
     let inner = area.width.saturating_sub(2) as usize;
+    // At the 72×18 floor the table would leave the records panel a three-row letter
+    // slot. Collapse the list to one summary line instead and give the records the
+    // rest of the body (K-11). Up/down still choose a run, and the summary names that.
+    if area.height <= 10 {
+        let total = app.recent.len();
+        let (first, shown) = visible_window(total, app.run_selected, 1);
+        let summary = if total == 0 {
+            "recent runs — none yet; press s on Agents to start one".to_owned()
+        } else {
+            let range = if total > 1 {
+                format!("recent runs {}–{} of {total}", first + 1, first + shown)
+            } else {
+                "recent runs 1 of 1".to_owned()
+            };
+            format!(
+                "{range} — up/down choose a run, enter opens it   {}",
+                app.selected_run()
+                    .map(|run| run.run_id.as_str())
+                    .unwrap_or("")
+            )
+        };
+        let list_area = Rect { height: 1, ..area };
+        let records_area = Rect {
+            y: area.y.saturating_add(1),
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(summary)
+                .style(muted_style())
+                .wrap(Wrap { trim: true }),
+            list_area,
+        );
+        if !notes.is_empty() {
+            draw_scrolled_panel(frame, app, notes, "run records", None, records_area);
+        }
+        return;
+    }
     let needed = pushed_rows(&notes, inner) as u16 + 2;
     // An empty list gets only its border and header; a populated list gets its rows
     // (at least three, so a person can survey it) and the note area takes the rest.
@@ -1636,24 +1685,22 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         (app.recent.len() as u16).saturating_add(3).max(6)
     };
-    let list_height = list_wanted
-        .min(area.height.saturating_sub(4))
-        .max(4);
+    let list_height = list_wanted.min(area.height.saturating_sub(4)).max(4);
     // The note area still gets the rows its own content needs (up to the space the
     // list can spare), so a cap sentence or a reason is not pushed below the fold just
     // because the list is long. With a short list the free rows all go to the note.
-    let notes_floor = needed
-        .min(area.height.saturating_sub(6).max(4))
-        .max(4);
+    let notes_floor = needed.min(area.height.saturating_sub(6).max(4)).max(4);
     let notes_height = area
         .height
         .saturating_sub(list_height)
         .max(notes_floor)
         .min(area.height.saturating_sub(4).max(4));
     let list_height = area.height.saturating_sub(notes_height).max(4);
-    let parts =
-        Layout::vertical([Constraint::Length(list_height), Constraint::Length(notes_height)])
-            .split(area);
+    let parts = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(notes_height),
+    ])
+    .split(area);
 
     let capacity = parts[0].height.saturating_sub(3) as usize;
     let (first, shown) = visible_window(app.recent.len(), app.run_selected, capacity);
@@ -1682,9 +1729,8 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
 
     // The start time is written in RFC 3339 UTC on disk; saying so in the header is
     // what stops it reading as a wrongly-set wall clock (W-4).
-    let header = Row::new(["", "agent", "run", "started (UTC)", "outcome"]).style(
-        muted_style().add_modifier(Modifier::BOLD),
-    );
+    let header = Row::new(["", "agent", "run", "started (UTC)", "outcome"])
+        .style(muted_style().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = app
         .recent
         .iter()
@@ -1728,29 +1774,19 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(STARTED as u16),
         Constraint::Length(outcome_w as u16),
     ];
-    let table = Table::new(rows, widths).header(header).block(
-        Block::bordered().title(list_title_with_total(
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered().title(list_title_with_total(
             "recent runs",
             first,
             shown,
             app.recent.len(),
             app.recent_total.max(app.recent.len()),
-        )),
-    );
+        )));
     frame.render_widget(table, parts[0]);
 
     if !notes.is_empty() {
-        let above = app.panel_scroll > 0;
-        let below = panel_overflows_from(&notes, parts[1], app.panel_scroll);
-        let (title, _) = fit_title(
-            parts[1].width as usize,
-            "run records",
-            None,
-            None,
-            above,
-            below,
-        );
-        draw_scrolled_panel(frame, notes, app.panel_scroll, title, parts[1]);
+        draw_scrolled_panel(frame, app, notes, "run records", None, parts[1]);
     }
 }
 
@@ -1789,9 +1825,12 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
                 app.run_state_word(run)
             )));
         } else {
-            lines.push(Line::from(format!(
-                "outcome: {}",
-                app.run_state_word(run)
+            lines.push(Line::from(format!("outcome: {}", app.run_state_word(run))));
+        }
+        if crate::run::run_pushed(run) {
+            lines.push(Line::from(Span::styled(
+                "next step: the run pushed its branch — press P on the Forgejo screen (4) to open the pull request.",
+                warning_style(),
             )));
         }
         // The offers lead the reason's tail: `T` and `o` are the page map's must-offers
@@ -1803,13 +1842,21 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
         // the secondary, machine-readable record behind `T`.
         if let Some(reply) = run.final_reply.as_deref() {
             lines.push(Line::from(""));
-            lines.push(Line::from("the model's final reply (readable, copyable):"));
+            lines.push(Line::from(Span::styled(
+                "── the model's final reply (readable, copyable) ──",
+                muted_style(),
+            )));
             for line in reply.lines() {
                 lines.push(Line::from(line.to_owned()));
             }
             if reply.lines().next().is_none() {
                 lines.push(Line::from("(the reply held no text)"));
             }
+            // The product's own notes follow this rule, never the reply's last line.
+            lines.push(Line::from(Span::styled(
+                "── end of the model's reply ──",
+                muted_style(),
+            )));
         }
         // `esc` is this product's way back everywhere, but not the pager's; name the
         // pager's own key on the screen, before the key is pressed (M-5).
@@ -1829,10 +1876,6 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             crate::run::file_sentence(&transcript, "transcript", run.read_error.as_deref()),
             crate::run::file_sentence(&run.log, "log", None)
         ))));
-        lines.push(Line::from(Span::styled(
-            "The outcome is decided by the process, not by what it wrote.",
-            muted_style(),
-        )));
     }
 
     lines.push(Line::from(format!(
@@ -1873,7 +1916,11 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
                 .filter(|run| !app.run_is_current(run))
                 .count();
             let belongs_to = "an agent the configuration no longer lists, or to an earlier agent with the same name";
-            let noun = if total == 1 { "record belongs" } else { "records belong" };
+            let noun = if total == 1 {
+                "record belongs"
+            } else {
+                "records belong"
+            };
             let text = if listed == 0 {
                 // Two logical rows: the count and the marker's absence are separate
                 // facts, and a wrapped line must not split the sentence that says the
@@ -1923,13 +1970,11 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
                 "This list stops at the newest {listed} of the {total} run records on disk: {older} older records are not listed here, but they are still on disk."
             )
         };
-        lines.push(Line::from(Span::styled(
-            text,
-            warning_style(),
-        )));
+        lines.push(Line::from(Span::styled(text, warning_style())));
     }
     lines
-}/// The widths of the hub's five data columns.
+}
+/// The widths of the hub's five data columns.
 ///
 /// The state column is given the room its longest word needs **first**, so a failure
 /// class is always whole (`failed (server_error)`). The name column then gets the
@@ -1951,12 +1996,23 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
     const SUPERVISION: usize = 11;
     const MODEL_MIN: usize = 6;
     let inner = (area.width as usize).saturating_sub(2);
-    let available = inner.saturating_sub(GAPS);
-    let names: Vec<&str> = app.agents().iter().map(|agent| agent.name.as_str()).collect();
+    // One column of right padding before the border at every size (K-17).
+    let available = inner.saturating_sub(GAPS + 1);
+    let names: Vec<&str> = app
+        .agents()
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .collect();
     let state_wanted = app
         .agents()
         .iter()
-        .map(|agent| app.supervisor.state(&agent.name).cell_word().chars().count())
+        .map(|agent| {
+            app.supervisor
+                .state(&agent.name)
+                .cell_word()
+                .chars()
+                .count()
+        })
         .max()
         .unwrap_or(0)
         .clamp(STATE_COLUMN_MIN, STATE_COLUMN_MAX);
@@ -1966,9 +2022,10 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
     // The leftover stays outside the table, so one row's fields stay together at any
     // width.
     let state = state_wanted
-        .min(available.saturating_sub(
-            MARKER + NAME_COLUMN_MIN + CONCURRENCY + SUPERVISION + MODEL_MIN,
-        ))
+        .min(
+            available
+                .saturating_sub(MARKER + NAME_COLUMN_MIN + CONCURRENCY + SUPERVISION + MODEL_MIN),
+        )
         .max(STATE_COLUMN_MIN.min(available));
     let name_budget = available
         .saturating_sub(MARKER + CONCURRENCY + SUPERVISION + state + MODEL_MIN)
@@ -1980,9 +2037,12 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
         .map(|agent| agent.model.chars().count())
         .max()
         .unwrap_or(0)
-        .max(MODEL_MIN);
-    let room_for_model = available.saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + state);
-    let model = model_content.min(room_for_model).max(MODEL_MIN.min(available));
+        .clamp(MODEL_MIN, FLEX_COLUMN_MAX);
+    let room_for_model =
+        available.saturating_sub(MARKER + name + CONCURRENCY + SUPERVISION + state);
+    let model = model_content
+        .min(room_for_model)
+        .max(MODEL_MIN.min(available));
     [
         name as u16,
         model as u16,
@@ -1999,7 +2059,17 @@ fn hub_column_widths(app: &App, area: Rect) -> [u16; 5] {
 /// longest name, the smallest width that still tells every distinct name apart
 /// (keeping both ends) is used; `cap` is the room the caller can give.
 fn name_column_width(names: &[&str], cap: usize) -> usize {
-    let cap = cap.max(NAME_COLUMN_MIN);
+    let cap = cap.clamp(NAME_COLUMN_MIN, FLEX_COLUMN_MAX);
+    let longest = names
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    if longest <= cap {
+        // Whole names, not the smallest distinct width: a wide window gives the extra
+        // columns to the names instead of ellipsizing them beside blank space.
+        return longest.max(NAME_COLUMN_MIN);
+    }
     let mut distinct: Vec<&str> = names.to_vec();
     distinct.sort_unstable();
     distinct.dedup();
@@ -2061,6 +2131,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     // footer names both instead of saying only `any key` (V-2).
     let legend = if app.show_acknowledgment && app.ack_review {
         "esc closes this overlay; [ and ] scroll; the record is unchanged"
+    } else if app.show_acknowledgment {
+        // The first-run modal's own keys. `q` and the screen keys are not advertised
+        // while it owns the screen (K-26).
+        "y records it once   n not now   esc not now"
     } else if app.overlay_owns_keys() {
         "esc closes this overlay"
     } else {
@@ -2073,11 +2147,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         parts[1],
     );
     frame.render_widget(
-        Paragraph::new(key_legend(
-            area.width as usize,
-            &running_clause(app),
-        ))
-        .style(muted_style()),
+        Paragraph::new(key_legend(area.width as usize, &running_clause(app))).style(muted_style()),
         parts[2],
     );
 }
@@ -2090,10 +2160,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 /// word longer than the row (a path) is broken across rows rather than clipped.
 fn status_rows(text: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
-    let rows: usize = text
-        .lines()
-        .map(|line| wrapped_rows(line, width))
-        .sum();
+    let rows: usize = text.lines().map(|line| wrapped_rows(line, width)).sum();
     rows.max(1) as u16
 }
 
@@ -2119,17 +2186,6 @@ fn pushed_rows(lines: &[Line], width: usize) -> usize {
 /// The Agent panel was the first to answer this in its title (D-7); every sibling
 /// panel asks the same question now, so a short window declares what is below the
 /// fold rather than dropping it without a word (O-3).
-/// Whether a scrolled panel still has content below the fold.
-///
-/// The question is asked of the wrapped rows from `offset` on (W36-1), not of the
-/// whole panel: the sixth round computed it for the unscrolled state only, so a
-/// scrolled panel dropped the declaration entirely (A-1).
-fn panel_overflows_from(lines: &[Line<'static>], area: Rect, offset: usize) -> bool {
-    let width = area.width.saturating_sub(2) as usize;
-    let body = area.height.saturating_sub(2) as usize;
-    offset.saturating_add(body) < panel_rows(lines, width).len()
-}
-
 /// The sentence a bordered panel puts in its title when its content does not fit.
 ///
 /// It is the one thing that must never be the part the terminal clips: a user who
@@ -2150,6 +2206,11 @@ const MORE_ABOVE: &str = "↑ more above — press [";
 
 /// The shorter form of the marker, for a title with no room for it all.
 const MORE_ABOVE_SHORT: &str = "↑ above — [";
+
+/// The tiniest declaration that still names the real key. A title may shorten its own
+/// name, but it never clips the sentence that says more content exists (K-19/M6).
+const MORE_BELOW_TINY: &str = "↓ press ]";
+const MORE_ABOVE_TINY: &str = "↑ press [";
 
 /// The first drawn row of a scrolled borderless note area.
 const MORE_ABOVE_NOTE: &str = "↑ more above — press [";
@@ -2235,10 +2296,31 @@ fn fit_title(
             }
         }
     }
-    (
-        compose_title(base, None, declaration_text(above, below, false).as_deref()),
-        extra.is_some(),
-    )
+    // Nothing else fits: shorten the **name** (with an ellipsis) until the declaration
+    // fits whole. A title that ends mid-declaration is worse than a shortened name:
+    // it points at content the reader cannot discover.
+    let declaration = match (above, below) {
+        (true, true) => format!("{MORE_ABOVE_TINY}; {MORE_BELOW_TINY}"),
+        (true, false) => MORE_ABOVE_TINY.to_owned(),
+        (false, true) => MORE_BELOW_TINY.to_owned(),
+        (false, false) => String::new(),
+    };
+    let name = short.unwrap_or(base);
+    if declaration.is_empty() {
+        return (format!(" {name} "), extra.is_some());
+    }
+    let fixed = format!(" {name} — {declaration} ");
+    if fixed.chars().count() <= room {
+        return (fixed, extra.is_some());
+    }
+    let reserve = declaration.chars().count() + 4; // spaces and the separator
+    let keep = room.saturating_sub(reserve).max(1);
+    let mut shortened: String = name.chars().take(keep).collect();
+    if keep < name.chars().count() && keep >= 2 {
+        shortened.pop();
+        shortened.push('…');
+    }
+    (format!(" {shortened} — {declaration} "), extra.is_some())
 }
 
 /// How many wrapped rows the panel or note area on show can scroll through.
@@ -2297,24 +2379,35 @@ fn line_text(line: &Line<'static>) -> String {
 /// `more above` declaration is the part that is never clipped.
 fn draw_scrolled_panel(
     frame: &mut Frame,
+    app: &App,
     lines: Vec<Line<'static>>,
-    offset: usize,
-    title: String,
+    base: &str,
+    short: Option<&str>,
     area: Rect,
 ) {
     let width = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
     let rows = panel_rows(&lines, width);
+    let total = rows.len().max(1);
+    let limit = rows.len().saturating_sub(height);
+    let offset = app.panel_scroll.min(limit);
+    // Store what was really drawn: a page key follows this height, and a resize
+    // clamps the next key to this limit instead of leaving the window past the end.
+    app.panel_height.set(height.max(1));
+    app.panel_scroll_limit.set(limit);
+    let line = format!("line {} of {total}", offset + 1);
+    let above = offset > 0;
+    let below = offset + height < rows.len();
+    let (title, _) = fit_title(area.width as usize, base, short, Some(&line), above, below);
     let window: Vec<Line<'static>> = if rows.is_empty() {
         Vec::new()
     } else {
-        let first = offset.min(rows.len() - 1);
-        rows[first..].iter().take(height).cloned().collect()
+        rows[offset..].iter().take(height).cloned().collect()
     };
     frame.render_widget(
         Paragraph::new(Text::from(window))
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: false }),
+            .style(base_style())
+            .block(Block::bordered().title(title).style(base_style())),
         area,
     );
 }
@@ -2327,38 +2420,19 @@ fn draw_scrolled_panel(
 fn draw_panel(frame: &mut Frame, lines: Vec<Line<'static>>, title: String, area: Rect) {
     let width = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
-    let lines = fit_panel_lines(lines, width, height);
+    let rows = panel_rows(&lines, width);
+    let window: Vec<Line<'static>> = rows.into_iter().take(height).collect();
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::bordered().title(title))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(window))
+            .style(base_style())
+            .block(Block::bordered().title(title).style(base_style())),
         area,
     );
 }
 
-/// Drop whole logical lines from the bottom until what is left fits the panel.
-///
-/// A bordered panel never draws half a wrapped line: ratatui would clip the last
-/// wrapped row at the border, and a sentence that ends at a box edge reads as a
-/// rendering bug (W-3). The panel title's `more below` declaration says the rest
-/// exists, and `[`/`]` reaches it.
-fn fit_panel_lines(
-    mut lines: Vec<Line<'static>>,
-    width: usize,
-    height: usize,
-) -> Vec<Line<'static>> {
-    while !lines.is_empty() && pushed_rows(&lines, width) > height {
-        lines.pop();
-    }
-    lines
-}
-
 /// A dim sentence used for a note area's own edge markers.
 fn note_marker(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_owned(),
-        muted_style(),
-    ))
+    Line::from(Span::styled(text.to_owned(), muted_style()))
 }
 
 /// Window a borderless note area, saying which way its content continues.
@@ -2422,7 +2496,11 @@ fn running_clause(app: &App) -> String {
         // older records are on disk: the count may be larger than it can see (L-5).
         // W39-3: the word is `ended`, not `finished`, because the count includes runs
         // that timed out or were stopped — "finished" read as "succeeded".
-        let plus = if app.finished_count_is_capped() { "+" } else { "" };
+        let plus = if app.finished_count_is_capped() {
+            "+"
+        } else {
+            ""
+        };
         format!("{base}· {finished}{plus} ended   ")
     }
 }
@@ -2501,29 +2579,26 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(
-            "Name an agent; its model endpoint, id and key are required. Forgejo URL and token are optional; say whether the token is `member` or `admin`.",
-        ),
+    // Compact introduction: two facts, each on its own sentence. The safety prose
+    // that used to take six rows now lives in the action line and the help overlay,
+    // so the floor shows named fields instead of only the first one (F9/K-24).
+    let mut body: Vec<Line> = vec![
+        Line::from("Required: name, model, key, full endpoint (https://host/v1/chat/completions)."),
         Line::from(Span::styled(
-            "The key and token go to the credentials file and are never shown. An administrator token is recorded once under both names, so `A` will not ask again; an agent's own token is supplied later with `v`.",
+            "Optional Forgejo URL/token; blank = shared. Keys are never shown; the agent's own token is supplied later with v.",
             muted_style(),
         )),
-        Line::from(""),
+        Line::from(Span::styled(
+            "token role: member or admin; blank keeps the configured role.",
+            muted_style(),
+        )),
     ];
-    // Where the field block starts, so the window can keep the cursor's own row drawn.
-    let fields_at = lines.len();
-    // The field the shown reason names (or the cursor's field when it names none). The
-    // reason row and the cursor row are both tracked as they are pushed, so the window
-    // below can keep both drawn (w46 F1/w47 F2) and the reason is read beside the field
-    // it is about, not beside whatever the cursor happens to be on.
+    let fields_at = body.len();
     let reason_at = form.reason_at();
     let mut cursor_line = fields_at;
     let mut reason_line: Option<usize> = None;
     for (at, (label, secret)) in NewAgentForm::FIELDS.iter().enumerate() {
         let value = &form.fields[at];
-        // A masked value says how much it holds: the mask alone is the same block of
-        // stars whether a paste landed once or twice (P-2).
         let shown = if *secret {
             let count = value.chars().count();
             if count == 0 {
@@ -2538,48 +2613,41 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
         let style = if at == form.cursor {
             selection_style()
         } else {
-            Style::new()
+            base_style()
         };
         if at == form.cursor {
-            cursor_line = lines.len();
+            cursor_line = body.len();
         }
-        lines.push(Line::from(Span::styled(
+        body.push(Line::from(Span::styled(
             format!("{marker} {label:<16} {shown}"),
             style,
         )));
-        // w45 F1: the refusal reason is drawn on the row immediately after the field
-        // it names, so the reason and the field are read together; w46 F1/w47 F2: the
-        // row is the **named** field's, not the cursor's, and the reason is withdrawn
-        // by the first key that edits a field or moves on. The window below keeps the
-        // cursor's row and this reason's row drawn together, so the box holds its own
-        // reason — it used to sit after the last field, which was the row the window
-        // dropped at the built geometry.
         if reason_at == Some(at) {
             if let Some(error) = &form.error {
-                reason_line = Some(lines.len());
-                lines.push(Line::from(Span::styled(
+                reason_line = Some(body.len());
+                body.push(Line::from(Span::styled(
                     format!("  {}", error.message),
                     error_style(),
                 )));
             }
         }
     }
-    lines.push(Line::from(""));
-    if form.error.is_none() {
-        lines.push(Line::from(Span::styled(
-            "  tab/up/down or enter moves on   ctrl-s writes it from any field (enter writes it on the last)   esc cancels",
-            muted_style(),
-        )));
-    }
-    // Size the box to what it holds, so `more below — press ]` is true: a
-    // bigger terminal really does draw the rest of the form. The overlay area is the
-    // cap (a floor window still windows the body).
+    // The action is part of the panel at every size (K-24). It is pinned after the
+    // body window, never left outside the border.
+    let action = Line::from(Span::styled(
+        "  tab/up/down or enter moves on   ctrl-s writes it   esc cancels",
+        muted_style(),
+    ));
+
     let inner = width.saturating_sub(2) as usize;
-    let content_rows = pushed_rows(&lines, inner) + 2;
-    let height = (content_rows as u16).min(screen.height).max(6);
+    let rows = panel_rows(&body, inner);
+    let body_rows = rows.len();
+    let action_rows = 1usize;
+    let wanted = (body_rows + action_rows + 2) as u16;
+    let height = wanted.min(screen.height).max(6);
     let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
+    clear_overlay_band(
+        frame,
         Rect {
             x: 0,
             y: popup.y,
@@ -2587,30 +2655,22 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
-    // A short window used to draw a `>` on a row it did not draw: the cursor walked
-    // onto the two Forgejo fields invisibly (M-1). The body is windowed so the
-    // cursor's own field is always among the drawn rows, and the title declares that
-    // the form is longer than the window.
     let content_height = popup.height.saturating_sub(2) as usize;
-    // The reason's own row is part of the span the window must keep drawn (w45 F1),
-    // and so is the cursor's row even when the reason names another field (w46 F1).
-    let must_first = reason_line.map_or(cursor_line, |reason| cursor_line.min(reason));
-    let must_last = reason_line.map_or(cursor_line, |reason| cursor_line.max(reason));
-    let must_rows = pushed_rows(&lines[must_first..=must_last], inner);
-    let mut first = 0usize;
-    while first < must_first
-        && pushed_rows(&lines[first..must_first], inner) + must_rows > content_height
-    {
-        first += 1;
-    }
+    let body_height = content_height.saturating_sub(action_rows).max(1);
+    // Keep the cursor's row and the reason's row drawn together, measured in the
+    // **wrapped rows** the panel really draws. A logical line can take two rows; the
+    // old logical-line window let the wrapped intro push the pinned action off the
+    // bottom border at 72×18.
+    let cursor_row = pushed_rows(&body[..cursor_line], inner);
+    let reason_row = reason_line.map(|line| pushed_rows(&body[..line], inner));
+    let must_last = reason_row.map_or(cursor_row, |reason| cursor_row.max(reason));
+    let first = if must_last < body_height {
+        0
+    } else {
+        must_last + 1 - body_height
+    };
     let above = first > 0;
-    let below = pushed_rows(&lines[first..], inner) > content_height;
-    // The action line lives in the title as well as the body: at 80x24 the intro
-    // prose pushes the body's last line off, and the key that submits the form must
-    // never be the line that disappears (P-3). The form types every ordinary
-    // character into its fields, `[`/`]` included (an IPv6 URL or a bracketed paste is
-    // data), so its declaration names the keys that really move between the dropped
-    // fields: tab and the arrows.
+    let below = first + body_height < rows.len();
     let declaration = match (above, below) {
         (true, true) => "↑↓ fields — tab/↑↓",
         (true, false) => "↑ fields — tab/↑",
@@ -2626,11 +2686,157 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App) {
             declaration,
         )
     };
+    // Draw only the body rows that fit, then the pinned action. The panel never draws
+    // past its own bottom border, and the action is part of the box at every size.
+    let mut shown: Vec<Line<'static>> = rows[first..].iter().take(body_height).cloned().collect();
+    shown.push(action);
     let block = Block::bordered()
         .title(title)
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(overlay_border_style());
     frame.render_widget(
-        Paragraph::new(Text::from(lines[first..].to_vec()))
+        Paragraph::new(Text::from(shown))
+            .style(base_style())
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+/// The endpoint/model/key editor (`E`), a bordered overlay on the Agent screen.
+fn draw_edit_agent(frame: &mut Frame, app: &App) {
+    let Some(form) = &app.edit_agent else {
+        return;
+    };
+    let Some(agent) = app.selected_agent() else {
+        return;
+    };
+    let screen = overlay_area(frame.area());
+    let width = (screen.width.saturating_sub(2)).min(76);
+    let mut body: Vec<Line> = vec![
+        Line::from(
+            "The endpoint is the full URL a run POSTs to, e.g. https://host/v1/chat/completions.",
+        ),
+        Line::from(Span::styled(
+            "Blank keeps the value. The model key is never shown.",
+            muted_style(),
+        )),
+    ];
+    let placeholders = [agent.endpoint.as_str(), agent.model.as_str()];
+    // A refusal is drawn on the row immediately under the field it is about, so the
+    // field and its reason are read together (C-1, the page map's `under the URL row`).
+    let error_after = form.error.as_ref().map(|error| {
+        if error.contains("model endpoint") {
+            0
+        } else {
+            form.cursor.min(EditAgentForm::FIELDS.len() - 1)
+        }
+    });
+    let mut cursor_line = body.len();
+    let mut error_line: Option<usize> = None;
+    for (at, (label, secret)) in EditAgentForm::FIELDS.iter().enumerate() {
+        let value = &form.fields[at];
+        let shown = if *secret {
+            let count = value.chars().count();
+            if count == 0 {
+                String::new()
+            } else {
+                format!("{} ({})", "*".repeat(count.min(12)), hidden_count(count))
+            }
+        } else {
+            value.clone()
+        };
+        let marker = if at == form.cursor { ">" } else { " " };
+        let style = if at == form.cursor {
+            selection_style()
+        } else {
+            base_style()
+        };
+        if at == form.cursor {
+            cursor_line = body.len();
+        }
+        body.push(Line::from(Span::styled(
+            format!("{marker} {label:<16} {shown}"),
+            style,
+        )));
+        if error_after == Some(at) {
+            if let Some(error) = &form.error {
+                error_line = Some(body.len());
+                body.push(Line::from(Span::styled(
+                    format!("  {error}"),
+                    error_style(),
+                )));
+            }
+        }
+        if at < placeholders.len() {
+            body.push(Line::from(Span::styled(
+                format!("  {:<16} now: {}", "", placeholders[at]),
+                muted_style(),
+            )));
+        }
+    }
+    // The action is pinned inside the border at every size (the page map's rule for
+    // this editor); only the body window scrolls, and only through fields.
+    let action = Line::from(Span::styled(
+        "  tab/up/down or enter moves on   ctrl-s writes it   esc cancels",
+        muted_style(),
+    ));
+    let inner = width.saturating_sub(2) as usize;
+    let rows = panel_rows(&body, inner);
+    let wanted = (rows.len() + 3) as u16;
+    let height = wanted.min(screen.height).max(6);
+    let popup = centered(screen, width, height);
+    clear_overlay_band(
+        frame,
+        Rect {
+            x: 0,
+            y: popup.y,
+            width: screen.width,
+            height: popup.height,
+        },
+    );
+    let content_height = popup.height.saturating_sub(2) as usize;
+    let body_height = content_height.saturating_sub(1).max(1);
+    let cursor_row = pushed_rows(&body[..cursor_line], inner);
+    let error_row = error_line.map(|line| pushed_rows(&body[..line], inner));
+    // Keep both the cursor's row and the refusal's row on screen. Three fields cannot
+    // be far enough apart for both not to fit at the floor; the `min(low)` guard keeps
+    // the pair together even if that ever changes.
+    let high = error_row.map_or(cursor_row, |error| cursor_row.max(error));
+    let low = error_row.map_or(cursor_row, |error| cursor_row.min(error));
+    let first = if high < body_height {
+        0
+    } else {
+        (high + 1 - body_height).min(low)
+    };
+    let above = first > 0;
+    let below = first + body_height < rows.len();
+    let declaration = match (above, below) {
+        (true, true) => "↑↓ fields — tab/↑↓",
+        (true, false) => "↑ fields — tab/↑",
+        (false, true) => "↓ more fields — tab/↓",
+        (false, false) => "",
+    };
+    let room = popup.width.saturating_sub(2) as usize;
+    let title = if declaration.is_empty() {
+        " edit the endpoint, model and key ".to_owned()
+    } else {
+        [
+            format!(" edit the endpoint, model and key — {declaration} "),
+            format!(" edit endpoint, model and key — {declaration} "),
+            format!(" edit endpoint — {declaration} "),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.chars().count() <= room)
+        .unwrap_or_else(|| " edit ".to_owned())
+    };
+    let mut shown: Vec<Line<'static>> = rows[first..].iter().take(body_height).cloned().collect();
+    shown.push(action);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(overlay_border_style());
+    frame.render_widget(
+        Paragraph::new(Text::from(shown))
+            .style(base_style())
             .block(block)
             .wrap(Wrap { trim: true }),
         popup,
@@ -2658,10 +2864,7 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
             prompt.subject()
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("> {shown}"),
-            selection_style(),
-        )),
+        Line::from(Span::styled(format!("> {shown}"), selection_style())),
         Line::from(""),
     ];
     match &prompt.error {
@@ -2680,8 +2883,8 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     let rows = pushed_rows(&lines, inner) + 2;
     let height = (rows as u16).min(screen.height).max(5);
     let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
+    clear_overlay_band(
+        frame,
         Rect {
             x: 0,
             y: popup.y,
@@ -2691,7 +2894,7 @@ fn draw_secret_prompt(frame: &mut Frame, app: &App) {
     );
     let block = Block::bordered()
         .title(format!(" set the {} ", prompt.subject()))
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(overlay_border_style());
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2716,10 +2919,17 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
             "The address is the Forgejo every agent in this configuration uses, and the role check runs against it.",
         ),
         Line::from(""),
-        Line::from(Span::styled(
-            format!("> {}", prompt.value),
-            selection_style(),
-        )),
+        if prompt.value.is_empty() {
+            Line::from(vec![
+                Span::styled("> ", selection_style()),
+                Span::styled(prompt.placeholder.clone(), muted_style()),
+            ])
+        } else {
+            Line::from(Span::styled(
+                format!("> {}", prompt.value),
+                selection_style(),
+            ))
+        },
         Line::from(""),
     ];
     match &prompt.error {
@@ -2738,8 +2948,8 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
     let rows = pushed_rows(&lines, inner) + 2;
     let height = (rows as u16).min(screen.height).max(5);
     let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
+    clear_overlay_band(
+        frame,
         Rect {
             x: 0,
             y: popup.y,
@@ -2749,7 +2959,7 @@ fn draw_url_prompt(frame: &mut Frame, app: &App) {
     );
     let block = Block::bordered()
         .title(" set the Forgejo instance address ")
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(overlay_border_style());
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2818,8 +3028,8 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 2;
     let height = (wanted as u16).min(screen.height).max(6);
     let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
+    clear_overlay_band(
+        frame,
         Rect {
             x: 0,
             y: popup.y,
@@ -2836,7 +3046,7 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     };
     let block = Block::bordered()
         .title(title)
-        .border_style(error_border_style());
+        .border_style(overlay_border_style());
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2879,8 +3089,8 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
     let wanted = pushed_rows(&body, inner_width) + pushed_rows(&answer, inner_width) + 2;
     let height = (wanted as u16).min(screen.height).max(6);
     let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
+    clear_overlay_band(
+        frame,
         Rect {
             x: 0,
             y: popup.y,
@@ -2891,13 +3101,21 @@ fn draw_forget_confirm(frame: &mut Frame, app: &App) {
     let inner_height = popup.height.saturating_sub(2) as usize;
     let (lines, above, below) = window_modal(app, &body, &answer, inner_width, inner_height);
     let title = if above || below {
-        fit_title(width as usize, "delete leftover secrets", None, None, above, below).0
+        fit_title(
+            width as usize,
+            "delete leftover secrets",
+            None,
+            None,
+            above,
+            below,
+        )
+        .0
     } else {
         " delete leftover secrets ".to_owned()
     };
     let block = Block::bordered()
         .title(title)
-        .border_style(error_border_style());
+        .border_style(overlay_border_style());
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -2933,7 +3151,11 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     let inner_width = width.saturating_sub(2) as usize;
     // The verb agrees with the label: `the declared steps … open`, `the instruction
     // … opens`. One fixed wording cannot be true of both (F6).
-    let verb = if action.target.map(|target| target.is_plural()).unwrap_or(false) {
+    let verb = if action
+        .target
+        .map(|target| target.is_plural())
+        .unwrap_or(false)
+    {
         "open"
     } else {
         "opens"
@@ -2996,8 +3218,8 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     let height = (wanted as u16 + 2).min(screen.height);
     let inner_height = height.saturating_sub(2) as usize;
     let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
+    clear_overlay_band(
+        frame,
         Rect {
             x: 0,
             y: popup.y,
@@ -3013,7 +3235,7 @@ fn draw_editor_confirm(frame: &mut Frame, app: &App) {
     };
     let block = Block::bordered()
         .title(title)
-        .border_style(warning_border_style());
+        .border_style(overlay_border_style());
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -3029,20 +3251,33 @@ fn draw_help(frame: &mut Frame, app: &App) {
     // (C-4). This is the same area the other overlays take.
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(80);
-    // The help is a list, so it takes the list rule: a window it can scroll, and a
-    // title that says the range. Every logical line is given room for two wrapped
-    // rows, so a windowed line is never the line that clips (P-6).
-    let capacity = (screen.height.saturating_sub(4) as usize / 2)
-        .max(1)
-        .min(HELP_LINES.len());
-    let total = HELP_LINES.len();
-    let max_first = total.saturating_sub(capacity);
+    let height = screen.height.saturating_sub(2) as usize;
+    let inner = width.saturating_sub(2) as usize;
+    let lines: Vec<Line<'static>> = HELP_LINES
+        .iter()
+        .map(|line| Line::from(help_line(app, line)))
+        .collect();
+    // The help is a list of **wrapped rows**, not two-row logical lines. Long lines
+    // can take three rows at 72/80, and the old fixed assumption clipped the last
+    // keys while claiming they were drawn. The title still counts keys, not rows, so
+    // `keys a–b of N` names the reference and not the terminal's wrap count.
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut owners: Vec<usize> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        for row in wrap_line(line, inner) {
+            rows.push(row);
+            owners.push(index);
+        }
+    }
+    let total_rows = rows.len();
+    let total_keys = lines.len();
+    let max_first = total_rows.saturating_sub(height);
     let first = app.help_offset.min(max_first);
-    let shown = capacity.min(total - first);
-    let height = (shown as u16 * 2 + 2).min(screen.height);
+    let shown = total_rows.saturating_sub(first).min(height);
+    let height = (shown as u16 + 2).min(screen.height);
     let popup = centered(screen, width, height);
-    frame.render_widget(
-        Clear,
+    clear_overlay_band(
+        frame,
         Rect {
             x: 0,
             y: popup.y,
@@ -3050,22 +3285,24 @@ fn draw_help(frame: &mut Frame, app: &App) {
             height: popup.height,
         },
     );
-    let lines: Vec<Line> = HELP_LINES[first..first + shown]
-        .iter()
-        .map(|line| Line::from(help_line(app, line)))
-        .collect();
-    let title = if total > shown {
-        format!(" keys {} ", list_title("", first, shown, total).trim())
+    let title = if total_rows > shown {
+        let first_key = owners.get(first).copied().unwrap_or(0) + 1;
+        let last_key = owners
+            .get(first + shown.saturating_sub(1))
+            .copied()
+            .unwrap_or(total_keys.saturating_sub(1))
+            + 1;
+        format!(" keys {first_key}–{last_key} of {total_keys} — [ / ] more ")
     } else {
         " keys ".to_owned()
     };
     let block = Block::bordered()
         .title(title)
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(overlay_border_style());
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block)
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(Text::from(rows[first..first + shown].to_vec()))
+            .style(base_style())
+            .block(block),
         popup,
     );
 }
@@ -3088,13 +3325,14 @@ fn help_line(app: &App, line: &str) -> String {
 const HELP_LINES: &[&str] = &[
     "Screens:   1-6 open a screen   tab / left / right (or l) move   esc back to Agents",
     "Moving:    up / down (or j / k) choose   enter open the chosen agent (or add one when none)",
+    "Words:     concurrency is how many model requests one agent may keep in flight at once; max turns is the most model turns one run may take",
     "Jump:      Home / g to the top   End / G to the bottom (on Forgejo, g clones instead)",
     "An agent:  s start   x stop   p test its endpoint   i settle its Forgejo identity",
     "           m switch tui/systemd supervision   e edit its instruction   t edit its declared steps",
     "           K start a new skill   o open its newest log   T open its newest transcript   d remove it",
     "A new one: n or a open the add-agent form (also enter on an empty list)",
-    "Panel:     [ / ] scroll the panel or note area; on Agent, Instruction and Credentials",
-    "           the arrows and PageUp/PageDown move it too, so its last line is reachable",
+    "Panel:     [ / ] and PageDown/PageUp scroll the panel or note area one page on every screen;",
+    "           the arrows move a panel too, while up/down choose a row in a list",
     "Forgejo:   c check the configured role   C check the administrator token",
     "           u set the instance address   up/down choose a repository   g clone it",
     "           P open a pull request   U update the newest one",
@@ -3103,20 +3341,32 @@ const HELP_LINES: &[&str] = &[
     "           D delete the leftover secrets of agents no longer configured (Credentials)",
     "Risk:      R read the acknowledged terms again; the record is not changed",
     "Files:     r re-read config.toml and credentials.toml   q quit   ^C quit and stop runs",
+    "Supervision: tui is a child of this UI; systemd is a user unit that keeps running when the UI exits and needs loginctl enable-linger to outlive a logout",
+    "Custody:   the configuration and credentials files are 0600, every directory the product makes is 0700, and the one systemd unit is 0644 because it holds no secret",
+    "Copying:   this configuration, its credentials, the acknowledgment and the endpoint test belong to the machine they were made on; run records do not travel with the configuration",
+    "Record:    the risk acknowledgment is a plain 0600 file, not signed; anyone who can read the directory can edit it, and its digest only shows whether the terms text changed",
+    "Skills:    one directory under skills/ per SKILL.md; a run installs every skill it finds into its own run directory",
     "Help:      ? or h or F1 show this list   esc or enter close it",
 ];
 
 /// The first-run risk acknowledgment, over everything else.
 fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let screen = frame.area();
-    // The modal sits over the body, above the footer, so the status line that says
-    // what answers the screen stays visible while the modal is up. At least one cell
-    // of margin on every side keeps it off the panel edge even on a narrow terminal.
+    // The overlay may use the body and the action row, but never the footer: the
+    // status sentence and the overlay's own key line stay visible. At 80×24 this is
+    // 19 rows, enough for the eight terms and the record facts; at 72×18 the body
+    // scrolls and only the answer row is pinned (w44 F2, M1).
+    // Leave the footer's status rows visible, and at the floor leave enough of the
+    // body for the terms to be a real scrolling surface; at 80×24 the shorter inset
+    // still holds every bullet and the record path.
+    // At 80×24 the full read-only record fits in the taller inset; at the 72×18 floor
+    // the smaller inset keeps the terms a real scrolling surface.
+    let footer = if screen.height >= 24 { 5 } else { 7 };
     let available = Rect {
         x: screen.x,
-        y: screen.y.saturating_add(3),
+        y: screen.y,
         width: screen.width,
-        height: screen.height.saturating_sub(8),
+        height: screen.height.saturating_sub(footer).max(3),
     };
     let width = (available.width.saturating_sub(2)).min(78);
     let inner_width = width.saturating_sub(2) as usize;
@@ -3135,19 +3385,18 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
             selection_style(),
         )));
         if let Some(record) = app.ack_record_line() {
-            answer.push(Line::from(Span::styled(
+            prose.push(Line::from(Span::styled(
                 format!("  {record}"),
                 muted_style(),
             )));
         }
         // C-4: the record is read here, so what it can and cannot prove is said here.
-        // The same sentence is in the hub's note area and the page map.
-        answer.push(Line::from(Span::styled(
+        prose.push(Line::from(Span::styled(
             format!("  {}", risk::RECORD_LIMIT),
             muted_style(),
         )));
         if let Some(check) = app.ack_state.terms_check() {
-            answer.push(Line::from(Span::styled(
+            prose.push(Line::from(Span::styled(
                 format!("  {check}"),
                 muted_style(),
             )));
@@ -3157,10 +3406,10 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
             "  y — I understand, record it once        n — not now",
             selection_style(),
         )));
-        answer.push(Line::from(
+        prose.push(Line::from(
             "  Until it is recorded, starting an agent stays refused.",
         ));
-        answer.push(Line::from(format!(
+        prose.push(Line::from(format!(
             "  The record will be written to {}",
             breakable_path(&app.ack_path.display().to_string())
         )));
@@ -3168,58 +3417,39 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
 
     // Size to the content, not to a fixed guess: the record path is a wrapped line,
     // and a modal that clips it ends the sentence without its object (W-7). The
-    // available area is already inset from the panel, so it is the cap.
-    //
-    // w44 F2: the review dropped three of the eight terms bullets and declared `more
-    // below — press ]`, but the box was capped at a fixed height, so
-    // enlarging revealed nothing — the declaration lied. The box is sized to what it
-    // holds now, so the declaration is true: a bigger window really does show the
-    // dropped bullets, and only the advertised floor has anything to declare.
+    // available area is the cap.
     let wanted = pushed_rows(&prose, inner_width) + pushed_rows(&answer, inner_width) + 2;
     let height = (wanted as u16).min(available.height).max(3);
     let popup = centered(available, width, height);
 
-    // F-1: the modal is a bordered panel, so it obeys the same rule as every other
-    // one — whole logical lines, never half a wrapped line. The answer line is the
-    // modal's own key, so it is the last row to go: the prose is dropped from the
-    // bottom first, then the sentences that follow the answer, and the title says
-    // when anything was dropped (`more below — press ]`). A person at the
-    // floor therefore never reads a sentence that stops mid-thought in silence.
+    // The body scrolls; the answer row is last and pinned. A box that does not need
+    // to scroll draws every term and record fact, so `more below` never lies.
     let inner_height = popup.height.saturating_sub(2) as usize;
     let (lines, above, below) = window_modal(app, &prose, &answer, inner_width, inner_height);
 
-    // w44 F3: the read-only review is not the first run. A record already exists and
-    // the acknowledgment is on file, so the overlay is titled for the state it is in;
-    // the terms text (and therefore the digest) keeps the first-run title it is
-    // written under.
     let base = if app.ack_review {
         risk::REVIEW_TITLE
     } else {
         risk::TITLE
     };
     let title = if above || below {
-        // The declaration is the part that must survive, so it is fitted to the box
-        // before it is drawn (Y-1).
         fit_title(popup.width as usize, base, None, None, above, below).0
     } else {
         format!(" {base} ")
     };
     let block = Block::bordered()
         .title(title)
-        .border_style(warning_border_style());
-    // The modal owns every row it covers: clear the full terminal width for those
-    // rows before drawing it, so the panel's border and wrapped notes cannot survive
-    // beside it and collide with its own edges. The modal is drawn with at least one
-    // cell of margin from the panel edge.
+        .border_style(overlay_border_style());
     let owned = Rect {
         x: 0,
         y: popup.y,
         width: available.width,
         height: popup.height,
     };
-    frame.render_widget(Clear, owned);
+    clear_overlay_band(frame, owned);
     frame.render_widget(
         Paragraph::new(Text::from(lines))
+            .style(base_style())
             .block(block)
             .wrap(Wrap { trim: true }),
         popup,
@@ -3294,6 +3524,23 @@ fn overlay_area(screen: Rect) -> Rect {
         y: screen.y.saturating_add(3),
         width: screen.width,
         height: screen.height.saturating_sub(8),
+    }
+}
+
+/// Clear an overlay's full-width band and paint every cell of it with the product's
+/// own background.
+///
+/// `Clear` resets a cell to the terminal's default, so a popup narrower than the band
+/// it clears used to leave terminal-default strips beside the box — white beside black
+/// on a light terminal. Painting the whole band keeps the explicit-background promise
+/// true under every overlay, not only on the body behind it.
+fn clear_overlay_band(frame: &mut Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    let buffer = frame.buffer_mut();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            buffer[(x, y)].set_style(base_style());
+        }
     }
 }
 
@@ -3393,12 +3640,21 @@ fn form_title(width: usize, base: &str, declaration: &str) -> String {
 /// file name in half (H-5).
 fn field(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{label:<LABEL_WIDTH$}"),
-            muted_style(),
-        ),
+        Span::styled(format!("{label:<LABEL_WIDTH$}"), muted_style()),
         Span::raw(breakable_path(value)),
     ])
+}
+
+/// A labelled value whose own sentence already carries a `—` separator.
+///
+/// The path stays on the label's row and the product's sentence about it starts on
+/// its own continuation row, so a long path cannot split the sentence's last words
+/// across a wrap (K-16). Both rows keep the label indent.
+fn field_split(label: &str, value: &str) -> Vec<Line<'static>> {
+    match value.split_once(" — ") {
+        Some((head, tail)) => vec![field(label, head), field("", &format!("— {tail}"))],
+        None => vec![field(label, value)],
+    }
 }
 
 /// A string whose `/` separators may break when a panel is too narrow.
@@ -3415,18 +3671,15 @@ fn breakable_path(text: &str) -> String {
 /// The sentence carries its own meaning; it never opens with a word from inside the
 /// product (D-5).
 fn placeholder(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("{text}."),
-        warning_style(),
-    ))
+    Line::from(Span::styled(format!("{text}."), warning_style()))
 }
 
 /// Why there is no agent to show.
 fn no_agent_text(app: &App) -> String {
     match &app.config_error {
-        Some(error) => format!(
-            "no agent to show: {error} — fix the file, then press r to read it again"
-        ),
+        Some(error) => {
+            format!("no agent to show: {error} — fix the file, then press r to read it again")
+        }
         None => "no agent to show: the configuration lists none".to_owned(),
     }
 }
@@ -3451,24 +3704,6 @@ mod tests {
         (0..count)
             .map(|at| Line::from(format!("line {at}")))
             .collect()
-    }
-
-    #[test]
-    fn a_bordered_panel_never_draws_half_a_wrapped_line() {
-        // W-3: at 80×24 the identity report was the panel's last row, wrapped and cut
-        // at the border mid-sentence. A logical line that does not fit whole is not
-        // drawn at all; the title's `more below` says the rest exists.
-        let long = vec![Line::from("short"), Line::from("x".repeat(30))];
-        // 1 + 3 wrapped rows fit exactly at height 4: both logical lines are kept.
-        assert_eq!(fit_panel_lines(long.clone(), 10, 4).len(), 2);
-        // One row fewer: the wrapped line cannot be drawn whole, so it is dropped.
-        assert_eq!(
-            fit_panel_lines(long, 10, 3).len(),
-            1,
-            "a partial wrap must not be drawn"
-        );
-        // The helper never invents rows.
-        assert_eq!(fit_panel_lines(lines(5), 20, 100).len(), 5);
     }
 
     #[test]
