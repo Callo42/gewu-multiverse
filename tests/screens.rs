@@ -3272,16 +3272,29 @@ fn a_removed_agents_records_are_listed_and_marked() {
         "the removed agent's records are listed, not only counted (R-5)"
     );
     app.show(Screen::Runs);
-    let screen = render_scrolled_to(100, 30, &mut app, "no longer lists");
+    // The note wraps with the length of the scratch path, so the sentence can span a
+    // page boundary or a row break. Read every page until its last phrase is drawn and
+    // assert on what was read, with the row separators removed.
+    let mut read = String::new();
+    for _ in 0..40 {
+        let page = render_at(100, 30, &app);
+        read.push_str(&page);
+        if normalised(&read).contains(&normalised("are marked `*`")) {
+            break;
+        }
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+    }
+    let flat = normalised(&read);
     assert!(
-        screen.contains("4 run records on disk"),
-        "the records are not counted: {screen}"
+        flat.contains(&normalised("4 run records on disk")),
+        "the records are not counted: {read}"
     );
     assert!(
-        screen.contains("no longer lists") && screen.contains("are marked `*`"),
-        "the unconfigured records are not named as listed: {screen}"
+        flat.contains(&normalised("no longer lists"))
+            && flat.contains(&normalised("are marked `*`")),
+        "the unconfigured records are not named as listed: {read}"
     );
-    assert!(screen.contains('*'), "the rows carry no marker: {screen}");
+    assert!(read.contains('*'), "the rows carry no marker: {read}");
 }
 
 #[test]
