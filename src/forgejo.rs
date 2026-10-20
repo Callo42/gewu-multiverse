@@ -181,8 +181,14 @@ pub struct PullRequest {
     pub html_url: Option<String>,
     /// The head branch.
     pub head: String,
+    /// The head repository's full name, when the instance names it.
+    pub head_repo: Option<String>,
     /// The base branch.
     pub base: String,
+    /// The base repository's full name, when the instance names it.
+    pub base_repo: Option<String>,
+    /// The login that opened the request, when the instance names it.
+    pub author: Option<String>,
 }
 
 impl PullRequest {
@@ -715,7 +721,7 @@ impl ForgejoClient {
             401 => Err(ForgejoError::BadToken { status }),
             403 => Err(ForgejoError::Forbidden {
                 status,
-                message: excerpt(&body, 300),
+                message: reply_message(&body, 300),
             }),
             404 => Err(ForgejoError::NotFound {
                 what: path.to_owned(),
@@ -723,7 +729,7 @@ impl ForgejoClient {
             }),
             status if !(200..=299).contains(&status) => Err(ForgejoError::Server {
                 status,
-                message: excerpt(&body, 300),
+                message: reply_message(&body, 300),
             }),
             _ => Ok(body),
         }
@@ -836,6 +842,32 @@ fn parse<T: serde::de::DeserializeOwned>(body: &str, what: &str) -> Result<T, Fo
     })
 }
 
+/// The provider's own message from an error reply, as one bounded line.
+///
+/// A Forgejo error envelope is read for `message`, `error.message` or a string
+/// `error`; the envelope itself is never pasted into a screen or a status line. A
+/// plain-text body is its own message, and a JSON body with no message leaves the
+/// HTTP status as the whole fact.
+fn reply_message(body: &str, limit: usize) -> String {
+    let message = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                value
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_owned(),
+        Err(_) => body.to_owned(),
+    };
+    let one_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    excerpt(&one_line, limit)
+}
+
 /// A bounded excerpt of some text, with a marker when it was cut.
 fn excerpt(text: &str, limit: usize) -> String {
     crate::model::excerpt(text, limit)
@@ -900,12 +932,36 @@ struct WirePull {
     html_url: Option<String>,
     head: WireRef,
     base: WireRef,
+    #[serde(default)]
+    user: Option<WireUser>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WireRef {
     #[serde(rename = "ref")]
     reference: String,
+    #[serde(default)]
+    repo: Option<WireRepoName>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireRepoName {
+    #[serde(default)]
+    full_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireUser {
+    #[serde(default)]
+    login: Option<String>,
+}
+
+impl WireRef {
+    fn full_name(&self) -> Option<String> {
+        self.repo
+            .as_ref()
+            .and_then(|repo| repo.full_name.clone())
+    }
 }
 
 impl From<WirePull> for PullRequest {
@@ -915,8 +971,11 @@ impl From<WirePull> for PullRequest {
             title: wire.title,
             state: wire.state,
             html_url: wire.html_url,
+            head_repo: wire.head.full_name(),
             head: wire.head.reference,
+            base_repo: wire.base.full_name(),
             base: wire.base.reference,
+            author: wire.user.and_then(|user| user.login),
         }
     }
 }

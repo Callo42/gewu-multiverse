@@ -368,6 +368,44 @@ pub fn commits_ahead_against(
     Ok((count, base.to_owned()))
 }
 
+/// The subjects of the commits `branch` has beyond `base`, newest first.
+///
+/// This is the neutral text a proposal falls back to when no hand-written file and no
+/// run's push witness name the branch. The same measured base as the gate is used, and
+/// the list is bounded so a long branch cannot turn a preview into a log.
+pub fn commit_subjects_ahead(
+    repository: &Path,
+    branch: &str,
+    base: &str,
+    limit: usize,
+) -> Result<(Vec<String>, String), WorkspaceError> {
+    let remote_ref = format!("refs/remotes/origin/{base}");
+    let measured = if run_git(
+        &["rev-parse", "--verify", "--quiet", &remote_ref],
+        repository,
+        None,
+    )
+    .is_ok()
+    {
+        format!("origin/{base}")
+    } else {
+        base.to_owned()
+    };
+    let range = format!("{measured}..{branch}");
+    let text = run_git(
+        &["log", "--format=%s", "-n", &limit.max(1).to_string(), &range],
+        repository,
+        None,
+    )?;
+    let subjects = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok((subjects, measured))
+}
+
 fn parse_commit_count(spec: &str, text: &str) -> Result<usize, WorkspaceError> {
     text.trim()
         .parse::<usize>()

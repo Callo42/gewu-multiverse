@@ -280,6 +280,15 @@ fn finish_run(dir: &Path, run_id: &str) {
 }
 
 /// Write a run's plan naming the agent workspace root, as the product's own start does.
+fn publish_witness(run_dir: &Path, branch: &str) {
+    gewu_multiverse::run::write_push_witness(
+        run_dir,
+        branch,
+        &format!("refs/remotes/origin/{branch}"),
+    )
+    .expect("the push witness is written");
+}
+
 fn write_plan(root: &Path, run_dir: &Path, run_id: &str) {
     let layout = Layout::rooted_at(root.to_path_buf());
     let paths = layout.agent("scribe").expect("the agent path");
@@ -437,9 +446,13 @@ fn p_refuses_a_witnessed_run_when_the_branch_is_not_on_the_remote() {
 
 #[test]
 fn p_shows_title_body_and_branch_pair_and_writes_only_on_y() {
-    let stub = Stub::start(vec![StubReply::json(
-        r#"{"number":4,"title":"lab: first work","state":"open","head":{"ref":"feature"},"base":{"ref":"main"}}"#,
-    )]);
+    let stub = Stub::start(vec![
+        StubReply::json("[]"),
+        StubReply::json("[]"),
+        StubReply::json(
+            r#"{"number":4,"title":"lab: first work","state":"open","head":{"ref":"feature"},"base":{"ref":"main"}}"#,
+        ),
+    ]);
     let root = scratch("p-preview");
     let config = endpoint_config(&stub.url(), "http://127.0.0.1:9/v1/chat/completions");
     let mut app = app_with(&root, &config);
@@ -451,12 +464,13 @@ fn p_shows_title_body_and_branch_pair_and_writes_only_on_y() {
         gewu_multiverse::workspace::branch_on_remote(&clone, "feature"),
         "the fixture's real push left no remote-tracking ref"
     );
-    write_run(
+    let run_dir = write_run(
         &root,
         "scribe",
         "run-1700000000002-0002-1",
         "first line of the reply\n\nand the body",
     );
+    publish_witness(&run_dir, "feature");
     app.reload();
     app.role_check = Some(Ok(role_check("lab/analysis-code", &stub.url())));
     app.show(Screen::Forgejo);
@@ -467,10 +481,12 @@ fn p_shows_title_body_and_branch_pair_and_writes_only_on_y() {
         "{}",
         app.status
     );
-    assert_eq!(
-        stub.requests().len(),
-        0,
-        "a write happened before confirmation"
+    let before = stub.requests();
+    assert_eq!(before.len(), 1, "one list call was expected: {before:?}");
+    assert_eq!(before[0].method, "GET", "{before:?}");
+    assert!(
+        before.iter().all(|request| request.method != "POST"),
+        "a write happened before confirmation: {before:?}"
     );
     let preview = render_at(100, 30, &app);
     assert!(
@@ -489,7 +505,7 @@ fn p_shows_title_body_and_branch_pair_and_writes_only_on_y() {
     );
 
     app.on_key(KeyEvent::from(KeyCode::Char('n')));
-    assert_eq!(stub.requests().len(), 0, "n wrote a pull request");
+    assert_eq!(stub.requests().len(), 1, "n wrote a pull request");
     assert!(app.status.contains("nothing was written"), "{}", app.status);
 
     app.on_key(KeyEvent::from(KeyCode::Char('P')));
@@ -497,11 +513,12 @@ fn p_shows_title_body_and_branch_pair_and_writes_only_on_y() {
     let requests = stub.requests();
     assert_eq!(
         requests.len(),
-        1,
-        "one create request was expected: {requests:?}"
+        3,
+        "a second list and one create request were expected: {requests:?}"
     );
-    assert!(requests[0].path.ends_with("/pulls"), "{}", requests[0].path);
-    let body = &requests[0].body;
+    assert_eq!(requests[2].method, "POST", "{requests:?}");
+    assert!(requests[2].path.ends_with("/pulls"), "{}", requests[2].path);
+    let body = &requests[2].body;
     assert!(body.contains("\"head\":\"feature\""), "{body}");
     assert!(body.contains("\"base\":\"main\""), "{body}");
     assert!(body.contains("first line of the reply"), "{body}");
@@ -510,9 +527,12 @@ fn p_shows_title_body_and_branch_pair_and_writes_only_on_y() {
 
 #[test]
 fn a_branch_pushed_by_an_earlier_run_can_be_opened_after_a_later_run_does_not_push() {
-    let stub = Stub::start(vec![StubReply::json(
-        r#"{"number":5,"title":"lab: earlier branch","state":"open","head":{"ref":"feature"},"base":{"ref":"main"}}"#,
-    )]);
+    let stub = Stub::start(vec![
+        StubReply::json("[]"),
+        StubReply::json(
+            r#"{"number":5,"title":"lab: earlier branch","state":"open","head":{"ref":"feature"},"base":{"ref":"main"}}"#,
+        ),
+    ]);
     let root = scratch("p-earlier-push");
     let config = endpoint_config(&stub.url(), "http://127.0.0.1:9/v1/chat/completions");
     let mut app = app_with(&root, &config);
@@ -539,13 +559,11 @@ fn a_branch_pushed_by_an_earlier_run_can_be_opened_after_a_later_run_does_not_pu
         "{}",
         app.status
     );
-    assert_eq!(
-        stub.requests().len(),
-        0,
-        "P wrote before the preview was answered"
-    );
+    let before = stub.requests();
+    assert_eq!(before.len(), 1, "the lookup did not run: {before:?}");
+    assert_eq!(before[0].method, "GET", "{before:?}");
     app.on_key(KeyEvent::from(KeyCode::Char('y')));
-    assert_eq!(stub.requests().len(), 1, "the pull request was not opened");
+    assert_eq!(stub.requests().len(), 2, "the pull request was not opened");
 }
 
 #[test]
@@ -571,11 +589,11 @@ fn a_clone_note_keeps_both_legend_rows_with_a_populated_list() {
             "the first key row is missing after a clone at {width}x{height}:\n{screen}"
         );
         assert!(
-            flat.contains(&normalised("up/down choose one")),
+            flat.contains(&normalised("up/down choose")),
             "the second key row is missing after a clone at {width}x{height}:\n{screen}"
         );
         assert!(
-            flat.contains(&normalised("U update the newest")),
+            flat.contains(&normalised("U update this branch's request")),
             "the second row lost its object after a clone at {width}x{height}:\n{screen}"
         );
     }
@@ -948,7 +966,9 @@ fn a_sibling_clones_push_does_not_stand_for_this_clone() {
 
 #[test]
 fn a_role_check_that_changes_the_default_branch_drops_the_cached_p() {
-    let stub = Stub::start(role_check_replies("feature"));
+    let mut replies = role_check_replies("feature");
+    replies.push(StubReply::json("[]"));
+    let stub = Stub::start(replies);
     let root = scratch("p-role-change");
     let config = endpoint_config(&stub.url(), "http://127.0.0.1:9/v1/chat/completions");
     let mut app = app_with(&root, &config);
@@ -993,8 +1013,8 @@ fn a_role_check_that_changes_the_default_branch_drops_the_cached_p() {
     );
     assert_eq!(
         stub.requests().len(),
-        2,
-        "the role check made the only requests; P wrote something"
+        3,
+        "the role check and its lookup made the only requests; P wrote something"
     );
 }
 
@@ -1102,10 +1122,12 @@ fn every_overlay_footer_names_only_its_own_keys() {
                     repository: "lab/analysis-code".to_owned(),
                     namespace: "lab".to_owned(),
                     name: "analysis-code".to_owned(),
+                    number: None,
                     branch: "feature".to_owned(),
                     base: "main".to_owned(),
                     title: "the proposed title".to_owned(),
                     body: "the proposed body".to_owned(),
+                    text_source: "pull-request.txt".to_owned(),
                 });
             }),
         ),
@@ -1483,11 +1505,18 @@ fn the_remove_confirmation_never_draws_half_a_wrapped_sentence() {
         .expect("the agent path");
     fs::create_dir_all(paths.config_dir()).expect("the agent directory");
     fs::create_dir_all(app.state_root().join("scribe")).expect("the run directory");
+    gewu_multiverse::credentials::record_secret(
+        &app.credentials_path,
+        Some("model_keys"),
+        "scribe",
+        "synthetic-model-key",
+    )
+    .expect("the model key is written");
     let name = "scribe".to_owned();
     app.confirm_remove = Some(name.clone());
     let answer = "y or enter remove it";
-    let head = "Its secret in";
-    let tail = "is left too";
+    let head = "its model key in";
+    let tail = "press D on the Credentials screen";
     let first = render_at(72, 18, &app);
     assert!(
         first.contains(answer),
@@ -1500,7 +1529,7 @@ fn the_remove_confirmation_never_draws_half_a_wrapped_sentence() {
         "the credentials sentence is drawn only in part above the answer:\n{first}"
     );
     let mut seen = first_flat.contains(head) && first_flat.contains(tail);
-    for _ in 0..6 {
+    for _ in 0..40 {
         if seen {
             break;
         }

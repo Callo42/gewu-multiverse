@@ -746,21 +746,25 @@ fn a_server_error_names_the_next_step_where_it_is_drawn() {
 
     let hub = flat(&render_at(120, 40, &app));
     assert!(
-        hub.contains("press s to try again") && hub.contains("p to test the endpoint"),
+        hub.contains("press p to test the endpoint again"),
         "the hub's server-error note gives no next step:\n{hub}"
+    );
+    assert!(
+        !hub.contains("press s to try again"),
+        "the hub's endpoint advice starts a run:\n{hub}"
     );
 
     app.show(Screen::AgentConfig);
     let detail = flat(&render_at(120, 40, &app));
     assert!(
-        detail.contains("press s to try again") && detail.contains("p to test the endpoint"),
+        detail.contains("press p to test the endpoint again"),
         "the Agent screen's server-error note gives no next step:\n{detail}"
     );
 
     app.show(Screen::Runs);
     let runs = flat(&render_at(120, 40, &app));
     assert!(
-        runs.contains("press s to try again") && runs.contains("p to test the endpoint"),
+        runs.contains("press p to test the endpoint again"),
         "the Runs screen's server-error note gives no next step:\n{runs}"
     );
 
@@ -777,8 +781,12 @@ fn a_server_error_names_the_next_step_where_it_is_drawn() {
     };
     let line = test.describe();
     assert!(
-        line.contains("press s to try again") && line.contains("p to test the endpoint"),
+        line.contains("press p to test the endpoint again"),
         "the endpoint-test line gives no next step: {line}"
+    );
+    assert!(
+        !line.contains("press s to try again"),
+        "the endpoint-test line starts a run: {line}"
     );
     assert!(
         app.supervisor.unfinished_run("two").is_none(),

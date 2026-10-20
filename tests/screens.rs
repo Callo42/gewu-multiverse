@@ -462,10 +462,11 @@ fn the_forgejo_screen_shows_a_role_check_and_an_identity_plainly() {
     app.show(Screen::Forgejo);
     let screen = render(&app);
     show("Forgejo (checked)", &app);
-    assert!(screen.contains("administrative view"), "{screen}");
+    assert!(screen.contains("as an administrator"), "{screen}");
     assert!(screen.contains("root/private"), "{screen}");
     assert!(screen.contains("private"), "{screen}");
-    assert!(screen.contains("root sees 2 repositories"), "{screen}");
+    let flat = normalised(&screen);
+    assert!(flat.contains(&normalised("root sees 2 repositories")), "{screen}");
     assert!(screen.contains("gewu-scribe"), "{screen}");
     assert!(screen.contains("(created"), "{screen}");
 
@@ -576,7 +577,8 @@ fn the_endpoint_test_shows_a_success_and_a_clear_failure_with_its_class() {
     let test = app.endpoint_test.clone().expect("an endpoint test result");
     assert!(test.result.is_ok(), "{}", app.status);
     assert!(
-        app.status.contains("endpoint test for `scribe`: ok"),
+        app.status
+            .contains(&format!("endpoint {} — model {} — ok", test.endpoint, test.model)),
         "{}",
         app.status
     );
@@ -1322,17 +1324,20 @@ fn the_removal_confirmation_only_promises_files_that_exist() {
     app.show_acknowledgment = false;
     app.on_key(KeyEvent::from(KeyCode::Char('d')));
     let no_files = render(&app);
-    assert!(no_files.contains("has no files"), "{no_files}");
     assert!(!no_files.contains("are left on disk"), "{no_files}");
+    assert!(no_files.contains("Nothing of it is left on disk"), "{no_files}");
     app.on_key(KeyEvent::from(KeyCode::Esc));
 
     let paths = app.ensure_agent("scribe").expect("the agent is prepared");
     fs::write(paths.instruction(), "typed\n").expect("the instruction is written");
     app.on_key(KeyEvent::from(KeyCode::Char('d')));
     let with_files = render(&app);
-    // A path that may break at `/` can move the phrase to the next row; the promise
-    // itself is what the test is about.
-    assert!(with_files.contains("left on disk"), "{with_files}");
+    // A path may break at `/` and a phrase may wrap; the promise itself is what the
+    // test is about.
+    assert!(
+        normalised(&with_files).contains(&normalised("left on disk")),
+        "{with_files}"
+    );
 }
 
 /// One repository, as a role check reports it, for the windowing tests.
@@ -1825,7 +1830,7 @@ fn every_panel_and_note_area_that_truncates_declares_it_at_eighty_columns() {
     // The unread Forgejo panel fits at 80×24 after the legend was compacted (Y-8):
     // nothing is below the fold, so there is no declaration to make, and the legend
     // must be drawn whole.
-    assert!(forgejo.contains("up/down choose one"), "{forgejo}");
+    assert!(forgejo.contains("up/down choose"), "{forgejo}");
     assert!(forgejo.contains("c role"), "{forgejo}");
 
     // The Agents note area has no border to carry a title, so its own last row says so
@@ -2053,7 +2058,9 @@ concurrency = 1
     // The footer carries it at the minimum (the sentence wraps, so the whole phrase is
     // not contiguous); the transport's errno is nowhere on the screen.
     assert!(
-        normalised(&screen).contains(&normalised("endpoint test for `scribe`")),
+        normalised(&screen).contains(&normalised(
+            "endpoint http://127.0.0.1:1/v1/chat/completions — model example-model"
+        )),
         "{screen}"
     );
     assert!(!screen.contains("os error"), "{screen}");
@@ -2573,7 +2580,7 @@ fn an_endpoint_test_is_dated_and_marked_when_the_endpoint_changed() {
     assert!(stale.contains("not current"), "{stale}");
     let rows = gewu_multiverse::ui::panel_rows_text(&app).join(" ");
     let flat = rows.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(flat.contains("press p to test it again"), "{stale}");
+    assert!(flat.contains("press p to test the current ones"), "{stale}");
 }
 
 #[test]
@@ -2595,7 +2602,7 @@ fn a_removal_names_the_run_records_and_the_secret_and_credentials_deletes_it() {
     );
 
     let state_dir = app.state_root().join("scribe");
-    fs::create_dir_all(&state_dir).expect("a run record directory");
+    fs::create_dir_all(state_dir.join("run-1700000000001-0001-1")).expect("a run record directory");
     let declared = app.selected_name().expect("the selected agent");
     app.confirm_remove = Some(declared);
     app.on_key(KeyEvent::from(KeyCode::Char('y')));
@@ -2624,11 +2631,12 @@ fn a_removal_names_the_run_records_and_the_secret_and_credentials_deletes_it() {
     // The removal confirmation names the run records and the credentials file too.
     let remaining = app.selected_name().expect("a remaining agent");
     app.ensure_agent(&remaining).expect("the agent files");
-    fs::create_dir_all(app.state_root().join(&remaining)).expect("a run record directory");
+    fs::create_dir_all(app.state_root().join(&remaining).join("run-1700000000002-0002-1"))
+        .expect("a run record directory");
     app.confirm_remove = Some(remaining);
     app.show(Screen::Agents);
     let boxed = render_at(80, 24, &app);
-    assert!(boxed.contains("run records under"), "{boxed}");
+    assert!(boxed.contains("run record"), "{boxed}");
 }
 
 #[test]
@@ -2787,7 +2795,7 @@ fn the_forgejo_panel_scrolls_to_its_repository_list_and_legend_below_eighty_by_t
         for _ in 0..=total {
             let reached = render_at(width, height, &app);
             saw_repo |= reached.contains("uxmember/") || reached.contains("uxadmin/");
-            saw_legend |= reached.contains("up/down choose one");
+            saw_legend |= reached.contains("up/down choose");
             app.on_key(KeyEvent::from(KeyCode::Char(']')));
         }
         assert!(saw_repo, "{width}x{height}: no repository row is reachable");
@@ -3480,7 +3488,12 @@ fn the_acknowledgment_modal_is_whole_or_declares_itself_at_the_floor() {
     // It now follows the same rule as every bordered panel: whole logical lines, and
     // `more below; enlarge the window` in the title when any was dropped, with the
     // answer line kept as the last drawn row. This is the guard at the floor.
-    let root = scratch("ack-floor");
+    // The modal's record-path row is part of what must fit at 80×24, so this guard
+    // keeps its configuration root short instead of varying with the harness's
+    // temporary directory. A very long TMPDIR is a path test, not a modal-width test.
+    let root = std::path::Path::new("/tmp").join(format!("gewu-ack-floor-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("the short acknowledgment root is created");
     let mut app = app(&root);
     assert!(app.show_acknowledgment, "the first-run modal is up");
     // At the advertised minimum (80×24) the modal is whole and declares nothing.
@@ -3521,6 +3534,7 @@ fn the_acknowledgment_modal_is_whole_or_declares_itself_at_the_floor() {
         review.contains("esc closes this overlay; [ and ] scroll; the record is unchanged"),
         "the review modal's footer disagrees with its own close line: {review}"
     );
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -3898,8 +3912,10 @@ fn the_endpoint_test_says_it_is_in_flight_and_stamps_the_result() {
     );
     app.wait_for_probe();
     let after = render_at(100, 40, &app);
+    let after = normalised(&after);
     assert!(
-        after.contains("the endpoint answered") && after.contains("tested just now"),
+        after.contains(&normalised("the endpoint answered"))
+            && after.contains(&normalised("tested just now")),
         "the finished result is not shown and stamped:\n{after}"
     );
 }

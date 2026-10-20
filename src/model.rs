@@ -320,11 +320,15 @@ pub enum ModelError {
         retry_after_secs: Option<u64>,
     },
     /// The endpoint answered with some other error status.
-    #[error("the endpoint answered HTTP {status}: {message}")]
+    ///
+    /// The message is the provider's own, reduced to one bounded line; a reply that
+    /// carries no message leaves the HTTP status as the whole fact, never the raw
+    /// JSON envelope.
+    #[error("the endpoint answered HTTP {status}{detail}", detail = if .message.is_empty() { String::new() } else { format!(": {}", .message) })]
     Server {
         /// The status the endpoint answered with.
         status: u16,
-        /// A bounded, redacted excerpt of what it said.
+        /// The provider's message, bounded to one line, or empty.
         message: String,
     },
     /// The endpoint answered, but not with a usable chat completion.
@@ -478,7 +482,7 @@ pub fn chat(
         status if !(200..=299).contains(&status) => {
             return Err(ModelError::Server {
                 status,
-                message: excerpt(&redacted_body, 400),
+                message: provider_message(&redacted_body).unwrap_or_default(),
             });
         }
         _ => {}
@@ -685,6 +689,31 @@ fn missing_model_key_agent(text: &str) -> Option<&str> {
     let rest = &text[start..];
     let end = rest.find('`')?;
     Some(&rest[..end])
+}
+
+/// The provider's own message from an error reply, as one bounded line.
+///
+/// A JSON error envelope is read for `error.message`, `message` or a string
+/// `error`; the envelope itself is never shown. A plain-text body is its own
+/// message. A JSON body with no message is no message at all, so the screen keeps
+/// the HTTP status as the whole fact.
+fn provider_message(body: &str) -> Option<String> {
+    let message = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => value
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+            .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)?,
+        Err(_) => body.to_owned(),
+    };
+    let one_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        None
+    } else {
+        Some(excerpt(&one_line, 200))
+    }
 }
 
 /// A bounded excerpt of some text, with a marker when it was cut.

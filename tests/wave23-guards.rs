@@ -296,6 +296,23 @@ fn the_review_draws_its_terms_and_is_titled_for_its_state() {
 fn a_confirmation_keeps_its_answer_at_the_floor() {
     let root = scratch("confirm-floor");
     let mut app = app_with(&root, ONE_AGENT);
+    // Make the inventory long enough that a floor window really has to drop a body
+    // line: the guard is about the declaration when content is dropped, not about a
+    // confirmation that now fits because it no longer promises absent files.
+    let paths = app.ensure_agent("scribe").expect("the agent is prepared");
+    for name in ["instruction.md", "steps.txt", "one.txt", "two.txt"] {
+        fs::write(paths.config_dir().join(name), "x\n").expect("an agent file");
+    }
+    for run in ["run-1700000000001-0001-1", "run-1700000000002-0002-1"] {
+        fs::create_dir_all(app.state_root().join("scribe").join(run)).expect("a run record");
+    }
+    gewu_multiverse::credentials::record_secret(
+        &app.credentials_path,
+        Some("model_keys"),
+        "scribe",
+        "synthetic-model-key",
+    )
+    .expect("the model key is written");
     app.on_key(key(KeyCode::Char('d')));
     assert!(app.confirm_remove.is_some(), "`d` did not open the confirmation");
     let floor = render_at(72, 18, &app);
@@ -345,7 +362,11 @@ fn a_record_made_on_another_machine_says_what_to_do() {
     // The way back lives with the full record facts, in the overlay that reads them.
     app.review_acknowledgment();
     let review = render_at(160, 60, &app);
-    let flat = review.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = review
+        .replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         flat.contains("start again"),
         "the review sentence does not carry the way back:\n{review}"

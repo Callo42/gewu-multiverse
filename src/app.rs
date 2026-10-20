@@ -503,6 +503,8 @@ pub struct PullRequestPreview {
     pub namespace: String,
     /// The repository's own name.
     pub name: String,
+    /// The pull request this update acts on; `None` means `P` opens a new one.
+    pub number: Option<u64>,
     /// The branch the pull request would come from.
     pub branch: String,
     /// The branch it would go into.
@@ -511,6 +513,246 @@ pub struct PullRequestPreview {
     pub title: String,
     /// The proposed body, whole; the overlay draws its beginning and scrolls.
     pub body: String,
+    /// Where the title and body came from, in a few words.
+    pub text_source: String,
+}
+
+/// The repository, agent and branch pair a pull request action is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullRequestTarget {
+    repository: crate::forgejo::Repository,
+    agent: String,
+    branch: String,
+    base: String,
+    destination: PathBuf,
+}
+
+/// Whether one open request is for this clone's branch pair in the same repository.
+///
+/// A head that names no repository is not a match: the product cannot prove that the
+/// request comes from this clone's repository, so it must not act on it.
+fn pull_matches_pair(
+    pull: &crate::forgejo::PullRequest,
+    repository: &str,
+    branch: &str,
+    base: &str,
+) -> bool {
+    pull.head == branch
+        && pull.base == base
+        && pull.head_repo.as_deref() == Some(repository)
+}
+
+fn pull_matches_target(pull: &crate::forgejo::PullRequest, target: &PullRequestTarget) -> bool {
+    pull_matches_pair(
+        pull,
+        &target.repository.full_name,
+        &target.branch,
+        &target.base,
+    )
+}
+
+/// Whose open request a matching pair belongs to.
+///
+/// The rule is deliberately conservative: only an author the instance names and that
+/// exactly equals the agent's own recorded login is the agent's own. A missing login,
+/// a missing author, or a different author is not the agent's own. The same answer
+/// decides the refusal route on `P`, `U`, the Runs note and an after-write conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullRequestAuthorship {
+    /// The request names the agent's own recorded login as its author.
+    Own,
+    /// The request names a different account.
+    AnotherAccount,
+    /// The request names no author at all.
+    UnnamedAuthor,
+}
+
+impl PullRequestAuthorship {
+    fn of(author: Option<&str>, login: Option<&str>) -> Self {
+        match (author, login) {
+            (Some(author), Some(login)) if author == login => Self::Own,
+            (Some(_), _) => Self::AnotherAccount,
+            (None, _) => Self::UnnamedAuthor,
+        }
+    }
+
+    /// Whether this request is the agent's own, and so what `U` may update.
+    pub fn is_own(self) -> bool {
+        self == Self::Own
+    }
+
+    /// What the request is, in the words every surface uses.
+    pub fn fact(self) -> &'static str {
+        match self {
+            Self::Own => "it is the agent's own request",
+            Self::AnotherAccount => "it is another account's request",
+            Self::UnnamedAuthor => "its author is not named",
+        }
+    }
+
+    /// The one route that would update this request, or why there is none.
+    fn update_route(self) -> &'static str {
+        match self {
+            Self::Own => "press U on the Forgejo screen (4) to update it",
+            Self::AnotherAccount | Self::UnnamedAuthor => {
+                "U updates only your own request, so nothing was written"
+            }
+        }
+    }
+}
+
+fn pull_request_authorship(
+    pull: &crate::forgejo::PullRequest,
+    login: Option<&str>,
+) -> PullRequestAuthorship {
+    PullRequestAuthorship::of(pull.author.as_deref(), login)
+}
+
+/// Put the agent's own request before another account's request on the same branch.
+fn own_requests_first(
+    mut pulls: Vec<crate::forgejo::PullRequest>,
+    login: Option<&str>,
+) -> Vec<crate::forgejo::PullRequest> {
+    pulls.sort_by_key(|pull| match pull_request_authorship(pull, login) {
+        PullRequestAuthorship::Own => 0u8,
+        PullRequestAuthorship::AnotherAccount | PullRequestAuthorship::UnnamedAuthor => 1u8,
+    });
+    pulls
+}
+
+/// What the product learned the last time it looked, and for which branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestLookup {
+    /// `namespace/name` of the repository the list was read from.
+    pub repository: String,
+    /// The agent whose token read the list.
+    pub agent: String,
+    /// The clone branch the answer is about.
+    pub branch: String,
+    /// The base the answer is about.
+    pub base: String,
+    /// The matching open request, none, or why the list could not be read.
+    pub result: Result<Vec<crate::forgejo::PullRequest>, ForgejoFailure>,
+}
+
+/// What a removal leaves behind, counted before the configuration is rewritten.
+///
+/// The confirmation and the receipt are built from this one record, so the status
+/// cannot promise a directory the confirmation said was absent (or hide a secret it
+/// said would remain).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalInventory {
+    name: String,
+    config_dir: PathBuf,
+    config_exists: bool,
+    files: usize,
+    state_dir: PathBuf,
+    runs: usize,
+    secrets: Vec<&'static str>,
+    credentials: PathBuf,
+}
+
+impl RemovalInventory {
+    /// What stays behind, in the confirmation's own words.
+    pub fn sentences(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.files > 0 {
+            lines.push(format!(
+                "Its files under {} ({}) are left on disk.",
+                self.config_dir.display(),
+                words::counted(self.files, "file", "files")
+            ));
+        } else if self.config_exists {
+            lines.push(format!(
+                "Its directory {} is left on disk; it holds no files.",
+                self.config_dir.display()
+            ));
+        }
+        if self.runs > 0 {
+            lines.push(format!(
+                "Its {} under {} are left on disk.",
+                words::counted(self.runs, "run record", "run records"),
+                self.state_dir.display()
+            ));
+        }
+        if !self.secrets.is_empty() {
+            lines.push(format!(
+                "{} in {} {}; press D on the Credentials screen (5) to delete {}.",
+                self.secret_subject(),
+                self.credentials.display(),
+                if self.secrets.len() == 1 { "stays" } else { "stay" },
+                if self.secrets.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        if lines.is_empty() {
+            lines.push(
+                "Nothing of it is left on disk, and the credentials file holds no secret for it."
+                    .to_owned(),
+            );
+        }
+        lines
+    }
+
+    /// The receipt after the removal, agreeing with the confirmation.
+    pub fn status(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.files > 0 {
+            parts.push(format!(
+                "its files under {} ({})",
+                self.config_dir.display(),
+                words::counted(self.files, "file", "files")
+            ));
+        } else if self.config_exists {
+            parts.push(format!(
+                "its directory {} (no files)",
+                self.config_dir.display()
+            ));
+        }
+        if self.runs > 0 {
+            parts.push(format!(
+                "its {} under {}",
+                words::counted(self.runs, "run record", "run records"),
+                self.state_dir.display()
+            ));
+        }
+        if !self.secrets.is_empty() {
+            parts.push(format!(
+                "{} in {} (delete {} with D on the Credentials screen)",
+                self.secret_subject(),
+                self.credentials.display(),
+                if self.secrets.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        if parts.is_empty() {
+            format!(
+                "removed `{}` from the configuration; nothing of it was left on disk and the credentials file holds no secret for it",
+                self.name
+            )
+        } else {
+            format!(
+                "removed `{}` from the configuration; still there: {}",
+                self.name,
+                parts.join("; ")
+            )
+        }
+    }
+
+    fn secret_subject(&self) -> String {
+        let names: Vec<String> = self
+            .secrets
+            .iter()
+            .map(|name| format!("its {name}"))
+            .collect();
+        match names.as_slice() {
+            [] => String::new(),
+            [one] => one.clone(),
+            [first, second] => format!("{first} and {second}"),
+            _ => {
+                let last = names.last().expect("a non-empty list").clone();
+                format!("{}, and {last}", names[..names.len() - 1].join(", "))
+            }
+        }
+    }
 }
 
 impl EndpointTest {
@@ -520,11 +762,14 @@ impl EndpointTest {
     /// cannot tell a person which address answered or whether the answer is current
     /// (w52 F9).
     pub fn describe(&self) -> String {
+        // The facts lead: at 72×18 a long provider message or the timeout
+        // correction follows them instead of pushing the address and model out of
+        // the field. The footer's after-test sentence uses the same order.
         format!(
-            "{} — endpoint {} — model {} — tested {}",
-            failure_recovery(&self.agent, &describe_endpoint_result(&self.result)),
+            "endpoint {} — model {} — {} — tested {}",
             self.endpoint,
             self.model,
+            failure_recovery(&self.agent, &describe_endpoint_result(&self.result)),
             tested_age(self.tested_at_ms)
         )
     }
@@ -733,6 +978,43 @@ pub fn write_role_check_stamp(path: &Path, stamp: &RoleCheckStamp) -> std::io::R
     crate::mode::write_private(path, text.as_bytes())
 }
 
+/// Regular files below one directory, for a removal inventory that names what stays.
+fn count_files(root: &Path) -> usize {
+    fn walk(dir: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                count += walk(&entry.path());
+            } else if kind.is_file() {
+                count += 1;
+            }
+        }
+        count
+    }
+    if !root.is_dir() {
+        return 0;
+    }
+    walk(root)
+}
+
+/// Run-record directories below one agent's state directory.
+fn count_run_directories(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| crate::run::looks_like_run_id(&entry.file_name().to_string_lossy()))
+        .count()
+}
+
 /// A byte count in the product's own words, so the file that grows with every run has
 /// a size a person can watch (L-3).
 ///
@@ -892,6 +1174,11 @@ pub enum ProbeWhat {
     AdminRole,
     /// The selected agent's identity.
     Identity { agent: String },
+    /// The open pull requests of the repository the selected clone is in.
+    PullRequest {
+        agent: String,
+        repository: String,
+    },
 }
 
 impl ProbeWhat {
@@ -914,6 +1201,14 @@ impl ProbeWhat {
             ProbeWhat::Identity { agent } => {
                 format!("settling the identity of `{agent}`{here} — the result follows")
             }
+            ProbeWhat::PullRequest {
+                agent,
+                repository,
+            } => {
+                format!(
+                    "checking the open pull requests of `{repository}` as `{agent}`{here} — the result follows"
+                )
+            }
         }
     }
 }
@@ -934,6 +1229,9 @@ enum ProbeDone {
     Identity {
         agent: String,
         result: Result<AgentIdentity, ForgejoFailure>,
+    },
+    PullRequest {
+        lookup: PullRequestLookup,
     },
 }
 
@@ -1049,7 +1347,7 @@ struct PendingStart {
 fn failure_recovery(agent: &str, reason: &str) -> String {
     // `press 1` used to be printed on screen 1 itself, where it does nothing. The
     // sentence names the screen without pretending the key is the next act there.
-    if reason.contains("(bad_key)") {
+    if reason.contains("(bad_key)") || reason.contains("(missing_key)") {
         // Lead with the two steps, so a wrapped reason cannot separate `press 5` from
         // `and k`; the historical reason follows after the route.
         return format!(
@@ -1057,10 +1355,31 @@ fn failure_recovery(agent: &str, reason: &str) -> String {
         );
     }
     if reason.contains("(server_error)") {
-        // The endpoint's own answer can be long. Put the next step first, so a short
-        // panel or a note area still shows it before the answer's body.
+        // The endpoint answered; the test is the one act that learns whether it is
+        // still failing. Never name `s` here: on the Agents screen `s` starts a run.
+        // The provider's message already leads the fact, bounded to one line.
         return format!(
-            "select `{agent}` on the Agents screen (1), then press s to try again or p to test the endpoint — {reason}"
+            "select `{agent}` on the Agents screen (1), then press p to test the endpoint again — {reason}"
+        );
+    }
+    if reason.contains("(rate_limited)") {
+        return format!(
+            "wait for the time the endpoint named, then select `{agent}` on the Agents screen (1) and press p to test it again — {reason}"
+        );
+    }
+    if reason.contains("(timeout)") {
+        return format!(
+            "check the endpoint address and that it is reachable, then select `{agent}` on the Agents screen (1) and press p to test it again — {reason}"
+        );
+    }
+    if reason.contains("(malformed_reply)") {
+        return format!(
+            "select `{agent}` on the Agents screen (1), then press 2 and E to set a compatible completions endpoint; press p to test it — {reason}"
+        );
+    }
+    if reason.contains("(unknown)") {
+        return format!(
+            "select `{agent}` on the Agents screen (1), then press p to test the endpoint again — {reason}"
         );
     }
     if reason.contains("(transport)") || reason.contains("(bad_url)") {
@@ -1086,6 +1405,53 @@ fn failure_recovery(agent: &str, reason: &str) -> String {
         );
     }
     reason.to_owned()
+}
+
+/// The first non-empty line of a reply or commit subject, bounded for a title.
+fn bounded_title(text: &str) -> Option<String> {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut title: String = first.chars().take(72).collect();
+    if first.chars().count() > 72 {
+        title.push('…');
+    }
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+/// One sentence for a pull-request write the Forgejo refused.
+///
+/// A `409` is a conflict, not a body to paste on screen: a race after the lookup means
+/// the request now exists (or changed), and the person's next act is `U`.
+fn pull_request_write_failure(
+    verb: &str,
+    preview: &PullRequestPreview,
+    error: &crate::forgejo::ForgejoError,
+    own_login: Option<&str>,
+) -> String {
+    if let crate::forgejo::ForgejoError::Server { status: 409, .. } = error {
+        return if preview.number.is_none() {
+            // The race happened after the lookup, so this reply names no author. The
+            // conservative answer is the one every unknown author gets: not the
+            // agent's own. `U` may check the request, but this sentence must not
+            // promise that it can update it.
+            let authorship = PullRequestAuthorship::of(None, own_login);
+            format!(
+                "{verb} a pull request failed (conflict, HTTP 409): a request for `{}` -> `{}` already exists, but the conflict reply does not name its author — {}; press U on the Forgejo screen (4) to check it",
+                preview.branch,
+                preview.base,
+                authorship.update_route()
+            )
+        } else {
+            format!(
+                "{verb} pull request #{} failed (conflict, HTTP 409): the request changed on the Forgejo — press U to check it again",
+                preview.number.unwrap_or_default()
+            )
+        };
+    }
+    format!("{verb} a pull request failed ({}): {error}", error.class())
 }
 
 /// The sentence for a run that has ended: the outcome, how long it ran, and its own
@@ -1192,6 +1558,17 @@ pub struct App {
     /// asked to read the terms again with `R`, so no key records anything; `[`/`]`
     /// scroll the terms and any other key closes it (C-3).
     pub ack_review: bool,
+    /// Whether every term has been on screen in the ordinary first-run modal. A
+    /// confirmation is refused until it is true; a name that cannot be recorded
+    /// unseen is a name the person actually saw (class 6).
+    pub(crate) ack_terms_seen: std::cell::Cell<bool>,
+    /// Whether the renderer has measured the current modal at least once, so a unit
+    /// test that drives the App without drawing does not invent a refusal.
+    pub(crate) ack_terms_checked: std::cell::Cell<bool>,
+    /// How many terms the renderer last found not yet on screen.
+    pub(crate) ack_terms_remaining: std::cell::Cell<usize>,
+    /// A bit per term that has been fully on screen at least once this opening.
+    pub(crate) ack_terms_mask: std::cell::Cell<u16>,
     /// The in-TUI add-agent form, when it is open.
     pub add_agent: Option<NewAgentForm>,
     /// A one-field prompt for a secret, when one is open.
@@ -1202,6 +1579,8 @@ pub struct App {
     pub edit_agent: Option<EditAgentForm>,
     /// An agent waiting on the "remove it?" confirmation, when one is open.
     pub confirm_remove: Option<String>,
+    /// What that confirmation counted, so the receipt agrees with it.
+    pub removal: Option<RemovalInventory>,
     /// The leftover per-agent secrets (agents no longer configured) waiting on a delete
     /// confirmation, when one is open (Y-6).
     pub confirm_forget: Option<Vec<String>>,
@@ -1306,6 +1685,8 @@ pub struct App {
     pub probe: Option<Probe>,
     /// The result of the last role check, if any.
     pub role_check: Option<Result<RoleCheck, ForgejoFailure>>,
+    /// The open-request answer learned this session for one repository branch.
+    pub pull_request_lookup: Option<PullRequestLookup>,
     /// When the last role check ran, in unix milliseconds (S-2's stamp).
     pub role_checked_at_ms: Option<u64>,
     /// The machine the last role check ran on, when the mark can be read.
@@ -1417,11 +1798,16 @@ impl App {
             last_seen: None,
             show_acknowledgment: false,
             ack_review: false,
+            ack_terms_seen: std::cell::Cell::new(true),
+            ack_terms_checked: std::cell::Cell::new(false),
+            ack_terms_remaining: std::cell::Cell::new(0),
+            ack_terms_mask: std::cell::Cell::new(0),
             add_agent: None,
             secret_prompt: None,
             url_prompt: None,
             edit_agent: None,
             confirm_remove: None,
+            removal: None,
             confirm_forget: None,
             confirm_pull_request: None,
             pull_request_cache: std::cell::RefCell::new(None),
@@ -1448,6 +1834,7 @@ impl App {
             persisted_endpoint_tests: Vec::new(),
             probe: None,
             role_check: None,
+            pull_request_lookup: None,
             role_checked_at_ms: None,
             role_check_machine: None,
             persisted_role_check_stamp: None,
@@ -1479,8 +1866,10 @@ impl App {
     /// Re-read the files, and apply the limits they carry. Run at start and on `r`.
     pub fn reload(&mut self) {
         // Every re-read can change the configuration, the selected agent or the
-        // credentials file; the pull-request legend is not allowed to outlive them.
+        // credentials file; the pull-request legend and the open-request answer are
+        // not allowed to outlive them.
         self.clear_pull_request_cache();
+        self.pull_request_lookup = None;
         // A screen change or an edit can change which workspace is on show; the
         // cache is keyed by agent name and a time, so the next tick re-reads it.
         match self.layout.ensure_root() {
@@ -2325,6 +2714,14 @@ impl App {
         // A review never records: it is a second person reading terms already agreed.
         // The confirm path is reached only from the first-run modal, which never has
         // `ack_review` set.
+        if !self.ack_terms_seen.get() {
+            let remaining = self.ack_terms_remaining.get().max(1);
+            self.status = format!(
+                "the terms have not all been on screen yet — {remaining} {} remain; press ] to read them, then y records the acknowledgment",
+                if remaining == 1 { "term" } else { "terms" }
+            );
+            return;
+        }
         self.ack_review = false;
         self.reset_modal_scroll();
         match risk::record(&self.ack_path) {
@@ -2365,6 +2762,10 @@ impl App {
     /// When no record exists this is the ordinary first-run modal, which does record.
     pub fn review_acknowledgment(&mut self) {
         self.show_acknowledgment = true;
+        self.ack_terms_seen.set(true);
+        self.ack_terms_checked.set(false);
+        self.ack_terms_remaining.set(0);
+        self.ack_terms_mask.set(0);
         self.reset_modal_scroll();
         if self.ack_state.is_confirmed() {
             self.ack_review = true;
@@ -2868,8 +3269,32 @@ impl App {
             );
             return;
         }
+        self.removal = Some(self.removal_inventory(&name));
         self.confirm_remove = Some(name.clone());
         self.status = format!("press y to remove `{name}` from the configuration, or n to keep it");
+    }
+
+    /// Count exactly what a removal will leave, before the configuration changes.
+    pub fn removal_inventory(&self, name: &str) -> RemovalInventory {
+        let config_dir = self
+            .layout
+            .agent(name)
+            .map(|paths| paths.config_dir().to_path_buf())
+            .unwrap_or_else(|_| self.layout.agents_dir().join(name));
+        let state_dir = self.layout.state_root().join(name);
+        let files = count_files(&config_dir);
+        let runs = count_run_directories(&state_dir);
+        let secrets = crate::credentials::agent_secret_names(&self.credentials_path, name);
+        RemovalInventory {
+            name: name.to_owned(),
+            config_exists: config_dir.is_dir(),
+            config_dir,
+            files,
+            state_dir,
+            runs,
+            secrets,
+            credentials: self.credentials_path.clone(),
+        }
     }
 
     /// Remove the agent the confirmation is about, and write the configuration back.
@@ -2877,6 +3302,10 @@ impl App {
         let Some(name) = self.confirm_remove.take() else {
             return;
         };
+        let inventory = self
+            .removal
+            .take()
+            .or_else(|| Some(self.removal_inventory(&name)));
         let Some(existing) = self.config.clone() else {
             self.status =
                 format!("the configuration file cannot be read, so `{name}` cannot be removed");
@@ -2900,28 +3329,16 @@ impl App {
             );
             return;
         }
-        let left = self
-            .layout
-            .agent(&name)
-            .map(|paths| paths.config_dir().display().to_string())
-            .unwrap_or_else(|_| "its files".to_owned());
-        let had_files = self
-            .layout
-            .agent(&name)
-            .map(|paths| paths.config_dir().is_dir())
-            .unwrap_or(false);
         self.reload();
-        self.status = if had_files {
-            format!(
-                "removed `{name}` from the configuration; its files under {left} were left on disk"
-            )
-        } else {
-            format!("removed `{name}` from the configuration; it had no files under {left} yet")
+        self.status = match inventory {
+            Some(inventory) => inventory.status(),
+            None => format!("removed `{name}` from the configuration"),
         };
     }
 
     /// Drop the removal confirmation without removing anything.
     fn cancel_remove_agent(&mut self) {
+        self.removal = None;
         if let Some(name) = self.confirm_remove.take() {
             self.status = format!("`{name}` was kept");
         }
@@ -3319,6 +3736,7 @@ impl App {
         let _ = std::fs::remove_file(self.layout.role_checks_file());
         self.reload();
         self.role_check = None;
+        self.pull_request_lookup = None;
         self.role_checked_at_ms = None;
         self.role_check_machine = None;
         self.persisted_role_check_stamp = None;
@@ -3993,9 +4411,8 @@ impl App {
                 // can tell which address answered and whether the answer is current.
                 // The facts lead, so a floor-width footer keeps `endpoint … — model
                 // …` while the prose wraps or is shortened after them (F4).
-                self.status = format!(
-                    "endpoint {endpoint} — model {model} — endpoint test for `{agent}`: {short} — tested just now"
-                );
+                self.status =
+                    format!("endpoint {endpoint} — model {model} — {short} — tested just now");
                 let test = EndpointTest {
                     agent,
                     endpoint,
@@ -4035,6 +4452,11 @@ impl App {
                 self.clear_pull_request_cache();
                 self.status = identity_receipt(&agent, &result);
                 self.identity_report = Some(IdentityReport { agent, result });
+            }
+            ProbeDone::PullRequest { lookup } => {
+                // The screen states what this lookup found; it does not replace the
+                // role receipt the person just earned.
+                self.pull_request_lookup = Some(lookup);
             }
         }
     }
@@ -4119,8 +4541,10 @@ impl App {
     /// Apply the role check's result, in the sentence the Forgejo screen made before.
     fn apply_role_check(&mut self, url: String, result: Result<RoleCheck, ForgejoFailure>) {
         // The check can change the repository list, its default branch and the
-        // selection; a cached `P` answer from before it is no longer the gate's.
+        // selection; a cached `P` answer from before it is no longer the gate's, and
+        // an open-request answer from the old view is not this view's.
         self.clear_pull_request_cache();
+        self.pull_request_lookup = None;
         let at = crate::time::now_unix_ms();
         let mark = crate::machine::mark();
         self.role_checked_at_ms = Some(at);
@@ -4149,6 +4573,8 @@ impl App {
         self.role_check = Some(result);
         self.repo_selected = 0;
         self.persist_role_check_stamp(at, mark, outcome);
+        // One lookup after `c`, as the product's own act — never on every frame.
+        self.start_pull_request_lookup();
     }
 
     /// Apply the administrator role check's result, keeping the last good view.
@@ -4177,6 +4603,7 @@ impl App {
                 self.role_check_machine = mark.clone();
                 self.repo_selected = 0;
                 self.persist_role_check_stamp(at, mark, Some("administrator".to_owned()));
+                self.start_pull_request_lookup();
             }
             Err(failure) => {
                 let keep = matches!(self.role_check, Some(Ok(_)));
@@ -4575,11 +5002,20 @@ impl App {
         )
     }
 
+    /// The Forgejo login recorded for an agent, when one was recorded.
+    ///
+    /// Pull-request authorship compares against this login, not against a display name
+    /// or the agent's configuration name: the instance names the account that opened
+    /// the request, and only that account is the agent's own.
+    fn recorded_login(&self, agent: &str) -> Option<String> {
+        credentials::recorded_login(&self.credentials_path, agent)
+            .ok()
+            .flatten()
+    }
+
     /// The git identity recorded for an agent, or why there is none yet.
     fn recorded_git_identity(&self, agent: &str) -> Result<GitIdentity, ForgejoFailure> {
-        let login = credentials::recorded_login(&self.credentials_path, agent)
-            .ok()
-            .flatten();
+        let login = self.recorded_login(agent);
         let email = credentials::recorded_email(&self.credentials_path, agent)
             .ok()
             .flatten();
@@ -4692,6 +5128,52 @@ impl App {
         }
     }
 
+    /// The repository, agent and clone branch a pull-request action is about.
+    fn pull_request_target_result(&self) -> Result<PullRequestTarget, String> {
+        let Some(repository) = self.selected_repository().cloned() else {
+            return Err("no repository is on show: press c to run the role check first".to_owned());
+        };
+        let Some(agent) = self.selected_name() else {
+            return Err("the configuration lists no agent to open a pull request for".to_owned());
+        };
+        if self.forgejo_settings().is_none() {
+            return Err("the configuration could not be read".to_owned());
+        }
+        let paths = self
+            .layout
+            .agent(&agent)
+            .map_err(|error| format!("`{agent}` cannot be prepared: {error}"))?;
+        let destination = workspace::clone_destination(paths.workspace(), &repository.full_name);
+        if !destination.join(".git").is_dir() {
+            return Err(format!(
+                "`{}` has not been cloned into `{agent}`'s workspace yet; press g first",
+                repository.full_name
+            ));
+        }
+        let branch = workspace::current_branch(&destination).map_err(|error| {
+            format!(
+                "the workspace branch could not be read ({}): {error}",
+                error.class()
+            )
+        })?;
+        let base = repository
+            .default_branch
+            .clone()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| "main".to_owned());
+        Ok(PullRequestTarget {
+            repository,
+            agent,
+            branch,
+            base,
+            destination,
+        })
+    }
+
+    fn pull_request_target(&self) -> Option<PullRequestTarget> {
+        self.pull_request_target_result().ok()
+    }
+
     /// Check what `P` would open, without writing anything.
     ///
     /// The gate is the page map's three facts: the branch is not the base, it has
@@ -4701,92 +5183,252 @@ impl App {
     /// the evidence that this clone's branch is actually on the remote. A failing check
     /// is one sentence in the status line, and no push, no pull request and no file is
     /// written.
-    fn pull_request_preview(&self) -> Result<PullRequestPreview, String> {
-        let Some(repository) = self.selected_repository().cloned() else {
-            return Err("no repository is on show: press c to run the role check first".to_owned());
-        };
-        let Some(name) = self.selected_name() else {
-            return Err("the configuration lists no agent to open a pull request for".to_owned());
-        };
-        if self.forgejo_settings().is_none() {
-            return Err("the configuration could not be read".to_owned());
-        }
-        let paths = self
-            .layout
-            .agent(&name)
-            .map_err(|error| format!("`{name}` cannot be prepared: {error}"))?;
-        let destination = workspace::clone_destination(paths.workspace(), &repository.full_name);
-        if !destination.join(".git").is_dir() {
+    fn pull_request_gate(&self) -> Result<PullRequestTarget, String> {
+        let target = self.pull_request_target_result().map_err(|refusal| {
+            if refusal.starts_with("no repository") || refusal.starts_with("the configuration") {
+                refusal
+            } else {
+                format!("`P` refused: {refusal}")
+            }
+        })?;
+        if target.branch == target.base {
             return Err(format!(
-                "`P` refused: {} has not been cloned into `{name}`'s workspace yet; press g first",
-                repository.full_name
+                "`P` refused: `{}` is the base branch, so there is nothing to open as a pull request",
+                target.branch
             ));
         }
-        let branch = workspace::current_branch(&destination).map_err(|error| {
+        let (ahead, measured_base) = workspace::commits_ahead_against(
+            &target.destination,
+            &target.branch,
+            &target.base,
+        )
+        .map_err(|error| {
             format!(
-                "`P` refused: the workspace branch could not be read ({}): {error}",
-                error.class()
+                "`P` refused: the commits `{}` has beyond `{}` could not be read ({}): {}",
+                target.branch,
+                target.base,
+                error.class(),
+                error.detail()
             )
         })?;
-        let base = repository
-            .default_branch
-            .clone()
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| "main".to_owned());
-        if branch == base {
-            return Err(format!(
-                "`P` refused: `{branch}` is the base branch, so there is nothing to open as a pull request"
-            ));
-        }
-        let (ahead, measured_base) =
-            workspace::commits_ahead_against(&destination, &branch, &base).map_err(|error| {
-                format!(
-                    "`P` refused: the commits `{branch}` has beyond `{base}` could not be read ({}): {}",
-                    error.class(),
-                    error.detail()
-                )
-            })?;
         if ahead == 0 {
             return Err(format!(
-                "`P` refused: `{branch}` has no commits `{measured_base}` lacks, so there is nothing to open"
+                "`P` refused: `{}` has no commits `{measured_base}` lacks, so there is nothing to open",
+                target.branch
             ));
         }
         // The selected clone's own remote-tracking ref is the evidence that the branch
         // is on the remote. A run's push witness is about the run's workspace, not this
         // clone: a sibling clone's push must not stand for this branch.
-        if !workspace::branch_on_remote(&destination, &branch) {
+        if !workspace::branch_on_remote(&target.destination, &target.branch) {
             return Err(format!(
-                "`P` refused: `{branch}` is not on the remote — push it first"
+                "`P` refused: `{}` is not on the remote — push it first",
+                target.branch
             ));
         }
         // Identity and the agent's token are needed only for the act that follows the
         // preview (the commit identity's login, the push credential and the receipt);
         // the gate's content checks come first, so a branch with nothing to open is
         // named as that, not as a missing identity.
-        let identity = match self.recorded_git_identity(&name) {
-            Ok(identity) => identity,
-            Err(failure) => return Err(format!("`P` refused: {}", failure.message)),
-        };
+        if let Err(failure) = self.recorded_git_identity(&target.agent) {
+            return Err(format!("`P` refused: {}", failure.message));
+        }
         // The action writes a pull request with the agent's own token. A legend that
         // offered `P` without it would name a key whose write cannot be made.
-        if let Err(error) = credentials::forgejo_agent_token(&self.credentials_path, &name) {
+        if let Err(error) = credentials::forgejo_agent_token(&self.credentials_path, &target.agent)
+        {
             return Err(format!(
                 "`P` refused: {}",
-                missing_agent_token_status(&name, &error)
+                missing_agent_token_status(&target.agent, &error)
             ));
         }
-        let (title, body) = self.pull_request_text(&name, &branch);
-        Ok(PullRequestPreview {
-            agent: name,
-            login: identity.login,
-            repository: repository.full_name,
-            namespace: repository.namespace,
-            name: repository.name,
-            branch,
-            base,
+        Ok(target)
+    }
+
+    /// One proposed request from a target, with its text source named.
+    fn proposal_for(
+        &self,
+        target: &PullRequestTarget,
+        number: Option<u64>,
+    ) -> PullRequestPreview {
+        let login = self
+            .recorded_git_identity(&target.agent)
+            .map(|identity| identity.login)
+            .unwrap_or_else(|_| target.agent.clone());
+        let (title, body, text_source) =
+            self.pull_request_text(&target.agent, &target.branch, &target.base);
+        PullRequestPreview {
+            agent: target.agent.clone(),
+            login,
+            repository: target.repository.full_name.clone(),
+            namespace: target.repository.namespace.clone(),
+            name: target.repository.name.clone(),
+            number,
+            branch: target.branch.clone(),
+            base: target.base.clone(),
             title,
             body,
+            text_source,
+        }
+    }
+
+    /// Read the repository's open pull requests as the agent's token, and keep only
+    /// the one whose head and base are this clone's branch pair.
+    fn lookup_open_pull_request(&self, target: &PullRequestTarget) -> PullRequestLookup {
+        let own_login = self.recorded_login(&target.agent);
+        let result = self
+            .forgejo_settings()
+            .ok_or_else(|| ForgejoFailure {
+                class: "configuration".to_owned(),
+                message: "the configuration could not be read".to_owned(),
+            })
+            .and_then(|settings| {
+                let token = credentials::forgejo_agent_token(&self.credentials_path, &target.agent)
+                    .map_err(|error| ForgejoFailure {
+                        class: "no_agent_token".to_owned(),
+                        message: missing_agent_token_status(&target.agent, &error),
+                    })?;
+                let client = ForgejoClient::new(&settings.url, token, forgejo::DEFAULT_TIMEOUT)
+                    .map_err(failure_of)?;
+                client
+                    .pull_requests(&target.repository.namespace, &target.repository.name)
+                    .map_err(failure_of)
+            })
+            .map(|pulls| {
+                own_requests_first(
+                    pulls
+                        .into_iter()
+                        .filter(|pull| pull_matches_target(pull, target))
+                        .collect(),
+                    own_login.as_deref(),
+                )
+            });
+        PullRequestLookup {
+            repository: target.repository.full_name.clone(),
+            agent: target.agent.clone(),
+            branch: target.branch.clone(),
+            base: target.base.clone(),
+            result,
+        }
+    }
+
+    /// What the Forgejo screen states about the selected clone branch's open request.
+    ///
+    /// Only a lookup for this exact repository, branch and base is presented as known;
+    /// any other selection is `not checked this session`, never an unknown presented as
+    /// none. This reads the clone's `HEAD` and nothing over the network.
+    pub fn pull_request_state_line(&self) -> Option<String> {
+        let repository = self.selected_repository()?;
+        let target = match self.pull_request_target() {
+            Some(target) => target,
+            None => return Some("not checked this session — press c, P or U".to_owned()),
+        };
+        if target.repository.full_name != repository.full_name {
+            return Some("not checked this session — press c, P or U".to_owned());
+        }
+        let Some(lookup) = &self.pull_request_lookup else {
+            return Some("not checked this session — press c, P or U".to_owned());
+        };
+        if lookup.repository != target.repository.full_name
+            || lookup.branch != target.branch
+            || lookup.base != target.base
+        {
+            return Some("not checked this session — press c, P or U".to_owned());
+        }
+        Some(match &lookup.result {
+            Ok(open) => match open.first() {
+                Some(pull) => format!(
+                    "#{} [open] {} ({} -> {})",
+                    pull.number, pull.title, pull.head, pull.base
+                ),
+                None => format!("none open for `{}` -> `{}`", target.branch, target.base),
+            },
+            Err(failure) => format!(
+                "not checked — the open pull requests could not be read ({}): {}",
+                failure.class, failure.message
+            ),
         })
+    }
+
+    /// The open request this session found for a run's witnessed push, when one was.
+    ///
+    /// The Runs note must not promise a new request the product already knows is open;
+    /// a witness that does not name the looked-up branch (or a run of another agent)
+    /// makes no such claim.
+    pub fn open_pull_request_for_run(
+        &self,
+        run: &RunSummary,
+    ) -> Option<(&crate::forgejo::PullRequest, PullRequestAuthorship)> {
+        let witness = crate::run::read_push_witness(&run.dir)?;
+        let lookup = self.pull_request_lookup.as_ref()?;
+        if lookup.agent != run.agent || lookup.branch != witness.branch {
+            return None;
+        }
+        let open = match &lookup.result {
+            Ok(open) => open.first()?,
+            _ => return None,
+        };
+        let login = self.recorded_login(&run.agent);
+        Some((open, pull_request_authorship(open, login.as_deref())))
+    }
+
+    /// Look for the selected branch's open request off the UI thread after a role
+    /// check. `c` learns the repository list; the branch answer follows the same way.
+    fn start_pull_request_lookup(&mut self) {
+        let Some(target) = self.pull_request_target() else {
+            return;
+        };
+        let Some(settings) = self.forgejo_settings() else {
+            return;
+        };
+        let token = match credentials::forgejo_agent_token(&self.credentials_path, &target.agent) {
+            Ok(token) => token,
+            Err(error) => {
+                self.pull_request_lookup = Some(PullRequestLookup {
+                    repository: target.repository.full_name.clone(),
+                    agent: target.agent.clone(),
+                    branch: target.branch.clone(),
+                    base: target.base.clone(),
+                    result: Err(ForgejoFailure {
+                        class: "no_agent_token".to_owned(),
+                        message: missing_agent_token_status(&target.agent, &error),
+                    }),
+                });
+                return;
+            }
+        };
+        let namespace = target.repository.namespace.clone();
+        let name = target.repository.name.clone();
+        let url = settings.url.clone();
+        let lookup_target = target.clone();
+        let own_login = self.recorded_login(&target.agent);
+        let what = ProbeWhat::PullRequest {
+            agent: target.agent.clone(),
+            repository: target.repository.full_name.clone(),
+        };
+        self.start_probe(what, move || {
+            let result = ForgejoClient::new(&url, token, forgejo::DEFAULT_TIMEOUT)
+                .map_err(failure_of)
+                .and_then(|client| client.pull_requests(&namespace, &name).map_err(failure_of))
+                .map(|pulls| {
+                    own_requests_first(
+                        pulls
+                            .into_iter()
+                            .filter(|pull| pull_matches_target(pull, &lookup_target))
+                            .collect(),
+                        own_login.as_deref(),
+                    )
+                });
+            ProbeDone::PullRequest {
+                lookup: PullRequestLookup {
+                    repository: lookup_target.repository.full_name.clone(),
+                    agent: lookup_target.agent.clone(),
+                    branch: lookup_target.branch.clone(),
+                    base: lookup_target.base.clone(),
+                    result,
+                },
+            }
+        });
     }
 
     /// Whether the Forgejo screen may name `P` in its key legend.
@@ -4808,7 +5450,7 @@ impl App {
                 return *ready;
             }
         }
-        let ready = self.pull_request_preview().is_ok();
+        let ready = self.pull_request_gate().is_ok();
         *self.pull_request_cache.borrow_mut() = Some((key, ready));
         ready
     }
@@ -4876,10 +5518,43 @@ impl App {
         )
     }
 
-    /// `P`: show the proposed pull request, or refuse with one reason and no write.
+    /// `P`: look, then show the proposed request, or refuse with one reason and no
+    /// write. The open-request lookup happens after the gate passes and before any
+    /// preview; an existing request for this branch is never opened twice.
     pub fn request_pull_request(&mut self) {
-        match self.pull_request_preview() {
-            Ok(preview) => {
+        let target = match self.pull_request_gate() {
+            Ok(target) => target,
+            Err(refusal) => {
+                self.confirm_pull_request = None;
+                self.status = refusal;
+                return;
+            }
+        };
+        let lookup = self.lookup_open_pull_request(&target);
+        self.pull_request_lookup = Some(lookup.clone());
+        match lookup.result {
+            Err(failure) => {
+                self.confirm_pull_request = None;
+                self.status = format!(
+                    "`P` refused: the open pull requests could not be listed ({}): {}",
+                    failure.class, failure.message
+                );
+            }
+            Ok(open) if !open.is_empty() => {
+                self.confirm_pull_request = None;
+                let authorship = pull_request_authorship(
+                    &open[0],
+                    self.recorded_login(&target.agent).as_deref(),
+                );
+                self.status = format!(
+                    "`P` refused: {} is already open for this branch — {}, and {}.",
+                    open[0].line(),
+                    authorship.fact(),
+                    authorship.update_route()
+                );
+            }
+            Ok(_) => {
+                let preview = self.proposal_for(&target, None);
                 self.reset_modal_scroll();
                 self.status = format!(
                     "pull request `{}` -> `{}`: press y or enter to open it, n or esc to write nothing",
@@ -4887,17 +5562,11 @@ impl App {
                 );
                 self.confirm_pull_request = Some(preview);
             }
-            Err(refusal) => {
-                self.confirm_pull_request = None;
-                self.status = refusal;
-            }
         }
     }
 
-    /// The confirmed half of `P`: push the branch, then open the previewed request.
-    ///
-    /// Nothing before the confirmation writes; this method is reached only from the
-    /// overlay's `y`/`enter`.
+    /// The confirmed half of `P` or `U`. Nothing before the confirmation writes; this
+    /// method is reached only from the overlay's `y`/`enter`.
     pub fn confirm_pull_request(&mut self) {
         let Some(preview) = self.confirm_pull_request.take() else {
             return;
@@ -4906,6 +5575,56 @@ impl App {
             self.status = "the configuration could not be read".to_owned();
             return;
         };
+        let token = match credentials::forgejo_agent_token(&self.credentials_path, &preview.agent) {
+            Ok(token) => token,
+            Err(error) => {
+                self.status = missing_agent_token_status(&preview.agent, &error);
+                return;
+            }
+        };
+        let client = match ForgejoClient::new(&settings.url, token, forgejo::DEFAULT_TIMEOUT) {
+            Ok(client) => client,
+            Err(error) => {
+                self.status = format!(
+                    "the Forgejo client could not be built ({}): {error}",
+                    error.class()
+                );
+                return;
+            }
+        };
+        if let Some(number) = preview.number {
+            // `U`: update exactly the request the preview named, and nothing else.
+            match client.update_pull_request(
+                &preview.namespace,
+                &preview.name,
+                number,
+                Some(&preview.title),
+                Some(&preview.body),
+                None,
+            ) {
+                Ok(updated) => {
+                    let note = format!("updated {} as `{}`", updated.line(), preview.agent);
+                    self.status = note.clone();
+                    self.forgejo_note = Some(note);
+                    self.pull_request_lookup = Some(PullRequestLookup {
+                        repository: preview.repository.clone(),
+                        agent: preview.agent.clone(),
+                        branch: preview.branch.clone(),
+                        base: preview.base.clone(),
+                        result: Ok(vec![updated]),
+                    });
+                }
+                Err(error) => {
+                    self.status = pull_request_write_failure(
+                        "updating",
+                        &preview,
+                        &error,
+                        self.recorded_login(&preview.agent).as_deref(),
+                    );
+                }
+            }
+            return;
+        }
         let paths = match self.layout.agent(&preview.agent) {
             Ok(paths) => paths,
             Err(error) => {
@@ -4930,23 +5649,6 @@ impl App {
             );
             return;
         }
-        let token = match credentials::forgejo_agent_token(&self.credentials_path, &preview.agent) {
-            Ok(token) => token,
-            Err(error) => {
-                self.status = missing_agent_token_status(&preview.agent, &error);
-                return;
-            }
-        };
-        let client = match ForgejoClient::new(&settings.url, token, forgejo::DEFAULT_TIMEOUT) {
-            Ok(client) => client,
-            Err(error) => {
-                self.status = format!(
-                    "the Forgejo client could not be built ({}): {error}",
-                    error.class()
-                );
-                return;
-            }
-        };
         match client.open_pull_request(
             &preview.namespace,
             &preview.name,
@@ -4959,156 +5661,182 @@ impl App {
                 let note = format!("opened {} as {}", pull.line(), preview.login);
                 self.status = note.clone();
                 self.forgejo_note = Some(note);
+                self.pull_request_lookup = Some(PullRequestLookup {
+                    repository: preview.repository.clone(),
+                    agent: preview.agent.clone(),
+                    branch: preview.branch.clone(),
+                    base: preview.base.clone(),
+                    result: Ok(vec![pull]),
+                });
             }
             Err(error) => {
-                self.status = format!("opening a pull request failed ({}): {error}", error.class());
+                self.status = pull_request_write_failure(
+                    "opening",
+                    &preview,
+                    &error,
+                    self.recorded_login(&preview.agent).as_deref(),
+                );
             }
         }
     }
 
     /// `n`/`esc` on the proposal: close it and say plainly that nothing was written.
     pub fn cancel_pull_request(&mut self) {
-        if self.confirm_pull_request.take().is_some() {
-            self.status = "no pull request was opened and nothing was written".to_owned();
+        if let Some(preview) = self.confirm_pull_request.take() {
+            self.status = if preview.number.is_some() {
+                "no pull request was updated and nothing was written".to_owned()
+            } else {
+                "no pull request was opened and nothing was written".to_owned()
+            };
         }
     }
 
-    /// Update the newest open pull request of the repository on show, as the agent.
+    /// `U`: update the open pull request whose head is this clone's branch and whose
+    /// base is this base — never another branch's or another person's request.
     pub fn request_update_pull_request(&mut self) {
-        let Some(repository) = self.selected_repository().cloned() else {
-            self.status =
-                "no repository is on show: press c to run the role check first".to_owned();
-            return;
-        };
-        let Some(name) = self.selected_name() else {
-            self.status = "the configuration lists no agent".to_owned();
-            return;
-        };
-        let Some(settings) = self.forgejo_settings() else {
-            self.status = "the configuration could not be read".to_owned();
-            return;
-        };
-        let token = match credentials::forgejo_agent_token(&self.credentials_path, &name) {
-            Ok(token) => token,
-            Err(error) => {
-                self.status = missing_agent_token_status(&name, &error);
+        let target = match self.pull_request_target_result() {
+            Ok(target) => target,
+            Err(refusal) => {
+                self.status = format!("`U` refused: {refusal}");
                 return;
             }
         };
-        let client = match ForgejoClient::new(&settings.url, token, forgejo::DEFAULT_TIMEOUT) {
-            Ok(client) => client,
-            Err(error) => {
+        let lookup = self.lookup_open_pull_request(&target);
+        self.pull_request_lookup = Some(lookup.clone());
+        match lookup.result {
+            Err(failure) => {
                 self.status = format!(
-                    "the Forgejo client could not be built ({}): {error}",
-                    error.class()
+                    "`U` refused: the open pull requests could not be listed ({}): {}",
+                    failure.class, failure.message
                 );
-                return;
             }
-        };
-        let open = match client.pull_requests(&repository.namespace, &repository.name) {
-            Ok(pulls) => pulls,
-            Err(error) => {
+            Ok(open) => {
+                // Only the agent's own request may be rewritten. The instance names
+                // the author; a request by another account, or one whose author is not
+                // named, is left untouched even when it uses the same branch and base.
+                let login = self.recorded_login(&target.agent);
+                let own_at = open
+                    .iter()
+                    .position(|pull| pull_request_authorship(pull, login.as_deref()).is_own());
+                let Some(at) = own_at else {
+                    if let Some(occupying) = open.first() {
+                        // The pair is occupied, but not by this agent. `P` refuses while
+                        // any request occupies it, so offering `P` would be a dead end.
+                        let authorship =
+                            pull_request_authorship(occupying, login.as_deref());
+                        self.status = format!(
+                            "`U` refused: {} is already open for this branch — {}, and {}.",
+                            occupying.line(),
+                            authorship.fact(),
+                            authorship.update_route()
+                        );
+                        return;
+                    }
+                    let gate_would_pass = self.pull_request_gate().is_ok();
+                    self.status = if gate_would_pass {
+                        format!(
+                            "`U` refused: `{}` has no open pull request to update; press P to open one",
+                            target.branch
+                        )
+                    } else {
+                        format!(
+                            "`U` refused: `{}` has no open pull request to update",
+                            target.branch
+                        )
+                    };
+                    return;
+                };
+                let pull = &open[at];
+                let preview = self.proposal_for(&target, Some(pull.number));
+                self.reset_modal_scroll();
                 self.status = format!(
-                    "the open pull requests could not be listed ({}): {error}",
-                    error.class()
+                    "pull request #{} `{}` -> `{}`: press y or enter to update it, n or esc to write nothing",
+                    pull.number, preview.branch, preview.base
                 );
-                return;
-            }
-        };
-        let Some(pull) = open.first() else {
-            self.status = format!(
-                "{} has no open pull request to update",
-                repository.full_name
-            );
-            return;
-        };
-        let (title, body) = self.pull_request_text(&name, &pull.head);
-        match client.update_pull_request(
-            &repository.namespace,
-            &repository.name,
-            pull.number,
-            Some(&title),
-            Some(&body),
-            None,
-        ) {
-            Ok(updated) => {
-                let note = format!("updated {} as `{name}`", updated.line());
-                self.status = note.clone();
-                self.forgejo_note = Some(note);
-            }
-            Err(error) => {
-                self.status = format!(
-                    "updating pull request #{} failed ({}): {error}",
-                    pull.number,
-                    error.class()
-                );
+                self.confirm_pull_request = Some(preview);
             }
         }
     }
 
-    /// The newest run's final reply, as a pull request title and body.
-    ///
-    /// The first non-empty line is the title (bounded so the Forgejo form stays a
-    /// title), and the whole reply is the body. Only a run of the configured agent
-    /// under the current name counts, so a removed or earlier agent's history cannot
-    /// become today's pull request.
-    fn run_reply_pull_request(&self, agent: &str) -> Option<(String, String)> {
-        let run = self
-            .recent
-            .iter()
-            .find(|run| run.agent == agent && self.run_is_current(run))?;
+    /// The newest run of this agent whose push witness names this branch, as a title
+    /// and body. A run that pushed nothing, or another branch, is never the source.
+    fn run_reply_for_branch(&self, agent: &str, branch: &str) -> Option<(String, String, String)> {
+        let run = self.recent.iter().find(|run| {
+            run.agent == agent
+                && self.run_is_current(run)
+                && crate::run::read_push_witness(&run.dir)
+                    .is_some_and(|witness| witness.branch == branch)
+        })?;
         let reply = run.final_reply.as_deref()?.trim();
-        if reply.is_empty() {
-            return None;
-        }
-        let mut title = reply
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("")
-            .chars()
-            .take(72)
-            .collect::<String>();
-        if reply
-            .lines()
-            .next()
-            .is_some_and(|first| first.trim().chars().count() > 72)
-        {
-            title.push('…');
-        }
-        if title.is_empty() {
-            return None;
-        }
-        Some((title, reply.to_owned()))
+        let title = bounded_title(reply)?;
+        Some((run.run_id.clone(), title, reply.to_owned()))
     }
 
-    /// The title and body of a pull request, from the agent's own file when it has one.
-    fn pull_request_text(&self, agent: &str, branch: &str) -> (String, String) {
+    /// A neutral title and body from the branch's own commits beyond the measured base.
+    fn branch_commit_text(
+        &self,
+        agent: &str,
+        branch: &str,
+        base: &str,
+    ) -> Option<(String, String)> {
+        let target = self.pull_request_target()?;
+        if target.agent != agent || target.branch != branch || target.base != base {
+            return None;
+        }
+        let (subjects, measured) =
+            workspace::commit_subjects_ahead(&target.destination, branch, base, 20).ok()?;
+        let newest = subjects.first()?;
+        let title = bounded_title(newest)?;
+        let list = subjects
+            .iter()
+            .map(|subject| format!("- {subject}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((
+            title,
+            format!("Commits on `{branch}` beyond `{measured}`:\n\n{list}"),
+        ))
+    }
+
+    /// The title and body of a pull request, and the source they came from.
+    ///
+    /// The fixed order is a present `pull-request.txt`; the newest run of this agent
+    /// whose push witness names the branch; then the branch's own commits beyond the
+    /// measured base. A run that pushed nothing, or another branch, is never used.
+    fn pull_request_text(&self, agent: &str, branch: &str, base: &str) -> (String, String, String) {
         let title = format!("Work by the agent `{agent}`");
         let body = format!(
             "Opened by `{agent}` from branch `{branch}`. The commit is authored by the agent's own Forgejo identity."
         );
         let Ok(paths) = self.layout.agent(agent) else {
-            return (title, body);
+            return (title, body, "the product".to_owned());
         };
         let path = paths.config_dir().join("pull-request.txt");
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            // No hand-written file: the run's own final reply is the useful default
-            // title and body, not the product's generic sentence (K-8).
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return self.run_reply_pull_request(agent).unwrap_or((title, body));
+                if let Some((run_id, title, body)) = self.run_reply_for_branch(agent, branch) {
+                    return (title, body, format!("run {run_id}"));
+                }
+                if let Some((title, body)) = self.branch_commit_text(agent, branch, base) {
+                    return (title, body, "the branch's commits".to_owned());
+                }
+                return (title, body, "the product".to_owned());
             }
-            Err(_) => return (title, body),
+            Err(_) => return (title, body, "the product".to_owned()),
         };
         let mut lines = text.lines();
         let first = lines.next().unwrap_or("").trim().to_owned();
         let rest = lines.collect::<Vec<_>>().join("\n");
         let rest = rest.trim().to_owned();
         if first.is_empty() {
-            (title, if rest.is_empty() { body } else { rest })
+            (
+                title,
+                if rest.is_empty() { body } else { rest },
+                "pull-request.txt".to_owned(),
+            )
         } else {
-            (first, rest)
+            (first, rest, "pull-request.txt".to_owned())
         }
     }
 
@@ -6340,7 +7068,9 @@ impl App {
                 return;
             }
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_acknowledgment(),
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_acknowledgment();
+                }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.decline_acknowledgment();
                 }
@@ -9408,6 +10138,9 @@ concurrency = 3
         let mut app = app_with(GOOD);
         app.show_acknowledgment = false;
         let run_dir = app.root().join("state").join("one").join("run-1");
+        std::fs::create_dir_all(&run_dir).expect("the run directory is created");
+        crate::run::write_push_witness(&run_dir, "changelog/weekly", "refs/remotes/origin/changelog/weekly")
+            .expect("the push witness is written");
         app.recent = vec![RunSummary {
             agent: "one".to_owned(),
             run_id: "run-1".to_owned(),
@@ -9422,7 +10155,7 @@ concurrency = 3
             log: run_dir.join(crate::run::LOG_FILE),
             dir: run_dir,
         }];
-        let (title, body) = app.pull_request_text("one", "changelog/weekly");
+        let (title, body, _source) = app.pull_request_text("one", "changelog/weekly", "main");
         assert_eq!(title, "Weekly changelog");
         assert!(
             body.contains("- the dashboard remembers its filter"),
@@ -9439,7 +10172,7 @@ concurrency = 3
             "Hand-written title\nHand-written body\n",
         )
         .expect("the file is written");
-        let (title, body) = app.pull_request_text("one", "changelog/weekly");
+        let (title, body, _source) = app.pull_request_text("one", "changelog/weekly", "main");
         assert_eq!(title, "Hand-written title");
         assert_eq!(body, "Hand-written body");
     }

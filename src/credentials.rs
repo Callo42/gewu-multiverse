@@ -503,6 +503,38 @@ pub fn present_secret_names(path: &Path) -> Vec<String> {
     names
 }
 
+/// The secret entries the credentials file holds for one agent, as names.
+///
+/// A removal confirmation names only entries that are really there: the agent's own
+/// model key under `[model_keys]` and its own Forgejo token under
+/// `[forgejo_agent_tokens]`. A top-level shared `model_key` is not the agent's own
+/// entry and remains for the configured agents, so it is not named.
+pub fn agent_secret_names(path: &Path, agent: &str) -> Vec<&'static str> {
+    let Ok(value) = read_value(path) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if value
+        .get("model_keys")
+        .and_then(|keys| keys.get(agent))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|text| !text.is_empty())
+    {
+        names.push("model key");
+    }
+    if value
+        .get("forgejo_agent_tokens")
+        .and_then(|tokens| tokens.get(agent))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|text| !text.is_empty())
+    {
+        names.push("Forgejo agent token");
+    }
+    names
+}
+
 /// Why the credentials file could not be read, when it could not.
 ///
 /// The Credentials screen uses this to tell a file that was read and is empty from one
