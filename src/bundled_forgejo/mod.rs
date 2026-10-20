@@ -7,11 +7,12 @@
 //! through the same check, so a fixture never needs the network.
 //!
 //! An instance is a directory of its own under the data root: `app.ini` with generated
-//! secrets and a loopback-only address, an SQLite database, file logs, and a generated
-//! administrator password held at mode 0600. The port is chosen once from 3000–3099
-//! and read back from `app.ini` on every later start, so the address a person sees does
-//! not move. `migrate` and the administrator account go through Forgejo's own CLI; the
-//! server then runs as `web` in its own process group.
+//! secrets and a loopback-only address, an SQLite database and file logs. The port is
+//! chosen once from 3000–3099 and read back from `app.ini` on every later start, so the
+//! address a person sees does not move. `migrate` and the administrator account go
+//! through Forgejo's own CLI; the password never appears in a product argument, and
+//! `p` resets it through the administration API. The server then runs as `web` in its
+//! own process group.
 //!
 //! Provisioning is idempotent and goes through the administration API: organisation
 //! `team`, team `agents` with write access to all its repositories, and the starter
@@ -411,9 +412,7 @@ pub struct InstancePaths {
     pub root: PathBuf,
     /// The generated configuration.
     pub app_ini: PathBuf,
-    /// The administrator's generated password, 0600.
-    pub admin_password: PathBuf,
-    /// The administrator's login, stored beside the password, 0600.
+    /// The administrator's login, stored beside the instance, 0600.
     pub admin_login_file: PathBuf,
     /// The file log directory.
     pub log_dir: PathBuf,
@@ -431,7 +430,6 @@ impl InstancePaths {
         let root = forgejo_dir(data_root).join(INSTANCE_DIR);
         Self {
             app_ini: root.join("app.ini"),
-            admin_password: root.join("secrets").join("admin-password"),
             admin_login_file: root.join("secrets").join("admin-login"),
             log_dir: root.join("log"),
             data_dir: root.join("data"),
@@ -483,6 +481,10 @@ pub struct PreparedInstance {
     pub port: u16,
     /// The browser address.
     pub url: String,
+    /// The administrator token minted when this start created the account. It is
+    /// never the password: the account is made with `--random-password` and the value
+    /// is read only to be discarded.
+    pub admin_token: Option<Secret>,
 }
 
 /// Read the kept port from an `app.ini` that already exists.
@@ -501,6 +503,114 @@ pub fn port_from_config(text: &str) -> Option<u16> {
     None
 }
 
+/// The configuration keys this build pins on every start, whatever version wrote the
+/// file before. An upgrade keeps the person's other settings; these are replaced in
+/// place (or added, with their section) so a version that wrote `SQLITE_TIMEOUT = 500`
+/// and no WAL is brought to the current write behaviour before Forgejo starts.
+pub const PINNED_APP_INI: &[(&str, &str, &str)] = &[
+    ("database", "SQLITE_TIMEOUT", "5000"),
+    ("database", "SQLITE_JOURNAL_MODE", "WAL"),
+    ("i18n", "LANGS", "en-US"),
+    ("i18n", "NAMES", "English"),
+    ("time", "DEFAULT_UI_LOCATION", "UTC"),
+];
+
+/// The lower-case section name of an INI header line.
+fn section_name(line: &str) -> Option<String> {
+    let line = line.trim();
+    line.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(|name| name.trim().to_ascii_lowercase())
+}
+
+/// Bring an existing `app.ini` to the keys this build pins, keeping every other line.
+///
+/// This is idempotent: a file that already carries the pinned values comes back
+/// unchanged. A key that is present is replaced in its own section; a missing key is
+/// inserted at the end of its section; a missing section is appended. Comments,
+/// blank lines and the person's own settings are left exactly as they are.
+pub fn pinned_app_ini(existing: &str) -> String {
+    let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
+    let mut found = vec![false; PINNED_APP_INI.len()];
+    let mut section = String::new();
+    for line in lines.iter_mut() {
+        let trimmed = line.trim();
+        if let Some(name) = section_name(trimmed) {
+            section = name;
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let mut replacement = None;
+        for (index, (pinned_section, pinned_key, pinned_value)) in PINNED_APP_INI.iter().enumerate()
+        {
+            if !found[index] && *pinned_section == section && *pinned_key == key {
+                replacement = Some(format!("{pinned_key} = {pinned_value}"));
+                found[index] = true;
+            }
+        }
+        if let Some(text) = replacement {
+            // Keep an inline comment on a replaced key (N10): `KEY = old ; note`
+            // becomes `KEY = new ; note`, not a line with the person's note lost.
+            let comment = line
+                .split_once('=')
+                .and_then(|(_, rest)| rest.find([';', '#']).map(|at| &rest[at..]))
+                .unwrap_or_default();
+            *line = format!("{text}{comment}");
+        }
+    }
+    // Add a missing key at the end of a section that already exists.
+    for (index, (pinned_section, pinned_key, pinned_value)) in PINNED_APP_INI.iter().enumerate() {
+        if found[index] {
+            continue;
+        }
+        let Some(header) = lines
+            .iter()
+            .position(|line| section_name(line).as_deref() == Some(*pinned_section))
+        else {
+            continue;
+        };
+        let mut end = lines.len();
+        for (position, line) in lines.iter().enumerate().skip(header + 1) {
+            if section_name(line).is_some() {
+                end = position;
+                break;
+            }
+        }
+        while end > header + 1 && lines[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+        lines.insert(end, format!("{pinned_key} = {pinned_value}"));
+        found[index] = true;
+    }
+    // Append a section that was not in the file at all, once, with its pinned keys.
+    let mut appended: Vec<&str> = Vec::new();
+    for (section, key, value) in PINNED_APP_INI {
+        if appended.contains(section) {
+            lines.push(format!("{key} = {value}"));
+            continue;
+        }
+        if lines
+            .iter()
+            .any(|line| section_name(line).as_deref() == Some(*section))
+        {
+            continue;
+        }
+        appended.push(section);
+        lines.push(String::new());
+        lines.push(format!("[{section}]"));
+        lines.push(format!("{key} = {value}"));
+    }
+    let mut text = lines.join("\n").trim_end_matches('\n').to_owned();
+    text.push('\n');
+    text
+}
+
 /// A free loopback port in the product's range.
 pub fn choose_port() -> Result<u16, String> {
     for port in 3000..=3099u16 {
@@ -511,16 +621,16 @@ pub fn choose_port() -> Result<u16, String> {
     Err("no free loopback port was found in 3000–3099".to_owned())
 }
 
-/// A login `$USER` can supply, when it is valid, else [`FALLBACK_ADMIN_LOGIN`].
+/// The fixed administrator login for a new installation.
+///
+/// It is deliberately not the operating system's account name: a person's local
+/// login should not be published to every teammate and agent on their Forgejo.
+/// Forgejo reserves `admin` itself (it is the administration route), so the fixed
+/// login is [`FALLBACK_ADMIN_LOGIN`]. An installation made by an earlier version
+/// keeps its recorded login, which `prepare_instance_checked` reads back; the
+/// Forgejo page says which one is in use.
 pub fn admin_login_from_env() -> String {
-    let name = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_default();
-    if valid_username(&name) {
-        name
-    } else {
-        FALLBACK_ADMIN_LOGIN.to_owned()
-    }
+    FALLBACK_ADMIN_LOGIN.to_owned()
 }
 
 /// Whether a string can be a Forgejo username.
@@ -571,7 +681,8 @@ pub fn app_ini_text(
          [database]\n\
          DB_TYPE = sqlite3\n\
          PATH = {root}/data/forgejo.db\n\
-         SQLITE_TIMEOUT = 500\n\
+         SQLITE_TIMEOUT = 5000\n\
+         SQLITE_JOURNAL_MODE = WAL\n\
          \n\
          [server]\n\
          PROTOCOL = http\n\
@@ -602,6 +713,15 @@ pub fn app_ini_text(
          ENABLE_NOTIFY_MAIL = false\n\
          DEFAULT_ALLOW_CREATE_ORGANIZATION = false\n\
          \n\
+         [i18n]\n\
+         ; A pinned, valid default: a browser that sends an unusable language tag\n\
+         ; still gets a page whose language, and whose date formats, are valid.\n\
+         LANGS = en-US\n\
+         NAMES = English\n\
+         \n\
+         [time]\n\
+         DEFAULT_UI_LOCATION = UTC\n\
+         \n\
          [repository]\n\
          ROOT = {root}/data/repositories\n\
          DEFAULT_BRANCH = main\n\
@@ -625,6 +745,56 @@ pub fn app_ini_text(
         internal = secrets.internal_token,
         jwt = secrets.jwt_secret,
     )
+}
+
+/// The small script that keeps Forgejo's bundled pages free of the red
+/// `JavaScript error` banner on browsers whose `navigator.language` is not a usable
+/// language tag (`C`, an empty string, a tag older ICU rejects).
+///
+/// Forgejo's `webcomponents.js` builds an `Intl.DateTimeFormat` from
+/// `navigator.language` at load time, and an invalid tag throws before the page's
+/// own script runs. A browser is not the product's to configure, so the pinned
+/// instance serves one pre-script that replaces only an invalid language with
+/// `en-US`; the page's own language (`<html lang>`) is already pinned in `app.ini`.
+/// A valid browser language is left exactly as it is.
+const LOCALE_GUARD: &str = r#"<script>
+(function () {
+  try {
+    var usable = function (tag) { try { new Intl.DateTimeFormat(tag); return true; } catch (e) { return false; } };
+    if (usable(navigator.language)) return;
+    var fallback = 'en-US';
+    Object.defineProperty(Navigator.prototype, 'language', { get: function () { return fallback; } });
+    Object.defineProperty(Navigator.prototype, 'languages', { get: function () { return [fallback]; } });
+  } catch (e) { /* no Intl: the page still renders in its pinned language */ }
+})();
+</script>
+"#;
+
+/// Write the pinned instance's one custom template: `base/head_script`, with
+/// [`LOCALE_GUARD`] before the original content. The original is read out of the
+/// pinned binary, so a Forgejo update cannot silently drop its scripts.
+fn write_locale_guard(binary: &Path, paths: &InstancePaths) -> Result<(), String> {
+    let output = forgejo_output_checked(
+        binary,
+        paths,
+        &["embedded", "view", "templates/base/head_script.tmpl"],
+        &|| false,
+    )?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(format!(
+            "the bundled Forgejo's page script could not be read: {}",
+            one_line(&String::from_utf8_lossy(&output.stderr), 240)
+        ));
+    }
+    let dir = paths.root.join("custom").join("templates").join("base");
+    fs::create_dir_all(&dir).map_err(|error| {
+        format!("the instance's custom template directory cannot be made: {error}")
+    })?;
+    let _ = crate::mode::set_mode(&dir, PRIVATE_DIR_MODE);
+    let mut text = String::from(LOCALE_GUARD);
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+    crate::mode::write_private(dir.join("head_script.tmpl"), text.as_bytes())
+        .map_err(|error| format!("the instance's page script cannot be written: {error}"))
 }
 
 /// Prepare one instance: `app.ini`, secrets, `migrate`, and the administrator account.
@@ -651,6 +821,7 @@ pub fn prepare_instance_checked(
     }
     let paths = InstancePaths::under(data_root);
     paths.ensure()?;
+    write_locale_guard(binary, &paths)?;
     let existing = fs::read_to_string(&paths.app_ini).ok();
     let port = existing
         .as_deref()
@@ -662,11 +833,26 @@ pub fn prepare_instance_checked(
     } else {
         admin_login_from_env()
     };
-    if existing.is_none() {
-        let secrets = InstanceSecrets::generate()?;
-        let text = app_ini_text(&paths, port, &run_user(), &secrets);
-        crate::mode::write_private(&paths.app_ini, text.as_bytes())
-            .map_err(|error| format!("the Forgejo configuration cannot be written: {error}"))?;
+    match existing.as_deref() {
+        None => {
+            let secrets = InstanceSecrets::generate()?;
+            let text = app_ini_text(&paths, port, &run_user(), &secrets);
+            crate::mode::write_private(&paths.app_ini, text.as_bytes())
+                .map_err(|error| format!("the Forgejo configuration cannot be written: {error}"))?;
+        }
+        Some(existing) => {
+            // An instance prepared by an earlier version keeps its settings; the
+            // keys this build pins (SQLite WAL and its wait, the page locale and
+            // time zone) are brought forward before Forgejo starts. Without this an
+            // upgrade keeps `SQLITE_TIMEOUT = 500` and no WAL, and the load finding
+            // returns (B2/N8).
+            let updated = pinned_app_ini(existing);
+            if updated != existing {
+                crate::mode::write_private(&paths.app_ini, updated.as_bytes()).map_err(
+                    |error| format!("the Forgejo configuration cannot be updated: {error}"),
+                )?;
+            }
+        }
     }
     // The login is part of this data directory's own record, so a later start uses
     // the same administrator even when the environment has changed.
@@ -679,19 +865,18 @@ pub fn prepare_instance_checked(
         .ok()
         .filter(|text| valid_username(text))
         .unwrap_or(login);
-    if !paths.admin_password.is_file() {
-        let password = generated_password()?;
-        crate::mode::write_private(&paths.admin_password, password.as_bytes())
-            .map_err(|error| format!("the administrator password cannot be kept: {error}"))?;
-    }
-    let password = fs::read_to_string(&paths.admin_password)
-        .map_err(|error| format!("the administrator password cannot be read: {error}"))?;
-    let password = password.trim().to_owned();
+    // The administrator password is never written down. The account is created by
+    // Forgejo's CLI with `--random-password` (the value never becomes a product
+    // argument), and `p` on the Forgejo page resets it through the administration API
+    // and shows the new one. A file left by an older product is removed here, not
+    // read.
+    let legacy = paths.root.join("secrets").join("admin-password");
+    let _ = fs::remove_file(&legacy);
     if cancelled() {
         return Err("the start was called off".to_owned());
     }
     forgejo_command_checked(binary, &paths, &["migrate"], &cancelled)?;
-    ensure_admin(binary, &paths, &kept_login, &password, &cancelled)?;
+    let admin_token = ensure_admin(binary, &paths, &kept_login, &cancelled)?;
     if cancelled() {
         return Err("the start was called off".to_owned());
     }
@@ -702,20 +887,33 @@ pub fn prepare_instance_checked(
         admin_login: kept_login,
         port,
         url: InstancePaths::url(port),
+        admin_token,
     })
 }
 
-/// Create the administrator, or reset its password when it already exists. The
-/// password is passed to Forgejo's own CLI and never printed by this product.
+/// Whether a byte stream contains a phrase.
+fn bytes_contain(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+/// Create the administrator, or leave an existing one untouched.
+///
+/// The account is made with Forgejo's own `--random-password`: the value is generated
+/// by the CLI, never chosen or passed by this product, and is present in no process
+/// argument. The output that carries it is read only to tell success apart from a
+/// failure, then wiped; the new account's administrator token is minted immediately
+/// (a token, not the password) and returned. An existing account keeps its password,
+/// and `p` resets it later through the administration API.
 fn ensure_admin(
     binary: &Path,
     paths: &InstancePaths,
     login: &str,
-    password: &str,
     cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
+) -> Result<Option<Secret>, String> {
     let email = format!("{login}@agents.invalid");
-    let output = forgejo_output_checked(
+    let mut output = forgejo_output_checked(
         binary,
         paths,
         &[
@@ -724,8 +922,9 @@ fn ensure_admin(
             "create",
             "--username",
             login,
-            "--password",
-            password,
+            "--random-password",
+            "--random-password-length",
+            "48",
             "--email",
             &email,
             "--admin",
@@ -733,46 +932,50 @@ fn ensure_admin(
         ],
         cancelled,
     )?;
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if text.contains("successfully created") || text.contains("Created user") {
-        return Ok(());
+    let created = bytes_contain(&output.stdout, "successfully created")
+        || bytes_contain(&output.stdout, "Created user")
+        || bytes_contain(&output.stderr, "successfully created")
+        || bytes_contain(&output.stderr, "Created user");
+    let exists = bytes_contain(&output.stdout, "already exists")
+        || bytes_contain(&output.stdout, "already used")
+        || bytes_contain(&output.stderr, "already exists")
+        || bytes_contain(&output.stderr, "already used");
+    // The random password, if the CLI printed it, is in these bytes. It is not turned
+    // into a string and is wiped before anything else can observe it.
+    output.stdout.fill(0);
+    if created {
+        let token = generate_admin_token_paths(binary, paths, login, cancelled, |_| {})?;
+        return Ok(Some(token));
     }
-    if !(text.to_lowercase().contains("already exists")
-        || text.to_lowercase().contains("already used"))
-    {
-        return Err(format!(
-            "the Forgejo administrator account could not be made: {}",
-            one_line(&text, 240)
-        ));
+    if exists {
+        return Ok(None);
     }
-    // The account was made by an earlier start. Hold the password file and the
-    // account together, without ever putting the password in an error line.
-    let output = forgejo_output_checked(
-        binary,
-        paths,
-        &[
-            "admin",
-            "user",
-            "change-password",
-            "--username",
-            login,
-            "--password",
-            password,
-            "--must-change-password=false",
-        ],
-        cancelled,
-    )?;
-    if !output.status.success() {
-        return Err(format!(
-            "the Forgejo administrator password could not be confirmed: {}",
-            one_line(&String::from_utf8_lossy(&output.stderr), 240)
-        ));
-    }
-    Ok(())
+    Err(format!(
+        "the Forgejo administrator account could not be made: {}",
+        one_line(&String::from_utf8_lossy(&output.stderr), 240)
+    ))
+}
+
+/// Reset the administrator password through the administration API and return the new
+/// one.
+///
+/// This is what `p` does. The new value is generated here and sent in the `PATCH`
+/// body — never in a process argument, where an ordinary process table would show it
+/// (B4). The administrator token the product already holds authorises the call. The
+/// value is returned for the one view that shows it and never written to a file; the
+/// one-line consequence is on the static Forgejo page: the password shown before this
+/// moment stops working.
+pub fn reset_admin_password(client: &ForgejoClient, login: &str) -> Result<String, String> {
+    let password = generated_password()?;
+    client
+        .set_user_password(login, &password)
+        .map_err(|error| {
+            format!(
+                "the administrator password could not be reset: {}",
+                one_line(&error.to_string(), 240)
+            )
+        })?;
+    Ok(password)
 }
 
 /// Ask Forgejo's CLI for an access token for the administrator. The token is returned
@@ -799,10 +1002,22 @@ pub fn generate_admin_token_checked(
     on_spawn: impl FnOnce(u32),
 ) -> Result<Secret, String> {
     let paths = InstancePaths::under(data_root);
+    generate_admin_token_paths(binary, &paths, login, cancelled, on_spawn)
+}
+
+/// The same token command against already-known instance paths, so preparation can
+/// mint the administrator's token before the server has started.
+fn generate_admin_token_paths(
+    binary: &Path,
+    paths: &InstancePaths,
+    login: &str,
+    cancelled: &dyn Fn() -> bool,
+    on_spawn: impl FnOnce(u32),
+) -> Result<Secret, String> {
     let name = format!("gewu-engine-admin-{}", crate::time::now_unix_ms());
     let output = forgejo_output_tracked(
         binary,
-        &paths,
+        paths,
         &[
             "admin",
             "user",
@@ -1396,6 +1611,10 @@ mod tests {
             "HTTP_PORT = 3042",
             "ROOT_URL = http://127.0.0.1:3042/",
             "DB_TYPE = sqlite3",
+            "SQLITE_TIMEOUT = 5000",
+            "SQLITE_JOURNAL_MODE = WAL",
+            "LANGS = en-US",
+            "DEFAULT_UI_LOCATION = UTC",
             "INSTALL_LOCK = true",
             "DISABLE_REGISTRATION = true",
             "REQUIRE_SIGNIN_VIEW = true",
@@ -1414,6 +1633,170 @@ mod tests {
             !text.contains("[actions]\nENABLED = true"),
             "actions were enabled"
         );
+    }
+
+    #[test]
+    fn no_product_spawned_command_line_carries_the_administrator_password() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::scratch_root("bundled-argv");
+        let capture = root.join("spawned-args.txt");
+        let binary = root.join("fake-forgejo");
+        let script = r#"#!/bin/sh
+{ printf '%s' "$0"; for a in "$@"; do printf '\t%s' "$a"; done; printf '\n'; } >> __CAPTURE__
+case "$1:$2" in
+  embedded:view) printf '%s\n' '<script>window.originalPageScript = true;</script>' ;;
+  migrate:*) exit 0 ;;
+  admin:user)
+    case "$3" in
+      create) printf "generated random password is 'fixture-random-password-value'\nNew user 'owner' has been successfully created!\n" ;;
+      generate-access-token) printf 'gf-fixture-admin-token\n' ;;
+    esac ;;
+esac
+"#
+        .replace("__CAPTURE__", &capture.display().to_string());
+        fs::write(&binary, script).expect("the fake binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("the fake binary is executable");
+        let data_root = root.join("data");
+        let prepared = prepare_instance_checked(&data_root, &binary, "owner", || false)
+            .expect("the instance prepares");
+        assert!(
+            prepared.admin_token.is_some(),
+            "the administrator token was not minted at setup"
+        );
+        let spawned = fs::read_to_string(&capture).expect("the spawn record");
+        assert!(
+            spawned.contains("--random-password"),
+            "the account was not created with a CLI-generated password: {spawned}"
+        );
+        assert!(
+            !spawned.contains("--password"),
+            "a password was passed in a process argument: {spawned}"
+        );
+        assert!(
+            !spawned.contains("fixture-random-password-value"),
+            "the generated value reached an argument: {spawned}"
+        );
+        assert!(
+            !spawned.contains("generated random password is"),
+            "the CLI output was treated as an argument: {spawned}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_password_reset_sends_the_value_in_the_api_body_not_an_argument() {
+        use crate::test_stub::{Route, Stub, StubReply};
+        let stub = Stub::start_routed(vec![Route::new(
+            "PATCH",
+            "/api/v1/admin/users/owner",
+            StubReply::json("{}"),
+        )]);
+        let client = ForgejoClient::new(
+            &format!("http://{}", stub.addr()),
+            Secret::new("gf-fixture-admin-token"),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("a client");
+        let password = reset_admin_password(&client, "owner").expect("the reset answers");
+        assert_eq!(password.chars().count(), 69);
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "PATCH");
+        assert_eq!(requests[0].path, "/api/v1/admin/users/owner");
+        let body: serde_json::Value = serde_json::from_str(&requests[0].body).expect("a JSON body");
+        assert_eq!(body["password"], serde_json::json!(password));
+        assert_eq!(body["must_change_password"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn an_older_app_ini_is_brought_forward_and_keeps_every_other_setting() {
+        let root = crate::test_support::scratch_root("bundled-ini-upgrade");
+        let paths = InstancePaths::under(&root);
+        let secrets = InstanceSecrets::generate().expect("secrets are generated");
+        // A v0.1.30 file: 500 ms, no journal mode, no [i18n] and no [time].
+        let old = app_ini_text(&paths, 3046, "tester", &secrets)
+            .replace("SQLITE_TIMEOUT = 5000", "SQLITE_TIMEOUT = 500 ; my note")
+            .replace("SQLITE_JOURNAL_MODE = WAL\n", "")
+            .replace("LEVEL = info", "LEVEL = warn")
+            .replace(
+                "\n[i18n]\n; A pinned, valid default: a browser that sends an unusable language tag\n; still gets a page whose language, and whose date formats, are valid.\nLANGS = en-US\nNAMES = English\n",
+                "",
+            )
+            .replace("\n[time]\nDEFAULT_UI_LOCATION = UTC\n", "");
+        assert!(!old.contains("SQLITE_JOURNAL_MODE"));
+        assert!(!old.contains("[i18n]"));
+        let updated = pinned_app_ini(&old);
+        for wanted in [
+            "SQLITE_TIMEOUT = 5000",
+            "SQLITE_JOURNAL_MODE = WAL",
+            "[i18n]\nLANGS = en-US\nNAMES = English",
+            "[time]\nDEFAULT_UI_LOCATION = UTC",
+            "LEVEL = warn",
+            "HTTP_PORT = 3046",
+            "SECRET_KEY = ",
+        ] {
+            assert!(
+                updated.contains(wanted),
+                "the upgrade has no {wanted:?}:\n{updated}"
+            );
+        }
+        assert_eq!(
+            pinned_app_ini(&updated),
+            updated,
+            "the upgrade is not idempotent"
+        );
+        assert!(
+            !updated.contains("SQLITE_TIMEOUT = 500 ;"),
+            "the old 500 ms wait survives:\n{updated}"
+        );
+        // A section that exists but lost a key gets it inside its own section.
+        let no_timeout = old.replace("SQLITE_TIMEOUT = 500 ; my note\n", "");
+        let updated = pinned_app_ini(&no_timeout);
+        let database = updated
+            .split("[database]")
+            .nth(1)
+            .and_then(|rest| rest.split('\n').find(|line| line.starts_with("PATH")))
+            .unwrap_or_default();
+        assert!(updated.contains("SQLITE_TIMEOUT = 5000"), "{updated}");
+        assert!(updated.contains("[server]"), "a section boundary moved");
+        assert!(!database.is_empty());
+    }
+
+    #[test]
+    fn the_locale_guard_is_prepended_to_the_pinned_page_script() {
+        let root = crate::test_support::scratch_root("bundled-locale");
+        let paths = InstancePaths::under(&root);
+        paths.ensure().expect("the instance directories");
+        let binary = root.join("fake-forgejo");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf '%s\\n' '<script>window.originalPageScript = true;</script>'\n",
+        )
+        .expect("the fake binary");
+        let mut permissions = fs::metadata(&binary).expect("metadata").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+        fs::set_permissions(&binary, permissions).expect("executable");
+        write_locale_guard(&binary, &paths).expect("the guard is written");
+        let target = paths.root.join("custom/templates/base/head_script.tmpl");
+        let text = fs::read_to_string(&target).expect("the custom template");
+        assert!(text.contains("usable(navigator.language)"), "{text}");
+        assert!(
+            text.contains("window.originalPageScript = true"),
+            "the pinned script was dropped: {text}"
+        );
+        assert!(
+            text.find("usable(navigator.language)") < text.find("window.originalPageScript"),
+            "the guard is not before the page script"
+        );
+    }
+
+    #[test]
+    fn a_new_installation_uses_a_fixed_login_not_the_computer_account() {
+        // Forgejo reserves `admin`; `owner` is the fixed login the README shows.
+        assert_eq!(admin_login_from_env(), FALLBACK_ADMIN_LOGIN);
+        assert_eq!(FALLBACK_ADMIN_LOGIN, "owner");
     }
 
     #[test]

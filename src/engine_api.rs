@@ -43,6 +43,13 @@ pub struct ForgejoView {
     pub organisation: String,
     /// Repositories in that organisation (the agents' shared work).
     pub repositories: usize,
+    /// Their `team/name` names, sorted, for the Forgejo page.
+    pub repository_names: Vec<String>,
+    /// Repository changes seen between two administration-API polls, oldest first:
+    /// `team/scratch was deleted`, `team/website was created`.
+    pub events: Vec<String>,
+    /// The recorded login is one an earlier version made, not the fixed default.
+    pub admin_login_kept: bool,
 }
 
 /// Whether an agent's Forgejo account is ready.
@@ -80,7 +87,10 @@ pub enum SessionState {
     /// A session is running; `number` counts sessions since the agent was last started.
     Running { number: u64, since: SystemTime },
     /// Started and between sessions: the next one starts at `next_at`.
-    Restarting { next_at: SystemTime, last: SessionEnd },
+    Restarting {
+        next_at: SystemTime,
+        last: SessionEnd,
+    },
     /// Started but unable to run; `reason` is one short sentence naming the fix
     /// (no endpoint, an empty instruction, Forgejo not running, the account not ready).
     Blocked { reason: String },
@@ -104,8 +114,47 @@ pub struct AgentView {
     pub instruction_chars: usize,
     /// The first line of the instruction, for the card and the panel.
     pub instruction_first_line: Option<String>,
+    /// How many lines the whole instruction has, so a card can say how much it is
+    /// not showing.
+    pub instruction_lines: usize,
     /// The newest thing it did in Forgejo, short: `commented #12`, `opened PR #4`.
     pub activity: Option<String>,
+    /// When that activity happened, for `last: … · 2m ago`.
+    pub activity_at: Option<SystemTime>,
+    /// The last finished run's error, first clause only, for the card.
+    pub last_error: Option<String>,
+    /// The last failure of a tool call inside the current or newest run: one line,
+    /// `✗ shell: exit 128 — …`'s first clause.
+    pub last_failure: Option<String>,
+    /// The tool call in flight right now, if a run is inside one.
+    pub current_tool: Option<String>,
+    /// How many seconds that call has been in flight.
+    pub current_tool_seconds: u64,
+    /// The last issue, branch, pull request and comment named by the newest run, at
+    /// most two short lines, for the card's work block.
+    pub last_work: Vec<String>,
+}
+
+/// What an older installation looked like when this version first opened it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeView {
+    /// The version recorded by the earlier build, e.g. `0.1.29`.
+    pub from_version: String,
+    /// This build's version.
+    pub to_version: String,
+    /// The earlier settings file was found; its model and agents are reused when
+    /// `multiverse.toml` exists, and `config.toml` is left as it was.
+    pub settings: bool,
+    /// How many agents the settings name.
+    pub agents: usize,
+    /// How many instruction documents were found.
+    pub instructions: usize,
+    /// How many run records were found.
+    pub runs: usize,
+    /// An old `config.toml` was found and is ignored (never read or converted).
+    pub ignored_config: bool,
+    /// The release page address.
+    pub release_url: String,
 }
 
 /// How an endpoint test went.
@@ -145,6 +194,11 @@ pub struct BoardView {
     /// The administrator password, present only in the view right after
     /// [`Command::RevealAdminPassword`], and never again until asked.
     pub admin_password: Option<String>,
+    /// Whether this computer can confine an agent's shell. When it cannot, the
+    /// board and the warnings say `runs are not confined on this computer`.
+    pub confined: bool,
+    /// The one screen shown the first time this build opens an older installation.
+    pub upgrade: Option<UpgradeView>,
 }
 
 /// What the board can ask for. Every command returns at once.
@@ -153,18 +207,30 @@ pub enum Command {
     /// Record the first-run terms.
     AcknowledgeTerms,
     /// Set the one model endpoint; `key: None` keeps the stored key.
-    SetEndpoint { url: String, model: String, key: Option<String> },
+    SetEndpoint {
+        url: String,
+        model: String,
+        key: Option<String>,
+    },
     /// Test the endpoint in the background.
     TestEndpoint,
     /// First setup: create `agent-1` … `agent-N` and their accounts.
-    CreateAgents { count: usize },
+    CreateAgents {
+        count: usize,
+    },
     /// Add one more agent (the next free `agent-N`).
     AddAgent,
     /// Stop it, revoke its token, remove it from the organisation; its Forgejo account
     /// and its history stay.
-    RemoveAgent { name: String },
-    Start { name: String },
-    Stop { name: String },
+    RemoveAgent {
+        name: String,
+    },
+    Start {
+        name: String,
+    },
+    Stop {
+        name: String,
+    },
     /// Fetch (if needed), prepare and start the bundled Forgejo.
     StartForgejo,
     /// Put the administrator password into the next view only.

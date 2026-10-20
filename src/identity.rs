@@ -231,6 +231,14 @@ pub fn manage(
     // The mark is written on every manage, so a fresh account can be recognised
     // afterwards and an old one is not mistaken for a person.
     client.mark_identity(&login, &format!("{LOGIN_PREFIX}{agent}"))?;
+    // An account removed by this product is deactivated, not deleted. Adding the
+    // agent again brings the same account and its history back.
+    if existing
+        .as_ref()
+        .is_some_and(|user| !user.active || user.prohibit_login)
+    {
+        client.set_user_active(&login, true)?;
+    }
     // A renewal makes a second token, and Forgejo refuses a duplicate token name:
     // the creation keeps the account's own name, while a renewal gets a name that
     // says it was made for the issue rights and when.

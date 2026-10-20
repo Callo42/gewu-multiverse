@@ -131,6 +131,7 @@ fn ask_to_end_with_the_parent() {
 struct RunLog {
     file: fs::File,
     secret: Secret,
+    dir: std::path::PathBuf,
 }
 
 impl RunLog {
@@ -144,6 +145,7 @@ impl RunLog {
         Ok(Self {
             file,
             secret: Secret::empty(),
+            dir: run_dir.to_path_buf(),
         })
     }
 
@@ -174,6 +176,54 @@ impl RunLog {
         let redacted = self.secret.redact(text);
         let _ = self.file.write_all(redacted.as_bytes());
         let _ = self.file.flush();
+    }
+
+    /// Say which tool is in flight, so the card can show it with its elapsed time.
+    fn tool_started(&self, tool: &str) {
+        let text = format!("{tool}\n{}\n", crate::time::now_unix_ms());
+        let _ = crate::mode::write_private(
+            self.dir.join(crate::run::CURRENT_TOOL_FILE),
+            text.as_bytes(),
+        );
+    }
+
+    /// The call is over, however it ended.
+    fn tool_finished(&self) {
+        let _ = fs::remove_file(self.dir.join(crate::run::CURRENT_TOOL_FILE));
+    }
+
+    /// One failed tool call: a visible `✗ <tool>: <first clause>` in the run log and
+    /// in the file the engine reads for the card. The model still gets the result and
+    /// may recover; the person sees that this call failed (P2/P6).
+    fn tool_failure(&mut self, tool: &str, detail: &str) {
+        let clause = first_clause(detail, 120);
+        // The file holds the card's text without the symbol; the log holds the line
+        // with it. The card adds the one `✗`.
+        let line = format!("{tool}: {clause}");
+        let redacted = self.secret.redact(&line);
+        let _ = crate::mode::write_private(
+            self.dir.join(crate::run::FAILURE_FILE),
+            redacted.as_bytes(),
+        );
+        self.line(&format!("✗ {line}"));
+    }
+}
+
+/// The first clause of a tool error: no raw body and no second sentence on a card.
+fn first_clause(text: &str, limit: usize) -> String {
+    let mut cut = text.len();
+    for needle in [" — ", " —", ". ", "; ", "\n"] {
+        if let Some(at) = text.find(needle) {
+            cut = cut.min(at);
+        }
+    }
+    let clause = text[..cut].trim();
+    if clause.chars().count() > limit {
+        let mut short: String = clause.chars().take(limit.saturating_sub(1)).collect();
+        short.push('…');
+        short
+    } else {
+        clause.to_owned()
     }
 }
 
@@ -359,12 +409,28 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
         return RunEnd::failed(format!("the transcript cannot be written: {error}"));
     }
 
+    // The shell is confined before any command runs. If this computer offers no
+    // confinement the run still works, and the board and warnings already say so.
+    let shell = match Shell::prepare(plan, run_dir) {
+        Ok(shell) => shell,
+        Err(reason) => return RunEnd::failed(reason),
+    };
+    // A plan promised a boundary this layout cannot keep. The marker and the
+    // rewritten plan are already on disk, so the engine's board stops claiming it;
+    // no command runs before the person sees that (B9-R-R).
+    if let Some(reason) = shell.refused.as_deref() {
+        log.line(&format!(
+            "confinement: the promised boundary cannot be kept — {reason}; no command was run"
+        ));
+        return RunEnd::failed(format!("runs are not confined on this computer — {reason}"));
+    }
+
     // The declared steps, as a fixed prelude. They are what the agent itself placed in
     // steps.txt; a run then hands the real decisions to the model.
     let mut tool_index: u32 = 0;
     for command in &plan.steps {
         tool_index += 1;
-        if let Err(end) = run_declared_step(tool_index, command, plan, transcript, log) {
+        if let Err(end) = run_declared_step(tool_index, command, plan, &shell, transcript, log) {
             return end;
         }
     }
@@ -379,6 +445,7 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
         &secret,
         tool_index,
         &mut forgejo,
+        &shell,
         transcript,
         log,
     )
@@ -435,6 +502,7 @@ fn run_declared_step(
     index: u32,
     command: &str,
     plan: &RunPlan,
+    shell: &Shell,
     transcript: &mut Transcript,
     log: &mut RunLog,
 ) -> Result<(), RunEnd> {
@@ -452,9 +520,12 @@ fn run_declared_step(
         )));
     }
     let started = Instant::now();
-    let outcome = match run_shell(command, plan, log) {
+    log.tool_started(model::SHELL_TOOL);
+    let outcome = match run_shell(command, plan, shell, log) {
         Ok(outcome) => outcome,
         Err(reason) => {
+            log.tool_finished();
+            log.tool_failure(model::SHELL_TOOL, &reason);
             let _ = transcript.append(&Record::tool_result(
                 None,
                 index,
@@ -467,8 +538,15 @@ fn run_declared_step(
             return Err(RunEnd::failed(reason));
         }
     };
+    log.tool_finished();
     let duration_ms = started.elapsed().as_millis() as u64;
     let end = describe_end(outcome.exit_code, outcome.signal);
+    if outcome.signal.is_some() || outcome.exit_code != Some(0) {
+        log.tool_failure(
+            model::SHELL_TOOL,
+            &format!("{end}: {}", outcome.excerpt.trim()),
+        );
+    }
     log.line(&format!("[step {index}] {end} after {duration_ms} ms"));
     if let Err(error) = transcript.append(&Record::tool_result(
         None,
@@ -507,12 +585,14 @@ fn run_declared_step(
 }
 
 /// The whole model loop: one turn at a time, until the model finishes or a bound ends it.
+#[allow(clippy::too_many_arguments)]
 fn model_loop(
     plan: &RunPlan,
     instruction: &[u8],
     secret: &Secret,
     mut tool_index: u32,
     forgejo: &mut Option<ForgejoTools>,
+    shell: &Shell,
     transcript: &mut Transcript,
     log: &mut RunLog,
 ) -> RunEnd {
@@ -669,6 +749,7 @@ fn model_loop(
                 tool_index,
                 plan,
                 forgejo.as_mut(),
+                shell,
                 transcript,
                 log,
             ) {
@@ -681,12 +762,14 @@ fn model_loop(
 }
 
 /// Run one tool the model asked for, and return what is fed back to the model.
+#[allow(clippy::too_many_arguments)]
 fn run_model_tool(
     call: &ToolCall,
     turn: u32,
     index: u32,
     plan: &RunPlan,
     forgejo: Option<&mut ForgejoTools>,
+    shell: &Shell,
     transcript: &mut Transcript,
     log: &mut RunLog,
 ) -> Result<String, RunEnd> {
@@ -731,9 +814,12 @@ fn run_model_tool(
         )));
     }
     let started = Instant::now();
-    let outcome = match run_shell(&command, plan, log) {
+    log.tool_started(model::SHELL_TOOL);
+    let outcome = match run_shell(&command, plan, shell, log) {
         Ok(outcome) => outcome,
         Err(reason) => {
+            log.tool_finished();
+            log.tool_failure(model::SHELL_TOOL, &reason);
             let _ = transcript.append(&Record::tool_result(
                 Some(turn),
                 index,
@@ -746,10 +832,17 @@ fn run_model_tool(
             return Err(RunEnd::failed(reason));
         }
     };
+    log.tool_finished();
     let duration_ms = started.elapsed().as_millis() as u64;
+    let end = describe_end(outcome.exit_code, outcome.signal);
+    if outcome.signal.is_some() || outcome.exit_code != Some(0) {
+        log.tool_failure(
+            model::SHELL_TOOL,
+            &format!("{end}: {}", outcome.excerpt.trim()),
+        );
+    }
     log.line(&format!(
-        "[turn {turn} tool {index}] {} after {duration_ms} ms",
-        describe_end(outcome.exit_code, outcome.signal)
+        "[turn {turn} tool {index}] {end} after {duration_ms} ms"
     ));
     if let Err(error) = transcript.append(&Record::tool_result(
         Some(turn),
@@ -881,7 +974,9 @@ fn run_forgejo_tool(
             "the transcript cannot be written: {error}"
         )));
     }
+    log.tool_started(&call.function.name);
     let outcome = tools.execute(&call.function.name, &call.function.arguments);
+    log.tool_finished();
     let (record_repository, record_number) = match &outcome {
         Ok(reply) => (
             reply.repository.clone().or_else(|| repository.clone()),
@@ -929,6 +1024,7 @@ fn run_forgejo_tool(
                 )));
             }
             log.line(&format!("[turn {turn} tool {index}] refused: {problem}"));
+            log.tool_failure(&call.function.name, &problem);
             Ok(problem)
         }
     }
@@ -1001,34 +1097,303 @@ struct ToolOutcome {
     excerpt: String,
 }
 
+/// The shell of one run: how it is confined, and the private directory it owns.
+///
+/// The directory is created before the first command and removed when the run ends.
+/// It holds an empty `HOME`, a private `TMPDIR`, and — only when the run has its own
+/// Forgejo login — a per-run askpass file with that one login and token. Removing
+/// the directory is the last thing the run does with it, on success or failure.
+struct Shell {
+    method: crate::confinement::Method,
+    /// The workspace the shell is actually rooted in, resolved with `realpath`.
+    workspace: std::path::PathBuf,
+    hide: Vec<std::path::PathBuf>,
+    temp: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+    askpass: Option<std::path::PathBuf>,
+    login: Option<String>,
+    root: Option<std::path::PathBuf>,
+    stage: Option<std::path::PathBuf>,
+    /// Why a plan's promised boundary could not be kept. It is never swallowed: the
+    /// plan is rewritten, a marker is left for the engine and the run does not
+    /// execute a command on an unconfined fallback (B9-R-R).
+    refused: Option<String>,
+}
+
+impl Shell {
+    /// Prepare the shell described by the plan. Nothing is created for an
+    /// unconfined plan, so a host without a confinement keeps the old behaviour.
+    fn prepare(plan: &RunPlan, run_dir: &Path) -> Result<Self, String> {
+        Self::prepare_with(plan, run_dir, crate::confinement::landlock_enforced)
+    }
+
+    /// [`Self::prepare`] with the Landlock enforcement check injected, so a test can
+    /// prove that a refused probe takes the never-silent path without needing a
+    /// kernel where the probe fails (B10).
+    fn prepare_with(
+        plan: &RunPlan,
+        run_dir: &Path,
+        landlock_enforced: impl Fn() -> bool,
+    ) -> Result<Self, String> {
+        let method = crate::confinement::Method::parse(&plan.confinement);
+        // The person's real home is always in the hide list, even when the engine's
+        // TMPDIR is below it (N12). The namespace mechanisms stage this run's own
+        // root before the hides and bind it back afterwards, so the run still has
+        // its private home and TMPDIR while `~/.ssh` and `~/.gitconfig` disappear.
+        let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let hide = crate::confinement::run_hide_roots(&plan.hide, real_home.as_deref());
+        let workspace = crate::confinement::resolved_layout(&plan.workspace)
+            .unwrap_or_else(|| plan.workspace.clone());
+        // The run-time layout is checked again, with the actual workspace and the
+        // actual home, and the result is the method the run may use. A downgrade is
+        // recorded below, never hidden (B9-R-R).
+        let (mut method, refusal) = crate::confinement::effective_method(method, &hide, &workspace);
+        let mut refused = refusal.map(str::to_owned);
+        // B10: a plan may name Landlock only while the kernel really enforces it. The
+        // probe runs again here, in a child, so a run never relies on a detection
+        // from minutes ago. A failed probe is the same never-silent refusal as a
+        // layout that cannot be kept: `record_refusal` rewrites the plan, leaves the
+        // marker the engine reads for the board, and `run_shell` refuses to execute.
+        if method == crate::confinement::Method::Landlock && !landlock_enforced() {
+            method = crate::confinement::Method::None;
+            refused = Some("the Landlock sandbox is not enforced on this computer".to_owned());
+        }
+        let mut engine_temp = if method.confined() {
+            crate::confinement::resolved_temp()
+        } else {
+            None
+        };
+        if method.confined() && engine_temp.is_none() {
+            method = crate::confinement::Method::None;
+            refused = Some("the engine's temporary root cannot be resolved".to_owned());
+        }
+        let hide = if method.namespace() {
+            match crate::confinement::resolved_hide_list(&hide) {
+                Some(hide) => hide,
+                None => {
+                    method = crate::confinement::Method::None;
+                    refused = Some("a path to hide cannot be resolved".to_owned());
+                    Vec::new()
+                }
+            }
+        } else {
+            hide
+        };
+        if let Some(reason) = refused.as_deref() {
+            record_refusal(plan, run_dir, method, reason)?;
+        }
+        if !method.confined() {
+            return Ok(Self {
+                method,
+                workspace,
+                hide: Vec::new(),
+                temp: None,
+                home: None,
+                askpass: None,
+                login: None,
+                root: None,
+                stage: None,
+                refused,
+            });
+        }
+        let engine_temp = engine_temp.take().expect("a confined run has a temp root");
+        let root = engine_temp.join(format!("gewu-run-{}-{}", std::process::id(), plan.run_id));
+        let home = root.join("home");
+        let temp = root.join("tmp");
+        let stage = if method.namespace() {
+            Some(crate::confinement::create_stage(&hide, &plan.run_id)?)
+        } else {
+            None
+        };
+        for path in [&root, &home, &temp] {
+            fs::create_dir_all(path).map_err(|error| {
+                format!(
+                    "the confined shell's private directory {} cannot be made: {error}",
+                    path.display()
+                )
+            })?;
+            let _ = crate::mode::set_mode(path, crate::mode::PRIVATE_DIR_MODE);
+        }
+        fs::create_dir_all(home.join(".config"))
+            .and_then(|()| fs::create_dir_all(home.join(".cache")))
+            .and_then(|()| fs::create_dir_all(home.join(".local/state")))
+            .and_then(|()| fs::write(home.join(".gitconfig"), b""))
+            .map_err(|error| format!("the confined shell's home cannot be written: {error}"))?;
+        let login = crate::run::read_forgejo_context(run_dir).map(|context| context.login);
+        let askpass = match (
+            login.as_ref(),
+            credentials::forgejo_agent_token(&plan.credentials, &plan.agent),
+        ) {
+            (Some(login), Ok(token)) => {
+                // Under the run's private TMPDIR, which every mechanism lets the run
+                // read. The old path beside the run root was outside Landlock's
+                // allow-list, so git could not authenticate in a confined run.
+                let path = temp.join("askpass.toml");
+                let text = format!(
+                    "[forgejo_agent_tokens]\n\"{}\" = \"{}\"\n[forgejo_logins]\n\"{}\" = \"{}\"\n",
+                    plan.agent,
+                    token.expose(),
+                    plan.agent,
+                    login
+                );
+                crate::mode::write_private(&path, text.as_bytes()).map_err(|error| {
+                    format!("the confined shell's login file cannot be written: {error}")
+                })?;
+                Some(path)
+            }
+            _ => None,
+        };
+        Ok(Self {
+            method,
+            workspace,
+            hide,
+            temp: Some(temp),
+            home: Some(home),
+            askpass,
+            login,
+            root: Some(root),
+            stage,
+            refused,
+        })
+    }
+}
+
+/// Record a run-time confinement refusal where both the run and the engine see it.
+///
+/// The plan no longer promises a mechanism the run does not have, and a marker in
+/// the run directory lets the engine take the sixth sentence and `confined = false`
+/// onto the board without waiting for the run to end (B9-R-R).
+fn record_refusal(
+    plan: &RunPlan,
+    run_dir: &Path,
+    method: crate::confinement::Method,
+    reason: &str,
+) -> Result<(), String> {
+    let mut recorded = plan.clone();
+    recorded.confinement = method.as_str().to_owned();
+    recorded
+        .write(run_dir)
+        .map_err(|error| format!("the run plan cannot record its confinement: {error}"))?;
+    crate::run::write_confinement_refusal(run_dir, reason)
+        .map_err(|error| format!("the confinement refusal cannot be recorded: {error}"))
+}
+
+impl Drop for Shell {
+    fn drop(&mut self) {
+        if let Some(root) = self.root.take() {
+            let _ = fs::remove_dir_all(root);
+        }
+        if let Some(stage) = self.stage.take() {
+            let _ = fs::remove_dir_all(stage);
+        }
+    }
+}
+
 /// Run one shell command inside the workspace, capturing its output.
 ///
 /// The shell is started with the workspace as its working directory, and its output
 /// is captured, redacted, written to the run's log and returned as an excerpt. That is
 /// the whole intent: a tool is meant to work in the workspace. It is not confinement,
 /// and the documentation says so.
-fn run_shell(command: &str, plan: &RunPlan, log: &mut RunLog) -> Result<ToolOutcome, String> {
-    let mut child_command = Command::new("/bin/sh");
+fn run_shell(
+    command: &str,
+    plan: &RunPlan,
+    shell: &Shell,
+    log: &mut RunLog,
+) -> Result<ToolOutcome, String> {
+    // A shell whose promised boundary was refused may not run anything: the plan
+    // said confined and falling back to an open `/bin/sh` would be the silent
+    // unconfined run B9-R-R is about. The refusal is already on the board.
+    if let Some(reason) = shell.refused.as_deref() {
+        return Err(format!("the command was not run — {reason}"));
+    }
+    let mut child_command = if shell.method.confined() {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("the confined shell cannot be found: {error}"))?;
+        let mut command_line = Command::new(exe);
+        // Clear the inherited environment first: `env_clear` also drops anything set
+        // before it, so every product variable below is added afterwards (N13).
+        command_line.env_clear();
+        for (key, value) in crate::confinement::safe_environment(std::env::vars_os()) {
+            command_line.env(key, value);
+        }
+        command_line
+            .arg("--confined-shell")
+            .env(crate::confinement::ENV_METHOD, shell.method.as_str())
+            .env(crate::confinement::ENV_COMMAND, command)
+            .env(crate::confinement::ENV_WORKSPACE, &shell.workspace);
+        if shell.method.namespace() {
+            if let Some(root) = shell.root.as_ref() {
+                command_line.env(crate::confinement::ENV_ROOT, root);
+            }
+            if let Some(stage) = shell.stage.as_ref() {
+                command_line.env(crate::confinement::ENV_STAGE, stage);
+            }
+            // The hide list is a namespace instruction; Landlock never uses it, and
+            // a Landlock run must not be handed the product's paths as a hint (B9).
+            command_line.env(
+                crate::confinement::ENV_HIDE,
+                shell
+                    .hide
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            );
+        }
+        if let Some(home) = shell.home.as_ref() {
+            command_line
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_STATE_HOME", home.join(".local/state"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"));
+        }
+        command_line
+    } else {
+        let mut command_line = Command::new("/bin/sh");
+        command_line.env_clear();
+        for (key, value) in crate::confinement::safe_environment(std::env::vars_os()) {
+            command_line.env(key, value);
+        }
+        command_line.arg("-c").arg(command);
+        command_line
+    };
+    if let Some(home) = shell.home.as_ref() {
+        child_command.env("HOME", home);
+    } else if let Some(home) = std::env::var_os("HOME") {
+        child_command.env("HOME", home);
+    }
+    if let Some(temp) = shell.temp.as_ref() {
+        child_command.env("TMPDIR", temp);
+    } else if let Some(temp) = std::env::var_os("TMPDIR") {
+        child_command.env("TMPDIR", temp);
+    }
     child_command
-        .arg("-c")
-        .arg(command)
-        .current_dir(&plan.workspace)
+        .current_dir(&shell.workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GEWU_AGENT", &plan.agent)
         .env("GEWU_RUN_ID", &plan.run_id)
-        .env("GEWU_WORKSPACE", &plan.workspace);
+        .env("GEWU_WORKSPACE", &shell.workspace);
     // `git` in the workspace authenticates as the agent, and asks this same program
-    // for the token through `GIT_ASKPASS`. The token is read from the credentials
-    // file by the askpass process and handed over a pipe, so it is never an argument
-    // to a command, a URL or a line in the log.
+    // for the token through `GIT_ASKPASS`. In a confined run the askpass process reads
+    // a per-run file that holds only this run's own login and token; the product's
+    // credentials file, with the model key and every other agent's login, is outside
+    // the sandbox. The token is never an argument, a URL or a log line.
     if let Ok(askpass) = std::env::current_exe() {
+        let credential_path = shell
+            .askpass
+            .as_deref()
+            .unwrap_or(plan.credentials.as_path());
         child_command
             .env("GIT_ASKPASS", askpass)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env(crate::workspace::ASKPASS_CREDENTIALS, &plan.credentials)
+            .env(crate::workspace::ASKPASS_CREDENTIALS, credential_path)
             .env(crate::workspace::ASKPASS_AGENT, &plan.agent);
+        if let Some(login) = shell.login.as_ref() {
+            child_command.env(crate::workspace::ASKPASS_LOGIN, login);
+        }
     }
     let mut child = child_command
         .spawn()
@@ -1425,6 +1790,8 @@ mod tests {
             max_turns,
             steps,
             timeout_secs: 30,
+            confinement: "none".to_owned(),
+            hide: Vec::new(),
         };
         plan.write(run_dir).expect("the plan is written");
         plan
@@ -1466,6 +1833,293 @@ mod tests {
             .iter()
             .map(|record| record.event().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_confined_runs_askpass_file_lives_in_the_tmpdir_it_may_read() {
+        let (root, config, skills, credentials) = agent_source("agent-run-askpass");
+        let dir = run_dir(&root);
+        crate::mode::write_private(
+            &credentials,
+            b"[forgejo_agent_tokens]\n\"scribe\" = \"gw-fixture-token\"\n[forgejo_logins]\n\"scribe\" = \"gewu-scribe\"\n",
+        )
+        .expect("the run credentials are written");
+        fs::write(
+            dir.join(crate::run::FORGEJO_CONTEXT_FILE),
+            serde_json::json!({
+                "url": "http://127.0.0.1:3000",
+                "login": "gewu-scribe",
+                "repositories": []
+            })
+            .to_string(),
+        )
+        .expect("the run context is written");
+        let mut plan = plan_with(
+            &dir,
+            &config,
+            &skills,
+            &credentials,
+            "http://127.0.0.1:1/v1/chat/completions",
+            1,
+            Vec::new(),
+        );
+        plan.confinement = "landlock".to_owned();
+        plan.hide = vec![config.clone(), root.join("state")];
+        let shell = Shell::prepare(&plan, &dir).expect("the confined shell prepares");
+        let askpass = shell.askpass.as_ref().expect("the run has a login file");
+        let temp = shell.temp.as_ref().expect("the run has a private TMPDIR");
+        // The file is under TMPDIR, which the Landlock path allows; the path beside
+        // the run root was outside the allow-list (B1).
+        assert!(
+            askpass.starts_with(temp),
+            "{} is not under {}",
+            askpass.display(),
+            temp.display()
+        );
+        assert!(askpass.is_file(), "the login file was not written");
+        assert_eq!(
+            crate::mode::mode_of(askpass).expect("the login file mode"),
+            0o600
+        );
+        // The product roots and the person's real home are in the hide list.
+        assert!(shell.hide.iter().any(|path| path == &config));
+        if let Some(real_home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            assert!(
+                shell.hide.iter().any(|path| path == &real_home),
+                "the person's home {} is not hidden: {:?}",
+                real_home.display(),
+                shell.hide
+            );
+        }
+    }
+
+    #[test]
+    fn a_landlock_plan_for_an_allowed_root_is_never_called_confined() {
+        // Landlock grants `/etc`; a hidden root there would be readable. The run
+        // must prefer a namespace or be honestly unconfined (B9), never Landlock.
+        let (root, config, skills, credentials) = agent_source("agent-run-landlock-overlap");
+        let dir = run_dir(&root);
+        let mut plan = plan_with(
+            &dir,
+            &config,
+            &skills,
+            &credentials,
+            "http://127.0.0.1:1/v1/chat/completions",
+            1,
+            Vec::new(),
+        );
+        plan.confinement = "landlock".to_owned();
+        plan.hide = vec![PathBuf::from("/etc")];
+        let shell = Shell::prepare(&plan, &dir).expect("the shell prepares");
+        assert_ne!(
+            shell.method,
+            crate::confinement::Method::Landlock,
+            "Landlock was chosen although `/etc` is in its allow-list"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hidden_root_inside_the_workspace_is_never_called_confined() {
+        // The namespace mechanisms bind the workspace back, so a state root inside
+        // it would come back with it; Landlock grants the workspace. There is no
+        // mechanism for this layout, so it must report none, not a boundary (B9).
+        let (root, config, skills, credentials) = agent_source("agent-run-workspace-overlap");
+        let dir = run_dir(&root);
+        let mut plan = plan_with(
+            &dir,
+            &config,
+            &skills,
+            &credentials,
+            "http://127.0.0.1:1/v1/chat/completions",
+            1,
+            Vec::new(),
+        );
+        for method in ["landlock", "unshare", "bwrap"] {
+            plan.confinement = method.to_owned();
+            let inside = plan.workspace.join("state");
+            fs::create_dir_all(&inside).expect("a state root inside the workspace");
+            plan.hide = vec![inside];
+            let shell = Shell::prepare(&plan, &dir).expect("the shell prepares");
+            assert_eq!(
+                shell.method,
+                crate::confinement::Method::None,
+                "{method} claimed a boundary for a root inside the workspace"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlinked_hidden_root_inside_the_workspace_is_never_called_confined() {
+        // B9-R: the state root's lexical path is outside the workspace, but its
+        // target is inside it. The namespace mechanisms bind the workspace back, so
+        // calling this confined would hand the records to the run.
+        let (root, config, skills, credentials) = agent_source("agent-run-b9r-state");
+        let dir = run_dir(&root);
+        let target = config.join("workspace/state");
+        fs::create_dir_all(&target).expect("a state root inside the workspace");
+        let state = root.join("state-link");
+        std::os::unix::fs::symlink(&target, &state).expect("the state symlink");
+        for method in ["landlock", "unshare", "bwrap"] {
+            let mut plan = plan_with(
+                &dir,
+                &config,
+                &skills,
+                &credentials,
+                "http://127.0.0.1:1/v1/chat/completions",
+                1,
+                Vec::new(),
+            );
+            plan.confinement = method.to_owned();
+            plan.hide = vec![config.clone(), state.clone()];
+            let shell = Shell::prepare(&plan, &dir).expect("the shell prepares");
+            assert_eq!(
+                shell.method,
+                crate::confinement::Method::None,
+                "{method} claimed a boundary for a symlinked state root inside the workspace"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlinked_workspace_over_the_config_root_is_never_called_confined() {
+        // B9-R: the workspace is a symlink to the parent of the configuration root,
+        // so the workspace rebind would restore the configuration root with it.
+        let (root, config, skills, credentials) = agent_source("agent-run-b9r-workspace");
+        let dir = run_dir(&root);
+        let workspace = root.join("work-link");
+        std::os::unix::fs::symlink(&root, &workspace).expect("the workspace symlink");
+        for method in ["landlock", "unshare", "bwrap"] {
+            let mut plan = plan_with(
+                &dir,
+                &config,
+                &skills,
+                &credentials,
+                "http://127.0.0.1:1/v1/chat/completions",
+                1,
+                Vec::new(),
+            );
+            plan.confinement = method.to_owned();
+            plan.workspace = workspace.clone();
+            plan.hide = vec![config.clone()];
+            let shell = Shell::prepare(&plan, &dir).expect("the shell prepares");
+            assert_eq!(
+                shell.method,
+                crate::confinement::Method::None,
+                "{method} claimed a boundary for a workspace symlinked over the config root"
+            );
+            // B9-R-R: the refusal is recorded, not swallowed. The plan no longer
+            // promises the method, the engine can see a marker, and a real shell
+            // command is refused instead of running unconfined.
+            let recorded = crate::run::RunPlan::read(&dir).expect("the rewritten plan");
+            assert_eq!(recorded.confinement, "none", "{method} left a false plan");
+            assert!(
+                crate::run::read_confinement_refusal(&dir).is_some(),
+                "{method} left no refusal marker"
+            );
+            let mut log = RunLog::open(&dir).expect("the run log");
+            let refused = run_shell("cat credentials.toml", &plan, &shell, &mut log);
+            assert!(
+                refused.is_err(),
+                "{method} ran an unconfined shell command after refusing the boundary"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_landlock_that_is_not_enforced_is_refused_not_run() {
+        // B10: the plan may name Landlock only while the kernel really enforces it.
+        // The injected probe says the enforcement check failed; the run must take
+        // the never-silent path — plan `none`, refusal marker, no command — instead
+        // of executing on a promise it cannot keep.
+        let (root, config, skills, credentials) = agent_source("agent-run-b10-probe");
+        let dir = run_dir(&root);
+        let mut plan = plan_with(
+            &dir,
+            &config,
+            &skills,
+            &credentials,
+            "http://127.0.0.1:1/v1/chat/completions",
+            1,
+            Vec::new(),
+        );
+        plan.confinement = "landlock".to_owned();
+        plan.hide = vec![config.clone()];
+        let shell = Shell::prepare_with(&plan, &dir, || false).expect("the refused shell prepares");
+        assert_eq!(
+            shell.method,
+            crate::confinement::Method::None,
+            "a failed Landlock probe still claimed a boundary"
+        );
+        assert!(shell.refused.is_some(), "the refusal has no reason");
+        let recorded = crate::run::RunPlan::read(&dir).expect("the rewritten plan");
+        assert_eq!(
+            recorded.confinement, "none",
+            "the plan still promises Landlock"
+        );
+        assert!(
+            crate::run::read_confinement_refusal(&dir).is_some(),
+            "the refusal left no marker for the board"
+        );
+        let mut log = RunLog::open(&dir).expect("the run log");
+        assert!(
+            run_shell("true", &plan, &shell, &mut log).is_err(),
+            "a command ran although the Landlock probe failed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dangling_hidden_symlink_is_never_called_confined() {
+        // B9-R: a dangling state root has no target yet; when one appears under the
+        // workspace it would be readable through the workspace rebind. Nothing
+        // proves it is outside, so the method must be none.
+        let (root, config, skills, credentials) = agent_source("agent-run-b9r-dangling");
+        let dir = run_dir(&root);
+        let state = root.join("state-link");
+        std::os::unix::fs::symlink(config.join("workspace/not-created-yet"), &state)
+            .expect("the dangling symlink");
+        for method in ["landlock", "unshare", "bwrap"] {
+            let mut plan = plan_with(
+                &dir,
+                &config,
+                &skills,
+                &credentials,
+                "http://127.0.0.1:1/v1/chat/completions",
+                1,
+                Vec::new(),
+            );
+            plan.confinement = method.to_owned();
+            plan.hide = vec![config.clone(), state.clone()];
+            let shell = Shell::prepare(&plan, &dir).expect("the shell prepares");
+            assert_eq!(
+                shell.method,
+                crate::confinement::Method::None,
+                "{method} claimed a boundary for a dangling hidden symlink"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_real_home_is_hidden_even_when_tmpdir_is_below_it() {
+        let root = crate::test_support::scratch_root("agent-run-home-tmp");
+        let home = root.join("home");
+        let run_root = home.join("tmp/gewu-run-1");
+        let config = root.join("config");
+        for path in [&home, &run_root, &config] {
+            fs::create_dir_all(path).expect("the scratch path");
+        }
+        let hide = crate::confinement::run_hide_roots(std::slice::from_ref(&config), Some(&home));
+        assert!(
+            hide.iter().any(|path| path == &home),
+            "a TMPDIR under the home leaves the home visible: {hide:?}"
+        );
+        assert!(hide.iter().any(|path| path == &config));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

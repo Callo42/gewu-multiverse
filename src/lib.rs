@@ -39,6 +39,7 @@ pub mod agent_run;
 pub mod board;
 pub mod bundled_forgejo;
 pub mod cli;
+pub mod confinement;
 pub mod credentials;
 pub mod editor;
 pub mod engine;

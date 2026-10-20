@@ -40,6 +40,8 @@ pub enum Screen {
     Forgejo,
     /// The keys.
     Help,
+    /// The first open by a newer build: what was found and what is reused.
+    Upgrade,
 }
 
 /// Where the model screen was opened from, which decides what `enter` does.
@@ -106,7 +108,9 @@ impl Board {
         let view = engine.board();
         let startup_notice = view.notice.clone();
         let terms_seen = vec![false; view.terms.len()];
-        let screen = if !view.terms_acknowledged {
+        let screen = if view.upgrade.is_some() {
+            Screen::Upgrade
+        } else if !view.terms_acknowledged {
             Screen::Terms
         } else if !view.endpoint.configured {
             Screen::Model
@@ -178,7 +182,9 @@ impl Board {
             self.set_notice(notice);
         }
         if let Some(password) = view.admin_password.clone() {
-            self.revealed_password = Some((password, 8));
+            // Ten seconds at the board's four ticks a second: long enough to read a
+            // wrapped value and type it into a browser.
+            self.revealed_password = Some((password, 40));
         }
         self.view = view;
         self.after_view();
@@ -271,6 +277,11 @@ impl Board {
         !self.model_fields[0].trim().is_empty() && !self.model_fields[1].trim().is_empty()
     }
 
+    /// Whether a key would be sent: one typed now, or one already stored.
+    fn key_available(&self) -> bool {
+        !self.model_fields[2].trim().is_empty() || self.view.endpoint.key_present
+    }
+
     /// What the person asked for.
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
@@ -289,6 +300,33 @@ impl Board {
             Screen::Agent => self.keys_agent(key),
             Screen::Forgejo => self.keys_forgejo(key),
             Screen::Help => self.keys_help(key),
+            Screen::Upgrade => self.keys_upgrade(key),
+        }
+    }
+
+    /// After the upgrade screen: the first screen this person belongs on.
+    fn after_upgrade(&self) -> Screen {
+        if !self.view.terms_acknowledged {
+            Screen::Terms
+        } else if !self.view.endpoint.configured {
+            Screen::Model
+        } else if self.view.agents.is_empty() {
+            Screen::Picker
+        } else {
+            Screen::Home
+        }
+    }
+
+    fn keys_upgrade(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                self.screen = self.after_upgrade();
+            }
+            _ => {
+                if let Some('q') = plain(key) {
+                    self.request_quit();
+                }
+            }
         }
     }
 
@@ -315,21 +353,50 @@ impl Board {
 
     fn keys_model(&mut self, key: KeyEvent) {
         if self.model_editing {
-            self.edit_field(key);
+            // One Tab behaviour in both modes: Tab keeps the field being edited and
+            // moves to the next one. Only Enter finishes editing and stays.
+            match key.code {
+                KeyCode::Tab | KeyCode::Down => {
+                    // Tab moves and keeps the person editing: one behaviour in both
+                    // modes, so a field can be typed without pressing `e` again.
+                    self.model_focus = (self.model_focus + 1) % 3;
+                    self.model_cursor = self.model_fields[self.model_focus].chars().count();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.model_focus = (self.model_focus + 2) % 3;
+                    self.model_cursor = self.model_fields[self.model_focus].chars().count();
+                }
+                _ => self.edit_field(key),
+            }
             return;
         }
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => {
+            KeyCode::Up => {
                 self.model_focus = (self.model_focus + 2) % 3;
                 self.model_cursor = self.model_fields[self.model_focus].chars().count();
             }
-            KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Down => {
                 self.model_focus = (self.model_focus + 1) % 3;
                 self.model_cursor = self.model_fields[self.model_focus].chars().count();
+            }
+            KeyCode::Tab => {
+                // One Tab behaviour: next field, ready to type, in view mode too.
+                self.model_focus = (self.model_focus + 1) % 3;
+                self.model_cursor = self.model_fields[self.model_focus].chars().count();
+                self.model_editing = true;
+            }
+            KeyCode::BackTab => {
+                self.model_focus = (self.model_focus + 2) % 3;
+                self.model_cursor = self.model_fields[self.model_focus].chars().count();
+                self.model_editing = true;
             }
             KeyCode::Enter => {
                 if !self.endpoint_fields_filled() {
                     self.set_notice("API address and model needed, then ⏎");
+                    return;
+                }
+                if !self.key_available() {
+                    self.set_notice("✗ the API key is empty");
                     return;
                 }
                 self.send(self.endpoint_command());
@@ -348,9 +415,17 @@ impl Board {
                 Some('t') => {
                     if !self.endpoint_fields_filled() {
                         self.set_notice("API address and model needed, then t");
+                    } else if !self.key_available() {
+                        // Nothing is sent: the error is the empty key, not a refusal
+                        // by a provider that never saw a request.
+                        self.set_notice("✗ the API key is empty");
                     } else {
                         self.send(self.endpoint_command());
                         self.send(Command::TestEndpoint);
+                        // The save notice must not sit under a failed test: the test's
+                        // own line is the only verdict on this model.
+                        self.notice = None;
+                        self.notice_ticks = 0;
                     }
                 }
                 Some('e') => self.begin_edit(),
@@ -609,10 +684,10 @@ impl Board {
             }
             _ => match plain(key) {
                 Some('p') => {
+                    // The reset runs through the administration API in the background; the new
+                    // password arrives in a later view, never before it is known.
+                    self.revealed_password = None;
                     self.send(Command::RevealAdminPassword);
-                    if self.revealed_password.is_none() {
-                        self.set_notice("password not available");
-                    }
                 }
                 Some('?') => {
                     self.help_back = Screen::Forgejo;

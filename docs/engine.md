@@ -43,8 +43,8 @@ forgejo/
   engine.lock                 0600, flock: one program per data directory
   instance/
     app.ini                   0600; generated secrets, this-computer-only address, SQLite, no SSH/mail/actions
-    secrets/admin-password    0600; generated once, never printed by the engine
     secrets/admin-login       0600; the login the instance was made with
+    custom/templates/base/head_script.tmpl   the pinned page script plus the locale guard
     log/forgejo.log
     data/forgejo.db, data/repositories/
 ```
@@ -53,9 +53,25 @@ The data root comes from the platform's data directory: on Linux
 `~/.local/share/gewu-multiverse` (or `$XDG_DATA_HOME/gewu-multiverse`).
 
 The port is chosen once from 3000–3099 and then read back from `app.ini`, so a restart
-uses the same address. `migrate` runs before the first administrative change; the
-person's administrator account (login from `$USER` when it is a valid OS login, else
-`owner`) is made through Forgejo's own `admin user` CLI. The process runs as `web` in
+uses the same address. SQLite runs in WAL mode with `SQLITE_TIMEOUT = 5000`, so two
+agents writing at once wait for the lock instead of a 500. `migrate` runs before the
+first administrative change; a new installation's administrator account uses the fixed
+login `owner`, never the operating system account name. Forgejo reserves `admin` for
+its own administration route, so `owner` is the fixed choice. An installation made by
+an earlier version keeps the login recorded in `secrets/admin-login` and the page says
+`(kept from an earlier setup)`.
+
+The administrator password is never written down and never appears in a process
+argument. The account is created with Forgejo's CLI `--random-password` (the value is
+produced by the CLI, read only to be discarded, and wiped from the captured output);
+`p` on the Forgejo page resets it through the administration API, with the new value in
+the `PATCH` body, and puts it in the next view only. The consequence is a static line:
+the password shown before that moment stops working.
+
+The administrator API's repository list is polled every five seconds. A name that
+disappeared or appeared between polls becomes an event on the board and on the Forgejo
+page (`team/scratch was deleted`, `team/website was created`), so a destroyed
+repository is never traceless. The process runs as `web` in
 its own process group. It is ready when `/api/v1/version` answers.
 
 Provisioning through the administration API is idempotent: organisation `team`, team
@@ -84,6 +100,79 @@ start tries again. A child that dies while the engine is open leaves `Failed` wi
 plain sentence, and a restart is scheduled: 3 s, 6 s, 12 s … capped at 60 s, reset when
 it has been running for a while. `shutdown(grace)` sends `SIGTERM` to the child's group,
 waits up to the grace, then sends `SIGKILL`, reaps it, and confirms no process is left.
+
+### Confining an agent's shell
+
+An agent's shell is the one process a model can point anywhere. The **automatic**
+mechanism is Landlock, the unprivileged kernel sandbox; the two namespace mechanisms
+are kept but chosen **only when the person opts in**, and the method that really works
+is written into every run's plan:
+
+1. Landlock (automatic): the shell may read only its workspace, its private temporary
+   directory (where its per-run askpass file lives), the system tools (`/usr`, `/bin`,
+   `/sbin`, `/lib`, `/opt`), `/etc`, `/proc`, `/sys`, `/run`, `/dev` and the product
+   binary's directory; the product's roots and the person's real home are denied,
+   though their names still exist. The method is claimed only after a child process
+   built a ruleset at `HardRequirement`, required `FullyEnforced`, read an allowed
+   control file and was denied one outside the grant; a kernel without Landlock (or
+   with it disabled) gives **none**, never a dummy ruleset. Landlock cannot subtract a
+   rule from a granted tree, so this method is not chosen when one of those hidden
+   roots lies inside a granted tree. A hidden root that resolves inside the workspace
+   is beyond every mechanism, because Landlock grants the workspace and the namespaces
+   bind it back; such a layout is **none**.
+2. `bwrap`, a user and mount namespace, with `GEWU_CONFINEMENT=bwrap`: the
+   configuration root, the state root, the Forgejo data root, the person's real home,
+   `/tmp` and the engine's temporary root are replaced by empty mounts; only this
+   run's own root and workspace are bound back, and the run gets an empty `HOME` and
+   its own `TMPDIR`.
+3. `unshare --user --map-root-user --mount --propagation private`, with
+   `GEWU_CONFINEMENT=unshare`, the same picture built from `mount` calls. The script
+   creates every bind target before the first bind, stages this run's own root and
+   workspace outside the hides, then mounts a private `tmpfs` over `/tmp` and the
+   engine's temporary root, hides the product's roots and the person's home, and binds
+   back only this run's own paths. It also runs `mount --make-rprivate /` before its
+   first mount: a scratch bind made inside the namespace must not be visible outside,
+   and the capability probe checks exactly that before choosing this mechanism.
+   Both namespace argument lists are tested against bubblewrap's and mount(8)'s
+   contracts and with fake programs; they have not yet been proven on a real
+   user-namespace host, which is why they are opt-in.
+
+The engine chooses the method against this installation's own roots when it opens, and
+enumerates every real `<agents>/<agent>/workspace` at that moment and again when an
+agent is added. Every hidden path and the engine's own `TMPDIR` are resolved with
+`realpath` before a mount is placed; a symlink cannot hide its target from the hide
+list, and bubblewrap is never handed a symlink as a mount destination. A namespace
+mechanism also needs a staging directory outside the hidden roots (usually `/dev/shm`);
+without one it is not chosen, because it could not make `/tmp` private.
+
+When Landlock is unavailable, the layout cannot be confined, or the opted-in namespace
+does not work, the run is not confined and the board and the first-run warnings say
+`runs are not confined on this computer`. An opted-in namespace that cannot be honoured
+gives **none**; Landlock is never substituted for the mechanism the person asked for.
+The product does not pretend. A run whose
+plan had promised a boundary that its run-time layout cannot keep — or whose Landlock
+probe fails when the run starts — records `none` in
+its plan, leaves a marker the engine reads for the board, and does not execute a
+command: a silent fallback to an open shell is never allowed.
+
+What a run can still see under every mechanism: `/etc`, `/proc`, `/sys`, `/run`, the
+network and the installed tools. Its environment is cleared to the short allow-list
+described below, so a socket or a key the person exported is not inherited; its stdin
+is empty. Under an opted-in bwrap or unshare it also sees the rest of the host root
+outside the replaced directories. Under Landlock an attempt on a replaced directory
+is `Permission denied`; under a namespace the name is an empty directory. Neither
+mechanism hides the network, and neither is a container.
+
+A confined shell gets an empty `HOME`, a private `TMPDIR`, an environment cleared to a
+short allow-list, and a per-run askpass file under that `TMPDIR` holding only that run's own
+Forgejo login and token, because git inside the run must authenticate. A sibling run's
+askpass file is not visible: an opted-in namespace replaces the shared temporary tree
+with a private `tmpfs`, and Landlock grants only this run's own subtree. The shared
+`credentials.toml` — the model key, the administrator token and every other agent's
+login — is outside the boundary. The run plan records the mechanism and the roots to
+hide, so a run started by an older build stays unconfined rather than being
+retroactively promised a boundary. A plan that is refused at run time is rewritten to
+`none` and marked; the engine takes that refusal onto the board.
 
 ### Left-over processes and the program's own ending
 
@@ -114,6 +203,11 @@ or log-pager hand-off watches that same stop predicate: a caught signal or lost 
 ends the hand-off program politely and then by force, reaps it, and returns so the board
 runs that one `shutdown`; a normal hand-off still waits for the person's own program.
 
+Closing the window leaves the old copy stopping its Forgejo and runs for a moment. A
+reopen waits up to ten seconds for the data lock and then opens; if it is still held it
+says `the previous copy is still stopping — try again in a moment` rather than a bare
+exit 1.
+
 ## Older files are left alone
 
 The engine's own settings are `multiverse.toml` in the configuration root:
@@ -135,6 +229,12 @@ it does, puts one line on the first screen: `an earlier setup was found and left
 was`. The old file is otherwise ignored, and the new settings start as if the
 installation were fresh.
 
+`last-seen.toml` records the newest version that opened the configuration. It is
+written at open and on a clean exit. When the recorded version is older than this
+build, the first open shows one Upgrade screen: the version it was, the version it is,
+how many agents, instructions and runs were found, what is reused, that the old
+`config.toml` is ignored, and the release page address.
+
 The secrets are in `credentials.toml` beside it, created with mode 0600: the bundled
 Forgejo's administrator token, the one model key (top-level `model_key`), and each
 agent's own Forgejo token under `[forgejo_agent_tokens]`. A value is read only when it
@@ -150,9 +250,11 @@ thread and retries while Forgejo is up; the card shows `Pending`, `Ready` or
 `Failed { reason }`.
 
 `RemoveAgent` stops the agent, deletes its token on the server by the name recorded
-when the token was made, removes it from team `agents`, deletes the dead token value
-from the credentials file, and forgets the agent in the settings. The account, its
-commits and its run records stay; removal is not a history rewrite.
+when the token was made, removes it from team `agents`, deactivates the account
+(`active = false` and `prohibit_login = true`, so a web sign-in is refused too),
+deletes the dead token value from the credentials file, and forgets the agent in the
+settings. The account, its commits and its run records stay; removal is not a history
+rewrite, and adding the agent name again reactivates the same account.
 
 The model is one set of three facts — address, model, key — used by every agent. The
 key is written to the shared top-level `model_key` in the credentials file.
@@ -191,7 +293,7 @@ on every tick, so the agent starts by itself as soon as the cause is removed.
 When a run ends, for **any** reason — success, a non-zero exit, a timeout, a crash —
 and the agent is still started, the next one is scheduled:
 
-- succeeded, or ran at least 60 s: **3 s**, and the quick-failure streak resets;
+- succeeded, or ran at least 60 s: **5 s**, and the quick-failure streak resets;
 - otherwise: **10 s**, doubling with each consecutive quick failure, capped at
   **5 min** (10, 20, 40, 80, 160, 300, 300 …).
 
@@ -201,7 +303,11 @@ that overruns the session timeout is stopped the same way and recorded as `Timed
 
 `recent` is the newest ten endings, reconstructed from the run records on open and
 updated as runs end. `activity` is the newest Forgejo action of the newest run, read from
-that run's transcript.
+that run's transcript; after the run ends it is drawn as `last: … · 2m ago`. The run
+writes `current-tool` while a tool call is in flight (so the card can say `shell · 12s`)
+and `last-failure` when one fails (so the card and the log carry
+`✗ <tool>: <first clause>`). `last_work` is the issue, pull request, branch and comment
+the newest run named, read from its transcript and push witness.
 
 ## Threads, ticks and the contract
 
@@ -219,7 +325,8 @@ and during a back-off, `Blocked` and its release, and resume after reopening.
 
 ## The words on screen
 
-The terms the board shows are the five fixed sentences in `engine::TERMS`; the
+The terms the board shows are the five fixed sentences in `engine::TERMS`, plus the
+one-sentence confinement warning when the host offers no confinement; the
 engine's reasons, notices, activities and model-test lines are written in the same
 plain words the board uses, so no technical word reaches a screen from either side.
 `src/board/status.rs` is the one cleaner for free text and also removes the backticks

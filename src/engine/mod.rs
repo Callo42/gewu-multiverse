@@ -14,6 +14,7 @@
 //! - `shutdown(grace)` stops every session and the server and leaves no process.
 
 pub mod clock;
+pub mod last_seen;
 pub mod session;
 pub mod settings;
 
@@ -32,7 +33,7 @@ use crate::bundled_forgejo::{self, PreparedInstance, RunningForgejo};
 use crate::credentials::{self, CredentialsFile, Secret};
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, Provisioning, SessionEnd, SessionState,
+    ForgejoView, Provisioning, SessionEnd, SessionState, UpgradeView,
 };
 use crate::forgejo::{DEFAULT_TIMEOUT, ForgejoClient, ForgejoError, Repository};
 use crate::identity;
@@ -60,7 +61,7 @@ pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The delay after a session that succeeded or ran at least this long.
-pub const RESTART_DELAY: Duration = Duration::from_secs(3);
+pub const RESTART_DELAY: Duration = Duration::from_secs(5);
 
 /// A session shorter than this is a quick failure.
 pub const LONG_SESSION: Duration = Duration::from_secs(60);
@@ -87,7 +88,7 @@ pub const REPOSITORY_REFRESH: Duration = Duration::from_secs(5);
 /// fixed words, in the first-time reader's language.
 pub const TERMS: &[&str] = &[
     "Agents use this computer with your permissions.",
-    "They can read your files, including saved keys.",
+    "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
     "Each has its own login on your Forgejo.",
     "Started agents keep going until you stop them.",
     "Their work is sent to your model provider.",
@@ -110,6 +111,10 @@ pub struct EngineOptions {
     pub ready_timeout: Duration,
     /// Start an already-installed Forgejo when the engine opens.
     pub auto_start_forgejo: bool,
+    /// How this computer can confine an agent's shell. It is detected once, when
+    /// the engine opens, so the board and the warnings can say the truth before a
+    /// run starts.
+    pub confinement: crate::confinement::Method,
     /// The tests' simulated readiness, never set in production.
     #[cfg(test)]
     pub(crate) forgejo_ready: bool,
@@ -124,14 +129,24 @@ impl EngineOptions {
     pub fn new(layout: Layout, data_root: impl Into<PathBuf>) -> Result<Self, String> {
         let product_binary = std::env::current_exe()
             .map_err(|error| format!("the product executable cannot be found: {error}"))?;
+        let data_root = data_root.into();
+        // The mechanism is chosen against this installation's own roots and **every
+        // real agent workspace**, not only the directory that contains them: a
+        // workspace symlinked over a parent of the configuration root cannot be
+        // confined, and `detect` must see that before the board claims anything
+        // (B9-R-R).
+        let workspaces = crate::confinement::agent_workspaces(&layout.agents_dir());
+        let confinement =
+            crate::confinement::detect(layout.root(), layout.state_root(), &data_root, &workspaces);
         Ok(Self {
             layout,
-            data_root: data_root.into(),
+            data_root,
             product_binary,
             session_timeout: DEFAULT_SESSION_TIMEOUT,
             stop_grace: DEFAULT_STOP_GRACE,
             ready_timeout: DEFAULT_READY_TIMEOUT,
             auto_start_forgejo: true,
+            confinement,
             #[cfg(test)]
             forgejo_ready: false,
             #[cfg(test)]
@@ -273,7 +288,10 @@ fn build(
     // product started, and stopped before a fresh one can start.
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
     recover_stale_sessions(&options.layout, options.stop_grace)?;
+    let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
     let mut inner = Inner::new(options.clone(), settings_path, settings, credentials)?;
+    inner.upgrade = upgrade;
+    last_seen::write(options.layout.root(), env!("CARGO_PKG_VERSION"))?;
     // An installation from the old screens may still hold `config.toml`. The new
     // engine does not read it and does not convert it; it says once, on the first
     // screen, that the earlier setup was left as it was.
@@ -288,6 +306,51 @@ fn build(
         options,
     };
     Ok(engine)
+}
+
+/// What the one upgrade screen should say, when this is the first open by a newer
+/// build. A fresh installation, a same-version open and a downgrade have no screen.
+fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> Option<UpgradeView> {
+    let from = last_seen::read(layout.root())?;
+    if !last_seen::is_older(&from, env!("CARGO_PKG_VERSION")) {
+        return None;
+    }
+    let mut instructions = 0;
+    let mut runs = 0;
+    if let Ok(agents) = fs::read_dir(layout.agents_dir()) {
+        for agent in agents.flatten() {
+            let path = agent.path().join("instruction.md");
+            if fs::read_to_string(&path)
+                .map(|text| !agent_run::instruction_is_blank(text.as_bytes()))
+                .unwrap_or(false)
+            {
+                instructions += 1;
+            }
+        }
+    }
+    if let Ok(agents) = fs::read_dir(layout.state_root()) {
+        for agent in agents.flatten() {
+            if let Ok(runs_of_agent) = fs::read_dir(agent.path()) {
+                runs += runs_of_agent
+                    .flatten()
+                    .filter(|run| run::looks_like_run_id(&run.file_name().to_string_lossy()))
+                    .count();
+            }
+        }
+    }
+    Some(UpgradeView {
+        from_version: from,
+        to_version: env!("CARGO_PKG_VERSION").to_owned(),
+        settings: settings_path.is_file() || layout.config_file().is_file(),
+        agents: settings.agents.len(),
+        instructions,
+        runs,
+        ignored_config: layout.config_file().is_file(),
+        release_url: format!(
+            "https://github.com/{}/releases",
+            bundled_forgejo::REPOSITORY
+        ),
+    })
 }
 
 /// Take the one-instance-per-data-directory lock. A second program fails here,
@@ -306,17 +369,31 @@ fn acquire_lock(data_root: &Path) -> Result<Flock<File>, String> {
         .mode(SECRET_FILE_MODE)
         .open(&path)
         .map_err(|error| format!("{} cannot be opened: {error}", path.display()))?;
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(lock) => Ok(lock),
-        Err((_, error))
-            if error == nix::errno::Errno::EWOULDBLOCK || error == nix::errno::Errno::EAGAIN =>
-        {
-            Err(format!(
-                "another gewu-multiverse is already using {}; close it first",
-                data_root.display()
-            ))
+    // Closing the terminal leaves the old copy stopping its Forgejo and runs for a
+    // moment; the lock is released when that finishes. Wait for it rather than
+    // refusing a reopen that would have worked a second later (P8).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut file = file;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(lock),
+            Err((returned, error))
+                if error == nix::errno::Errno::EWOULDBLOCK
+                    || error == nix::errno::Errno::EAGAIN =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "the previous copy is still stopping — try again in a moment (it is using {})",
+                        data_root.display()
+                    ));
+                }
+                file = returned;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err((_, error)) => {
+                return Err(format!("{} cannot be locked: {error}", path.display()));
+            }
         }
-        Err((_, error)) => Err(format!("{} cannot be locked: {error}", path.display())),
     }
 }
 
@@ -344,8 +421,15 @@ struct AgentRuntime {
     recent: VecDeque<SessionEnd>,
     instruction_chars: usize,
     instruction_first_line: Option<String>,
+    instruction_lines: usize,
     instruction_mtime: Option<SystemTime>,
     activity: Option<String>,
+    activity_at: Option<SystemTime>,
+    last_error: Option<String>,
+    last_failure: Option<String>,
+    current_tool: Option<String>,
+    current_tool_since: Option<SystemTime>,
+    last_work: Vec<String>,
     activity_refresh_at: Option<Instant>,
     newest_run: Option<PathBuf>,
     running: Option<RunningState>,
@@ -366,6 +450,7 @@ struct ForgejoRuntime {
     state: ForgejoState,
     url: String,
     admin_login: String,
+    admin_login_kept: bool,
     admin_token: Option<Secret>,
     child: Option<RunningForgejo>,
     /// The pid of a Forgejo child whose start has not returned yet.
@@ -386,6 +471,8 @@ struct ForgejoRuntime {
     provision_inflight: bool,
     provision_retry_at: Option<Instant>,
     repositories: Vec<Repository>,
+    /// Repository changes seen between administration-API polls, oldest first.
+    events: VecDeque<String>,
     repositories_refreshed_at: Option<Instant>,
     repositories_inflight: bool,
 }
@@ -401,6 +488,8 @@ struct Inner {
     endpoint_test: EndpointTest,
     notice: Option<String>,
     admin_password_once: Option<String>,
+    password_reset_inflight: bool,
+    upgrade: Option<UpgradeView>,
     sequence: u64,
     stopping: bool,
     generation: u64,
@@ -418,15 +507,22 @@ impl Inner {
         let port = fs::read_to_string(&paths.app_ini)
             .ok()
             .and_then(|text| bundled_forgejo::port_from_config(&text));
+        let recorded_login = fs::read_to_string(&paths.admin_login_file)
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|text| bundled_forgejo::valid_username(text));
         let admin_login = if !settings.forgejo.admin_login.trim().is_empty() {
             settings.forgejo.admin_login.clone()
         } else {
-            fs::read_to_string(&paths.admin_login_file)
-                .ok()
-                .map(|text| text.trim().to_owned())
-                .filter(|text| bundled_forgejo::valid_username(text))
+            recorded_login
+                .clone()
                 .unwrap_or_else(bundled_forgejo::admin_login_from_env)
         };
+        // An earlier version used the computer account name. It stays the working
+        // login for that installation; the page says so, and a new installation
+        // uses the fixed default instead.
+        let admin_login_kept =
+            !admin_login.is_empty() && admin_login != bundled_forgejo::admin_login_from_env();
         let state = if binary.is_file() {
             ForgejoState::Stopped
         } else {
@@ -445,6 +541,7 @@ impl Inner {
                 .map(bundled_forgejo::InstancePaths::url)
                 .unwrap_or_default(),
             admin_login,
+            admin_login_kept,
             admin_token: None,
             child: None,
             start_pid: None,
@@ -459,6 +556,7 @@ impl Inner {
             provision_inflight: false,
             provision_retry_at: None,
             repositories,
+            events: VecDeque::new(),
             repositories_refreshed_at: None,
             repositories_inflight: false,
         };
@@ -482,6 +580,8 @@ impl Inner {
             endpoint_test: EndpointTest::NotRun,
             notice: None,
             admin_password_once: None,
+            password_reset_inflight: false,
+            upgrade: None,
             sequence: 0,
             stopping: false,
             generation: 0,
@@ -519,6 +619,39 @@ impl Inner {
 
     fn note(&mut self, text: impl Into<String>) {
         self.notice = Some(crate::forgejo_tools::sentence(text.into()));
+    }
+
+    /// Recompute the mechanism after the set of agent workspaces changed. A new
+    /// workspace that cannot be confined takes the board's claim away now, instead of
+    /// waiting for a run to refuse it (B9-R-R).
+    fn refresh_confinement(&mut self) {
+        let workspaces = crate::confinement::agent_workspaces(&self.options.layout.agents_dir());
+        let method = crate::confinement::detect(
+            self.options.layout.root(),
+            self.options.layout.state_root(),
+            &self.options.data_root,
+            &workspaces,
+        );
+        if method != self.options.confinement {
+            self.options.confinement = method;
+            if !method.confined() {
+                self.note("Runs are not confined on this computer.");
+            }
+        }
+    }
+
+    /// A run whose plan promised a boundary the run-time layout could not keep left a
+    /// marker. Take that refusal onto the board and the warnings now: it must never
+    /// stay a silent fallback (B9-R-R).
+    fn observe_confinement_refusal(&mut self, run_dir: &Path) {
+        if !self.options.confinement.confined() {
+            return;
+        }
+        let Some(reason) = crate::run::read_confinement_refusal(run_dir) else {
+            return;
+        };
+        self.options.confinement = crate::confinement::Method::None;
+        self.note(format!("Runs are not confined on this computer — {reason}"));
     }
 
     /// The saved choice for one agent, kept in step with the settings.
@@ -564,10 +697,10 @@ impl AgentRuntime {
         let instruction = paths
             .as_ref()
             .map(|paths| paths.instruction().to_path_buf());
-        let (chars, first_line, mtime) = instruction
+        let (chars, first_line, lines, mtime) = instruction
             .as_deref()
             .map(instruction_facts)
-            .unwrap_or((0, None, None));
+            .unwrap_or((0, None, 0, None));
         let mut runs = run::runs_of_agent(inner.options.layout.state_root(), name);
         runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         let mut recent = VecDeque::new();
@@ -584,6 +717,30 @@ impl AgentRuntime {
             .as_deref()
             .and_then(|dir| run::forgejo_actions(dir).pop())
             .map(|action| plain_activity(&action.sentence));
+        let activity_at = newest_run
+            .as_deref()
+            .and_then(|dir| fs::metadata(dir).ok())
+            .and_then(|metadata| metadata.modified().ok());
+        let last_error = newest_run.as_deref().and_then(|dir| {
+            run::runs_of_agent(inner.options.layout.state_root(), name)
+                .into_iter()
+                .rev()
+                .find_map(|summary| {
+                    if summary.dir == dir {
+                        match summary.outcome {
+                            Some(run::RunOutcome::Failed) => summary.reason,
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+        });
+        let last_failure = newest_run.as_deref().and_then(run::read_failure);
+        let last_work = newest_run
+            .as_deref()
+            .map(run::work_summary)
+            .unwrap_or_default();
         Self {
             name: name.to_owned(),
             desired,
@@ -596,8 +753,15 @@ impl AgentRuntime {
             recent,
             instruction_chars: chars,
             instruction_first_line: first_line,
+            instruction_lines: lines,
             instruction_mtime: mtime,
             activity,
+            activity_at,
+            last_error,
+            last_failure,
+            current_tool: None,
+            current_tool_since: None,
+            last_work,
             activity_refresh_at: None,
             newest_run,
             running: None,
@@ -624,9 +788,10 @@ impl AgentRuntime {
         if mtime == self.instruction_mtime && self.instruction_first_line.is_some() {
             return;
         }
-        let (chars, first_line, mtime) = instruction_facts(paths.instruction());
+        let (chars, first_line, lines, mtime) = instruction_facts(paths.instruction());
         self.instruction_chars = chars;
         self.instruction_first_line = first_line;
+        self.instruction_lines = lines;
         self.instruction_mtime = mtime;
     }
 }
@@ -647,18 +812,19 @@ fn end_from_outcome(summary: &run::RunSummary) -> Option<SessionEnd> {
     }
 }
 
-fn instruction_facts(path: &Path) -> (usize, Option<String>, Option<SystemTime>) {
+fn instruction_facts(path: &Path) -> (usize, Option<String>, usize, Option<SystemTime>) {
     let mtime = fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok());
     let Ok(bytes) = fs::read(path) else {
-        return (0, None, mtime);
+        return (0, None, 0, mtime);
     };
     if agent_run::instruction_is_blank(&bytes) {
-        return (0, None, mtime);
+        return (0, None, 0, mtime);
     }
     let text = String::from_utf8_lossy(&bytes);
     let chars = text.chars().count();
+    let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
     let first = text
         .lines()
         .map(str::trim)
@@ -671,7 +837,7 @@ fn instruction_facts(path: &Path) -> (usize, Option<String>, Option<SystemTime>)
             }
             line
         });
-    (chars, first, mtime)
+    (chars, first, lines, mtime)
 }
 
 fn backoff_for_quick_failure(failures: u32) -> Duration {
@@ -823,7 +989,7 @@ impl Inner {
 
     fn poll_agent(&mut self, index: usize, now: Instant) {
         let desired = self.agents[index].desired;
-        let mut ended: Option<(SessionEnd, Instant)> = None;
+        let mut ended: Option<(SessionEnd, Instant, PathBuf)> = None;
         if let Some(run) = self.agents[index].running.as_mut() {
             if !run.stopping {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
@@ -848,10 +1014,11 @@ impl Inner {
                         reason: session_failure_reason(&run.run_dir, status),
                     }
                 };
-                ended = Some((end, run.started));
+                ended = Some((end, run.started, run.run_dir.clone()));
             }
         }
-        if let Some((end, started)) = ended {
+        if let Some((end, started, run_dir)) = ended {
+            self.observe_confinement_refusal(&run_dir);
             self.agents[index].running = None;
             self.agents[index].starting = false;
             self.agents[index].activity_refresh_at = None;
@@ -871,7 +1038,16 @@ impl Inner {
             {
                 if let Some(action) = run::forgejo_actions(&run_dir).pop() {
                     self.agents[index].activity = Some(plain_activity(&action.sentence));
+                    self.agents[index].activity_at = Some(SystemTime::now());
                 }
+                self.agents[index].current_tool =
+                    run::read_current_tool(&run_dir).map(|(tool, _started)| tool);
+                self.agents[index].current_tool_since =
+                    run::read_current_tool(&run_dir).map(|(_tool, started)| started);
+                if let Some(failure) = run::read_failure(&run_dir) {
+                    self.agents[index].last_failure = Some(failure);
+                }
+                self.observe_confinement_refusal(&run_dir);
                 self.agents[index].activity_refresh_at = Some(now);
             }
         }
@@ -1071,8 +1247,33 @@ impl Inner {
     }
 
     fn session_request(&mut self, index: usize) -> Option<SessionRequest> {
+        let agent_name = self.agents[index].name.clone();
+        let paths = self.options.layout.agent(&agent_name).ok()?;
+        let workspace = paths.workspace().to_path_buf();
+        let hide = vec![
+            self.options.layout.root().to_path_buf(),
+            self.options.layout.state_root().to_path_buf(),
+            self.options.data_root.clone(),
+        ];
+        // The layout may have changed since the engine opened (a workspace turned
+        // into a symlink, a root moved). Check the actual run-time layout here, in
+        // the parent, and take the result onto the board before the plan is written:
+        // a run must not start with a promise `Shell::prepare` will refuse (B9-R-R).
+        let real_home = std::env::var_os("HOME").map(PathBuf::from);
+        let run_hide = crate::confinement::run_hide_roots(&hide, real_home.as_deref());
+        let requested = self.options.confinement;
+        let (confinement, refusal) =
+            crate::confinement::effective_method(requested, &run_hide, &workspace);
+        if confinement != requested {
+            self.options.confinement = confinement;
+            if !confinement.confined() {
+                self.note(format!(
+                    "Runs are not confined on this computer — {}",
+                    refusal.unwrap_or("the layout changed")
+                ));
+            }
+        }
         let agent = &self.agents[index];
-        let paths = self.options.layout.agent(&agent.name).ok()?;
         self.sequence = self.sequence.saturating_add(1);
         let run_id = run::new_run_id(self.sequence);
         let run_dir = paths.run_dir(&run_id);
@@ -1092,11 +1293,11 @@ impl Inner {
             })
             .collect();
         Some(SessionRequest {
-            agent: agent.name.clone(),
+            agent: agent_name,
             run_id,
             run_dir,
             state_root: self.options.layout.state_root().to_path_buf(),
-            workspace: paths.workspace().to_path_buf(),
+            workspace,
             instruction: paths.instruction().to_path_buf(),
             skills_dir: paths.skills_dir().to_path_buf(),
             endpoint: self.settings.endpoint.url.clone(),
@@ -1108,6 +1309,8 @@ impl Inner {
             email,
             forgejo_url: self.forgejo.url.clone(),
             repositories,
+            confinement,
+            hide,
         })
     }
 }
@@ -1171,10 +1374,19 @@ fn finish_session(agent: &mut AgentRuntime, mut end: SessionEnd, now: Instant, s
         agent.recent.pop_front();
     }
     agent.last_end = Some(end.clone());
+    agent.last_error = match &end {
+        SessionEnd::Failed { reason } => Some(reason.clone()),
+        _ => None,
+    };
+    agent.current_tool = None;
+    agent.current_tool_since = None;
     if let Some(dir) = agent.newest_run.clone() {
         if let Some(action) = run::forgejo_actions(&dir).pop() {
             agent.activity = Some(plain_activity(&action.sentence));
+            agent.activity_at = Some(SystemTime::now());
         }
+        agent.last_failure = run::read_failure(&dir);
+        agent.last_work = run::work_summary(&dir);
     }
     if agent.desired == Desired::Stopped || end == SessionEnd::Stopped {
         agent.session = SessionState::Idle;
@@ -1221,6 +1433,18 @@ impl EngineApi for Engine {
             admin_login: inner.forgejo.admin_login.clone(),
             organisation: bundled_forgejo::ORGANISATION.to_owned(),
             repositories: inner.forgejo.repositories.len(),
+            repository_names: {
+                let mut names: Vec<String> = inner
+                    .forgejo
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.full_name.clone())
+                    .collect();
+                names.sort();
+                names
+            },
+            events: inner.forgejo.events.iter().cloned().collect(),
+            admin_login_kept: inner.forgejo.admin_login_kept,
         };
         let agents = inner
             .agents
@@ -1238,18 +1462,39 @@ impl EngineApi for Engine {
                 recent: agent.recent.iter().cloned().collect(),
                 instruction_chars: agent.instruction_chars,
                 instruction_first_line: agent.instruction_first_line.clone(),
+                instruction_lines: agent.instruction_lines,
                 activity: agent.activity.clone(),
+                activity_at: agent.activity_at,
+                last_error: agent.last_error.clone(),
+                last_failure: agent.last_failure.clone(),
+                current_tool: agent.current_tool.clone(),
+                current_tool_seconds: agent
+                    .current_tool_since
+                    .and_then(|since| SystemTime::now().duration_since(since).ok())
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0),
+                last_work: agent.last_work.clone(),
             })
             .collect();
         BoardView {
             terms_acknowledged,
-            terms: TERMS.iter().map(|term| (*term).to_owned()).collect(),
+            terms: {
+                let mut terms: Vec<String> = TERMS.iter().map(|term| (*term).to_owned()).collect();
+                if !inner.options.confinement.confined() {
+                    // The warning screen says what the board will also say, in one
+                    // sentence, instead of pretending the run is confined.
+                    terms.push("Runs are not confined on this computer.".to_owned());
+                }
+                terms
+            },
             setup_complete,
             forgejo,
             agents,
             endpoint,
             notice,
             admin_password,
+            confined: inner.options.confinement.confined(),
+            upgrade: inner.upgrade.clone(),
         }
     }
 
@@ -1311,6 +1556,10 @@ impl EngineApi for Engine {
                     }
                 }
                 inner.save_settings()?;
+                // A new workspace is a new bound tree; re-run the layout decision so
+                // a workspace that cannot be confined takes the claim off the board
+                // now (B9-R-R).
+                inner.refresh_confinement();
                 let count = inner.agents.len();
                 inner.note(format!("{count} agents are ready"));
                 Ok(())
@@ -1322,6 +1571,7 @@ impl EngineApi for Engine {
                 let runtime = AgentRuntime::load(&inner, &name);
                 inner.agents.push(runtime);
                 inner.save_settings()?;
+                inner.refresh_confinement();
                 inner.note(format!("`{name}` was added"));
                 Ok(())
             }
@@ -1348,8 +1598,18 @@ impl EngineApi for Engine {
                 agent.session_number = 0;
                 agent.quick_failures = 0;
                 agent.next_at = None;
+                let no_instruction = agent.instruction_chars == 0;
+                if no_instruction {
+                    agent.session = SessionState::Blocked {
+                        reason: "needs an instruction".to_owned(),
+                    };
+                }
                 inner.save_settings()?;
-                inner.note(format!("`{name}` started"));
+                inner.note(if no_instruction {
+                    "not started — write an instruction first".to_owned()
+                } else {
+                    format!("`{name}` started")
+                });
                 Ok(())
             }
             Command::Stop { name } => {
@@ -1383,10 +1643,41 @@ impl EngineApi for Engine {
                 Ok(())
             }
             Command::RevealAdminPassword => {
-                let paths = bundled_forgejo::InstancePaths::under(&inner.options.data_root);
-                let password = fs::read_to_string(&paths.admin_password)
-                    .map_err(|_| "the administrator password is not there yet".to_owned())?;
-                inner.admin_password_once = Some(password.trim().to_owned());
+                if !matches!(inner.forgejo.state, ForgejoState::Running) {
+                    return Err(
+                        "Forgejo is not running, so its password cannot be reset".to_owned()
+                    );
+                }
+                if inner.password_reset_inflight {
+                    inner.note("the password is already being reset");
+                    return Ok(());
+                }
+                inner.password_reset_inflight = true;
+                let inner_arc = Arc::clone(&self.inner);
+                let url = inner.forgejo.url.clone();
+                let login = inner.forgejo.admin_login.clone();
+                let token = inner.forgejo.admin_token.clone();
+                let Some(token) = token else {
+                    return Err("the Forgejo administrator token is not ready".to_owned());
+                };
+                drop(inner);
+                std::thread::spawn(move || {
+                    let result = ForgejoClient::new(&url, token, DEFAULT_TIMEOUT)
+                        .map_err(|error| sentence(&error))
+                        .and_then(|client| bundled_forgejo::reset_admin_password(&client, &login));
+                    if let Ok(mut inner) = inner_arc.lock() {
+                        inner.password_reset_inflight = false;
+                        if inner.stopping {
+                            return;
+                        }
+                        match result {
+                            Ok(password) => {
+                                inner.admin_password_once = Some(password);
+                            }
+                            Err(reason) => inner.note(reason),
+                        }
+                    }
+                });
                 Ok(())
             }
         }
@@ -1547,6 +1838,10 @@ impl EngineApi for Engine {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A clean exit records the version too, so an installation that is opened and
+        // closed many times keeps one current line.
+        let root = lock_inner(&self.inner).options.layout.root().to_path_buf();
+        let _ = last_seen::write(&root, env!("CARGO_PKG_VERSION"));
     }
 }
 
@@ -1740,10 +2035,26 @@ fn forgejo_start_job_inner(inner: Arc<Mutex<Inner>>, options: EngineOptions, gen
                 admin_login: admin_login.clone(),
                 port: 3000,
                 url: "http://127.0.0.1:3000".to_owned(),
+                admin_token: None,
             }
         } else {
             bundled_forgejo::prepare_instance_checked(&data_root, &binary, &admin_login, &cancel)?
         };
+        // A start that created the account also minted its administrator token before
+        // the server came up. Record it now, so no later step needs the password.
+        if let Some(token) = prepared.admin_token.as_ref() {
+            let credentials_path = match inner.lock() {
+                Ok(inner) => Some(inner.credentials.clone()),
+                Err(poisoned) => Some(poisoned.into_inner().credentials.clone()),
+            };
+            if let Some(path) = credentials_path {
+                let _ =
+                    credentials::record_secret(&path, None, "forgejo_admin_token", token.expose());
+                if let Ok(mut inner) = inner.lock() {
+                    inner.forgejo.admin_token = Some(token.clone());
+                }
+            }
+        }
         if let Ok(mut inner) = inner.lock() {
             if inner.generation == generation && !inner.stopping {
                 inner.forgejo.admin_login = prepared.admin_login.clone();
@@ -2011,9 +2322,54 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
         inner.forgejo.repositories_inflight = false;
         inner.forgejo.repositories_refreshed_at = Some(Instant::now());
         if let Ok(repositories) = result {
+            // The administration API's own repository list is polled; a name that
+            // disappeared or appeared between two polls is an event on the board, so
+            // a destroyed repository is never traceless.
+            let before: Vec<String> = inner
+                .forgejo
+                .repositories
+                .iter()
+                .map(|repository| repository.full_name.clone())
+                .collect();
+            let after: Vec<String> = repositories
+                .iter()
+                .map(|repository| repository.full_name.clone())
+                .collect();
+            for event in repository_events(&before, &after) {
+                inner.forgejo.events.push_back(event);
+            }
+            while inner.forgejo.events.len() > 5 {
+                inner.forgejo.events.pop_front();
+            }
+            if before != after {
+                if let Some(event) = inner.forgejo.events.back().cloned() {
+                    inner.note(event);
+                }
+            }
             inner.forgejo.repositories = repositories;
         }
     }
+}
+
+/// The repository changes between two administration-API polls, as the board's
+/// events: a deleted repository is never traceless, and a new one is announced.
+fn repository_events(before: &[String], after: &[String]) -> Vec<String> {
+    let mut events = Vec::new();
+    for name in before {
+        if !after.contains(name) {
+            events.push(format!("`{name}` was deleted"));
+        }
+    }
+    // The first list is the provisioning result, not a set of creations: only a
+    // later poll can know that a repository is new.
+    if !before.is_empty() {
+        for name in after {
+            if !before.contains(name) {
+                events.push(format!("`{name}` was created"));
+            }
+        }
+    }
+    events
 }
 
 fn provision_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
@@ -2248,6 +2604,11 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                     .map_err(|error| sentence(&error))?;
             }
             bundled_forgejo::leave_team(&client, login).map_err(|error| sentence(&error))?;
+            // The account row and its history stay; `active = false` is what stops a
+            // web sign-in as well as every token (P4).
+            client
+                .deactivate_user(login)
+                .map_err(|error| sentence(&error))?;
         }
         credentials::remove_agent_token(&credentials, &name)
             .map_err(|error| format!("the local token could not be removed: {error}"))?;
@@ -2265,7 +2626,7 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                     inner.note(format!("`{name}` was removed, but {error}"));
                 } else {
                     inner.note(format!(
-                        "`{name}` was removed; its Forgejo account and history stay"
+                        "`{name}` was removed; its login is deactivated, its token revoked, its history kept"
                     ));
                 }
             }
@@ -2353,6 +2714,7 @@ mod tests {
             stop_grace: DEFAULT_STOP_GRACE,
             ready_timeout: DEFAULT_READY_TIMEOUT,
             auto_start_forgejo: false,
+            confinement: crate::confinement::Method::None,
             forgejo_ready: true,
             forgejo_starter: None,
         }
@@ -2428,6 +2790,307 @@ mod tests {
         assert_eq!(
             fs::read_to_string(layout.config_file()).expect("the old file is still there"),
             "[forgejo]\nurl = \"https://example.org\"\n"
+        );
+    }
+
+    #[test]
+    fn starting_an_agent_without_an_instruction_says_so_and_does_not_run() {
+        let root = scratch_root("engine-start-no-instruction");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+        let paths = layout.agent("agent-1").expect("paths");
+        fs::remove_file(paths.instruction()).expect("the instruction is removed");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("start");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let board = engine.board();
+        assert_eq!(
+            board.notice.as_deref(),
+            Some("not started — write an instruction first")
+        );
+        assert!(matches!(
+            board.agents[0].session,
+            SessionState::Blocked { .. }
+        ));
+        assert_eq!(fake.counts().1, 0, "a run started without an instruction");
+    }
+
+    #[test]
+    fn repository_polls_turn_into_created_and_deleted_events() {
+        let before = vec!["team/workspace".to_owned(), "team/scratch".to_owned()];
+        let after = vec!["team/workspace".to_owned(), "team/website".to_owned()];
+        assert_eq!(
+            repository_events(&before, &after),
+            vec!["`team/scratch` was deleted", "`team/website` was created"]
+        );
+        // The provisioning result is not a creation event.
+        assert!(repository_events(&[], &after).is_empty());
+        assert!(repository_events(&after, &after).is_empty());
+    }
+
+    #[test]
+    fn an_unconfined_host_says_so_in_the_terms_and_on_the_board() {
+        let root = scratch_root("engine-unconfined-words");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let board = engine.board();
+        assert!(!board.confined, "the board pretends the run is confined");
+        assert_eq!(
+            board.terms.last().map(String::as_str),
+            Some("Runs are not confined on this computer."),
+            "the sixth warning is missing: {:?}",
+            board.terms
+        );
+        assert_eq!(board.terms.len(), TERMS.len() + 1);
+    }
+
+    #[test]
+    fn a_symlinked_state_root_inside_a_workspace_is_unconfined_on_the_board() {
+        // B9-R: `detect` must compare canonical paths. The state root's name is
+        // beside the configuration root, but its target is inside an agent's
+        // workspace, which the namespace mechanisms bind back. The board must say so
+        // with the sixth sentence, not claim a boundary.
+        let root = scratch_root("engine-b9r-symlink");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let target = root.join("agents/agent-1/workspace/state");
+        fs::create_dir_all(&target).expect("a state root inside the workspace");
+        let state = root.join("state-link");
+        std::os::unix::fs::symlink(&target, &state).expect("the state symlink");
+        let layout = Layout::rooted_at(root.clone())
+            .expect("the test layout")
+            .with_state_root(state)
+            .expect("the state root");
+        let mut options =
+            EngineOptions::new(layout, root.join("data")).expect("the engine options");
+        assert_eq!(
+            options.confinement,
+            crate::confinement::Method::None,
+            "detect claimed a boundary for a symlinked state root inside the workspace"
+        );
+        options.auto_start_forgejo = false;
+        options.forgejo_ready = true;
+        options.forgejo_starter = None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let board = engine.board();
+        assert!(!board.confined, "the board pretends the run is confined");
+        assert_eq!(
+            board.terms.last().map(String::as_str),
+            Some("Runs are not confined on this computer."),
+            "the sixth warning is missing: {:?}",
+            board.terms
+        );
+        assert_eq!(board.terms.len(), TERMS.len() + 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_symlinked_workspace_over_the_config_parent_is_unconfined_on_the_board() {
+        // B9-R-R: `detect` must enumerate the real workspaces. `<config>/agents/
+        // agent-1/workspace` is a link to the configuration root's parent; the lexical
+        // workspace is inside `<config>/agents`, which the old check did see, but the
+        // *resolved* workspace contains the configuration root and every mechanism
+        // would hand it back. The board must say so with the sixth sentence.
+        let base = scratch_root("engine-b9rr-workspace");
+        let config = base.join("config");
+        let settings = write_ready(&config, &[("agent-1", Desired::Stopped)]);
+        let workspace = config.join("agents/agent-1/workspace");
+        fs::remove_dir_all(&workspace).expect("the created workspace");
+        std::os::unix::fs::symlink(&base, &workspace).expect("the workspace symlink");
+        let mut options = EngineOptions::new(
+            Layout::rooted_at(config.clone()).expect("layout"),
+            base.join("data"),
+        )
+        .expect("the engine options");
+        assert_eq!(
+            options.confinement,
+            crate::confinement::Method::None,
+            "detect claimed a boundary for a workspace symlinked over the config parent"
+        );
+        options.auto_start_forgejo = false;
+        options.forgejo_ready = true;
+        options.forgejo_starter = None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let board = engine.board();
+        assert!(!board.confined, "the board pretends the run is confined");
+        assert_eq!(
+            board.terms.last().map(String::as_str),
+            Some("Runs are not confined on this computer."),
+            "the sixth warning is missing: {:?}",
+            board.terms
+        );
+        assert_eq!(board.terms.len(), TERMS.len() + 1);
+        // The session request that follows carries `none`, not the stale method, so
+        // the run plan does not promise a boundary the layout cannot keep.
+        let mut inner = engine.inner.lock().expect("the engine");
+        let request = inner.session_request(0).expect("a session request");
+        assert_eq!(request.confinement, crate::confinement::Method::None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_run_time_refusal_marker_takes_the_confined_claim_off_the_board() {
+        // B9-R-R: even a plan written before the layout changed must not fall back
+        // silently. The child's marker is read by the poll and the board stops
+        // claiming confinement, with the sixth sentence and a notice.
+        let root = scratch_root("engine-b9rr-refusal");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::Landlock;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let run_dir = root.join("state/agent-1/run-1");
+        fs::create_dir_all(&run_dir).expect("the run directory");
+        crate::run::write_confinement_refusal(
+            &run_dir,
+            "a hidden directory lies inside the run's workspace",
+        )
+        .expect("the refusal marker");
+        assert!(engine.board().confined, "the test starts confined");
+        {
+            let mut inner = engine.inner.lock().expect("the engine");
+            inner.observe_confinement_refusal(&run_dir);
+        }
+        let board = engine.board();
+        assert!(!board.confined, "the refusal left the claim on the board");
+        assert_eq!(
+            board.terms.last().map(String::as_str),
+            Some("Runs are not confined on this computer."),
+            "the sixth warning is missing: {:?}",
+            board.terms
+        );
+        assert!(
+            board
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Runs are not confined on this computer")),
+            "the refusal is not on the board: {:?}",
+            board.notice
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_confined_session_plan_names_the_roots_to_hide() {
+        let root = scratch_root("engine-confined-plan");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::Landlock;
+        let engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let mut inner = engine.inner.lock().expect("the engine");
+        let request = inner.session_request(0).expect("a session request");
+        assert_eq!(request.confinement, crate::confinement::Method::Landlock);
+        assert!(
+            request
+                .hide
+                .iter()
+                .any(|path| path == inner.options.layout.root())
+        );
+        assert!(
+            request
+                .hide
+                .iter()
+                .any(|path| path == inner.options.layout.state_root())
+        );
+        assert!(
+            request
+                .hide
+                .iter()
+                .any(|path| path == &inner.options.data_root)
+        );
+    }
+
+    #[test]
+    fn a_v0129_shaped_home_shows_one_upgrade_screen_and_records_the_version() {
+        let root = scratch_root("engine-upgrade");
+        let settings = write_ready(
+            &root,
+            &[("agent-1", Desired::Stopped), ("agent-2", Desired::Started)],
+        );
+        let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+        // The earlier build's own records: a version, the old text screen's
+        // config.toml, instructions (write_ready made two) and one run directory.
+        last_seen::write(&root, "0.1.29").expect("the old version");
+        fs::write(
+            layout.config_file(),
+            "[forgejo]\nurl = \"https://example.org\"\n",
+        )
+        .expect("the old configuration");
+        let run_dir = layout
+            .agent("agent-1")
+            .expect("agent paths")
+            .run_dir("run-1700000000000-0001");
+        fs::create_dir_all(&run_dir).expect("the old run directory");
+        let mut engine = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        let view = engine.board();
+        let upgrade = view.upgrade.expect("the upgrade screen is due");
+        assert_eq!(upgrade.from_version, "0.1.29");
+        assert_eq!(upgrade.to_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(upgrade.agents, 2);
+        assert_eq!(upgrade.instructions, 2);
+        assert_eq!(upgrade.runs, 1);
+        assert!(upgrade.ignored_config, "the old config.toml was not named");
+        assert!(upgrade.release_url.contains("/releases"));
+        // The file now says this build, at open.
+        assert_eq!(
+            last_seen::read(&root).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // The board shows exactly one screen before the usual first screen.
+        let mut board = crate::board::Board::new(engine);
+        assert_eq!(board.screen(), crate::board::Screen::Upgrade);
+        board.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        ));
+        assert_eq!(board.screen(), crate::board::Screen::Home);
+        // A clean exit writes the version again, even if the file was removed while
+        // the board was open.
+        let _ = fs::remove_file(root.join(last_seen::FILE));
+        drop(board);
+        assert_eq!(
+            last_seen::read(&root).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
         );
     }
 
@@ -2555,7 +3218,7 @@ mod tests {
             TERMS,
             [
                 "Agents use this computer with your permissions.",
-                "They can read your files, including saved keys.",
+                "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
                 "Each has its own login on your Forgejo.",
                 "Started agents keep going until you stop them.",
                 "Their work is sent to your model provider.",
@@ -2638,7 +3301,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_that_succeeds_restarts_after_three_seconds() {
+    fn a_session_that_succeeds_restarts_after_a_visible_idle() {
         let root = scratch_root("engine-success");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
         let clock = Arc::new(FakeClock::new());
@@ -2656,8 +3319,8 @@ mod tests {
                 ..
             }
         ));
-        tick(&mut engine, &clock, Duration::from_secs(2));
-        assert_eq!(fake.counts().1, 1, "a session started before the 3 s delay");
+        tick(&mut engine, &clock, Duration::from_secs(4));
+        assert_eq!(fake.counts().1, 1, "a session started before the 5 s idle");
         tick(&mut engine, &clock, Duration::from_secs(1));
         wait_started(&fake, 2);
         fake.finish_current(0);
@@ -2692,7 +3355,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_failure_resets_the_backoff_to_three_seconds() {
+    fn a_long_failure_resets_the_backoff_to_the_visible_idle() {
         let root = scratch_root("engine-long");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
         let clock = Arc::new(FakeClock::new());
@@ -2708,8 +3371,8 @@ mod tests {
         fake.finish_current(1);
         tick(&mut engine, &clock, Duration::ZERO);
         let started = fake.counts().1;
-        tick(&mut engine, &clock, Duration::from_secs(2));
-        assert_eq!(fake.counts().1, started, "a long failure did not wait 3 s");
+        tick(&mut engine, &clock, Duration::from_secs(4));
+        assert_eq!(fake.counts().1, started, "a long failure did not wait 5 s");
         tick(&mut engine, &clock, Duration::from_secs(1));
         wait_started(&fake, started + 1);
         fake.finish_current(0);

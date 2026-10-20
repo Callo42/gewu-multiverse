@@ -68,6 +68,10 @@ pub struct SessionRequest {
     pub forgejo_url: String,
     /// The repositories of `team` this session may use.
     pub repositories: Vec<SessionRepository>,
+    /// How the run's shell is confined.
+    pub confinement: crate::confinement::Method,
+    /// The directories the confined shell must not see.
+    pub hide: Vec<PathBuf>,
 }
 
 /// A session whose slow work is done and whose plan is on disk.
@@ -202,6 +206,8 @@ impl SessionSpawner for RealSpawner {
             max_turns: request.max_turns,
             steps: Vec::new(),
             timeout_secs: request.timeout_secs,
+            confinement: request.confinement.as_str().to_owned(),
+            hide: request.hide.clone(),
         };
         plan.write(&request.run_dir)
             .map_err(|error| format!("the session's plan cannot be written: {error}"))?;
@@ -468,6 +474,8 @@ impl SessionSpawner for FakeSpawner {
             max_turns: request.max_turns,
             steps: Vec::new(),
             timeout_secs: request.timeout_secs,
+            confinement: request.confinement.as_str().to_owned(),
+            hide: request.hide.clone(),
         };
         plan.write(&request.run_dir)
             .map_err(|error| format!("the session's plan cannot be written: {error}"))?;

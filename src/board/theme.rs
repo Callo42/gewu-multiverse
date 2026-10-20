@@ -64,3 +64,8 @@ pub fn card_bold(color: Color, selected: bool) -> Style {
 pub fn field(color: Color) -> Style {
     Style::new().fg(color).bg(FIELD)
 }
+
+/// The field the keyboard is on: a bright background, not only a coloured label.
+pub fn focus_field() -> Style {
+    Style::new().fg(BG).bg(SELECT).add_modifier(Modifier::BOLD)
+}

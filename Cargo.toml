@@ -37,6 +37,11 @@ signal-hook = "0.3"
 # sha2 — checks the pinned Forgejo download against its published digest before the
 # binary is renamed into place.
 sha2 = "0.10"
+# landlock — the safe, unprivileged way to confine an agent's shell to its workspace
+# when this computer cannot give it a user and mount namespace (bwrap/unshare). The
+# kernel feature is Linux 5.13+; where it is absent the board says runs are not
+# confined. This is the one dependency the confinement needs; docs/engine.md names it.
+landlock = "0.4"
 
 [lints.rust]
 unsafe_code = "forbid"

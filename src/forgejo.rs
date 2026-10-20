@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::credentials::{REDACTED, Secret};
 
 /// How long one Forgejo request may take.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many repositories one listing asks for at most.
 pub const MAX_REPOSITORIES: usize = 200;
@@ -91,6 +91,19 @@ pub struct Viewer {
     /// Whether the account is an administrator of the instance.
     #[serde(default)]
     pub is_admin: bool,
+    /// Whether the account may sign in. A removed agent's account is kept with
+    /// `active = false`, so its rows and history stay and its sign-in does not.
+    #[serde(default = "default_active")]
+    pub active: bool,
+    /// Whether sign-in is explicitly prohibited. Removal sets this as well as
+    /// `active = false`, because Forgejo otherwise signs the account in and then
+    /// shows it as suspended.
+    #[serde(default)]
+    pub prohibit_login: bool,
+}
+
+fn default_active() -> bool {
+    true
 }
 
 /// What one caller may do with one repository.
@@ -353,6 +366,9 @@ pub struct ForgejoClient {
     base: String,
     token: Secret,
     agent: ureq::Agent,
+    /// How long one request may take, so a timeout message names the real bound
+    /// instead of a second hard-coded number (N11).
+    timeout: Duration,
     /// Whether the newest request that produced an answer was answered with a 2xx.
     ///
     /// A write can be accepted by the instance and still carry a body this client
@@ -381,6 +397,7 @@ impl ForgejoClient {
             base,
             token,
             agent,
+            timeout,
             last_2xx: Cell::new(false),
         })
     }
@@ -543,6 +560,13 @@ impl ForgejoClient {
         }
     }
 
+    /// Delete one repository, as an administrator. Used by the confinement proof:
+    /// an agent's own token must be refused this call.
+    pub fn delete_repository(&self, namespace: &str, name: &str) -> Result<(), ForgejoError> {
+        let path = format!("/api/v1/repos/{}/{}", segment(namespace), segment(name));
+        self.delete(&path)
+    }
+
     /// Create an account, as an administrator.
     pub fn create_user(
         &self,
@@ -568,6 +592,43 @@ impl ForgejoClient {
         let body = serde_json::json!({
             "description": IDENTITY_DESCRIPTION,
             "full_name": full_name,
+        })
+        .to_string();
+        self.patch(&path, &body)?;
+        Ok(())
+    }
+
+    /// Deactivate an account, as an administrator.
+    ///
+    /// The row, its commits, its issues and its comments stay; `active = false` is
+    /// the deactivation the walk asked for, and `prohibit_login = true` is what makes
+    /// Forgejo refuse a web sign-in instead of signing the account in and then saying
+    /// it is suspended. This is removal in the product: history is not rewritten.
+    pub fn deactivate_user(&self, login: &str) -> Result<(), ForgejoError> {
+        let path = format!("/api/v1/admin/users/{}", segment(login));
+        let body = serde_json::json!({ "active": false, "prohibit_login": true }).to_string();
+        self.patch(&path, &body)?;
+        Ok(())
+    }
+
+    /// Set whether an account may sign in. Reactivating is how an agent removed and
+    /// then added again gets its account back without losing its history.
+    pub fn set_user_active(&self, login: &str, active: bool) -> Result<(), ForgejoError> {
+        let path = format!("/api/v1/admin/users/{}", segment(login));
+        let body = serde_json::json!({ "active": active, "prohibit_login": !active }).to_string();
+        self.patch(&path, &body)?;
+        Ok(())
+    }
+
+    /// Set an account's password, as an administrator, through the API.
+    ///
+    /// The value travels in the `PATCH` body; it is never a process argument, so an
+    /// ordinary process table cannot show it. This is the whole of `p`.
+    pub fn set_user_password(&self, login: &str, password: &str) -> Result<(), ForgejoError> {
+        let path = format!("/api/v1/admin/users/{}", segment(login));
+        let body = serde_json::json!({
+            "password": password,
+            "must_change_password": false,
         })
         .to_string();
         self.patch(&path, &body)?;
@@ -884,7 +945,9 @@ impl ForgejoClient {
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::Timeout(_)) => {
-                return Err(ForgejoError::Timeout { secs: 30 });
+                return Err(ForgejoError::Timeout {
+                    secs: self.timeout.as_secs().max(1),
+                });
             }
             Err(ureq::Error::BadUri(problem)) => {
                 return Err(ForgejoError::BadUrl {
@@ -1307,6 +1370,38 @@ mod tests {
         )
         .expect_err("refused");
         assert_eq!(error.class(), "missing_token");
+    }
+
+    #[test]
+    fn a_timed_out_call_names_the_clients_own_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let addr = listener.local_addr().expect("an address");
+        std::thread::spawn(move || {
+            if let Ok((_stream, _peer)) = listener.accept() {
+                // Accept, answer nothing, and hold the connection past the timeout.
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+        let client = ForgejoClient::new(
+            &format!("http://{addr}"),
+            Secret::new("gw-fixture-token-not-real"),
+            Duration::from_secs(1),
+        )
+        .expect("a client");
+        let started = std::time::Instant::now();
+        let error = client.viewer().expect_err("the call times out");
+        assert_eq!(error.class(), "timeout");
+        let text = error.to_string();
+        assert!(text.contains("within 1 s"), "{text}");
+        assert!(
+            !text.contains("30 s"),
+            "the message names a wrong bound: {text}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the client did not honour its own timeout: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

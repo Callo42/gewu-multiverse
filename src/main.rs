@@ -32,6 +32,7 @@ use gewu_multiverse::agent_run;
 use gewu_multiverse::board::{Board, FakeEngine, HandoffKind};
 use gewu_multiverse::bundled_forgejo;
 use gewu_multiverse::cli::{Cli, Invocation, help_text, parse_args};
+use gewu_multiverse::confinement;
 use gewu_multiverse::editor;
 use gewu_multiverse::engine::{self, EngineOptions};
 use gewu_multiverse::engine_api::Desired;
@@ -85,6 +86,12 @@ fn main() -> ExitCode {
         }
         Invocation::GitAskpass { prompt } => {
             ExitCode::from(workspace::askpass_main(&prompt).clamp(0, 255) as u8)
+        }
+        Invocation::ConfinedShell => {
+            ExitCode::from(confinement::run_confined_shell().clamp(0, 255) as u8)
+        }
+        Invocation::LandlockProbe { root } => {
+            ExitCode::from(confinement::run_landlock_probe(&root).clamp(0, 255) as u8)
         }
         Invocation::InstallForgejo => match install_forgejo() {
             Ok(()) => ExitCode::SUCCESS,
