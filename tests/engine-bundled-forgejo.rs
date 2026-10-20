@@ -6,6 +6,7 @@
 //! `GEWU_FORGEJO_BINARY`; it fails rather than passing when the binary is absent.
 
 use std::fs;
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -1071,4 +1072,226 @@ fn token_status(url: &str, token: &str) -> u16 {
         Ok(response) => response.status().as_u16(),
         Err(_) => 0,
     }
+}
+
+/// Whether the instance's port still accepts a connection.
+fn listener_on(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// The live quit-at-many-points run: open the engine, start the real Forgejo, and
+/// shut down at 30 points from immediately after `StartForgejo` to just after
+/// `Running`. After every cycle, every recorded pid must be gone and the instance
+/// port must refuse.
+#[test]
+#[ignore = "live Forgejo: run with GEWU_FORGEJO_BINARY=/path/to/forgejo cargo test --test engine-bundled-forgejo quitting_at_every_point -- --ignored --nocapture"]
+fn quitting_at_every_point_of_a_forgejo_start_leaves_nothing() {
+    let binary = PathBuf::from(std::env::var("GEWU_FORGEJO_BINARY").unwrap_or_else(|_| {
+        panic!("GEWU_FORGEJO_BINARY is not set; this live test verifies nothing without it")
+    }));
+    assert!(binary.is_file(), "{} is not a file", binary.display());
+    assert_eq!(
+        bundled_forgejo::sha256_file(&binary).expect("the binary hashes"),
+        bundled_forgejo::SHA256,
+        "the staged Forgejo binary is not the pinned one"
+    );
+    let root = Scratch::new("live-quit-start");
+    let layout =
+        Layout::rooted_at(root.path().join("config")).expect("the test layout is absolute");
+    let data_root = root.path().join("data");
+    let options = || {
+        let mut options = EngineOptions::new(layout.clone(), &data_root).expect("options");
+        options.auto_start_forgejo = false;
+        options.ready_timeout = Duration::from_secs(240);
+        options.stop_grace = Duration::from_secs(5);
+        options
+    };
+    let pid_file = bundled_forgejo::InstancePaths::under(&data_root)
+        .root
+        .join(bundled_forgejo::PID_FILE);
+    let app_ini = bundled_forgejo::InstancePaths::under(&data_root).app_ini;
+    let read_pid = || {
+        fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    let instance_port = || {
+        fs::read_to_string(&app_ini)
+            .ok()
+            .and_then(|text| bundled_forgejo::port_from_config(&text))
+    };
+
+    // A warm-up start measures how long this machine takes. It also writes the
+    // instance, so every measured cycle starts from the same prepared state.
+    let mut engine = engine::open_with(options()).expect("the engine opens");
+    engine.send(Command::StartForgejo).expect("start Forgejo");
+    let began = Instant::now();
+    let mut starting: Option<u128> = None;
+    let ready = loop {
+        engine.tick();
+        let state = engine.board().forgejo.state;
+        if matches!(state, ForgejoState::Starting) && starting.is_none() {
+            starting = Some(began.elapsed().as_millis());
+        }
+        if matches!(state, ForgejoState::Running) {
+            break began.elapsed();
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(240),
+            "the warm-up start did not reach running"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let ready_ms = ready.as_millis() as u64;
+    let port = instance_port().expect("the warm-up wrote a port");
+    engine.shutdown(Duration::from_secs(2));
+    drop(engine);
+    assert!(!listener_on(port), "the warm-up left the port listening");
+    eprintln!("live quit-start: warm-up reached running in {ready_ms} ms on port {port}");
+
+    // The warm-up also says when the first child appeared (`Starting`). Thirty quits:
+    // eight by elapsed time early in the start, sixteen at the first `Starting` frame
+    // plus a short suffix, and six at the first `● running` frame plus a suffix.
+    let starting_ms = starting.map(|value| value as u64).unwrap_or(ready_ms / 2);
+    let mut plan: Vec<(&str, u64)> = Vec::new();
+    for index in 0..8 {
+        plan.push(("elapsed", starting_ms * index / 7));
+    }
+    for index in 0..16 {
+        plan.push(("starting", index * 10));
+    }
+    for suffix in [0u64, 50, 100, 150, 250, 400] {
+        plan.push(("running", suffix));
+    }
+    assert_eq!(plan.len(), 30);
+
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let mut records = Vec::new();
+    for (number, (kind, target)) in plan.iter().enumerate() {
+        let mut engine = engine::open_with(options()).expect("the engine opens");
+        engine.send(Command::StartForgejo).expect("start Forgejo");
+        let began = Instant::now();
+        let mut seen: Vec<u32> = Vec::new();
+        let mut starting_hit: Option<u128> = None;
+        let mut running_hit: Option<u128> = None;
+        let state_at_quit = loop {
+            engine.tick();
+            for pid in engine.live_pids() {
+                if !seen.contains(&pid) {
+                    seen.push(pid);
+                }
+            }
+            if let Some(pid) = read_pid()
+                && !seen.contains(&pid)
+            {
+                seen.push(pid);
+            }
+            let state = engine.board().forgejo.state.clone();
+            let elapsed = began.elapsed().as_millis();
+            if matches!(state, ForgejoState::Starting) && starting_hit.is_none() && !seen.is_empty()
+            {
+                starting_hit = Some(elapsed);
+            }
+            if matches!(state, ForgejoState::Running) && running_hit.is_none() {
+                running_hit = Some(elapsed);
+            }
+            let reached = match *kind {
+                "starting" => starting_hit.is_some_and(|hit| elapsed >= hit + *target as u128),
+                "running" => running_hit.is_some_and(|hit| elapsed >= hit + *target as u128),
+                _ => elapsed >= *target as u128,
+            };
+            if reached {
+                break state;
+            }
+            assert!(
+                elapsed < 60_000,
+                "cycle {number}: the start never reached {kind}+{target} ms"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let quit_after_ms = began.elapsed().as_millis();
+        let shutdown_began = Instant::now();
+        // The product quits with a two-second grace; the test uses the same bound so
+        // a server that is slow to stop gracefully is forced and reaped.
+        engine.shutdown(Duration::from_secs(2));
+        let shutdown_ms = shutdown_began.elapsed().as_millis();
+        let mut pids_alive_after: Vec<u32> = Vec::new();
+        for pid in &seen {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while process_alive(*pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if process_alive(*pid) {
+                pids_alive_after.push(*pid);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let listening_after = listener_on(port);
+        let engine_pids = engine.live_pids();
+        assert!(
+            pids_alive_after.is_empty(),
+            "cycle {number}: pids still alive after shutdown: {pids_alive_after:?} (seen {seen:?})"
+        );
+        assert!(
+            engine_pids.is_empty(),
+            "cycle {number}: the engine still records {engine_pids:?}"
+        );
+        assert!(
+            !listening_after,
+            "cycle {number}: port {port} still accepts after shutdown"
+        );
+        assert!(
+            shutdown_ms < 5_000,
+            "cycle {number}: shutdown took {shutdown_ms} ms"
+        );
+        let record = serde_json::json!({
+            "cycle": number + 1,
+            "target_ms": target,
+            "quit_after_ms": quit_after_ms,
+            "target_kind": kind,
+            "target_offset_ms": target,
+            "starting_hit_ms": starting_hit,
+            "running_hit_ms": running_hit,
+            "state_at_quit": format!("{state_at_quit:?}"),
+            "pids": seen,
+            "shutdown_ms": shutdown_ms,
+            "pids_alive_after": pids_alive_after,
+            "listener_after": listening_after,
+        });
+        eprintln!(
+            "live quit-start cycle {:02}: {}+{} ms quit={} ms state={:?} pids={:?} shutdown={} ms listener={}",
+            number + 1,
+            kind,
+            target,
+            quit_after_ms,
+            state_at_quit,
+            record["pids"],
+            shutdown_ms,
+            listening_after
+        );
+        records.push(record);
+    }
+    let report = serde_json::json!({
+        "binary_sha256": bundled_forgejo::SHA256,
+        "ready_ms": ready_ms,
+        "starting_ms": starting_ms,
+        "port": port,
+        "started_at_unix_ms": started_at,
+        "cycles": records,
+    });
+    if let Ok(path) = std::env::var("GEWU_QUIT_CYCLES_RECORD") {
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&report).expect("the record is JSON"),
+        )
+        .expect("the cycle record is written");
+    }
+    eprintln!("live quit-start: 30 cycles, every pid gone and no listener");
 }

@@ -14,7 +14,8 @@ use std::env;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 /// Which editing program to use, given the two variables that can name one.
 ///
@@ -91,12 +92,42 @@ pub fn pager() -> String {
 
 /// Hand a path to the editing program and wait for it.
 pub fn edit(path: &Path) -> io::Result<ExitStatus> {
-    run(editor(), path, Handoff::Edit)
+    edit_with_stop(path, &|| false)
+}
+
+/// The same hand-off, ending the program when the board is stopping.
+///
+/// The person's editor still owns the terminal for a normal hand-off. If a
+/// terminating signal or a lost terminal arrives while it is open, the wait ends the
+/// program politely and then by force, reaps it, and returns so the board can shut
+/// the engine down.
+pub fn edit_with_stop(path: &Path, stop: &dyn Fn() -> bool) -> io::Result<ExitStatus> {
+    run(editor(), path, Handoff::Edit, stop)
 }
 
 /// Hand a path to the reading program and wait for it.
 pub fn view(path: &Path) -> io::Result<ExitStatus> {
-    run(pager(), path, Handoff::View)
+    view_with_stop(path, &|| false)
+}
+
+/// The same pager hand-off, ending the pager when the board is stopping.
+pub fn view_with_stop(path: &Path, stop: &dyn Fn() -> bool) -> io::Result<ExitStatus> {
+    run(pager(), path, Handoff::View, stop)
+}
+
+/// One hand-off with an explicit program, for a caller that already knows it.
+///
+/// The board uses [`edit_with_stop`] and [`view_with_stop`]; this is the seam a test
+/// uses to put a fake long-running program where the person's editor would be.
+#[doc(hidden)]
+pub fn handoff_with(
+    program: &str,
+    path: &Path,
+    view: bool,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<ExitStatus> {
+    let handoff = if view { Handoff::View } else { Handoff::Edit };
+    run(program.to_owned(), path, handoff, stop)
 }
 
 /// Which kind of hand-off is running, so its own scratch files can be suppressed.
@@ -227,7 +258,16 @@ fn handoff_plan(
 
 /// Run `program` with the path as its one argument, through a shell so that a
 /// program named with its own options (`code --wait`, `less -R`) still works.
-fn run(program: String, path: &Path, handoff: Handoff) -> io::Result<ExitStatus> {
+///
+/// A normal hand-off waits for the person to leave the program. `stop` is the board's
+/// terminating-signal/lost-terminal predicate; when it turns true the wait ends the
+/// program (SIGTERM, then SIGKILL after [`HANDOFF_STOP_GRACE`]) and reaps it.
+fn run(
+    program: String,
+    path: &Path,
+    handoff: Handoff,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<ExitStatus> {
     let scratch = Scratch::make()?;
     let (program, env) = handoff_plan(&program, handoff, &scratch.dir);
     let mut command = Command::new("/bin/sh");
@@ -239,9 +279,51 @@ fn run(program: String, path: &Path, handoff: Handoff) -> io::Result<ExitStatus>
     for (key, value) in env {
         command.env(key, value);
     }
-    let status = command.status();
+    let mut child = command.spawn()?;
+    let status = wait_and_stop(&mut child, stop, HANDOFF_STOP_GRACE);
     drop(scratch);
     status
+}
+
+/// How long the hand-off wait gives its program to leave after `SIGTERM` before it
+/// forces the end. Short enough that a caught signal is acted on within a second.
+const HANDOFF_STOP_GRACE: Duration = Duration::from_millis(400);
+
+/// How often the hand-off wait looks at the program and at the stop predicate.
+const HANDOFF_POLL: Duration = Duration::from_millis(50);
+
+/// Wait for one hand-off program, ending it when the board is stopping.
+///
+/// A normal hand-off never sees `stop` true; the program exits on its own and the
+/// status is returned as before. Once the predicate is true the program is asked to
+/// leave, then forced, and always waited for, so no child is left behind the shutdown.
+fn wait_and_stop(
+    child: &mut Child,
+    stop: &dyn Fn() -> bool,
+    polite_grace: Duration,
+) -> io::Result<ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if stop() {
+            let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+            let deadline = Instant::now() + polite_grace;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            return child.wait();
+        }
+        std::thread::sleep(HANDOFF_POLL);
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +414,88 @@ mod tests {
             .status()
             .expect("the shell runs");
         assert!(status.success());
+    }
+
+    /// A normal hand-off still waits for the person's own program and keeps its exit.
+    #[test]
+    fn a_normal_hand_off_still_waits_for_the_program() {
+        let root = crate::test_support::scratch_root("editor-handoff-normal");
+        let script = root.join("quick-editor.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'edited\\n' > \"$1\"\nexit 0\n")
+            .expect("the quick editor is written");
+        crate::mode::set_mode(&script, 0o755).expect("the quick editor is executable");
+        let path = root.join("instruction.md");
+        let status = handoff_with(
+            script.to_str().expect("a UTF-8 path"),
+            &path,
+            false,
+            &|| false,
+        )
+        .expect("the normal hand-off returns");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the editor wrote the file"),
+            "edited\n"
+        );
+    }
+
+    /// A hand-off that is still running when the board stops is ended, forced after a
+    /// short grace, and reaped; its pid is gone from `/proc`, not a zombie.
+    #[test]
+    fn a_stop_request_ends_and_reaps_a_long_running_hand_off() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = crate::test_support::scratch_root("editor-handoff-stop");
+        let pid_file = root.join("editor.pid");
+        let script = root.join("fake-editor.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\ntrap '' TERM HUP\nprintf '%s' \"$$\" > '{}'\nwhile :; do read -t 1 _ || true; done\n",
+                pid_file.display()
+            ),
+        )
+        .expect("the fake editor is written");
+        crate::mode::set_mode(&script, 0o755).expect("the fake editor is executable");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let stop = Arc::clone(&stop);
+            let pid_file = pid_file.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !pid_file.is_file() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let began = Instant::now();
+        let status = handoff_with(
+            script.to_str().expect("a UTF-8 path"),
+            &root.join("instruction.md"),
+            false,
+            &|| stop.load(Ordering::SeqCst),
+        )
+        .expect("the hand-off returns after the stop");
+        let elapsed = began.elapsed();
+        setter.join().expect("the setter ends");
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the fake editor wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the hand-off child {pid} was left running or unreaped"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the hand-off took {elapsed:?} to end after the stop"
+        );
+        assert!(!status.success(), "the stopped editor exited successfully");
     }
 
     #[test]

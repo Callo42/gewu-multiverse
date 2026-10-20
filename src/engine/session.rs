@@ -100,8 +100,18 @@ pub trait RunningSession: Send {
 pub trait SessionSpawner: Send + Sync {
     /// Clone/fetch the repositories and write the run's plan. This is the slow half.
     fn prepare(&self, request: &SessionRequest) -> Result<PreparedSession, String>;
-    /// Start the prepared run. This is the short half, called under the state lock.
-    fn spawn(&self, prepared: &PreparedSession) -> Result<Box<dyn RunningSession>, String>;
+    /// Start the prepared run and report the child's pid through `on_spawn` as soon
+    /// as the child exists, before any wait of the spawner's own. The engine records
+    /// that pid so `shutdown` can signal a spawn that has not returned yet.
+    fn spawn_with(
+        &self,
+        prepared: &PreparedSession,
+        on_spawn: &mut dyn FnMut(u32),
+    ) -> Result<Box<dyn RunningSession>, String>;
+    /// Start the prepared run when the caller does not need the pid early.
+    fn spawn(&self, prepared: &PreparedSession) -> Result<Box<dyn RunningSession>, String> {
+        self.spawn_with(prepared, &mut |_pid| {})
+    }
 }
 
 /// The real spawner: git in the agent's workspace and the product's own run binary.
@@ -206,7 +216,11 @@ impl SessionSpawner for RealSpawner {
         })
     }
 
-    fn spawn(&self, prepared: &PreparedSession) -> Result<Box<dyn RunningSession>, String> {
+    fn spawn_with(
+        &self,
+        prepared: &PreparedSession,
+        on_spawn: &mut dyn FnMut(u32),
+    ) -> Result<Box<dyn RunningSession>, String> {
         // The run process asks the kernel to signal it when its *parent thread* goes
         // away (`PR_SET_PDEATHSIG`). A short-lived thread would therefore kill
         // every session as soon as it returned, so a dedicated host thread does the
@@ -255,11 +269,16 @@ impl SessionSpawner for RealSpawner {
             }
         });
         match ready_rx.recv_timeout(std::time::Duration::from_secs(30)) {
-            Ok(Ok(pid)) => Ok(Box::new(HostedSession {
-                pid,
-                status: status_rx,
-                exited: None,
-            })),
+            Ok(Ok(pid)) => {
+                // The child exists and its pid record is written; report it before
+                // this function returns so a shutdown can signal it during any wait.
+                on_spawn(pid);
+                Ok(Box::new(HostedSession {
+                    pid,
+                    status: status_rx,
+                    exited: None,
+                }))
+            }
             Ok(Err(reason)) => Err(reason),
             Err(_) => Err("the session process did not start within 30 s".to_owned()),
         }
@@ -331,6 +350,7 @@ struct FakeInner {
     last_run_dir: Option<PathBuf>,
     last_repositories: Vec<SessionRepository>,
     prepare_failure: Option<String>,
+    block_next_spawn: Option<(std::sync::mpsc::Sender<u32>, std::sync::mpsc::Receiver<()>)>,
 }
 
 impl FakeSpawner {
@@ -396,6 +416,37 @@ impl FakeSpawner {
             .expect("the fake is not poisoned")
             .prepare_failure = Some(reason.to_owned());
     }
+
+    /// Make the next spawn report its pid and then wait for a release before it
+    /// returns. Returns the pid report and the release sender.
+    pub fn block_next_spawn(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<u32>, std::sync::mpsc::Sender<()>) {
+        let (pid_tx, pid_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .block_next_spawn = Some((pid_tx, release_rx));
+        (pid_rx, release_tx)
+    }
+
+    /// Whether a started pid has not been signalled to an end.
+    pub fn is_live(&self, pid: u32) -> bool {
+        let inner = self.inner.lock().expect("the fake is not poisoned");
+        inner.live.contains(&pid) && !inner.exits.contains_key(&pid)
+    }
+
+    /// Every started pid that has not been signalled to an end.
+    pub fn live(&self) -> Vec<u32> {
+        let inner = self.inner.lock().expect("the fake is not poisoned");
+        inner
+            .live
+            .iter()
+            .copied()
+            .filter(|pid| !inner.exits.contains_key(pid))
+            .collect()
+    }
 }
 
 impl SessionSpawner for FakeSpawner {
@@ -447,16 +498,30 @@ impl SessionSpawner for FakeSpawner {
         })
     }
 
-    fn spawn(&self, _prepared: &PreparedSession) -> Result<Box<dyn RunningSession>, String> {
-        let mut inner = self.inner.lock().expect("the fake is not poisoned");
-        inner.next_pid += 1;
-        let pid = 40_000 + inner.next_pid;
-        inner.live.push(pid);
-        let agent = inner
-            .last_prepared
-            .clone()
-            .unwrap_or_else(|| "fake".to_owned());
-        inner.starts.push(agent);
+    fn spawn_with(
+        &self,
+        _prepared: &PreparedSession,
+        on_spawn: &mut dyn FnMut(u32),
+    ) -> Result<Box<dyn RunningSession>, String> {
+        let (pid, block) = {
+            let mut inner = self.inner.lock().expect("the fake is not poisoned");
+            inner.next_pid += 1;
+            let pid = 40_000 + inner.next_pid;
+            inner.live.push(pid);
+            let agent = inner
+                .last_prepared
+                .clone()
+                .unwrap_or_else(|| "fake".to_owned());
+            inner.starts.push(agent);
+            (pid, inner.block_next_spawn.take())
+        };
+        // The pid is reported before the optional wait: a shutdown during the wait
+        // must be able to name the child the fake is holding.
+        on_spawn(pid);
+        if let Some((reported, release)) = block {
+            let _ = reported.send(pid);
+            let _ = release.recv();
+        }
         Ok(Box::new(FakeHandle {
             inner: Arc::clone(&self.inner),
             pid,

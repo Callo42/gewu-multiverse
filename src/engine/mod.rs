@@ -21,13 +21,14 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::fcntl::{Flock, FlockArg};
 
 use crate::agent_run;
-use crate::bundled_forgejo::{self, RunningForgejo};
+use crate::bundled_forgejo::{self, PreparedInstance, RunningForgejo};
 use crate::credentials::{self, CredentialsFile, Secret};
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
@@ -112,6 +113,10 @@ pub struct EngineOptions {
     /// The tests' simulated readiness, never set in production.
     #[cfg(test)]
     pub(crate) forgejo_ready: bool,
+    /// The tests' starter, which can block after the child exists. Production uses
+    /// the bundled launcher.
+    #[cfg(test)]
+    forgejo_starter: Option<Arc<dyn ForgejoStarter>>,
 }
 
 impl EngineOptions {
@@ -129,8 +134,62 @@ impl EngineOptions {
             auto_start_forgejo: true,
             #[cfg(test)]
             forgejo_ready: false,
+            #[cfg(test)]
+            forgejo_starter: Some(Arc::new(RealForgejoStarter)),
         })
     }
+}
+
+/// How the engine starts one Forgejo instance.
+///
+/// Production calls [`bundled_forgejo::spawn_prepared`] with the instance the start
+/// job already prepared. The tests use it to hold a child after it exists and before
+/// the readiness wait, so the shutdown interleavings can be driven exactly.
+#[cfg(test)]
+trait ForgejoStarter: Send + Sync + std::fmt::Debug {
+    fn start(
+        &self,
+        binary: &Path,
+        prepared: PreparedInstance,
+        ready_timeout: Duration,
+        on_spawn: &mut dyn FnMut(u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<RunningForgejo, String>;
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RealForgejoStarter;
+
+#[cfg(test)]
+impl ForgejoStarter for RealForgejoStarter {
+    fn start(
+        &self,
+        binary: &Path,
+        prepared: PreparedInstance,
+        ready_timeout: Duration,
+        on_spawn: &mut dyn FnMut(u32),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<RunningForgejo, String> {
+        bundled_forgejo::spawn_prepared(prepared, binary, ready_timeout, on_spawn, cancelled)
+    }
+}
+
+/// Spawn one Forgejo through the tests' starter when one is installed, else through
+/// the bundled launcher, from an instance the job has already prepared.
+fn start_forgejo(
+    _options: &EngineOptions,
+    binary: &Path,
+    prepared: PreparedInstance,
+    ready_timeout: Duration,
+    on_spawn: &mut dyn FnMut(u32),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<RunningForgejo, String> {
+    #[cfg(test)]
+    if let Some(starter) = _options.forgejo_starter.as_ref() {
+        return starter.start(binary, prepared, ready_timeout, on_spawn, cancelled);
+    }
+    bundled_forgejo::spawn_prepared(prepared, binary, ready_timeout, on_spawn, cancelled)
 }
 
 /// The engine, as the board holds it.
@@ -291,6 +350,7 @@ struct AgentRuntime {
     newest_run: Option<PathBuf>,
     running: Option<RunningState>,
     starting: bool,
+    starting_pid: Option<u32>,
     starting_since: Option<Instant>,
     next_at: Option<Instant>,
     last_end: Option<SessionEnd>,
@@ -308,7 +368,16 @@ struct ForgejoRuntime {
     admin_login: String,
     admin_token: Option<Secret>,
     child: Option<RunningForgejo>,
+    /// The pid of a Forgejo child whose start has not returned yet.
+    start_pid: Option<u32>,
     start_inflight: bool,
+    /// Access-token helpers started by the start or provisioning job. They are
+    /// recorded before they run and are visible to `shutdown`, like `start_pid`.
+    helper_pids: Vec<u32>,
+    /// How many token helpers are between "about to spawn" and "reaped". Visible to
+    /// `shutdown` under the same lock, so a helper cannot be spawned after the final
+    /// force phase has passed.
+    helper_inflight: usize,
     start_requested: bool,
     retry_start: bool,
     retry_at: Option<Instant>,
@@ -378,7 +447,10 @@ impl Inner {
             admin_login,
             admin_token: None,
             child: None,
+            start_pid: None,
             start_inflight: false,
+            helper_pids: Vec::new(),
+            helper_inflight: 0,
             start_requested: false,
             retry_start: false,
             retry_at: None,
@@ -530,6 +602,7 @@ impl AgentRuntime {
             newest_run,
             running: None,
             starting: false,
+            starting_pid: None,
             starting_since: None,
             next_at: None,
             last_end: None,
@@ -630,9 +703,16 @@ impl Engine {
         if let Some(server) = inner.forgejo.child.as_ref() {
             pids.push(server.pid());
         }
+        if let Some(pid) = inner.forgejo.start_pid {
+            pids.push(pid);
+        }
+        pids.extend(inner.forgejo.helper_pids.iter().copied());
         for agent in &inner.agents {
             if let Some(run) = agent.running.as_ref() {
                 pids.push(run.handle.pid());
+            }
+            if let Some(pid) = agent.starting_pid {
+                pids.push(pid);
             }
         }
         pids
@@ -1337,82 +1417,178 @@ impl EngineApi for Engine {
     }
 
     fn shutdown(&mut self, grace: Duration) {
-        let mut inner = match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if inner.stopping {
-            return;
-        }
-        inner.stopping = true;
-        inner.generation = inner.generation.saturating_add(1);
-        // Ask every group politely.
-        for agent in &mut inner.agents {
-            if let Some(run) = agent.running.as_mut() {
-                run.stopping = true;
-                run.handle.signal(false);
+        let started = Instant::now();
+        {
+            let mut inner = lock_inner(&self.inner);
+            if inner.stopping {
+                return;
             }
-        }
-        if let Some(server) = inner.forgejo.child.as_mut() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(server.pid() as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-        let deadline = Instant::now() + grace;
-        loop {
-            let mut alive = false;
+            inner.stopping = true;
+            inner.generation = inner.generation.saturating_add(1);
+            // Ask every group politely. A start or spawn still in flight records its
+            // child's pid, and is signalled again as that pid appears below.
             for agent in &mut inner.agents {
                 if let Some(run) = agent.running.as_mut() {
-                    if run.handle.try_status().is_some() {
-                        agent.running = None;
-                    } else {
-                        alive = true;
-                    }
+                    run.stopping = true;
+                    run.handle.signal(false);
+                }
+                if let Some(pid) = agent.starting_pid {
+                    signal_group(pid, nix::sys::signal::Signal::SIGTERM);
                 }
             }
             if let Some(server) = inner.forgejo.child.as_mut() {
-                if server.try_status().is_some() {
-                    inner.forgejo.child = None;
-                } else {
+                signal_group(server.pid(), nix::sys::signal::Signal::SIGTERM);
+            }
+            if let Some(pid) = inner.forgejo.start_pid {
+                signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+            }
+            for pid in &inner.forgejo.helper_pids {
+                signal_group(*pid, nix::sys::signal::Signal::SIGTERM);
+            }
+        }
+        // The bounded hand-over: a start or spawn that is between spawning its child
+        // and returning must see the new generation and stop that child itself. The
+        // engine lock is not held here, so that work can finish. Pids that appear
+        // during the wait are signalled as soon as they are visible.
+        let mut signalled: Vec<u32> = Vec::new();
+        loop {
+            let mut appeared: Vec<u32> = Vec::new();
+            let mut alive = false;
+            {
+                let mut inner = lock_inner(&self.inner);
+                for agent in &mut inner.agents {
+                    if let Some(run) = agent.running.as_mut() {
+                        if run.handle.try_status().is_some() {
+                            agent.running = None;
+                        } else {
+                            alive = true;
+                        }
+                    }
+                    if agent.starting {
+                        alive = true;
+                        if let Some(pid) = agent.starting_pid {
+                            appeared.push(pid);
+                        }
+                    }
+                }
+                if inner.forgejo.start_inflight {
+                    alive = true;
+                    if let Some(pid) = inner.forgejo.start_pid {
+                        appeared.push(pid);
+                    }
+                }
+                if inner.forgejo.helper_inflight > 0 {
                     alive = true;
                 }
+                for pid in &inner.forgejo.helper_pids {
+                    appeared.push(*pid);
+                }
+                if let Some(server) = inner.forgejo.child.as_ref() {
+                    alive = true;
+                    appeared.push(server.pid());
+                }
             }
-            if !alive || Instant::now() >= deadline {
+            for pid in appeared {
+                if !signalled.contains(&pid) {
+                    signalled.push(pid);
+                    signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+                }
+            }
+            if !alive || started.elapsed() >= grace {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(20));
         }
-        // Force whatever is left, then reap it.
-        for agent in &mut inner.agents {
-            if let Some(mut run) = agent.running.take() {
-                run.handle.signal(true);
-                for _ in 0..100 {
-                    if run.handle.try_status().is_some() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
+        // Force whatever is left, then reap it. The lock is held for this last short
+        // phase; the jobs that own an in-flight child see the generation changed and
+        // stop and reap it on their own thread.
+        {
+            let mut inner = lock_inner(&self.inner);
+            for agent in &mut inner.agents {
+                if let Some(mut run) = agent.running.take() {
+                    stop_running_session(&mut run.handle, Duration::from_millis(500));
                 }
-                agent.session = SessionState::Idle;
+                if let Some(pid) = agent.starting_pid.take() {
+                    signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                }
                 agent.starting = false;
+                agent.session = SessionState::Idle;
                 agent.next_at = None;
             }
+            if let Some(mut server) = inner.forgejo.child.take() {
+                server.stop(Duration::from_millis(100));
+                debug_assert!(!process_alive(server.pid()));
+            }
+            if let Some(pid) = inner.forgejo.start_pid.take() {
+                // The job that spawned this child owns its reaping. It has seen the
+                // generation change; this is the last bound if it is still blocked.
+                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            for pid in std::mem::take(&mut inner.forgejo.helper_pids) {
+                // The token helper's job owns the wait and reaping; the force below
+                // ends it if it is still in the grace window's shadow.
+                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            inner.forgejo.state = ForgejoState::Stopped;
+            inner.forgejo.admin_token = None;
+            inner.forgejo.start_requested = false;
+            inner.forgejo.start_inflight = false;
+            inner.forgejo.provisioned = false;
         }
-        if let Some(mut server) = inner.forgejo.child.take() {
-            server.stop(Duration::from_millis(100));
-            debug_assert!(!process_alive(server.pid()));
-        }
-        inner.forgejo.state = ForgejoState::Stopped;
-        inner.forgejo.admin_token = None;
-        inner.forgejo.start_requested = false;
-        inner.forgejo.start_inflight = false;
-        inner.forgejo.provisioned = false;
-        for agent in &mut inner.agents {
-            agent.session = SessionState::Idle;
-            agent.starting = false;
-            agent.next_at = None;
+        // A token helper may have been between "recorded as in flight" and "spawn"
+        // when the force phase ran. The job that started it checks the stop flag
+        // before spawning and stops and reaps a child it did start; wait briefly for
+        // that hand-over, so no helper survives the call.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let pending = lock_inner(&self.inner).forgejo.helper_inflight;
+            if pending == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+/// Take the engine state lock, recovering from a poisoned holder.
+fn lock_inner(inner: &Arc<Mutex<Inner>>) -> std::sync::MutexGuard<'_, Inner> {
+    match inner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Stop one session handle politely, then by force, and wait for its status so the
+/// child is reaped before the handle is dropped.
+fn stop_running_session(run: &mut Box<dyn RunningSession>, grace: Duration) {
+    if run.try_status().is_some() {
+        return;
+    }
+    run.signal(false);
+    if wait_session_status(run, grace) {
+        return;
+    }
+    run.signal(true);
+    let _ = wait_session_status(run, Duration::from_secs(1));
+}
+
+fn wait_session_status(run: &mut Box<dyn RunningSession>, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if run.try_status().is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Signal a process group by the pid that leads it. A pid that is already gone is
+/// not an error: the job that owns it reaps it and notices the generation change.
+fn signal_group(pid: u32, signal: nix::sys::signal::Signal) {
+    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
 }
 
 impl Drop for Engine {
@@ -1485,7 +1661,11 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) {
     agent.next_at = None;
     agent.session = SessionState::Idle;
     if agent.starting {
-        // The prepare job checks the desired choice before it spawns, and aborts.
+        // The job checks the desired choice after every wait, stops a child it has
+        // already spawned, and clears `starting` itself.
+        if let Some(pid) = agent.starting_pid {
+            signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+        }
         agent.starting = false;
     }
     if let Some(run) = agent.running.as_mut() {
@@ -1499,6 +1679,15 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) {
 // ---- background work -------------------------------------------------------
 
 fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generation: u64) {
+    forgejo_start_job_inner(Arc::clone(&inner), options, generation);
+    // The job is over however it ended: a shutdown waiting for the hand-over must
+    // stop waiting, and no pid may stay in the in-flight slot.
+    let mut guard = lock_inner(&inner);
+    guard.forgejo.start_inflight = false;
+    guard.forgejo.start_pid = None;
+}
+
+fn forgejo_start_job_inner(inner: Arc<Mutex<Inner>>, options: EngineOptions, generation: u64) {
     let binary = bundled_forgejo::binary_path(&options.data_root);
     let data_root = options.data_root.clone();
     let ready_timeout = options.ready_timeout;
@@ -1509,8 +1698,16 @@ fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generatio
             (inner.forgejo.admin_login.clone(), inner.forgejo.retry_start)
         }
     };
-    let had_binary = binary.is_file()
-        && bundled_forgejo::sha256_file(&binary).is_ok_and(|hash| hash == bundled_forgejo::SHA256);
+    // A test starter supplies its own child; nothing is installed or prepared for
+    // the real binary in that case.
+    #[cfg(test)]
+    let test_starter = options.forgejo_starter.is_some();
+    #[cfg(not(test))]
+    let test_starter = false;
+    let had_binary = test_starter
+        || (binary.is_file()
+            && bundled_forgejo::sha256_file(&binary)
+                .is_ok_and(|hash| hash == bundled_forgejo::SHA256));
     let installed = if had_binary {
         Ok(binary.clone())
     } else {
@@ -1532,7 +1729,21 @@ fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generatio
                 inner.forgejo.state = ForgejoState::Preparing;
             }
         }
-        let prepared = bundled_forgejo::prepare_instance(&data_root, &binary, &admin_login)?;
+        let cancel_inner = Arc::clone(&inner);
+        let cancel = move || {
+            let inner = lock_inner(&cancel_inner);
+            inner.stopping || inner.generation != generation
+        };
+        let prepared = if test_starter {
+            bundled_forgejo::PreparedInstance {
+                paths: bundled_forgejo::InstancePaths::under(&data_root),
+                admin_login: admin_login.clone(),
+                port: 3000,
+                url: "http://127.0.0.1:3000".to_owned(),
+            }
+        } else {
+            bundled_forgejo::prepare_instance_checked(&data_root, &binary, &admin_login, &cancel)?
+        };
         if let Ok(mut inner) = inner.lock() {
             if inner.generation == generation && !inner.stopping {
                 inner.forgejo.admin_login = prepared.admin_login.clone();
@@ -1542,14 +1753,21 @@ fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generatio
                 inner.forgejo.state = ForgejoState::Starting;
             }
         }
-        let cancel_inner = Arc::clone(&inner);
-        let server =
-            bundled_forgejo::start_instance_checked(&binary, &data_root, ready_timeout, || {
-                cancel_inner
-                    .lock()
-                    .map(|inner| inner.stopping || inner.generation != generation)
-                    .unwrap_or(true)
-            })?;
+        let record_inner = Arc::clone(&inner);
+        let mut record = move |pid| {
+            // Record the child before any readiness wait, even if shutdown has
+            // already begun: its bounded hand-over looks for this pid.
+            let mut inner = lock_inner(&record_inner);
+            inner.forgejo.start_pid = Some(pid);
+        };
+        let server = start_forgejo(
+            &options,
+            &binary,
+            prepared.clone(),
+            ready_timeout,
+            &mut record,
+            &cancel,
+        )?;
         Ok((server, prepared))
     });
     match result {
@@ -1559,11 +1777,7 @@ fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generatio
             // work: `shutdown` must be able to stop a server that is still being
             // provisioned. Only the short store happens under the lock.
             {
-                let Ok(mut inner) = inner.lock() else {
-                    let mut server = server;
-                    server.stop(Duration::from_secs(2));
-                    return;
-                };
+                let mut inner = lock_inner(&inner);
                 if inner.generation != generation || inner.stopping {
                     drop(inner);
                     let mut server = server;
@@ -1571,6 +1785,7 @@ fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generatio
                     return;
                 }
                 inner.forgejo.child = Some(server);
+                inner.forgejo.start_pid = None;
                 inner.forgejo.state = ForgejoState::Running;
                 inner.forgejo.url = url.clone();
                 inner.forgejo.admin_login = prepared.admin_login.clone();
@@ -1582,7 +1797,20 @@ fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generatio
                 inner.forgejo.provision_retry_at = None;
                 inner.note(format!("Forgejo is ready at {url}"));
             }
-            let token = ensure_admin_token(&inner, &binary, &data_root, &prepared.admin_login);
+            let token_cancel = {
+                let inner = Arc::clone(&inner);
+                move || {
+                    let inner = lock_inner(&inner);
+                    inner.stopping || inner.generation != generation
+                }
+            };
+            let token = ensure_admin_token(
+                &inner,
+                &binary,
+                &data_root,
+                &prepared.admin_login,
+                &token_cancel,
+            );
             let provisioned = token.as_ref().ok().map(|token| {
                 let client = ForgejoClient::new(&url, token.clone(), DEFAULT_TIMEOUT);
                 client
@@ -1609,31 +1837,31 @@ fn forgejo_start_job(inner: Arc<Mutex<Inner>>, options: EngineOptions, generatio
         }
         Err(_reason) => {
             let was_fetching = !had_binary && !install_succeeded;
-            if let Ok(mut inner) = inner.lock() {
-                if inner.generation != generation {
-                    return;
-                }
-                inner.forgejo.start_inflight = false;
-                let plain = if was_fetching {
-                    "could not download Forgejo — check the internet connection; the next start tries again"
-                } else if retry {
-                    "could not start Forgejo — it tries again"
-                } else {
-                    "could not start Forgejo — press r to try again"
-                };
-                inner.forgejo.state = ForgejoState::Failed {
-                    reason: plain.to_owned(),
-                };
-                if retry {
-                    inner.forgejo.failures = inner.forgejo.failures.saturating_add(1);
-                    inner.forgejo.retry_at =
-                        Some(Instant::now() + backoff_for_restart(inner.forgejo.failures));
-                    inner.forgejo.start_requested = true;
-                } else {
-                    inner.forgejo.start_requested = false;
-                }
-                inner.note(plain);
+            let mut inner = lock_inner(&inner);
+            if inner.generation != generation || inner.stopping {
+                return;
             }
+            inner.forgejo.start_inflight = false;
+            inner.forgejo.start_pid = None;
+            let plain = if was_fetching {
+                "could not download Forgejo — check the internet connection; the next start tries again"
+            } else if retry {
+                "could not start Forgejo — it tries again"
+            } else {
+                "could not start Forgejo — press r to try again"
+            };
+            inner.forgejo.state = ForgejoState::Failed {
+                reason: plain.to_owned(),
+            };
+            if retry {
+                inner.forgejo.failures = inner.forgejo.failures.saturating_add(1);
+                inner.forgejo.retry_at =
+                    Some(Instant::now() + backoff_for_restart(inner.forgejo.failures));
+                inner.forgejo.start_requested = true;
+            } else {
+                inner.forgejo.start_requested = false;
+            }
+            inner.note(plain);
         }
     }
 }
@@ -1643,6 +1871,7 @@ fn ensure_admin_token(
     binary: &Path,
     data_root: &Path,
     admin_login: &str,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Secret, String> {
     let credentials = inner
         .lock()
@@ -1661,7 +1890,46 @@ fn ensure_admin_token(
             }
         }
     }
-    let token = bundled_forgejo::generate_admin_token(binary, data_root, admin_login)?;
+    if cancelled() {
+        return Err("the start was called off".to_owned());
+    }
+    // Register the helper as in flight under the state lock before the child exists.
+    // `shutdown` sees either this count or the child's pid, so it cannot finish
+    // between the stop check and the spawn and leave the helper behind.
+    {
+        let mut inner = lock_inner(inner);
+        if inner.stopping {
+            return Err("the start was called off".to_owned());
+        }
+        inner.forgejo.helper_inflight += 1;
+    }
+    let spawned = Arc::new(AtomicU32::new(0));
+    let record_inner = Arc::clone(inner);
+    let record_spawned = Arc::clone(&spawned);
+    let on_spawn = move |pid: u32| {
+        record_spawned.store(pid, Ordering::SeqCst);
+        let mut inner = lock_inner(&record_inner);
+        inner.forgejo.helper_pids.push(pid);
+    };
+    let result = bundled_forgejo::generate_admin_token_checked(
+        binary,
+        data_root,
+        admin_login,
+        cancelled,
+        on_spawn,
+    );
+    // The helper's own job has waited for it, so this removes a pid that is already
+    // reaped. The count is cleared on every path, including a failed or called-off
+    // helper, so `shutdown`'s final wait can end.
+    {
+        let mut inner = lock_inner(inner);
+        inner.forgejo.helper_inflight = inner.forgejo.helper_inflight.saturating_sub(1);
+        let pid = spawned.load(Ordering::SeqCst);
+        if pid != 0 {
+            inner.forgejo.helper_pids.retain(|kept| *kept != pid);
+        }
+    }
+    let token = result?;
     credentials::record_secret(&credentials, None, "forgejo_admin_token", token.expose())
         .map_err(|error| format!("the administrator token could not be kept: {error}"))?;
     Ok(token)
@@ -1684,8 +1952,20 @@ fn forgejo_provision_job(inner: Arc<Mutex<Inner>>, options: EngineOptions) {
         }
     };
     let binary = bundled_forgejo::binary_path(&options.data_root);
-    let token = token
-        .or_else(|| ensure_admin_token(&inner, &binary, &options.data_root, &admin_login).ok());
+    let token_cancel = {
+        let inner = Arc::clone(&inner);
+        move || lock_inner(&inner).stopping
+    };
+    let token = token.or_else(|| {
+        ensure_admin_token(
+            &inner,
+            &binary,
+            &options.data_root,
+            &admin_login,
+            &token_cancel,
+        )
+        .ok()
+    });
     let result = match token.as_ref() {
         Some(token) => ForgejoClient::new(&url, token.clone(), DEFAULT_TIMEOUT)
             .and_then(|client| bundled_forgejo::provision(&client)),
@@ -1796,59 +2076,115 @@ fn session_job(
     generation: u64,
 ) {
     let prepared: Result<PreparedSession, String> = spawner.prepare(&request);
-    let now = clock.now();
-    let mut guard = match inner.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    // The slow half is over: no child exists yet. A stop or shutdown that happened
+    // during it must win before anything is spawned.
+    {
+        let mut guard = lock_inner(&inner);
+        let Some(index) = guard.agent_index(&request.agent) else {
+            return;
+        };
+        if guard.stopping
+            || guard.generation != generation
+            || guard.agents[index].desired != Desired::Started
+            || !guard.agents[index].starting
+        {
+            guard.agents[index].starting = false;
+            guard.agents[index].starting_pid = None;
+            return;
+        }
+    }
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            let now = clock.now();
+            let mut guard = lock_inner(&inner);
+            let Some(index) = guard.agent_index(&request.agent) else {
+                return;
+            };
+            if guard.stopping
+                || guard.generation != generation
+                || guard.agents[index].desired != Desired::Started
+            {
+                guard.agents[index].starting = false;
+                guard.agents[index].starting_pid = None;
+                return;
+            }
+            guard.agents[index].starting = false;
+            guard.agents[index].starting_pid = None;
+            let started = guard.agents[index].starting_since.unwrap_or(now);
+            let agent = &mut guard.agents[index];
+            finish_session(agent, SessionEnd::Failed { reason }, now, started);
+            return;
+        }
     };
+    // Spawn without the state lock. The spawner reports the pid as soon as the child
+    // exists, so a shutdown during a spawner's own wait can signal it. Recording the
+    // pid takes the lock only for the short store.
+    let record_inner = Arc::clone(&inner);
+    let record_agent = request.agent.clone();
+    let mut on_spawn = move |pid: u32| {
+        let mut guard = lock_inner(&record_inner);
+        if let Some(index) = guard.agent_index(&record_agent) {
+            guard.agents[index].starting_pid = Some(pid);
+        }
+    };
+    let spawned = spawner.spawn_with(&prepared, &mut on_spawn);
+    let now = clock.now();
+    let mut guard = lock_inner(&inner);
     let Some(index) = guard.agent_index(&request.agent) else {
+        drop(guard);
+        if let Ok(mut handle) = spawned {
+            stop_running_session(&mut handle, Duration::from_secs(1));
+        }
         return;
     };
-    if guard.stopping
+    let called_off = guard.stopping
         || guard.generation != generation
         || guard.agents[index].desired != Desired::Started
-        || !guard.agents[index].starting
-    {
+        || !guard.agents[index].starting;
+    if called_off {
         guard.agents[index].starting = false;
+        guard.agents[index].starting_pid = None;
+        drop(guard);
+        if let Ok(mut handle) = spawned {
+            // This job owns the child it has just spawned. Stop and reap it; the
+            // shutdown that called it off may have signalled the group already.
+            stop_running_session(&mut handle, Duration::from_secs(1));
+        }
         return;
     }
     let started = guard.agents[index].starting_since.unwrap_or(now);
-    match prepared {
-        Ok(prepared) => match spawner.spawn(&prepared) {
-            Ok(handle) => {
-                let _pid = handle.pid();
-                guard.agents[index].starting = false;
-                guard.agents[index].running = Some(RunningState {
-                    run_dir: request.run_dir.clone(),
-                    started,
-                    handle,
-                    stopping: false,
-                    stop_deadline: None,
-                    stop_requested: false,
-                    timed_out: false,
-                });
-                guard.agents[index].newest_run = Some(request.run_dir.clone());
-                guard.agents[index].activity_refresh_at = None;
-                guard.agents[index].session = SessionState::Running {
-                    number: guard.agents[index].session_number,
-                    since: SystemTime::now(),
-                };
-            }
-            Err(reason) => {
-                guard.agents[index].starting = false;
-                let _ = transcript::record_outcome_if_missing(
-                    &request.run_dir,
-                    &request.run_id,
-                    run::RunOutcome::Failed,
-                    Some(reason.clone()),
-                    0,
-                );
-                let agent = &mut guard.agents[index];
-                finish_session(agent, SessionEnd::Failed { reason }, now, started);
-            }
-        },
+    match spawned {
+        Ok(handle) => {
+            let _pid = handle.pid();
+            guard.agents[index].starting = false;
+            guard.agents[index].starting_pid = None;
+            guard.agents[index].running = Some(RunningState {
+                run_dir: request.run_dir.clone(),
+                started,
+                handle,
+                stopping: false,
+                stop_deadline: None,
+                stop_requested: false,
+                timed_out: false,
+            });
+            guard.agents[index].newest_run = Some(request.run_dir.clone());
+            guard.agents[index].activity_refresh_at = None;
+            guard.agents[index].session = SessionState::Running {
+                number: guard.agents[index].session_number,
+                since: SystemTime::now(),
+            };
+        }
         Err(reason) => {
             guard.agents[index].starting = false;
+            guard.agents[index].starting_pid = None;
+            let _ = transcript::record_outcome_if_missing(
+                &request.run_dir,
+                &request.run_id,
+                run::RunOutcome::Failed,
+                Some(reason.clone()),
+                0,
+            );
             let agent = &mut guard.agents[index];
             finish_session(agent, SessionEnd::Failed { reason }, now, started);
         }
@@ -2018,6 +2354,7 @@ mod tests {
             ready_timeout: DEFAULT_READY_TIMEOUT,
             auto_start_forgejo: false,
             forgejo_ready: true,
+            forgejo_starter: None,
         }
     }
 
@@ -2608,5 +2945,291 @@ mod tests {
             })
             .expect("stop");
         tick(&mut again, &clock, Duration::ZERO);
+    }
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    /// A starter that spawns a real sleeping child, reports its pid, and then blocks
+    /// until the test releases it. It models a slow readiness wait that a shutdown
+    /// must be able to interrupt.
+    #[derive(Debug)]
+    struct BlockingForgejoStarter {
+        entered: Mutex<Option<std::sync::mpsc::Sender<u32>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        log: PathBuf,
+        pid_file: PathBuf,
+    }
+
+    impl BlockingForgejoStarter {
+        fn new(
+            root: &Path,
+        ) -> (
+            Arc<Self>,
+            std::sync::mpsc::Receiver<u32>,
+            std::sync::mpsc::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            (
+                Arc::new(Self {
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: Mutex::new(release_rx),
+                    finished: Mutex::new(Some(finished_tx)),
+                    log: root.join("fake-forgejo.log"),
+                    pid_file: root.join("fake-forgejo.pid"),
+                }),
+                entered_rx,
+                release_tx,
+                finished_rx,
+            )
+        }
+
+        fn finished(&self) {
+            if let Some(tx) = self
+                .finished
+                .lock()
+                .expect("the fake is not poisoned")
+                .take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    impl ForgejoStarter for BlockingForgejoStarter {
+        fn start(
+            &self,
+            _binary: &Path,
+            _prepared: PreparedInstance,
+            _ready_timeout: Duration,
+            on_spawn: &mut dyn FnMut(u32),
+            cancelled: &dyn Fn() -> bool,
+        ) -> Result<RunningForgejo, String> {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("the fake server starts");
+            let pid = child.id();
+            on_spawn(pid);
+            if let Some(tx) = self
+                .entered
+                .lock()
+                .expect("the fake is not poisoned")
+                .take()
+            {
+                let _ = tx.send(pid);
+            }
+            let _ = self
+                .release
+                .lock()
+                .expect("the fake is not poisoned")
+                .recv();
+            let mut server = bundled_forgejo::test_server(
+                child,
+                "http://127.0.0.1:3000".to_owned(),
+                self.log.clone(),
+                self.pid_file.clone(),
+            );
+            if cancelled() {
+                server.stop(Duration::from_secs(2));
+                self.finished();
+                return Err("the start was called off".to_owned());
+            }
+            self.finished();
+            Ok(server)
+        }
+    }
+
+    /// Whether a pid exists and is not a zombie: a zombie still answers `kill -0`,
+    /// but it is no longer a running child.
+    fn process_running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|text| text.split_whitespace().nth(2).map(|state| state != "Z"))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn shutdown_ends_a_forgejo_token_helper_that_is_still_running() {
+        let root = scratch_root("engine-token-helper-stop");
+        let settings = write_ready(&root, &[]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        bundled_forgejo::InstancePaths::under(&root)
+            .ensure()
+            .expect("the instance paths");
+
+        let pid_file = root.join("token-helper.pid");
+        let helper = root.join("fake-forgejo-token.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/bash\ntrap '' TERM HUP\nprintf '%s' \"$$\" > '{}'\nwhile :; do read -t 1 _ || true; done\n",
+                pid_file.display()
+            ),
+        )
+        .expect("the fake token helper is written");
+        crate::mode::set_mode(&helper, 0o755).expect("the fake helper is executable");
+
+        let token_inner = Arc::clone(&engine.inner);
+        let cancel_inner = Arc::clone(&token_inner);
+        let job = std::thread::spawn(move || {
+            ensure_admin_token(&token_inner, &helper, &root, "tester", &move || {
+                lock_inner(&cancel_inner).stopping
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_file.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the token helper wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(process_alive(pid), "the token helper did not start");
+
+        let began = Instant::now();
+        engine.shutdown(Duration::from_millis(200));
+        let elapsed = began.elapsed();
+        let result = job.join().expect("the token job ends");
+        assert!(result.is_err(), "the helper was not called off");
+        assert!(
+            !process_alive(pid),
+            "the token helper {pid} was left running or unreaped"
+        );
+        assert!(
+            engine.live_pids().is_empty(),
+            "the engine still records {:?}",
+            engine.live_pids()
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown waited {elapsed:?} for the token helper"
+        );
+    }
+
+    #[test]
+    fn shutdown_stops_a_forgejo_whose_start_is_still_in_flight() {
+        let root = scratch_root("engine-quit-forgejo-start");
+        let (starter, entered, release, finished) = BlockingForgejoStarter::new(&root);
+        let mut options = test_options(&root);
+        options.forgejo_ready = false;
+        options.auto_start_forgejo = false;
+        options.stop_grace = Duration::from_secs(2);
+        options.forgejo_starter = Some(starter);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_for_test(options, clock, fake, Settings::default())
+            .expect("the test engine opens");
+        engine.send(Command::StartForgejo).expect("start Forgejo");
+        engine.tick();
+        let pid = entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake server reached its child");
+        assert!(process_alive(pid), "the fake child did not start");
+
+        let began = Instant::now();
+        engine.shutdown(Duration::from_millis(250));
+        let waited = began.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "shutdown waited {waited:?} on an in-flight start"
+        );
+        // The child was signalled during the block. It may be a zombie until the job
+        // that owns it is released and reaps it, but it is no longer running.
+        assert!(
+            !process_running(pid),
+            "pid {pid} is still running after shutdown"
+        );
+        assert!(
+            engine.live_pids().is_empty(),
+            "the engine still records {:?}",
+            engine.live_pids()
+        );
+
+        // Releasing after shutdown must finish the job and reap the child, not keep
+        // the server for a later start.
+        release.send(()).expect("the fake is released");
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the start job exits after shutdown");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!process_alive(pid), "pid {pid} was kept after release");
+        assert!(
+            engine.live_pids().is_empty(),
+            "the engine kept a child: {:?}",
+            engine.live_pids()
+        );
+        assert!(matches!(
+            engine.board().forgejo.state,
+            ForgejoState::Stopped
+        ));
+    }
+
+    #[test]
+    fn shutdown_returns_while_a_session_spawn_is_blocked_and_keeps_no_child() {
+        let root = scratch_root("engine-quit-session-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (pid_rx, release) = fake.block_next_spawn();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session reached its child");
+        assert!(fake.is_live(pid), "the fake child did not start");
+
+        let began = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (engine_tx, engine_rx) = std::sync::mpsc::channel();
+        let shutdown_thread = std::thread::spawn(move || {
+            let mut engine = engine;
+            engine.shutdown(Duration::from_millis(200));
+            let _ = done_tx.send(());
+            let _ = engine_tx.send(engine);
+        });
+        match done_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "shutdown took {:?} while a spawn was blocked",
+                began.elapsed()
+            ),
+            Err(_) => {
+                let _ = release.send(());
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
+                panic!("shutdown blocked on the in-flight session spawn");
+            }
+        }
+        let mut engine = engine_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the engine comes back after shutdown");
+        let _ = shutdown_thread.join();
+        let _ = release.send(());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fake.is_live(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!fake.is_live(pid), "the session child was kept");
+        assert!(
+            engine.live_pids().is_empty(),
+            "the engine still records {:?}",
+            engine.live_pids()
+        );
+        let board = engine.board();
+        assert!(matches!(board.agents[0].session, SessionState::Idle));
     }
 }
