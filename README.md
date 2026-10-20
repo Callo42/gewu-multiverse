@@ -189,10 +189,34 @@ exactly while this gate passes; the answer is recomputed when the checked-out br
 tip, the local base's tip or the clone's remote-tracking refs change, and the cache is
 cleared when a role check is applied or an identity or token changes, so a local commit
 or reset, a changed default branch or a removed agent token cannot leave `P` behind.
-`U` updates the newest open one. With no
-hand-written `<config dir>/agents/<agent>/pull-request.txt`, the newest run's final
-reply is used: its first line is the title and the whole reply is the body. A file,
-when present, still wins (first line the title, the rest the body).
+When those checks pass, `P` **first lists the repository's open pull requests** (the
+same list call, as the agent's token) before it shows a preview. If one already has
+the selected clone's current branch as head and the base as base, `P` writes nothing
+and names that request — its number, title and branch pair. When its author is the
+agent's own recorded login, the sentence names `U` as the way to update it; when the
+author is another account or is not named, the sentence says the request is not the
+agent's own, says `U` updates only the agent's own request, and names no update route
+for it. A list that cannot be read is one refusal sentence naming the cause, and
+nothing is written.
+
+`U` acts **only** on the open pull request whose head is the selected clone's current
+branch, whose base is the base, and whose author is the agent's own recorded login —
+never another branch's request, another person's request, or a request whose author is
+not named. A head that names no repository is not a match. It shows the same bordered
+preview as `P` and writes only on `y` or `enter`; `n` or `esc` writes nothing. With
+none open for that branch it refuses in one sentence and says `P` opens one when `P`'s
+gate would pass. When a request for the pair is open but is not the agent's own, it
+names that request and says `U` updates only the agent's own request; it does not offer
+`P`, which refuses while any request occupies the pair.
+
+The title and body come from one fixed order: a present
+`<config dir>/agents/<agent>/pull-request.txt` (first line the title, the rest the
+body); otherwise the final reply of the **newest run of this agent whose push witness
+names this branch** (`push.json` records the branch; a run that pushed nothing, or
+another branch, is never used); otherwise a neutral text built from the branch's own
+commits beyond the measured base (the newest subject is the title, a bounded subject
+list is the body). The preview names the source in a few words: the file, the run id,
+or the branch's commits.
 
 **Every request carries a token.** There are no anonymous calls. A token is read from
 the credentials file and travels only in a request's `Authorization` header. Git is
@@ -300,7 +324,7 @@ supervision modes (`tui` and `systemd`), `p` tests its model endpoint,
 `i` settles the chosen agent's Forgejo identity, `E` edits the selected agent's endpoint, model and
 key, `g`
 clones the chosen repository into its workspace, `P` shows the proposed pull request and
-opens it only after you confirm, `U` updates the newest open one, `e` edits its instruction, `K`
+opens it only after you confirm, `U` updates this branch's own open request, `e` edits its instruction, `K`
 starts a new skill, `t` edits its declared run steps, `o` opens its newest log,
 `T` opens its newest transcript,
 and `r` re-reads the files. Each agent's own files live under

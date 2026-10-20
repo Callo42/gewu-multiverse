@@ -247,7 +247,7 @@ fn screen_actions(app: &App) -> &'static str {
                 "k model key   f role token   A admin token   D leftover   ? all keys"
             }
         }
-        Screen::Runs => "o log   T transcript   up/down run   [ ] page   enter open   ? all keys",
+        Screen::Runs => "o log   T transcript   up/down run   [ ] page   enter open the agent   ? all keys",
     }
 }
 
@@ -612,12 +612,9 @@ fn agent_config_lines(app: &App) -> Vec<Line<'static>> {
                     };
                     lines.push(field("endpoint test", &line));
                 }
-                Some(test) => lines.push(field(
+                Some(_test) => lines.push(field(
                     "endpoint test",
-                    &format!(
-                        "not current — the endpoint or model changed since it ran ({}); press p to test it again",
-                        test.describe()
-                    ),
+                    "not current — the last test was of the previous settings; press p to test the current ones",
                 )),
                 None => lines.push(field("endpoint test", "not tested yet — press p")),
                 }
@@ -1104,16 +1101,31 @@ fn draw_forgejo(frame: &mut Frame, app: &App, area: Rect) {
     // identity tail and the legend.
     let (range_title, short_title) = forgejo_scrolled_title(app, total);
     if app.forgejo_note.is_some() {
-        // After a clone the note is one of the facts a person needs, and the key
-        // legend's second row must not be what it pushes off. The legend is pinned as
-        // two whole rows; the content above it scrolls with `[`/`]`.
+        // After a clone or a pull-request write the note is one of the facts a person
+        // needs, and the key legend's second row must not be what it pushes off. The
+        // legend is pinned as two whole rows; the content above it scrolls with `[`/`]`.
+        // The selected repository row is pinned above that legend when the shorter
+        // body would otherwise drop it, so the floor never hides the row an action
+        // acts on.
         let mut content = head;
         if total > 0 {
             content.push(note_marker(&format!("repositories 1–{total} of {total}")));
         }
+        let selected_at = (total > 0).then_some(content.len() + app.repo_selected);
+        let selected_repo = all_repos.get(app.repo_selected).cloned();
         content.extend(all_repos);
         content.extend(tail);
-        draw_forgejo_pinned_legend(frame, app, content, legend, &range_title, &short_title, area);
+        draw_forgejo_pinned_legend(
+            frame,
+            app,
+            content,
+            legend,
+            selected_at,
+            selected_repo,
+            &range_title,
+            &short_title,
+            area,
+        );
     } else {
         let lines = forgejo_scrolled_lines(app);
         draw_scrolled_panel(frame, app, lines, &range_title, Some(&short_title), area);
@@ -1153,11 +1165,14 @@ fn forgejo_scrolled_title(app: &App, total: usize) -> (String, String) {
 }
 
 /// Draw the Forgejo scrolled form with its two-row legend pinned inside the border.
+#[allow(clippy::too_many_arguments)]
 fn draw_forgejo_pinned_legend(
     frame: &mut Frame,
     app: &App,
     content: Vec<Line<'static>>,
     legend: Vec<Line<'static>>,
+    selected_at: Option<usize>,
+    selected_repo: Option<Line<'static>>,
     base: &str,
     short: &str,
     area: Rect,
@@ -1168,9 +1183,34 @@ fn draw_forgejo_pinned_legend(
     // Keep at least one content row even if a window is absurdly short; the floor is
     // guarded before this function is reached.
     let legend_height = legend_rows.len().min(inner_height.saturating_sub(1));
-    let body_height = inner_height.saturating_sub(legend_height).max(1);
+    let base_body_height = inner_height.saturating_sub(legend_height).max(1);
     let (rows, owners) = panel_rows_owned(&content, width);
     let total = rows.len().max(1);
+    // The selected repository is one logical line in the content. If the body above
+    // the pinned legend would drop it, give it a pinned row of its own. The rest of
+    // the content keeps scrolling; the row an action acts on is never the row the
+    // floor drops.
+    let selected_visible = selected_at.is_none_or(|at| {
+        let Some((start, end)) = logical_group(&owners, at) else {
+            return false;
+        };
+        let offset = app
+            .panel_scroll
+            .min(rows.len().saturating_sub(base_body_height));
+        start >= offset && end <= offset + base_body_height
+    });
+    let pinned_rows = if selected_visible {
+        Vec::new()
+    } else {
+        selected_repo
+            .map(|line| panel_rows(&[line], width))
+            .unwrap_or_default()
+    };
+    let pinned_rows: Vec<Line<'static>> = pinned_rows
+        .into_iter()
+        .take(base_body_height.saturating_sub(1))
+        .collect();
+    let body_height = base_body_height.saturating_sub(pinned_rows.len());
     let limit = rows.len().saturating_sub(body_height);
     let offset = app.panel_scroll.min(limit);
     app.panel_height.set(body_height.max(1));
@@ -1192,6 +1232,18 @@ fn draw_forgejo_pinned_legend(
         Paragraph::new(Text::from(window)).style(base_style()),
         body_area,
     );
+    if !pinned_rows.is_empty() {
+        let pinned_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1 + body_height as u16,
+            width: area.width.saturating_sub(2),
+            height: pinned_rows.len() as u16,
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(pinned_rows)).style(base_style()),
+            pinned_area,
+        );
+    }
     let legend_area = Rect {
         x: area.x + 1,
         y: area.y + 1 + inner_height.saturating_sub(legend_height) as u16,
@@ -1204,6 +1256,13 @@ fn draw_forgejo_pinned_legend(
     );
 }
 
+/// The first and last row of one logical line in a wrapped panel.
+fn logical_group(owners: &[usize], at: usize) -> Option<(usize, usize)> {
+    let start = owners.iter().position(|owner| *owner == at)?;
+    let end = owners.iter().rposition(|owner| *owner == at)? + 1;
+    Some((start, end))
+}
+
 /// The Forgejo key legend, two compact rows.
 ///
 /// Each phrase keeps its object: `v agent token` says what `v` sets, and the panel
@@ -1211,11 +1270,13 @@ fn draw_forgejo_pinned_legend(
 /// leaves the repository list more than one row at 80×24. `P` is named only while the
 /// pull-request gate passes, so the legend never offers a key that would refuse.
 fn forgejo_legend(app: &App) -> Vec<Line<'static>> {
-    let mut second = "up/down choose one   g clone".to_owned();
+    let mut second = "up/down choose   g clone".to_owned();
     if app.can_open_pull_request() {
         second.push_str("   P pull request");
     }
-    second.push_str("   U update the newest");
+    // The object is the selected clone's branch, not the repository's newest request;
+    // a longer phrase keeps the same row by shortening `choose one` to `choose`.
+    second.push_str("   U update this branch's request");
     [
         "u url   c role   C admin role   v agent token   A admin token   i identity".to_owned(),
         second,
@@ -1279,7 +1340,13 @@ fn forgejo_scrolled_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = head;
     if !all_repos.is_empty() {
         let total = all_repos.len();
-        lines.push(note_marker(&format!("repositories 1–{total} of {total}")));
+        // The title carries the range whenever it can share it with the overflow
+        // declaration; only when it cannot is the range named on its own row above
+        // the list. Keeping a duplicate row cost the selected repository its place at
+        // the floor once a clone note was present (class 5).
+        if !forgejo_scrolled_title(app, total).0.contains("repositories") {
+            lines.push(note_marker(&format!("repositories 1–{total} of {total}")));
+        }
     }
     lines.extend(all_repos);
     lines.extend(tail);
@@ -1294,111 +1361,29 @@ fn forgejo_scrolled_lines(app: &App) -> Vec<Line<'static>> {
 /// list a title describes and the list `[`/`]` reaches can never disagree (A-3).
 fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut head: Vec<Line> = Vec::new();
+    let mut all_repos: Vec<Line> = Vec::new();
+    let checked = matches!(app.role_check, Some(Ok(_)));
     match &app.config {
         None => head.push(Line::from(no_agent_text(app))),
         Some(config) => {
             head.push(field("url", &config.forgejo.url));
-            let (_, admin) = app.forgejo_tokens_present();
-            // The role label follows the token that actually produced this view. A
-            // successful administrative check is an administrator even while the
-            // configuration still says `member`; a member check whose account is an
-            // administrator says so, and names `C` only when that key can work. Without
-            // an administrator token it names the route that can supply one (`A`),
-            // exactly as the summary line does.
-            let role = match &app.role_check {
-                Some(Ok(check)) if check.administrative() => "administrator".to_owned(),
-                Some(Ok(check)) if check.viewer.is_admin => {
-                    if admin {
-                        "administrator account — checked as an ordinary member; C shows that view"
-                            .to_owned()
-                    } else {
-                        "administrator account — checked as an ordinary member; press A on the Credentials screen to add the administrator token"
-                            .to_owned()
-                    }
-                }
-                Some(Ok(_)) => "member".to_owned(),
-                // No result this session (or a failed one): do not print the configured
-                // default as if the check had said it. The persisted stamp carries the
-                // last real result and its age (K-14).
-                Some(Err(failure)) => format!("last check failed ({})", failure.class),
-                None => app
-                    .last_check_line()
-                    .unwrap_or_else(|| "not checked this session".to_owned()),
-            };
-            head.push(field("role", &role));
-            let _ = config;
         }
     }
     let (member, admin) = app.forgejo_tokens_present();
-    head.push(field(
-        "role token",
-        if member {
-            "in the credentials file"
-        } else {
-            "absent"
-        },
-    ));
-    head.push(field(
-        "admin token",
-        if admin {
-            "configured (identities are managed)"
-        } else {
-            "absent (identities are supplied)"
-        },
-    ));
-    let mut all_repos: Vec<Line> = Vec::new();
     match &app.role_check {
-        None => {
-            // W37-1: the stamp is persisted, so even a session that has not run a
-            // check can say when the last one ran; the fact does not vanish with the
-            // session that learned it.
-            match (app.last_check_line(), app.role_check_stamp()) {
-                (Some(line), _) => head.push(placeholder(&format!(
-                    "not checked this session — {line} — press c to check again"
-                ))),
-                (None, Some(stamp)) => head.push(placeholder(&format!(
-                    "not checked this session — {stamp} — press c to check again"
-                ))),
-                (None, None) => head.push(placeholder(
-                    "not checked this session — press c to list what the configured token can see",
-                )),
-            }
-        }
-        Some(Err(failure)) => {
-            // P-7: a refusal names the URL the user configured, not only the API path,
-            // so a mistyped path connects to what was typed. S-2: the refusal carries
-            // the stamp of when and where it was made.
-            let at = app
-                .config
-                .as_ref()
-                .map(|config| config.forgejo.url.clone())
-                .unwrap_or_else(|| "the configured address".to_owned());
-            let line = match app.role_check_stamp() {
-                Some(stamp) => format!(
-                    "role check failed ({}) at {at}: {} — {stamp}",
-                    failure.class, failure.message
-                ),
-                None => format!(
-                    "role check failed ({}) at {at}: {}",
-                    failure.class, failure.message
-                ),
-            };
-            head.push(Line::from(Span::styled(line, error_style())));
-        }
         Some(Ok(check)) => {
-            let mut summary = format!(
-                "{} — {}",
-                if check.administrative() {
-                    "administrative view"
-                } else {
-                    "ordinary view"
-                },
-                check.summary_with_admin(admin)
-            );
+            // The role and the view it produced are one fact, so they share one field.
+            // The summary's `as an ordinary member` / `as an administrator` carries the
+            // role; dropping the duplicated `ordinary view —` clause leaves the row the
+            // selected repository needs at the floor.
+            let mut summary = check.summary_with_admin(admin);
             if let Some(stamp) = app.role_check_stamp() {
                 summary = format!("{summary} — {stamp}");
             }
-            head.push(Line::from(summary));
+            head.push(field("role", &summary));
+            if let Some(state) = app.pull_request_state_line() {
+                head.push(field("pull request", &state));
+            }
             if check.repositories.is_empty() {
                 head.push(Line::from(
                     "the token can see no repository on this instance",
@@ -1407,15 +1392,101 @@ fn forgejo_head_and_repos(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>)
                 all_repos = repository_rows(check, app);
             }
         }
+        _ => {
+            // The role label follows the token that actually produced this view. A
+            // successful administrative check is an administrator even while the
+            // configuration still says `member`; a member check whose account is an
+            // administrator says so, and names `C` only when that key can work. Without
+            // an administrator token it names the route that can supply one (`A`),
+            // exactly as the summary line does.
+            let role = match &app.role_check {
+                Some(Err(failure)) => format!("last check failed ({})", failure.class),
+                _ => app
+                    .last_check_line()
+                    .unwrap_or_else(|| "not checked this session".to_owned()),
+            };
+            head.push(field("role", &role));
+            // Before any connection exists, the optionality is the first fact the
+            // screen owes a person who has no Forgejo at all, so it leads the tokens
+            // and the explanation instead of waiting behind them.
+            head.push(Line::from(Span::styled(
+                "Forgejo is optional — agents run without one; press c to check one.",
+                muted_style(),
+            )));
+            head.push(field(
+                "role token",
+                if member {
+                    "in the credentials file"
+                } else {
+                    "absent"
+                },
+            ));
+            head.push(field(
+                "admin token",
+                if admin {
+                    "configured (identities are managed)"
+                } else {
+                    "absent (identities are supplied)"
+                },
+            ));
+            match &app.role_check {
+                None => {
+                    // W37-1: the stamp is persisted, so even a session that has not run
+                    // a check can say when the last one ran; the fact does not vanish
+                    // with the session that learned it.
+                    match (app.last_check_line(), app.role_check_stamp()) {
+                        (Some(line), _) => head.push(placeholder(&format!(
+                            "not checked this session — {line} — press c to check again"
+                        ))),
+                        (None, Some(stamp)) => head.push(placeholder(&format!(
+                            "not checked this session — {stamp} — press c to check again"
+                        ))),
+                        (None, None) => head.push(placeholder(
+                            "not checked this session — press c to list what the configured token can see",
+                        )),
+                    }
+                }
+                Some(Err(failure)) => {
+                    // P-7: a refusal names the URL the user configured, not only the
+                    // API path, so a mistyped path connects to what was typed. S-2: the
+                    // refusal carries the stamp of when and where it was made.
+                    let at = app
+                        .config
+                        .as_ref()
+                        .map(|config| config.forgejo.url.clone())
+                        .unwrap_or_else(|| "the configured address".to_owned());
+                    let line = match app.role_check_stamp() {
+                        Some(stamp) => format!(
+                            "role check failed ({}) at {at}: {} — {stamp}",
+                            failure.class, failure.message
+                        ),
+                        None => format!(
+                            "role check failed ({}) at {at}: {}",
+                            failure.class, failure.message
+                        ),
+                    };
+                    head.push(Line::from(Span::styled(line, error_style())));
+                }
+                Some(Ok(_)) => {}
+            }
+            // The definition of a role is what the screen owes *before* `c` is pressed;
+            // once the check has run, the repositories are what the panel is for, and
+            // the list gets the rows (T-12).
+            head.push(Line::from(Span::styled(ROLE_EXPLANATION, muted_style())));
+        }
     }
-    // The definition of a role is what the screen owes *before* `c` is pressed; once
-    // the check has run, the repositories are what the panel is for, and the list
-    // gets the rows (T-12).
-    if !matches!(app.role_check, Some(Ok(_))) {
-        head.push(Line::from(Span::styled(ROLE_EXPLANATION, muted_style())));
+    if !checked {
+        head.push(Line::from(""));
     }
-    head.push(Line::from(""));
     (head, all_repos)
+}
+
+/// Whether the configured address is still the sample's, so the screen may explain
+/// that a Forgejo is optional before any connection exists.
+fn forgejo_address_is_sample(app: &App) -> bool {
+    app.config.as_ref().is_some_and(|config| {
+        config.forgejo.url.trim().trim_end_matches('/') == "https://forgejo.example.org"
+    })
 }
 
 /// The identity line, drawn once and placed after the repository list.
@@ -1478,8 +1549,35 @@ fn forgejo_identity_line(app: &App) -> Option<Line<'static>> {
 /// key legend. The report is one line and it is drawn once (W-3/K-23).
 fn forgejo_frame(app: &App) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut tail: Vec<Line> = Vec::new();
+    // The identity report is the tail's primary fact, so it comes first; the token
+    // facts and the optional-Forgejo sentence follow it and stay reachable.
     if let Some(line) = forgejo_identity_line(app) {
         tail.push(line);
+    }
+    if forgejo_address_is_sample(app) && matches!(app.role_check, Some(Ok(_))) {
+        tail.push(Line::from(Span::styled(
+            "Forgejo is optional — agents run without one; press c to check one.",
+            muted_style(),
+        )));
+    }
+    if matches!(app.role_check, Some(Ok(_))) {
+        let (member, admin) = app.forgejo_tokens_present();
+        tail.push(field(
+            "role token",
+            if member {
+                "in the credentials file"
+            } else {
+                "absent"
+            },
+        ));
+        tail.push(field(
+            "admin token",
+            if admin {
+                "configured (identities are managed)"
+            } else {
+                "absent (identities are supplied)"
+            },
+        ));
     }
     if let Some(note) = &app.forgejo_note {
         tail.push(Line::from(note.clone()));
@@ -1532,6 +1630,22 @@ fn wrapped_rows(text: &str, width: usize) -> usize {
 /// space is a break opportunity, and so is the zero-width space `breakable_path`
 /// inserts after each `/`, so a path never breaks inside a file name (H-5); a run of
 /// characters with no break is hard-broken only as a last resort.
+/// The width of a line's own leading indent: its spaces, plus a bullet marker.
+///
+/// `  prose` is two columns; `  * a bullet` is four, so the bullet's continuation
+/// lines up under the text after the marker.
+fn leading_indent(chars: &[(char, Style)]) -> usize {
+    let spaces = chars.iter().take_while(|(ch, _)| *ch == ' ').count();
+    let marker = chars.get(spaces).copied();
+    if marker.is_some_and(|(ch, _)| matches!(ch, '*' | '-' | '•'))
+        && chars.get(spaces + 1).is_some_and(|(ch, _)| *ch == ' ')
+    {
+        spaces + 2
+    } else {
+        spaces
+    }
+}
+
 fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return vec![line.clone()];
@@ -1583,6 +1697,34 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
                     label.clone()
                 } else {
                     vec![(' ', label_style); hanging]
+                };
+                row_chars.extend(
+                    row.spans
+                        .iter()
+                        .flat_map(|span| span.content.chars().map(|ch| (ch, span.style))),
+                );
+                spans_from_chars(row_chars)
+            })
+            .collect();
+    }
+    // A line that is deliberately indented — prose under a label, or a bullet — keeps
+    // that indent on its continuation rows. The bullet marker itself belongs to the
+    // first row; the rows after it line up under the bullet's text, not at the edge.
+    let indent = leading_indent(&chars);
+    if indent > 0 && indent < width && chars.len() > indent {
+        let prefix: Vec<(char, Style)> = chars[..indent].to_vec();
+        let rest: Vec<(char, Style)> = chars[indent..].to_vec();
+        let rest_line = spans_from_chars(rest);
+        let rows = wrap_line(&rest_line, width - indent);
+        let continuation_style = prefix.last().map(|(_, style)| *style).unwrap_or_default();
+        return rows
+            .into_iter()
+            .enumerate()
+            .map(|(at, row)| {
+                let mut row_chars: Vec<(char, Style)> = if at == 0 {
+                    prefix.clone()
+                } else {
+                    vec![(' ', continuation_style); indent]
                 };
                 row_chars.extend(
                     row.spans
@@ -1860,7 +2002,7 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
                 "recent runs 1 of 1".to_owned()
             };
             format!(
-                "{range} — up/down choose a run, enter opens it   {}",
+                "{range} — up/down choose a run, enter opens its agent   {}",
                 app.selected_run()
                     .map(|run| run.run_id.as_str())
                     .unwrap_or("")
@@ -2047,10 +2189,19 @@ fn run_notes(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from(format!("outcome: {}", app.run_state_word(run))));
         }
         if crate::run::run_pushed(run) {
-            lines.push(Line::from(Span::styled(
-                "next step: the run pushed its branch — press P on the Forgejo screen (4); it checks the branch before it opens anything.",
-                warning_style(),
-            )));
+            let next = match app.open_pull_request_for_run(run) {
+                Some((open, authorship)) if authorship.is_own() => format!(
+                    "next step: the run pushed its branch — {} is already open; press U on the Forgejo screen (4) to update it.",
+                    open.line()
+                ),
+                Some((open, authorship)) => format!(
+                    "next step: the run pushed its branch — {} is already open, but {}; U updates only your own request, and P refuses while any request occupies the pair.",
+                    open.line(),
+                    authorship.fact()
+                ),
+                None => "next step: the run pushed its branch — press P on the Forgejo screen (4); it checks the branch before it opens anything.".to_owned(),
+            };
+            lines.push(Line::from(Span::styled(next, warning_style())));
         }
         // The offers lead the reason's tail: `T` and `o` are the page map's must-offers
         // at 80×24, so they are on one line above the paths and the prose, and cannot
@@ -2380,7 +2531,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         None => {
             let (include_start, include_stop) = footer_start_stop(app);
             (
-                "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open   r re-read".to_owned(),
+                "q quit   esc agents   tab or left/right screen   1-6 screen   up/down select   enter open the agent   r re-read".to_owned(),
                 key_legend(
                     area.width as usize,
                     &running_clause(app),
@@ -2835,31 +2986,39 @@ fn draw_pull_request(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let mut body: Vec<Line> = vec![
-        Line::from(Span::styled(
-            format!("head -> base   {} -> {}", preview.branch, preview.base),
-            muted_style(),
-        )),
-        Line::from(vec![
-            Span::styled("title  ", muted_style()),
-            Span::raw(preview.title.clone()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("body", muted_style())),
-    ];
+    let mut body: Vec<Line> = Vec::new();
+    if let Some(number) = preview.number {
+        body.push(field("pull request", &format!("#{number}")));
+    }
+    body.push(Line::from(Span::styled(
+        format!("head -> base   {} -> {}", preview.branch, preview.base),
+        muted_style(),
+    )));
+    body.push(Line::from(vec![
+        Span::styled("title  ", muted_style()),
+        Span::raw(preview.title.clone()),
+    ]));
+    body.push(Line::from(vec![
+        Span::styled("text source  ", muted_style()),
+        Span::raw(preview.text_source.clone()),
+    ]));
+    body.push(Line::from(""));
+    body.push(Line::from(Span::styled("body", muted_style())));
     for line in preview.body.lines() {
         body.push(Line::from(line.to_owned()));
     }
     if preview.body.trim().is_empty() {
         body.push(Line::from(Span::styled(
-            "(the run's reply held no text to use as a body)",
+            "(the chosen source held no text to use as a body)",
             muted_style(),
         )));
     }
-    let answer: Vec<Line> = vec![Line::from(Span::styled(
-        "y or enter opens it        n, esc or q writes nothing",
-        selection_style(),
-    ))];
+    let answer_text = if preview.number.is_some() {
+        "y or enter updates it        n, esc or q writes nothing"
+    } else {
+        "y or enter opens it        n, esc or q writes nothing"
+    };
+    let answer: Vec<Line> = vec![Line::from(Span::styled(answer_text, selection_style()))];
     let inner = width.saturating_sub(2) as usize;
     let wanted = pushed_rows(&body, inner) + pushed_rows(&answer, inner) + 2;
     let height = (wanted as u16).min(screen.height).max(6);
@@ -2867,10 +3026,15 @@ fn draw_pull_request(frame: &mut Frame, app: &App) {
     clear_overlay_band(frame, screen);
     let inner_height = popup.height.saturating_sub(2) as usize;
     let (lines, above, below) = window_modal(app, &body, &answer, inner, inner_height);
-    let title = if above || below {
-        fit_title(width as usize, "open the pull request?", None, None, above, below).0
+    let base = if preview.number.is_some() {
+        "update the pull request?"
     } else {
-        " open the pull request? ".to_owned()
+        "open the pull request?"
+    };
+    let title = if above || below {
+        fit_title(width as usize, base, None, None, above, below).0
+    } else {
+        format!(" {base} ")
     };
     let block = Block::bordered()
         .title(title)
@@ -3277,37 +3441,19 @@ fn draw_remove_confirm(frame: &mut Frame, app: &App) {
     };
     let screen = overlay_area(frame.area());
     let width = (screen.width.saturating_sub(2)).min(76);
-    let config_dir = app
-        .selected_paths()
-        .map(|paths| breakable_path(&paths.config_dir().display().to_string()))
-        .unwrap_or_else(|| "its files".to_owned());
-    let state_dir = breakable_path(&app.state_root().join(name).display().to_string());
-    let config_exists = app
-        .selected_paths()
-        .map(|paths| paths.config_dir().is_dir())
-        .unwrap_or(false);
-    let state_exists = app.state_root().join(name).is_dir();
-    // The confirmation's job is to say exactly what stays, and where. A sentence that
-    // promises files to a user who never wrote any is a small lie that makes them hunt
-    // for a directory that does not exist; one that names only the agent directory
-    // leaves the run records and the secret unaccounted for (Y-6).
-    let question = if config_exists || state_exists {
-        format!(
-            "Remove `{name}` from the configuration? Its files under {config_dir} and its run records under {state_dir} are left on disk."
-        )
-    } else {
-        format!(
-            "Remove `{name}` from the configuration? It has no files under {config_dir} yet, and no run records."
-        )
-    };
-    let body: Vec<Line> = vec![
-        Line::from(question),
-        Line::from(format!(
-            "Its secret in {} is left too, marked on the Credentials screen; press D there to delete a secret whose agent is gone.",
-            breakable_path(&app.credentials_path.display().to_string())
-        )),
-        Line::from(""),
-    ];
+    // The confirmation's job is to say exactly what stays, and where. It is built
+    // from the inventory counted when the confirmation opened, so a directory, a run
+    // record or a secret is named only when it really is there (Y-6).
+    let question = format!("Remove `{name}` from the configuration?");
+    let mut body: Vec<Line> = vec![Line::from(question)];
+    let inventory = app
+        .removal
+        .clone()
+        .unwrap_or_else(|| app.removal_inventory(name));
+    for sentence in inventory.sentences() {
+        body.push(Line::from(sentence));
+    }
+    body.push(Line::from(""));
     let answer: Vec<Line> = vec![Line::from(Span::styled(
         "y or enter remove it        n, esc or q keep it",
         selection_style(),
@@ -3598,7 +3744,7 @@ const HELP_LINES: &[&str] = &[
     "           the arrows move a panel too, while up/down choose a row in a list",
     "Forgejo:   c check the configured role   C check the administrator token",
     "           u set the instance address   up/down choose a repository   g clone it",
-    "           P open a pull request   U update the newest one",
+    "           P open a pull request   U update this branch's request",
     "Secrets:   k set the model key (Credentials)   f set the role token (Credentials)",
     "           v set the agent's own Forgejo token (Forgejo)   A set the administrator token",
     "           D delete the leftover secrets of agents no longer configured (Credentials)",
@@ -3628,6 +3774,10 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
         prose.push(Line::from(vec![Span::raw("  * "), Span::raw(*text)]));
     }
     prose.push(Line::from(""));
+    let normal_answer = Line::from(Span::styled(
+        "  y — I understand, record it once        n — not now",
+        selection_style(),
+    ));
     let mut answer: Vec<Line> = Vec::new();
     if app.ack_review {
         // Read-only: the record exists and a second person is reading it. Nothing
@@ -3654,10 +3804,7 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
             )));
         }
     } else {
-        answer.push(Line::from(Span::styled(
-            "  y — I understand, record it once        n — not now",
-            selection_style(),
-        )));
+        answer.push(normal_answer.clone());
         prose.push(Line::from(
             "  Until it is recorded, starting an agent stays refused.",
         ));
@@ -3673,10 +3820,56 @@ fn draw_acknowledgment(frame: &mut Frame, app: &App) {
     let wanted = pushed_rows(&prose, inner_width) + pushed_rows(&answer, inner_width) + 2;
     let height = (wanted as u16).min(available.height).max(3);
     let popup = centered(available, width, height);
+    let inner_height = popup.height.saturating_sub(2) as usize;
+
+    if !app.ack_review {
+        // Measure which terms the current window really shows. The answer row is
+        // pinned and one row tall in both forms, so the visible body is the same
+        // whether this render is allowed to record or not.
+        let (body_rows, owners) = panel_rows_owned(&prose, inner_width);
+        let answer_rows = panel_rows(&answer, inner_width);
+        let visible = inner_height.saturating_sub(answer_rows.len().min(1));
+        let max_scroll = body_rows.len().saturating_sub(visible);
+        let offset = app.modal_scroll.min(max_scroll);
+        // A term counts as seen once **every row of it** has been inside the window,
+        // and the fact stays true after the window moves on: a window shorter than the
+        // whole terms list can never show all eight at once, but the person can still
+        // read every one of them (class 6).
+        let mut mask = app.ack_terms_mask.get();
+        for term in 0..risk::LINES.len() {
+            let rows: Vec<usize> = owners
+                .iter()
+                .enumerate()
+                .filter(|(_, owner)| **owner == term)
+                .map(|(row, _)| row)
+                .collect();
+            let fully_visible = rows.first().is_some_and(|first| *first >= offset)
+                && rows
+                    .last()
+                    .is_some_and(|last| last.saturating_add(1) <= offset + visible);
+            if fully_visible {
+                mask |= 1 << term;
+            }
+        }
+        app.ack_terms_mask.set(mask);
+        let all = (1u16 << risk::LINES.len()) - 1;
+        let remaining = (all & !mask).count_ones() as usize;
+        let seen = remaining == 0;
+        app.ack_terms_checked.set(true);
+        app.ack_terms_seen.set(seen);
+        app.ack_terms_remaining.set(remaining);
+        if !seen {
+            answer = vec![Line::from(Span::styled(
+                format!(
+                    "  y after all terms — {remaining} terms remain; ] shows them   n not now"
+                ),
+                selection_style(),
+            ))];
+        }
+    }
 
     // The body scrolls; the answer row is last and pinned. A box that does not need
     // to scroll draws every term and record fact, so `more below` never lies.
-    let inner_height = popup.height.saturating_sub(2) as usize;
     let (lines, above, below) = window_modal(app, &prose, &answer, inner_width, inner_height);
 
     let base = if app.ack_review {

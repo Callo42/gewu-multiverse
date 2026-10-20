@@ -615,10 +615,20 @@ fn the_forgejo_identity_report_is_drawn_once_after_the_list_and_the_range_is_tru
         1,
         "the identity report is duplicated:\n{screen}"
     );
-    assert!(
-        !screen.contains("repositories 1–4 of 4"),
-        "the range claims four rows when the window draws fewer:\n{screen}"
-    );
+    // The range is truthful for the form drawn: the windowed form may not claim
+    // rows it does not draw, while the scrolled form names the whole list because
+    // `[`/`]` really reach every row.
+    if screen.contains("line 1 of") {
+        assert!(
+            screen.contains("more below"),
+            "the scrolled list declares no way to reach its other rows:\n{screen}"
+        );
+    } else {
+        assert!(
+            !screen.contains("repositories 1–4 of 4"),
+            "the range claims four rows when the window draws fewer:\n{screen}"
+        );
+    }
     assert!(
         screen.contains("repositories 1–"),
         "the list has no truthful range:\n{screen}"

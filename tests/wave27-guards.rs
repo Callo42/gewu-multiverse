@@ -461,10 +461,9 @@ fn errors_warnings_information_and_selection_use_one_scheme() {
 
     let root = scratch("colour-footer");
     let mut app = app_with(&root, EMPTY_CONFIG);
-    app.status =
-        "endpoint test for `scribe`: failed (transport): the endpoint refused the connection"
-            .to_owned();
-    let (fg, bg, modifier) = cell_style_after(&app, 160, 40, "endpoint test for");
+    app.status = "endpoint https://model.example.org/v1 — model example-model — select `scribe` on the Agents screen (1), then press p to test the endpoint again — failed (transport): the endpoint refused the connection"
+        .to_owned();
+    let (fg, bg, modifier) = cell_style_after(&app, 160, 40, "endpoint https");
     assert_eq!(
         fg,
         Color::Rgb(255, 95, 95),

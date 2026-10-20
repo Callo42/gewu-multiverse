@@ -157,19 +157,39 @@ fn render_at(width: u16, height: u16, app: &App) -> String {
     text
 }
 
+fn normalised(text: &str) -> String {
+    text.replace('│', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::from(code)
 }
 
 fn role_field(screen: &str) -> String {
-    screen
-        .lines()
-        .find(|line| {
-            let text = line.trim_start_matches(['│', ' ']);
-            text.starts_with("role") && !text.starts_with("role token")
-        })
-        .unwrap_or_default()
-        .to_owned()
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(at) = lines.iter().position(|line| {
+        let text = line.trim_start_matches(['│', ' ']);
+        text.starts_with("role") && !text.starts_with("role token")
+    }) else {
+        return String::new();
+    };
+    let mut field = lines[at].trim_start_matches(['│', ' ']).trim_end().to_owned();
+    // The field wraps; a continuation row is indented under the value.
+    for line in &lines[at + 1..] {
+        if !line.starts_with('│') {
+            break;
+        }
+        let text = line.trim_start_matches('│');
+        if !text.starts_with("                ") {
+            break;
+        }
+        field.push(' ');
+        field.push_str(text.trim());
+    }
+    field
 }
 
 fn write_run(root: &Path, agent: &str, run_id: &str, reason: Option<&str>) {
@@ -238,7 +258,7 @@ fn the_role_field_follows_the_supplied_token_and_gates_c_on_an_admin_token() {
     let screen = render_at(120, 40, &app);
     let role = role_field(&screen);
     assert!(
-        role.contains("administrator account"),
+        role.contains("is an administrator"),
         "the role field does not name the administrator standing: {role:?}\n{screen}"
     );
     assert!(
@@ -277,7 +297,7 @@ fn the_role_field_follows_the_supplied_token_and_gates_c_on_an_admin_token() {
     let screen = render_at(120, 40, &app);
     let role = role_field(&screen);
     assert!(
-        role.contains("C shows that view"),
+        role.contains("press C"),
         "the field does not offer C when an administrator token exists: {role:?}\n{screen}"
     );
     assert!(
@@ -313,7 +333,8 @@ fn the_first_run_terms_scroll_to_their_last_bullet_with_the_answer_pinned() {
             "`]` answered the modal instead of scrolling it:\n{screen}"
         );
         assert!(
-            screen.contains("y — I understand, record it once"),
+            screen.contains("y — I understand, record it once")
+                || screen.contains("y after all terms —"),
             "the answer line left the floor while scrolling:\n{screen}"
         );
         assert!(
@@ -391,6 +412,20 @@ fn the_add_agent_form_advertises_only_the_field_keys_it_handles() {
 fn the_removal_confirmation_scrolls_to_its_dropped_lines_with_the_answer_pinned() {
     let root = deep_scratch("remove-scroll");
     let mut app = app_with(&root, &long_agent_config());
+    let paths = app.ensure_agent(LONG_AGENT).expect("the agent is prepared");
+    for name in ["instruction.md", "steps.txt", "one.txt", "two.txt"] {
+        fs::write(paths.config_dir().join(name), "x\n").expect("an agent file");
+    }
+    for run in ["run-1700000000001-0001-1", "run-1700000000002-0002-1"] {
+        fs::create_dir_all(app.state_root().join(LONG_AGENT).join(run)).expect("a run record");
+    }
+    gewu_multiverse::credentials::record_secret(
+        &app.credentials_path,
+        Some("model_keys"),
+        LONG_AGENT,
+        "synthetic-model-key",
+    )
+    .expect("the model key is written");
     app.on_key(key(KeyCode::Char('d')));
     assert!(app.confirm_remove.is_some(), "the confirmation is open");
     let before = render_at(72, 18, &app);
@@ -398,9 +433,9 @@ fn the_removal_confirmation_scrolls_to_its_dropped_lines_with_the_answer_pinned(
         before.contains("more below"),
         "the confirmation does not declare its dropped lines:\n{before}"
     );
-    let needle = "press D there to delete a secret";
+    let needle = "press D on the Credentials screen";
     assert!(
-        !before.contains(needle),
+        !normalised(&before).contains(&normalised(needle)),
         "the dropped line is already drawn; the guard cannot exercise scrolling:\n{before}"
     );
 
@@ -412,7 +447,7 @@ fn the_removal_confirmation_scrolls_to_its_dropped_lines_with_the_answer_pinned(
             screen.contains("y or enter remove it"),
             "the destructive answer left the floor while scrolling:\n{screen}"
         );
-        if screen.contains(needle) {
+        if normalised(&screen).contains(&normalised(needle)) {
             seen = true;
             break;
         }
@@ -457,7 +492,7 @@ fn the_leftover_secret_confirmation_scrolls_to_its_dropped_lines() {
             screen.contains("y or enter delete them"),
             "the delete answer left the floor while scrolling:\n{screen}"
         );
-        if screen.contains(needle) {
+        if normalised(&screen).contains(&normalised(needle)) {
             seen = true;
             break;
         }
@@ -509,7 +544,7 @@ fn the_editor_confirmation_scrolls_to_its_dropped_recovery_line() {
             screen.contains("enter open it"),
             "the open answer left the floor while scrolling:\n{screen}"
         );
-        if screen.contains(needle) {
+        if normalised(&screen).contains(&normalised(needle)) {
             seen = true;
             break;
         }

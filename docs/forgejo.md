@@ -95,9 +95,10 @@ cloning again.
 
 The agent uses **the user's own `git`**; the tool needs no `glab` and no other Git host
 client. `P` pushes the workspace's current branch and opens a pull request as the agent;
-`U` updates the newest open pull request. A title and body for the pull request can be
-put in `<config dir>/agents/<agent>/pull-request.txt` — the first line is the title, the
-rest is the body.
+`U` updates this branch's own open pull request, never another branch's or another
+account's. A title and body for the pull request can be put in
+`<config dir>/agents/<agent>/pull-request.txt` — the first line is the title, the rest
+is the body.
 
 ### Authoring, not spoofing
 
