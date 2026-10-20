@@ -7,27 +7,67 @@
 //! and it is torn down — process and directory — when the test ends, successfully or
 //! not.
 //!
-//! When `GEWU_FORGEJO_BIN` is not set the test says so and does nothing: the
-//! repository does not carry a 120 MB server binary, so an environment without one
-//! skips the integration test rather than pretending it passed.
+//! The repository does not carry a 120 MB server binary, so the live tests are
+//! `#[ignore]`d and run explicitly with `GEWU_FORGEJO_BIN=... cargo test --test
+//! forgejo -- --ignored`. When they are run explicitly and the variable is absent,
+//! they fail rather than passing without verifying anything (B3).
+//!
+//! Every scratch root made here is a [`Scratch`] guard: it removes itself when the
+//! test ends, so no token-bearing test directory is left under the temporary root.
 
 #![allow(dead_code)]
 
 use std::net::TcpListener;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// A fresh scratch directory for one test.
-pub fn scratch(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let root =
-        std::env::temp_dir().join(format!("gewu-forgejo-{tag}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("the scratch directory is created");
-    root
+/// A fresh scratch directory for one test, removed when the guard drops.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    /// Make one, with a name that cannot collide with another test's.
+    pub fn new(tag: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("gewu-forgejo-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("the scratch directory is created");
+        Self(root)
+    }
+
+    /// The directory, as a plain path.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A fresh scratch directory for one test, removed when the returned guard drops.
+pub fn scratch(tag: &str) -> Scratch {
+    Scratch::new(tag)
 }
 
 /// A running Forgejo, owned by one test.
@@ -41,46 +81,61 @@ pub struct TestForgejo {
     /// Its base URL, without a trailing slash.
     pub url: String,
     child: Option<Child>,
+    /// The instance's scratch root, removed with the guard when the test ends.
+    _scratch: Scratch,
 }
 
 impl TestForgejo {
-    /// Start a Forgejo, or `None` when no binary was named.
-    pub fn start(tag: &str) -> Option<Self> {
-        let bin = std::env::var("GEWU_FORGEJO_BIN").ok()?;
+    /// Start a Forgejo named by `GEWU_FORGEJO_BIN`; fail loudly when it is not named.
+    pub fn start(tag: &str) -> Self {
+        let bin = std::env::var("GEWU_FORGEJO_BIN").unwrap_or_else(|_| {
+            panic!(
+                "GEWU_FORGEJO_BIN is not set, so this live Forgejo test cannot verify anything; \
+                 run it with GEWU_FORGEJO_BIN=/path/to/forgejo"
+            )
+        });
         let bin = PathBuf::from(bin);
         if !bin.is_file() {
-            eprintln!(
-                "GEWU_FORGEJO_BIN is set to {} but that is not a file; skipping",
+            panic!(
+                "GEWU_FORGEJO_BIN names {}, which is not a file",
                 bin.display()
             );
-            return None;
         }
-        let dir = scratch(tag);
+        let scratch = scratch(tag);
+        let dir = scratch.path().to_path_buf();
         std::fs::create_dir_all(dir.join("data").join("repositories")).expect("data directory");
         let port = free_port();
         let url = format!("http://127.0.0.1:{port}");
         let config = dir.join("app.ini");
         std::fs::write(&config, app_ini(&dir, port)).expect("app.ini is written");
         let log = std::fs::File::create(dir.join("server.log")).expect("the log is created");
+        // Forgejo initialises git and writes a global git config if it can. Point it
+        // at this throwaway root, never at the person's own config.
+        std::fs::create_dir_all(dir.join("home")).expect("the home directory");
+        let git_config = dir.join("home").join("gitconfig");
         let child = Command::new(&bin)
             .arg("web")
             .arg("--config")
             .arg(&config)
             .env("FORGEJO_WORK_DIR", &dir)
+            .env("HOME", dir.join("home"))
+            .env("GIT_CONFIG_GLOBAL", &git_config)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().expect("the log clones")))
             .stderr(Stdio::from(log))
             .spawn()
             .expect("the Forgejo process is started");
+        println!("test Forgejo pid {}", child.id());
         let server = Self {
             dir,
             bin,
             port,
             url,
             child: Some(child),
+            _scratch: scratch,
         };
         server.wait_until_ready();
-        Some(server)
+        server
     }
 
     /// Wait for the instance to answer its health check.
@@ -108,6 +163,8 @@ impl TestForgejo {
             .arg("--config")
             .arg(self.dir.join("app.ini"))
             .env("FORGEJO_WORK_DIR", &self.dir)
+            .env("HOME", self.dir.join("home"))
+            .env("GIT_CONFIG_GLOBAL", self.dir.join("home").join("gitconfig"))
             .output()
             .expect("the Forgejo command-line tool runs");
         if !output.status.success() {
@@ -181,6 +238,11 @@ impl TestForgejo {
                 .header("Accept", "application/json")
                 .header("Authorization", &authorization)
                 .call(),
+            "DELETE" => agent
+                .delete(&url)
+                .header("Accept", "application/json")
+                .header("Authorization", &authorization)
+                .call(),
             "POST" | "PUT" | "PATCH" => {
                 let mut request = match method {
                     "POST" => agent.post(&url),
@@ -244,8 +306,7 @@ impl Drop for TestForgejo {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // The temporary root goes with the instance; nothing outside it was touched.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // The temporary root goes with the guard; nothing outside it was touched.
     }
 }
 

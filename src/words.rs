@@ -18,6 +18,22 @@ pub fn counted(count: usize, one: &str, many: &str) -> String {
     }
 }
 
+/// A file size in the shortest unit that keeps it readable: `812 B`, `4.0 KiB`.
+pub fn filesize_text(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kib = bytes as f64 / 1024.0;
+    if kib < 1024.0 {
+        return format!("{kib:.1} KiB");
+    }
+    let mib = kib / 1024.0;
+    if mib < 1024.0 {
+        return format!("{mib:.1} MiB");
+    }
+    format!("{:.1} GiB", mib / 1024.0)
+}
+
 /// A login and its email, joined so a screen never splits them at their own space.
 ///
 /// `<login> <email>` is one fact, and word wrap consumes the separating space at a
@@ -38,7 +54,7 @@ pub fn join_identity(identity: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{counted, identity_pair, join_identity};
+    use super::{counted, filesize_text, identity_pair, join_identity};
 
     #[test]
     fn a_count_reads_as_a_sentence() {
@@ -50,16 +66,20 @@ mod tests {
     }
 
     #[test]
+    fn a_file_size_is_readable_in_the_right_unit() {
+        assert_eq!(filesize_text(812), "812 B");
+        assert_eq!(filesize_text(4096), "4.0 KiB");
+        assert_eq!(filesize_text(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
     fn an_identity_pair_keeps_a_space_that_a_wrap_cannot_eat() {
         // N-2: the pair reads `login <email>`; the separator is a no-break space so a
         // wrap can never land on it and leave the email glued to the login.
         let pair = identity_pair("someone-else", "someone@else.invalid");
         assert_eq!(pair, "someone-else\u{a0}<someone@else.invalid>");
         assert!(!pair.contains(" \u{a0}"), "the pair has no breakable space");
-        assert_eq!(
-            join_identity("someone-else <someone@else.invalid>"),
-            pair
-        );
+        assert_eq!(join_identity("someone-else <someone@else.invalid>"), pair);
         // A bare name is left as it is: there is no pair to protect.
         assert_eq!(join_identity("someone-else"), "someone-else");
     }

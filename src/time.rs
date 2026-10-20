@@ -149,12 +149,7 @@ mod tests {
 
     #[test]
     fn the_written_form_reads_back_to_the_same_instant() {
-        for instant in [
-            0,
-            1_609_459_200_000,
-            1_709_210_096_789,
-            4_107_542_400_000,
-        ] {
+        for instant in [0, 1_609_459_200_000, 1_709_210_096_789, 4_107_542_400_000] {
             let text = rfc3339(instant);
             assert_eq!(parse_rfc3339(&text), Some(instant), "{text}");
         }

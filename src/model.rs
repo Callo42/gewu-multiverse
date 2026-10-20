@@ -19,6 +19,7 @@
 //! recorded as `Bearer <redacted>`.
 
 use std::fmt;
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,166 @@ pub fn tools() -> Vec<ToolSpec> {
             }),
         },
     }]
+}
+
+/// The declared tools of a run: `shell`, plus the Forgejo tools when the run's context
+/// says the agent can use them.
+pub fn tools_with_forgejo(forgejo: bool) -> Vec<ToolSpec> {
+    let mut declared = tools();
+    if forgejo {
+        declared.extend(forgejo_tools());
+    }
+    declared
+}
+
+/// The six Forgejo tools, with the limits their descriptions state.
+///
+/// The schemas are the model's whole contract: a repository is `owner/name`, a number
+/// is the issue or pull-request number, and no call takes a token. The descriptions
+/// say what the tool can touch and which bound applies, so the model is told the same
+/// limits the tool enforces.
+fn forgejo_tools() -> Vec<ToolSpec> {
+    let repository = || {
+        serde_json::json!({
+            "type": "string",
+            "description": "The repository as `owner/name`, cloned into your workspace. Any other repository is refused."
+        })
+    };
+    let number = || {
+        serde_json::json!({
+            "type": "integer",
+            "minimum": 1,
+            "description": "The issue or pull-request number in that repository."
+        })
+    };
+    vec![
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: crate::forgejo_tools::LIST_ASSIGNED_ISSUES,
+                description: "List the open issues assigned to your own Forgejo account in the \
+                    repositories cloned into your workspace: repository, number, title, labels \
+                    and when each was updated. Read only; at most 50, and a cut is declared.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: crate::forgejo_tools::READ_ISSUE_OR_PULL,
+                description: "Read one issue or pull request, with its comments, from a \
+                    repository cloned into your workspace. The body is cut at 8 KiB, a \
+                    comment at 2 KiB, at most 20 comments, and the result says what was cut.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": repository(),
+                        "number": number()
+                    },
+                    "required": ["repository", "number"],
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: crate::forgejo_tools::COMMENT,
+                description: "Write one comment on an issue or pull request in a repository \
+                    cloned into your workspace, as your own Forgejo account. This is a \
+                    write: it counts against this run's bound of 8 writes. At most 8 KiB.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": repository(),
+                        "number": number(),
+                        "body": {
+                            "type": "string",
+                            "description": "The comment text, non-empty and at most 8192 bytes."
+                        }
+                    },
+                    "required": ["repository", "number", "body"],
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: crate::forgejo_tools::LIST_MY_PULL_REQUESTS,
+                description: "List your own open pull requests in the repositories cloned into \
+                    your workspace: repository, number, title, head -> base and web URL. Read only.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: crate::forgejo_tools::OPEN_PULL_REQUEST,
+                description: "Open a pull request from the checked-out branch of a repository \
+                    cloned into your workspace into that repository's default branch. The branch \
+                    must not be the base, must have commits the base lacks, must already be on \
+                    the remote, and must have no open pull request for the pair; otherwise \
+                    nothing is written and the result names the existing request. This is a \
+                    write: it counts against this run's bound of 8 writes.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": repository(),
+                        "title": {
+                            "type": "string",
+                            "description": "The pull request's title, non-empty."
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "The pull request's body, when there is one."
+                        }
+                    },
+                    "required": ["repository", "title"],
+                    "additionalProperties": false
+                }),
+            },
+        },
+        ToolSpec {
+            kind: "function",
+            function: FunctionSpec {
+                name: crate::forgejo_tools::UPDATE_PULL_REQUEST,
+                description: "Change the title and/or body of your own open pull request for the \
+                    checked-out branch of a repository cloned into your workspace. Only the \
+                    agent's own open request whose head is that branch, whose base is the default \
+                    branch and whose repository is the same may be updated; another account's \
+                    request is never changed. This is a write: it counts against this run's \
+                    bound of 8 writes.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": repository(),
+                        "number": number(),
+                        "title": {
+                            "type": "string",
+                            "description": "The new title, when it should change; non-empty."
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "The new body, when it should change."
+                        }
+                    },
+                    "required": ["repository", "number"],
+                    "additionalProperties": false
+                }),
+            },
+        },
+    ]
 }
 
 /// What one exchange needs: where, which model, which key, how long to wait.
@@ -415,18 +576,32 @@ pub fn chat(
         .build()
         .new_agent();
 
-    let response = agent
-        .post(endpoint)
-        .header("Content-Type", "application/json")
-        .header(
-            "Authorization",
-            format!("Bearer {}", config.api_key.expose()),
-        )
-        .send(request_body.clone());
-
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => return Err(transport_error(config, error)),
+    // A signal delivered while a blocking connect or read is in progress may show up
+    // as EINTR. That is not the endpoint failing; try the same request again while the
+    // exchange still has time. Any other transport error keeps its class.
+    let mut interrupted = 0u8;
+    let response = loop {
+        let attempt = agent
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .header(
+                "Authorization",
+                format!("Bearer {}", config.api_key.expose()),
+            )
+            .send(request_body.clone());
+        match attempt {
+            Ok(response) => break response,
+            Err(error) if is_interrupted(&error) => {
+                if interrupted < 2 {
+                    interrupted = interrupted.saturating_add(1);
+                    continue;
+                }
+                return Err(ModelError::Timeout {
+                    secs: config.timeout.as_secs(),
+                });
+            }
+            Err(error) => return Err(transport_error(config, error)),
+        }
     };
 
     let status = response.status().as_u16();
@@ -437,6 +612,14 @@ pub fn chat(
         .and_then(|value| value.trim().parse::<u64>().ok());
     let text = match response.into_body().read_to_string() {
         Ok(text) => text,
+        Err(error) if is_interrupted(&error) => {
+            // The body arrived but its read was cut short by a signal. The exchange
+            // cannot be resumed, and calling it a transport failure would name a
+            // cause the endpoint did not produce.
+            return Err(ModelError::Timeout {
+                secs: config.timeout.as_secs(),
+            });
+        }
         Err(error) => {
             return Err(ModelError::Transport {
                 endpoint: config.endpoint.clone(),
@@ -594,7 +777,10 @@ fn model_list_answer(config: &ModelConfig) -> Option<bool> {
         .new_agent();
     let response = agent
         .get(&models_url(&config.endpoint))
-        .header("Authorization", format!("Bearer {}", config.api_key.expose()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", config.api_key.expose()),
+        )
         .call()
         .ok()?;
     if !(200..=299).contains(&response.status().as_u16()) {
@@ -613,6 +799,14 @@ fn model_list_answer(config: &ModelConfig) -> Option<bool> {
             .is_some_and(|id| id == config.model)
             || entry.as_str().is_some_and(|id| id == config.model)
     }))
+}
+
+/// Whether a transport failure is the operating system's `EINTR`, not the endpoint's.
+fn is_interrupted(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Io(error) => error.kind() == ErrorKind::Interrupted,
+        other => other.to_string().contains("Interrupted system call"),
+    }
 }
 
 /// Turn a transport failure into a class, without ever naming the key.
@@ -959,13 +1153,14 @@ mod tests {
             "the connection dropped"
         );
         assert_eq!(
-            in_product_words(
-                "io: failed to lookup address information: Name or service not known"
-            ),
+            in_product_words("io: failed to lookup address information: Name or service not known"),
             "the address could not be resolved"
         );
         // Anything the product does not know keeps the transport's sentence.
-        assert_eq!(in_product_words("a frobnicator failed"), "a frobnicator failed");
+        assert_eq!(
+            in_product_words("a frobnicator failed"),
+            "a frobnicator failed"
+        );
         // S-4: a dropped connection is the product's sentence, not the transport's.
         assert_eq!(
             in_product_words("the request could not be sent: io: Peer disconnected"),

@@ -31,30 +31,37 @@ use crate::mode::{PRIVATE_DIR_MODE, SECRET_FILE_MODE, mode_of, render, set_mode}
 /// The text that stands in for a secret wherever one would otherwise be written.
 pub const REDACTED: &str = "<redacted>";
 
+/// One lock for every rewrite of the credentials file. Two agents' accounts are
+/// provisioned on two background threads, and each write is a read-modify-write of
+/// the same file: without this lock one account's write can lose the other's, or one
+/// reader can start from a half-written file. The lock is process-wide; the atomic
+/// rename in [`crate::mode::write_private`] covers the other processes that read it.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the credentials rewrite lock, recovering from a panicked holder.
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The text a fresh credentials file starts with. It holds no secret: the keys are
 /// there, the values are empty, and the comments say what the file is for.
 pub const TEMPLATE: &str = r#"# gewu-multiverse credentials
 #
 # Secrets only. This file is created with mode 0600: readable and writable by you
 # alone. It is never printed, never written to a log, and never passed on a command
-# line. The configuration file holds no secret at all.
+# line. The settings file holds no secret at all.
 #
-# The token the tool uses for the role check: the repositories it lists are the
-# repositories this token can see. Put a member's token here for an ordinary view,
-# or an administrator's token when the configuration says role = "admin".
-forgejo_token = ""
-#
-# An administrator's token, if you have one. With it, the tool creates and manages
-# one Forgejo account and token per agent, derived from the agent's name. Without
-# it, supply each agent's token under [forgejo_agent_tokens] below.
+# The administrator token for the bundled Forgejo. The tool uses it to create one
+# account per agent, each with its own login. It is written here by the product.
 forgejo_admin_token = ""
-
-[model_keys]
-# One key per agent name. For an agent called example-agent:
-# "example-agent" = ""
+#
+# The one model key every agent uses.
+model_key = ""
 
 [forgejo_agent_tokens]
-# One token per agent name, used when no administrator token is configured above:
+# One token per agent name, made by the product when it creates the account:
 # "example-agent" = ""
 "#;
 
@@ -153,7 +160,7 @@ pub enum CredentialsError {
     },
     /// The file holds no key for that agent.
     #[error(
-        "the credentials file {path} records no model key for the agent `{agent}`; add one under [model_keys]"
+        "the credentials file {path} records no model key for the agent `{agent}`; add `model_key` to the file"
     )]
     MissingKey {
         /// The file that was read.
@@ -388,7 +395,11 @@ pub fn model_key(path: &Path, agent: &str) -> Result<Secret, CredentialsError> {
     Ok(Secret::new(key.to_owned()))
 }
 
-/// Read the token the role check uses, from `forgejo_token`.
+/// Read an earlier installation's role token, from `forgejo_token`.
+///
+/// The current product makes one administrator token and never a role token, but
+/// an earlier credentials file may still hold this secret; reading it here keeps it
+/// in the set every log line is redacted with.
 pub fn forgejo_token(path: &Path) -> Result<Secret, CredentialsError> {
     let value = read_value(path)?;
     secret_at(path, &value, "forgejo_token")
@@ -479,7 +490,11 @@ pub fn present_secret_names(path: &Path) -> Vec<String> {
     if non_empty(value.get("forgejo_token").and_then(toml::Value::as_str)) {
         names.push("Forgejo role token".to_owned());
     }
-    if non_empty(value.get("forgejo_admin_token").and_then(toml::Value::as_str)) {
+    if non_empty(
+        value
+            .get("forgejo_admin_token")
+            .and_then(toml::Value::as_str),
+    ) {
         names.push("Forgejo administrator token".to_owned());
     }
     if non_empty(value.get("model_key").and_then(toml::Value::as_str)) {
@@ -492,7 +507,10 @@ pub fn present_secret_names(path: &Path) -> Vec<String> {
             }
         }
     }
-    if let Some(tokens) = value.get("forgejo_agent_tokens").and_then(toml::Value::as_table) {
+    if let Some(tokens) = value
+        .get("forgejo_agent_tokens")
+        .and_then(toml::Value::as_table)
+    {
         for (agent, text) in tokens {
             if non_empty(text.as_str()) {
                 names.push(format!("Forgejo token for `{agent}`"));
@@ -577,6 +595,142 @@ pub fn recorded_identity_created(
         .and_then(|seconds| u64::try_from(seconds).ok()))
 }
 
+/// The rights marker recorded for an agent's managed token, when one was recorded.
+///
+/// A managed identity made before the Forgejo issue tools existed has no marker; the
+/// screens say so and `i` renews the token. The marker is a version word, not the
+/// token's scopes: the product knows what it asked Forgejo for, not what a later
+/// Forgejo release stored.
+pub fn recorded_agent_identity_rights(
+    path: &Path,
+    agent: &str,
+) -> Result<Option<String>, CredentialsError> {
+    let value = read_value(path)?;
+    Ok(text_at(&value, "forgejo_identity_rights", agent))
+}
+
+/// Record the rights marker for an agent's managed token.
+pub fn record_agent_identity_rights(
+    path: &Path,
+    agent: &str,
+    rights: &str,
+) -> Result<(), CredentialsError> {
+    let _guard = write_lock();
+    let mut value = value_for_write(path)?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| CredentialsError::MissingToken {
+            path: path.to_path_buf(),
+            key: "the credentials file".to_owned(),
+        })?;
+    let rights_table = table
+        .entry("forgejo_identity_rights".to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let Some(rights_table) = rights_table.as_table_mut() {
+        rights_table.insert(agent.to_owned(), toml::Value::String(rights.to_owned()));
+    }
+    let text = toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// The name of the access token the tool last made for an agent, when one was
+/// recorded.
+///
+/// A token's name is not a secret, and it is what lets a renewal revoke the token it
+/// replaces: Forgejo deletes a token by its name. A managed identity settled before
+/// this record existed has none; the deterministic first name (`gewu-<agent>`) is the
+/// only name such a token can have.
+pub fn recorded_agent_token_name(
+    path: &Path,
+    agent: &str,
+) -> Result<Option<String>, CredentialsError> {
+    let value = read_value(path)?;
+    Ok(text_at(&value, "forgejo_token_names", agent))
+}
+
+/// Record the name of the access token last made for an agent. The name is not a
+/// secret; the token itself stays in `[forgejo_agent_tokens]`.
+pub fn record_agent_token_name(
+    path: &Path,
+    agent: &str,
+    name: &str,
+) -> Result<(), CredentialsError> {
+    let _guard = write_lock();
+    let mut value = value_for_write(path)?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| CredentialsError::MissingToken {
+            path: path.to_path_buf(),
+            key: "the credentials file".to_owned(),
+        })?;
+    let names = table
+        .entry("forgejo_token_names".to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let Some(names) = names.as_table_mut() {
+        names.insert(agent.to_owned(), toml::Value::String(name.to_owned()));
+    }
+    let text = toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Remove an agent's token and the token's recorded name, keeping its login and
+/// email as the agent's history.
+///
+/// This is the local half of a removal: the token has just been revoked on the
+/// server, so keeping its value in the credentials file would leave a dead secret
+/// behind. The name goes with it; the account and its runs stay.
+pub fn remove_agent_token(path: &Path, agent: &str) -> Result<Vec<String>, CredentialsError> {
+    let _guard = write_lock();
+    let mut root = match read_value(path) {
+        Ok(value) => value,
+        Err(CredentialsError::Absent { .. }) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut removed = Vec::new();
+    if let Some(root) = root.as_table_mut() {
+        for (table, label) in [
+            ("forgejo_agent_tokens", "Forgejo token"),
+            ("forgejo_token_names", "token name"),
+        ] {
+            if let Some(entries) = root.get_mut(table).and_then(toml::Value::as_table_mut) {
+                if entries.remove(agent).is_some() {
+                    removed.push(format!("{label} for `{agent}`"));
+                }
+            }
+        }
+    }
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    let text = toml::to_string_pretty(&root).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| {
+        CredentialsError::Rewrite {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    removed.sort();
+    Ok(removed)
+}
+
 /// Which identity path the credentials file records, when it records one.
 pub fn recorded_identity_mode(path: &Path) -> Result<Option<String>, CredentialsError> {
     let value = read_value(path)?;
@@ -597,6 +751,7 @@ pub fn record_agent_identity(
     mode: &str,
     created_at: Option<u64>,
 ) -> Result<(), CredentialsError> {
+    let _guard = write_lock();
     let mut value = value_for_write(path)?;
     let table = value
         .as_table_mut()
@@ -639,10 +794,7 @@ pub fn record_agent_identity(
             .entry("forgejo_identity_created".to_owned())
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
         if let Some(created) = created.as_table_mut() {
-            created.insert(
-                agent.to_owned(),
-                toml::Value::Integer(seconds as i64),
-            );
+            created.insert(agent.to_owned(), toml::Value::Integer(seconds as i64));
         }
     }
     let text = toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
@@ -696,6 +848,7 @@ pub fn record_form_secrets(
     forgejo_token: Option<&str>,
     forgejo_admin_token: Option<&str>,
 ) -> Result<(), CredentialsError> {
+    let _guard = write_lock();
     let mut value = value_for_write(path)?;
     let table = value
         .as_table_mut()
@@ -709,7 +862,10 @@ pub fn record_form_secrets(
             toml::Value::String(token.to_owned()),
         );
     }
-    if let Some(token) = forgejo_admin_token.map(str::trim).filter(|text| !text.is_empty()) {
+    if let Some(token) = forgejo_admin_token
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
         table.insert(
             "forgejo_admin_token".to_owned(),
             toml::Value::String(token.to_owned()),
@@ -723,17 +879,14 @@ pub fn record_form_secrets(
             keys.insert(agent.to_owned(), toml::Value::String(key.to_owned()));
         }
     }
-    let text =
-        toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
-            path: path.to_path_buf(),
-            source: io::Error::other(error),
-        })?;
+    let text = toml::to_string_pretty(&value).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
     let text = format!("# gewu-multiverse credentials (written by the add-agent form)\n{text}");
-    crate::mode::write_private(path, text.as_bytes()).map_err(|source| {
-        CredentialsError::Rewrite {
-            path: path.to_path_buf(),
-            source,
-        }
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
@@ -750,6 +903,7 @@ pub fn record_secret(
     key: &str,
     value: &str,
 ) -> Result<(), CredentialsError> {
+    let _guard = write_lock();
     let value = value.trim();
     if value.is_empty() {
         return Ok(());
@@ -796,6 +950,7 @@ pub fn remove_agent_secrets(
     path: &Path,
     agents: &[String],
 ) -> Result<Vec<String>, CredentialsError> {
+    let _guard = write_lock();
     // A file that is not there holds nothing to remove; writing one to delete from it
     // would create a file as a side effect of a tidy-up.
     let mut root = match read_value(path) {
@@ -826,9 +981,11 @@ pub fn remove_agent_secrets(
         source: io::Error::other(error),
     })?;
     let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
-    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
-        path: path.to_path_buf(),
-        source,
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| {
+        CredentialsError::Rewrite {
+            path: path.to_path_buf(),
+            source,
+        }
     })?;
     removed.sort();
     Ok(removed)
@@ -945,7 +1102,7 @@ mod tests {
         let path = root.join("credentials.toml");
         CredentialsFile::prepare(&path).expect("the file is prepared");
         let text = fs::read_to_string(&path).expect("the template can be read by the test");
-        assert!(text.contains("forgejo_token"));
+        assert!(text.contains("model_key") && text.contains("forgejo_admin_token"));
         assert!(
             !text.contains("sk-"),
             "the template must not look like a real secret"
@@ -956,7 +1113,7 @@ mod tests {
     fn a_wider_mode_is_tightened() {
         let root = scratch_root("credentials-tighten");
         let path = root.join("credentials.toml");
-        fs::write(&path, "forgejo_token = \"\"\n").expect("the test writes the file");
+        fs::write(&path, "forgejo_admin_token = \"\"\n").expect("the test writes the file");
         set_mode(&path, 0o644).expect("the test widens the mode");
         assert_eq!(mode_of(&path).expect("the mode is readable"), 0o644);
         let file = CredentialsFile::prepare(&path).expect("the file is tightened");
@@ -984,7 +1141,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .expect("readable")
-                .contains("forgejo_token")
+                .contains("forgejo_admin_token")
         );
     }
 
@@ -1088,7 +1245,7 @@ mod tests {
         let error = model_key(&path, "scribe").expect_err("the key is absent");
         let message = error.to_string();
         assert!(message.contains("scribe"), "{message}");
-        assert!(message.contains("model_keys"), "{message}");
+        assert!(message.contains("model_key"), "{message}");
     }
 
     #[test]
@@ -1399,8 +1556,14 @@ mod form_tests {
         let root = scratch_root("credentials-form");
         let path = root.join("credentials.toml");
         CredentialsFile::prepare(&path).expect("the file is prepared");
-        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"), None)
-            .expect("the form's secrets are written");
+        record_form_secrets(
+            &path,
+            "scribe",
+            Some("sk-form-key"),
+            Some("role-token"),
+            None,
+        )
+        .expect("the form's secrets are written");
         // The token and the key are there.
         assert_eq!(
             forgejo_token(&path).expect("a token").expose(),
@@ -1428,8 +1591,14 @@ mod form_tests {
         let root = scratch_root("credentials-present");
         let path = root.join("credentials.toml");
         CredentialsFile::prepare(&path).expect("the file is prepared");
-        record_form_secrets(&path, "scribe", Some("sk-form-key"), Some("role-token"), None)
-            .expect("the form's secrets are written");
+        record_form_secrets(
+            &path,
+            "scribe",
+            Some("sk-form-key"),
+            Some("role-token"),
+            None,
+        )
+        .expect("the form's secrets are written");
         let names = present_secret_names(&path);
         assert!(names.iter().any(|name| name == "model key for `scribe`"));
         assert!(names.iter().any(|name| name == "Forgejo role token"));

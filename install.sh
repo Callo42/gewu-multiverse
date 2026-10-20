@@ -66,6 +66,16 @@ if ! "$dir/gewu-multiverse" --version >/dev/null 2>&1; then
     say "      cargo install --git https://github.com/$repo"
     exit 1
 fi
+# The product's own Forgejo is fetched now, once, so the first run does not have to
+# wait for it. A failure is not fatal: the product is installed, and its first start
+# tries again.
+say "fetching Forgejo 17.0.0 for gewu-multiverse (about 122 MB)"
+if "$dir/gewu-multiverse" --install-forgejo >/dev/null 2>&1; then
+    say "Forgejo 17.0.0 is ready"
+else
+    say "the Forgejo download did not finish — the product is installed; its first start will try again"
+fi
+
 # The closing line must be a command that resolves. When the directory is not on
 # PATH, the bare name would print `command not found` on the user's first command
 #.

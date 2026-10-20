@@ -1,44 +1,46 @@
 //! The Forgejo integration test, against a local throwaway instance.
 //!
-//! It runs only when `GEWU_FORGEJO_BIN` names a Forgejo server binary; when it does
-//! not, it says so and does nothing. Everything it proves is proved against that one
-//! local instance, with a temporary root, and nothing else on the machine is touched:
+//! It runs only when `GEWU_FORGEJO_BIN` names a Forgejo server binary. The tests are
+//! `#[ignore]`d, so the ordinary suite lists them as ignored rather than counting them
+//! as passed; they are run explicitly and fail when the variable is absent. Everything
+//! it proves is proved against that one local instance, with a temporary root, and
+//! nothing else on the machine is touched:
 //!
-//! 1. the role check under an administrator's token and under an ordinary token, with
-//!    the difference — the private repositories only the administrator can see —
-//!    visible;
-//! 2. a bad URL, a bad token, and an ordinary token where the configuration expects an
-//!    administrator, each with its own failure class;
-//! 3. an agent identity created by the tool from an administrator token, and the token
-//!    it makes stored in the credentials file, mode 0600;
+//! 1. a token's account and the repositories it can see, including the private
+//!    repository an administrator can see and an ordinary account cannot;
+//! 2. a URL without a scheme and a token the instance refuses, each with its own
+//!    failure class;
+//! 3. an agent identity created by the tool from the administrator token, and the
+//!    token it makes stored in the credentials file, mode 0600;
 //! 4. a commit, made in the agent's workspace, authored by that identity — the
 //!    author line is printed and asserted — pushed, and a pull request opened and
 //!    updated as the agent;
-//! 5. the non-administrator path: a token the user supplied, producing a commit with
-//!    the same attribution;
-//! 6. an operation outside the ordinary token's rights, refused, with the error the
+//! 5. an operation outside the ordinary token's rights, refused, with the error the
 //!    instance gave;
-//! 7. the assertion that none of the tokens appears in anything the tool produces,
+//! 6. the assertion that none of the tokens appears in anything the tool produces,
 //!    including the askpass answer, which is the one place a token is meant to leave.
 //!
 //! Run it with the server binary named:
 //!
 //! ```text
-//! GEWU_FORGEJO_BIN=/path/to/forgejo cargo test --test forgejo -- --nocapture
+//! GEWU_FORGEJO_BIN=/path/to/forgejo cargo test --test forgejo -- --ignored --nocapture
 //! ```
 
 mod forgejo_support;
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use forgejo_support::TestForgejo;
 
-use gewu_multiverse::config::Role;
 use gewu_multiverse::credentials::{self, Secret};
-use gewu_multiverse::forgejo::{self, DEFAULT_TIMEOUT, ForgejoClient, ForgejoConfig};
-use gewu_multiverse::identity::{self, IdentityMode};
+use gewu_multiverse::forgejo::{DEFAULT_TIMEOUT, ForgejoClient};
+use gewu_multiverse::identity;
 use gewu_multiverse::mode;
+use gewu_multiverse::run::RunPlan;
+use gewu_multiverse::test_stub::{Stub, StubReply};
+use gewu_multiverse::transcript;
 use gewu_multiverse::workspace::{self, GitCredential, GitIdentity};
 
 /// The password of the test administrator. It is a throwaway for a throwaway
@@ -83,14 +85,9 @@ fn client_for(url: &str, token: &str) -> ForgejoClient {
 }
 
 #[test]
+#[ignore = "live Forgejo: run with GEWU_FORGEJO_BIN=... cargo test --test forgejo -- --ignored"]
 fn the_forgejo_round_trip() {
-    let Some(fj) = TestForgejo::start("round-trip") else {
-        eprintln!(
-            "GEWU_FORGEJO_BIN is not set, so the local Forgejo integration test was skipped; \
-             nothing was verified by it."
-        );
-        return;
-    };
+    let fj = TestForgejo::start("round-trip");
     println!("local test Forgejo ready at {}", fj.url);
 
     // ---- an instance with an administrator, and two repositories ----
@@ -99,94 +96,61 @@ fn the_forgejo_round_trip() {
     fj.create_repo(&admin, "demo", false);
     fj.create_repo(&admin, "secret-repo", true);
 
-    // ---- the role check, administrative view ----
-    let admin_config = ForgejoConfig::new(&fj.url, Secret::new(&admin));
-    let administrative =
-        forgejo::role_check(&admin_config, Role::Admin).expect("the administrator's check passes");
-    println!("role check (admin): {}", administrative.summary());
-    assert!(administrative.viewer.is_admin);
-    assert!(administrative.administrative());
+    // ---- the account and the repositories it can see ----
+    let admin_client = client_for(&fj.url, &admin);
+    let administrative = admin_client
+        .viewer()
+        .expect("the administrator's token works");
+    assert!(administrative.is_admin);
+    let admin_repositories = admin_client
+        .repositories()
+        .expect("the repositories are read");
     assert!(
-        administrative.private_visible >= 1,
-        "an administrator sees the private repositories: {}",
-        administrative.summary()
-    );
-    assert!(
-        administrative
-            .repositories
+        admin_repositories
             .iter()
-            .any(|repo| repo.full_name == "root/secret-repo")
+            .any(|repo| repo.full_name == "root/secret-repo"),
+        "an administrator sees the private repositories"
     );
-    assert!(
-        administrative
-            .repositories
-            .iter()
-            .any(|repo| repo.permissions.admin)
-    );
+    assert!(admin_repositories.iter().any(|repo| repo.permissions.admin));
 
-    // ---- the role check, ordinary view ----
+    // An ordinary account's token sees the public repository and not another
+    // account's private one.
     fj.create_user("author", AUTHOR_PASSWORD, false);
-    // The author's token is made through the tool itself, with the tool's own rights:
-    // enough to read and to write a repository, and no more.
     let author_token = client_for(&fj.url, &admin)
         .create_token_for("author", "author-token")
         .expect("a token is made for the ordinary account");
-    let author_config = ForgejoConfig::new(&fj.url, author_token.clone());
-    let ordinary =
-        forgejo::role_check(&author_config, Role::Member).expect("the member's check passes");
-    println!("role check (member): {}", ordinary.summary());
-    assert!(!ordinary.viewer.is_admin);
-    assert!(!ordinary.administrative());
-    // The difference is visible: the ordinary token cannot see the private
-    // repository at all, while the administrator's can.
+    let ordinary_client = client_for(&fj.url, author_token.expose());
+    let ordinary = ordinary_client.viewer().expect("the ordinary token works");
+    assert!(!ordinary.is_admin);
+    let ordinary_repositories = ordinary_client
+        .repositories()
+        .expect("the ordinary account's repositories are read");
     assert!(
-        !ordinary
-            .repositories
+        !ordinary_repositories
             .iter()
             .any(|repo| repo.full_name == "root/secret-repo"),
         "an ordinary token must not see another account's private repository"
     );
     assert!(
-        ordinary
-            .repositories
+        ordinary_repositories
             .iter()
             .any(|repo| repo.full_name == "root/demo")
     );
-    assert_eq!(ordinary.private_visible, 0);
     println!(
-        "difference: admin sees {} repository(ies) ({} private), member sees {} ({} private)",
-        administrative.repositories.len(),
-        administrative.private_visible,
-        ordinary.repositories.len(),
-        ordinary.private_visible
-    );
-
-    // ---- a token without the rights the configuration expects ----
-    let not_admin =
-        forgejo::role_check(&author_config, Role::Admin).expect_err("an ordinary token is refused");
-    assert_eq!(not_admin.class(), "not_admin");
-    println!(
-        "role = admin with an ordinary token: ({}) {not_admin}",
-        not_admin.class()
+        "admin sees {} repository(ies), member sees {}",
+        admin_repositories.len(),
+        ordinary_repositories.len()
     );
 
     // ---- a bad URL and a bad token ----
-    let bad_url = forgejo::role_check(
-        &ForgejoConfig::new("forgejo.example.org", Secret::new(&admin)),
-        Role::Member,
-    )
-    .expect_err("a URL without a scheme is refused");
+    let bad_url = ForgejoClient::new("forgejo.example.org", Secret::new(&admin), DEFAULT_TIMEOUT)
+        .expect_err("a URL without a scheme is refused");
     assert_eq!(bad_url.class(), "bad_url");
     println!("bad URL: ({}) {bad_url}", bad_url.class());
 
-    let bad_token = forgejo::role_check(
-        &ForgejoConfig::new(
-            &fj.url,
-            Secret::new("gw-not-a-real-token-00000000000000000000"),
-        ),
-        Role::Member,
-    )
-    .expect_err("a bad token is refused");
+    let bad_token = client_for(&fj.url, "gw-not-a-real-token-00000000000000000000")
+        .viewer()
+        .expect_err("a bad token is refused");
     assert_eq!(bad_token.class(), "bad_token");
     println!("bad token: ({}) {bad_token}", bad_token.class());
 
@@ -203,7 +167,6 @@ fn the_forgejo_round_trip() {
     println!("managed identity created: {}", scribe.line());
     assert_eq!(scribe.login, "gewu-scribe");
     assert!(scribe.created, "the account was created by the tool");
-    assert_eq!(scribe.mode, IdentityMode::Managed);
     // The credentials file is held to 0600, and the token it now holds works.
     assert_eq!(
         mode::mode_of(&managed_credentials).expect("the mode is readable"),
@@ -294,88 +257,13 @@ fn the_forgejo_round_trip() {
     assert_eq!(updated.title, "A note, as the agent (updated)");
     println!("updated pull request {}", updated.line());
 
-    // ---- the non-administrator path: a supplied token, same attribution ----
-    fj.create_repo(author_token.expose(), "work", false);
-    let supplied_root = forgejo_support::scratch("supplied");
-    let supplied_credentials = supplied_root.join("credentials.toml");
-    mode::write_private(
-        &supplied_credentials,
-        format!(
-            "[forgejo_agent_tokens]\n\"scribe\" = \"{}\"\n",
-            author_token.expose()
-        )
-        .as_bytes(),
-    )
-    .expect("the supplied credentials file is written");
-    let supplied = identity::resolve(&fj.url, "scribe", &supplied_credentials)
-        .expect("the supplied token settles the identity");
-    println!("supplied identity: {}", supplied.line());
-    assert_eq!(supplied.login, "author");
-    assert_eq!(supplied.mode, IdentityMode::Supplied);
-    assert!(!supplied.created);
-
-    let supplied_workspace = forgejo_support::scratch("workspace-supplied");
-    let supplied_destination = workspace::clone_destination(&supplied_workspace, "author/work");
-    let supplied_identity = GitIdentity {
-        login: supplied.login.clone(),
-        email: supplied.email.clone(),
-    };
-    let supplied_credential = GitCredential {
-        askpass: Path::new(askpass_binary()),
-        credentials: &supplied_credentials,
-        agent: "scribe",
-        login: &supplied.login,
-    };
-    workspace::prepare(
-        &fj.url,
-        "author/work",
-        &supplied_workspace,
-        &supplied_destination,
-        &supplied_identity,
-        Some(&supplied_credential),
-    )
-    .expect("the second repository is cloned under the supplied identity");
-    git(&supplied_destination, &["checkout", "-b", "note-as-author"]);
-    std::fs::write(
-        supplied_destination.join("note.txt"),
-        "written by the supplied agent\n",
-    )
-    .expect("the note is written");
-    git(&supplied_destination, &["add", "-A"]);
-    git(
-        &supplied_destination,
-        &[
-            "commit",
-            "-m",
-            "Add a note, authored by the supplied identity",
-        ],
-    );
-    let supplied_author = commit_author(&supplied_destination);
-    println!("commit author (supplied path): {supplied_author}");
-    assert_eq!(
-        supplied_author,
-        format!("{} <{}>", supplied.login, supplied.email)
-    );
-    workspace::push(&supplied_destination, &supplied_credential)
-        .expect("the branch is pushed under the supplied token");
-    let supplied_pull = client_for(&fj.url, author_token.expose())
-        .open_pull_request(
-            "author",
-            "work",
-            "A note, as the supplied agent",
-            "Opened with the token the user supplied.",
-            "note-as-author",
-            "main",
-        )
-        .expect("the pull request is opened under the supplied token");
-    println!("opened pull request {}", supplied_pull.line());
-    assert_eq!(supplied_pull.state, "open");
-
     // ---- an operation outside the ordinary token's rights, refused ----
     let refused = client_for(&fj.url, author_token.expose())
         .create_user("never-created", "never-created@example.org", "Gw-Never-1!")
         .expect_err("an ordinary token cannot create an account");
-    assert_eq!(refused.class(), "forbidden");
+    // Forgejo names the missing scope in the 403 body; the product keeps the right
+    // and never the rest of the body.
+    assert_eq!(refused.class(), "missing_scope");
     println!(
         "operation outside the ordinary token's rights refused: ({}) {refused}",
         refused.class()
@@ -384,22 +272,16 @@ fn the_forgejo_round_trip() {
 
     // ---- no token in anything the tool produces ----
     let surroundings = vec![
-        administrative.summary(),
-        ordinary.summary(),
-        not_admin.to_string(),
         bad_url.to_string(),
         bad_token.to_string(),
         scribe.line(),
-        supplied.line(),
         pull.line(),
         updated.line(),
-        supplied_pull.line(),
         refused.to_string(),
-        format!("{admin_config:?}"),
-        format!("{author_config:?}"),
+        format!("{admin_client:?}"),
+        format!("{ordinary_client:?}"),
         format!("{scribe_client:?}"),
         format!("{credential:?}"),
-        format!("{supplied_credential:?}"),
     ];
     for text in &surroundings {
         for token in [admin.as_str(), author_token.expose(), scribe_token.expose()] {
@@ -419,17 +301,6 @@ fn the_forgejo_round_trip() {
             .as_deref(),
         Some("managed")
     );
-    assert_eq!(
-        credentials::recorded_identity_mode(&supplied_credentials)
-            .expect("the file reads")
-            .as_deref(),
-        Some("supplied")
-    );
-    assert_eq!(
-        mode::mode_of(&supplied_credentials).expect("the mode is readable"),
-        0o600
-    );
-
     // ---- the one place a token leaves: the askpass pipe, and only there ----
     let askpass = askpass_binary();
     for (prompt, expected) in [
@@ -459,4 +330,377 @@ fn the_forgejo_round_trip() {
     println!("the askpass mode answers on standard output only, and nothing on standard error");
 
     println!("the Forgejo round trip passed");
+}
+
+/// The six tools against the real instance, through the real binary and run loop.
+///
+/// This is the bounded real-Forgejo fidelity test: the same run the product would
+/// make, with the model's calls scripted by a loopback stub and every Forgejo call
+/// going to the throwaway instance. It is `#[ignore]`d and run explicitly with a server
+/// binary named.
+#[test]
+#[ignore = "live Forgejo: run with GEWU_FORGEJO_BIN=... cargo test --test forgejo -- --ignored"]
+fn the_agent_tools_round_trip_against_a_live_instance() {
+    let fj = TestForgejo::start("tools");
+    fj.create_user("root", ADMIN_PASSWORD, true);
+    let admin = fj.access_token_for("root");
+
+    let root = forgejo_support::scratch("tools-run");
+    let credentials = root.join("credentials.toml");
+    mode::write_private(
+        &credentials,
+        format!("forgejo_token = \"{admin}\"\nforgejo_admin_token = \"{admin}\"\n").as_bytes(),
+    )
+    .expect("the credentials file");
+    let scribe = identity::manage(&fj.url, "scribe", &credentials)
+        .expect("the tool creates the agent's identity");
+    let agent_token = credentials::forgejo_agent_token(&credentials, "scribe")
+        .expect("the agent token is recorded");
+    let client = ForgejoClient::new(&fj.url, agent_token.clone(), DEFAULT_TIMEOUT)
+        .expect("a client for the agent");
+    client
+        .assigned_issues()
+        .expect("a managed token can read issues");
+
+    // The agent's own repository, with an issue assigned to its account.
+    fj.create_repo_for(&admin, &scribe.login, "demo", false);
+    let (status, text) = fj.api(
+        &admin,
+        "POST",
+        &format!("/api/v1/repos/{}/demo/issues", scribe.login),
+        Some(
+            serde_json::json!({
+                "title": "Work for the agent",
+                "body": "please do it",
+                "assignees": [scribe.login]
+            })
+            .to_string()
+            .as_str(),
+        ),
+    );
+    assert!(
+        (200..300).contains(&status),
+        "issue create {status}: {text}"
+    );
+
+    // A clone the product made, on a branch that really is pushed to the instance.
+    let workspace_root = root.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("the workspace");
+    let destination =
+        workspace::clone_destination(&workspace_root, &format!("{}/demo", scribe.login));
+    let identity = GitIdentity {
+        login: scribe.login.clone(),
+        email: scribe.email.clone(),
+    };
+    let credential = GitCredential {
+        askpass: Path::new(askpass_binary()),
+        credentials: &credentials,
+        agent: "scribe",
+        login: &scribe.login,
+    };
+    workspace::prepare(
+        &fj.url,
+        &format!("{}/demo", scribe.login),
+        &workspace_root,
+        &destination,
+        &identity,
+        Some(&credential),
+    )
+    .expect("the agent's clone");
+    git(&destination, &["checkout", "-q", "-b", "agent-work"]);
+    fs::write(destination.join("agent-work.txt"), "the agent's work\n").expect("a file");
+    git(&destination, &["add", "-A"]);
+    git(&destination, &["commit", "-qm", "agent work"]);
+    workspace::push(&destination, &credential).expect("the branch is pushed as the agent");
+
+    credentials::record_form_secrets(
+        &credentials,
+        "scribe",
+        Some("gw-live-model-key"),
+        None,
+        None,
+    )
+    .expect("the model key");
+
+    let model_key = "gw-live-model-key";
+    let script = |id: &str, name: &str, arguments: serde_json::Value| {
+        StubReply::json(
+            serde_json::json!({
+                "model": "lab-chat-1",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments.to_string()}
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )
+    };
+    let done = StubReply::json(
+        serde_json::json!({
+            "model": "lab-chat-1",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "done"}
+            }]
+        })
+        .to_string(),
+    );
+    let repo_name = format!("{}/demo", scribe.login);
+    let model = Stub::start(vec![
+        script("c1", "forgejo_list_assigned_issues", serde_json::json!({})),
+        script(
+            "c2",
+            "forgejo_read_issue_or_pull",
+            serde_json::json!({"repository": repo_name, "number": 1}),
+        ),
+        script(
+            "c3",
+            "forgejo_comment",
+            serde_json::json!({"repository": repo_name, "number": 1, "body": "I am on it."}),
+        ),
+        script("c4", "forgejo_list_my_pull_requests", serde_json::json!({})),
+        script(
+            "c5",
+            "forgejo_open_pull_request",
+            serde_json::json!({
+                "repository": repo_name,
+                "title": "Agent work for #1",
+                "body": "Opened by the agent."
+            }),
+        ),
+        script(
+            "c6",
+            "forgejo_update_pull_request",
+            serde_json::json!({
+                "repository": repo_name,
+                "number": 2,
+                "title": "Agent work for #1 (updated)",
+                "body": "The agent updated its own request."
+            }),
+        ),
+        done,
+    ]);
+
+    let run_dir = root.join("run-live-1");
+    fs::create_dir_all(&run_dir).expect("the run directory");
+    let instruction = root.join("instruction.md");
+    fs::write(
+        &instruction,
+        "Work the issue, comment, then open and update the pull request.\n",
+    )
+    .expect("the instruction");
+    RunPlan {
+        run_id: "run-live-1".to_owned(),
+        agent: "scribe".to_owned(),
+        workspace: workspace_root.clone(),
+        instruction,
+        skills_dir: root.join("skills"),
+        endpoint: model.url(),
+        model: "lab-chat-1".to_owned(),
+        credentials: credentials.clone(),
+        max_turns: 12,
+        steps: Vec::new(),
+        timeout_secs: 90,
+    }
+    .write(&run_dir)
+    .expect("the plan");
+    fs::write(
+        run_dir.join("forgejo.json"),
+        serde_json::json!({
+            "url": fj.url.clone(),
+            "login": scribe.login.clone(),
+            "repositories": [{"full_name": repo_name, "directory": "demo"}]
+        })
+        .to_string(),
+    )
+    .expect("the context");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--run-agent")
+        .arg(&run_dir)
+        .status()
+        .expect("the agent process");
+    assert!(status.success(), "the live run exited {status:?}");
+    let file = transcript::read(&run_dir).expect("the transcript");
+    let actions: Vec<(String, String)> = file
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            gewu_multiverse::transcript::Record::ForgejoResult {
+                action: Some(action),
+                url: Some(url),
+                ..
+            } => Some((action.clone(), url.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        actions.iter().any(|(action, _)| action == "commented"),
+        "{actions:?}"
+    );
+    assert!(
+        actions.iter().any(|(action, _)| action == "opened"),
+        "{actions:?}"
+    );
+    assert!(
+        actions.iter().any(|(action, _)| action == "updated"),
+        "{actions:?}"
+    );
+
+    // The instance really has the comment and the updated request.
+    let (status, text) = fj.api(
+        &admin,
+        "GET",
+        &format!("/api/v1/repos/{repo_name}/issues/1/comments"),
+        None,
+    );
+    assert_eq!(status, 200);
+    assert!(text.contains("I am on it."), "{text}");
+    let (status, text) = fj.api(
+        &admin,
+        "GET",
+        &format!("/api/v1/repos/{repo_name}/pulls/2"),
+        None,
+    );
+    assert_eq!(status, 200);
+    assert!(text.contains("Agent work for #1 (updated)"), "{text}");
+    let (status, text) = fj.api(
+        agent_token.expose(),
+        "GET",
+        "/api/v1/repos/issues/search?state=open&assigned=true&type=issues&limit=10",
+        None,
+    );
+    assert_eq!(status, 200);
+    assert!(text.contains("Work for the agent"), "{text}");
+
+    // No token reached the run's records, the workspace, or a model request. The
+    // credentials file is the one place a token is allowed to live.
+    let scan = |dir: &Path| {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = fs::read(&path) {
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(
+                        !text.contains(agent_token.expose()),
+                        "{} holds the agent token",
+                        path.display()
+                    );
+                }
+            }
+        }
+    };
+    scan(&run_dir);
+    scan(&workspace_root);
+    for request in model.requests() {
+        assert!(
+            !request.body.contains(agent_token.expose()),
+            "{}",
+            request.body
+        );
+        assert!(!request.body.contains(model_key), "{}", request.body);
+    }
+}
+
+/// A managed token made before the issue tools is renewed, and the token it replaces
+/// stops answering the instance.
+#[test]
+#[ignore = "live Forgejo: run with GEWU_FORGEJO_BIN=... cargo test --test forgejo -- --ignored"]
+fn a_managed_token_is_renewed() {
+    let fj = TestForgejo::start("rights");
+    fj.create_user("root", ADMIN_PASSWORD, true);
+    let admin = fj.access_token_for("root");
+    let root = forgejo_support::scratch("rights-run");
+    let credentials = root.join("credentials.toml");
+    mode::write_private(
+        &credentials,
+        format!("forgejo_token = \"{admin}\"\nforgejo_admin_token = \"{admin}\"\n").as_bytes(),
+    )
+    .expect("the credentials file");
+
+    let first = identity::manage(&fj.url, "scribe", &credentials).expect("the managed identity");
+    let first_token =
+        credentials::forgejo_agent_token(&credentials, "scribe").expect("the first token");
+    let first_name = credentials::recorded_agent_token_name(&credentials, "scribe")
+        .expect("the first token's name is recorded")
+        .expect("the first token has a name");
+    assert_eq!(first_name, "gewu-scribe");
+    assert_eq!(
+        credentials::recorded_agent_identity_rights(&credentials, "scribe")
+            .expect("the marker")
+            .as_deref(),
+        Some(identity::TOOL_RIGHTS_VERSION)
+    );
+
+    // A record made before this change: the marker is old. `i` must make a new token
+    // rather than reuse the one whose rights are unknown — and it must revoke the old
+    // token on the server, not merely stop recording it (B1).
+    credentials::record_agent_identity_rights(&credentials, "scribe", "before-issue-tools")
+        .expect("the old marker");
+    let second = identity::manage(&fj.url, "scribe", &credentials).expect("the renewal");
+    let second_token =
+        credentials::forgejo_agent_token(&credentials, "scribe").expect("the second token");
+    let second_name = credentials::recorded_agent_token_name(&credentials, "scribe")
+        .expect("the renewed token's name is recorded")
+        .expect("the renewed token has a name");
+    assert_ne!(first_name, second_name, "the renewal reused the token name");
+    assert_eq!(first.login, second.login);
+    assert_ne!(
+        first_token.expose(),
+        second_token.expose(),
+        "the old managed token was reused after the marker was removed"
+    );
+    let client = ForgejoClient::new(&fj.url, second_token, DEFAULT_TIMEOUT).expect("a client");
+    client
+        .assigned_issues()
+        .expect("the renewed token carries the issue right");
+    // The superseded token now answers 401, and its name is gone from the server's
+    // list: the renewal revoked it.
+    let (old_status, _) = fj.api(first_token.expose(), "GET", "/api/v1/user", None);
+    assert_eq!(
+        old_status, 401,
+        "the superseded managed token still answers the server"
+    );
+    let (list_status, list_body) = fj.api(
+        &admin,
+        "GET",
+        "/api/v1/admin/users/gewu-scribe/tokens",
+        None,
+    );
+    assert_eq!(list_status, 200, "the token list: {list_body}");
+    let names: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&list_body)
+        .expect("the token list is JSON")
+        .into_iter()
+        .filter_map(|token| {
+            token
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    assert!(
+        !names.contains(&first_name),
+        "the superseded token {first_name:?} is still listed: {names:?}"
+    );
+    assert!(
+        names.contains(&second_name),
+        "the renewed token {second_name:?} is not listed: {names:?}"
+    );
+    println!("renewal revoked {first_name:?}: the old token answers 401 and is no longer listed");
 }
