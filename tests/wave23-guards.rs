@@ -338,10 +338,17 @@ fn a_record_made_on_another_machine_says_what_to_do() {
     );
     app.show(Screen::Agents);
     let hub = render_at(160, 60, &app);
-    let flat = hub.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        hub.contains("risk recorded on") && hub.contains("R shows the record"),
+        "the hub does not name the record's one line:\n{hub}"
+    );
+    // The way back lives with the full record facts, in the overlay that reads them.
+    app.review_acknowledgment();
+    let review = render_at(160, 60, &app);
+    let flat = review.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         flat.contains("start again"),
-        "the hub sentence does not carry the way back:\n{hub}"
+        "the review sentence does not carry the way back:\n{review}"
     );
     app.shutdown();
 }

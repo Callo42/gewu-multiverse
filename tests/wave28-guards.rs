@@ -890,7 +890,7 @@ fn a_pushed_run_names_the_pull_request_key_as_the_next_step() {
     app.show(Screen::Runs);
     let screen = render_at(120, 40, &app);
     assert!(
-        screen.contains("P ") && screen.to_ascii_lowercase().contains("pull request"),
+        screen.contains("P ") && screen.contains("checks the branch"),
         "the pushed run does not offer P as the next step:\n{screen}"
     );
 }

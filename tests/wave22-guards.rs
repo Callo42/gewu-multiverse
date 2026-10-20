@@ -244,9 +244,15 @@ fn the_consent_record_states_what_it_can_and_cannot_prove() {
     app.show_acknowledgment = false;
     app.show(Screen::Agents);
     let hub = render_at(120, 40, &app);
+    // The hub keeps one quiet line; the plain-file limit is read where the record is
+    // read, in the review overlay above.
     assert!(
-        hub.contains("plain file") && hub.contains("signed"),
-        "the landing screen does not name what the record is:\n{hub}"
+        hub.contains("risk recorded on") && hub.contains("R shows the record"),
+        "the landing screen does not name the record's one line:\n{hub}"
+    );
+    assert!(
+        !hub.contains("not signed"),
+        "the landing screen still carries the long record paragraph:\n{hub}"
     );
     // The sentence is the same constant in both places and in the page map.
     assert!(RECORD_LIMIT.contains("does not sign it"), "{RECORD_LIMIT}");
@@ -305,10 +311,12 @@ fn an_older_build_against_newer_data_says_so() {
         hub.contains("used by version 0.1.99") && hub.contains("newer than this build"),
         "an older build against newer data says nothing:\n{hub}"
     );
-    // The acknowledgment line carries the same comparison in its own words.
+    // The read-only overlay carries the acknowledgment line's version comparison.
+    app.review_acknowledgment();
+    let review = render_at(140, 50, &app);
     assert!(
-        hub.contains("used by version 0.1.99 since"),
-        "the acknowledgment line does not carry the comparison:\n{hub}"
+        review.contains("used by version 0.1.99 since"),
+        "the acknowledgment line does not carry the comparison:\n{review}"
     );
     app.shutdown();
 }

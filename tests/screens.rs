@@ -250,7 +250,7 @@ fn every_screen_renders_and_what_is_missing_is_named_as_missing() {
     app.show(Screen::Forgejo);
     let forgejo = render(&app);
     assert!(
-        forgejo.contains("no role check has been run yet"),
+        forgejo.contains("not checked this session"),
         "Forgejo must say what is not there yet:\n{forgejo}"
     );
 
@@ -388,7 +388,7 @@ fn the_forgejo_screen_shows_the_configured_url_and_role_and_claims_no_check() {
     assert!(screen.contains("https://forgejo.example.org"), "{screen}");
     assert!(!screen.contains("role            member"), "{screen}");
     assert!(
-        screen.contains("no role check has been run yet"),
+        screen.contains("not checked this session"),
         "{screen}"
     );
     assert!(screen.contains("admin token"), "{screen}");
@@ -797,7 +797,10 @@ fn question_mark_opens_the_key_reference_and_lists_the_hidden_keys() {
     assert!(app.show_help);
     let screen = render(&app);
     assert!(screen.contains("keys"), "{screen}");
-    assert!(screen.contains("T open its newest transcript"), "{screen}");
+    assert!(
+        normalised(&screen).contains(&normalised("T open its newest transcript")),
+        "{screen}"
+    );
     assert!(
         screen.contains("n or a open the add-agent form"),
         "{screen}"
@@ -844,7 +847,8 @@ fn the_runs_screen_opens_the_transcript_as_well_as_the_log() {
 fn the_key_legend_never_stops_without_naming_the_full_list() {
     // C-1 / N-1: at 80 columns the legend must end with an explicit tail, not mid-key.
     let root = scratch("legend-tail");
-    let app = app(&root);
+    let mut app = app(&root);
+    app.show_acknowledgment = false;
     let screen = render_at(80, 24, &app);
     let legend = screen
         .lines()
@@ -1670,7 +1674,7 @@ fn the_forgejo_screen_never_says_placeholder() {
     let screen = render(&app);
     assert!(!screen.contains("Placeholder"), "{screen}");
     assert!(
-        screen.contains("no role check has been run yet"),
+        screen.contains("not checked this session"),
         "{screen}"
     );
 }
@@ -2048,7 +2052,10 @@ concurrency = 1
     let screen = render_at(80, 24, &app);
     // The footer carries it at the minimum (the sentence wraps, so the whole phrase is
     // not contiguous); the transport's errno is nowhere on the screen.
-    assert!(screen.contains("endpoint test for `scribe`"), "{screen}");
+    assert!(
+        normalised(&screen).contains(&normalised("endpoint test for `scribe`")),
+        "{screen}"
+    );
     assert!(!screen.contains("os error"), "{screen}");
 }
 
@@ -2415,8 +2422,8 @@ fn the_footer_never_advertises_q_quit_under_an_overlay_that_owns_the_keys() {
         "the footer still advertises quit under a confirmation: {overlay}"
     );
     assert!(
-        overlay.contains("esc closes this overlay"),
-        "the footer does not say what the keys do here: {overlay}"
+        overlay.contains("keep it") && overlay.contains("esc"),
+        "the footer does not name the confirmation's own keys: {overlay}"
     );
     assert!(
         overlay.contains("remove it"),
@@ -3353,25 +3360,15 @@ fn a_used_configuration_says_when_and_under_which_version_the_risk_was_acknowled
     app.show(Screen::Agents);
     let screen = render(&app);
     assert!(
-        screen.contains("the risk was acknowledged on"),
-        "the record is not on the screen: {screen}"
+        screen.contains("risk recorded on") && screen.contains("R shows the record"),
+        "the hub's one-line record is not on the screen: {screen}"
     );
     assert!(
-        normalised(&screen).contains(&normalised("press R to read the terms again")),
-        "there is no way to read the terms again: {screen}"
-    );
-    assert!(
-        screen.contains(env!("CARGO_PKG_VERSION")),
-        "the version that wrote the record is not named: {screen}"
-    );
-    // F3: the version now running is named beside the record's own version, so the
-    // comparison a second person came for is on the screen.
-    assert!(
-        screen.contains("this build is"),
-        "the running version is not labelled: {screen}"
+        !screen.contains("the risk was acknowledged on"),
+        "the hub still carries the record's long paragraph: {screen}"
     );
 
-    // `R` shows the terms without writing anything.
+    // `R` shows the terms and the full record facts without writing anything.
     let record_before = fs::read(root.join("risk-acknowledgment.toml")).expect("the record");
     app.on_key(KeyEvent::from(KeyCode::Char('R')));
     assert!(app.show_acknowledgment, "the terms are not shown");
@@ -3380,6 +3377,14 @@ fn a_used_configuration_says_when_and_under_which_version_the_risk_was_acknowled
     assert!(
         review.contains("the record is unchanged"),
         "the review does not say it writes nothing: {review}"
+    );
+    let review_flat = normalised(&review);
+    assert!(
+        review_flat.contains(&normalised("the risk was acknowledged on"))
+            && review.contains(env!("CARGO_PKG_VERSION"))
+            && review_flat.contains(&normalised("this build is"))
+            && review_flat.contains(&normalised("plain file")),
+        "the review does not carry the full record facts: {review}"
     );
     app.on_key(KeyEvent::from(KeyCode::Esc));
     let record_after = fs::read(root.join("risk-acknowledgment.toml")).expect("the record");
@@ -3711,7 +3716,7 @@ fn the_first_run_modal_leaves_no_fragment_of_the_note_area() {
     app.show_acknowledgment = false;
     let screen = render_at(100, 40, &app);
     assert!(
-        screen.contains("There is no scheduler"),
+        screen.contains("no scheduler"),
         "the note area did not return: {screen}"
     );
 }
@@ -3821,7 +3826,7 @@ fn every_overlay_owns_the_note_area_behind_it() {
             let screen = render_at(width, height, &app);
             for fragment in [
                 "is not acknowledged",
-                "There is no scheduler",
+                "no scheduler",
                 "not a sandbox",
             ] {
                 assert!(
@@ -3842,7 +3847,7 @@ fn every_overlay_owns_the_note_area_behind_it() {
     let mut app = app(&full);
     app.show_acknowledgment = false;
     assert!(
-        render_at(100, 40, &app).contains("There is no scheduler"),
+        render_at(100, 40, &app).contains("no scheduler"),
         "the agent note area did not return"
     );
 }

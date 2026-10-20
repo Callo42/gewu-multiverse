@@ -327,6 +327,74 @@ pub fn current_branch(repository: &Path) -> Result<String, WorkspaceError> {
     }
 }
 
+/// How many commits `branch` has that `base` does not.
+///
+/// This is the local half of the pull-request gate: a branch that is level with its
+/// base has nothing to open. The real base is preferred: when the clone carries the
+/// remote-tracking `refs/remotes/origin/<base>`, the count is measured against it, so a
+/// fetch that has not updated the local base cannot hide an empty pull request. The
+/// local base is used only when the clone has no remote-tracking base. Nothing is
+/// fetched.
+pub fn commits_ahead(repository: &Path, branch: &str, base: &str) -> Result<usize, WorkspaceError> {
+    commits_ahead_against(repository, branch, base).map(|(count, _)| count)
+}
+
+/// How many commits `branch` has that `base` does not, and the ref measured.
+///
+/// The second value is the ref the count was measured against — `origin/<base>` for the
+/// remote-tracking base, `<base>` for the local fallback — so a refusal can name the
+/// base it actually consulted.
+pub fn commits_ahead_against(
+    repository: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<(usize, String), WorkspaceError> {
+    let remote_ref = format!("refs/remotes/origin/{base}");
+    if run_git(
+        &["rev-parse", "--verify", "--quiet", &remote_ref],
+        repository,
+        None,
+    )
+    .is_ok()
+    {
+        let remote = format!("{remote_ref}..{branch}");
+        let text = run_git(&["rev-list", "--count", &remote], repository, None)?;
+        let count = parse_commit_count(&remote, &text)?;
+        return Ok((count, format!("origin/{base}")));
+    }
+    let local = format!("{base}..{branch}");
+    let text = run_git(&["rev-list", "--count", &local], repository, None)?;
+    let count = parse_commit_count(&local, &text)?;
+    Ok((count, base.to_owned()))
+}
+
+fn parse_commit_count(spec: &str, text: &str) -> Result<usize, WorkspaceError> {
+    text.trim()
+        .parse::<usize>()
+        .map_err(|_| WorkspaceError::Git {
+            command: format!("git rev-list --count {spec}"),
+            message: format!("the count was not a number: {text:?}"),
+        })
+}
+
+/// Whether the clone carries the remote-tracking ref `refs/remotes/origin/<branch>`.
+///
+/// This is the selected clone's own evidence that its branch is on the remote, and the
+/// pull-request gate's third fact. The ref is named exactly, not matched by suffix:
+/// another remote's tracking ref is not this clone's `origin`. This costs no network
+/// call while the Forgejo screen is being drawn.
+pub fn branch_on_remote(repository: &Path, branch: &str) -> bool {
+    let refname = format!("refs/remotes/origin/{branch}");
+    let Ok(text) = run_git(
+        &["for-each-ref", "--format=%(refname)", &refname],
+        repository,
+        None,
+    ) else {
+        return false;
+    };
+    text.lines().any(|name| name.trim() == refname)
+}
+
 /// One repository cloned into a directory below a workspace root.
 ///
 /// The product's own clone puts a repository at `workspace/<repo>`, so the workspace

@@ -354,10 +354,12 @@ pub enum ForgejoError {
         message: String,
     },
     /// The thing asked for is not there, or the token may not see it.
-    #[error("the Forgejo has nothing at {what} (HTTP 404)")]
+    #[error("the Forgejo has nothing at {what} (HTTP 404){hint}")]
     NotFound {
         /// The path that was asked for.
         what: String,
+        /// A correction when the configured base URL carries a page path.
+        hint: String,
     },
     /// The instance answered with an error of its own.
     #[error("the Forgejo answered HTTP {status}: {message}")]
@@ -480,6 +482,7 @@ impl ForgejoClient {
             self.repository(namespace, name)?
                 .ok_or_else(|| ForgejoError::NotFound {
                     what: format!("{namespace}/{name}"),
+                    hint: String::new(),
                 })?;
         let branches = self.branches(namespace, name)?;
         let open_pull_requests = self.pull_requests(namespace, name)?;
@@ -716,6 +719,7 @@ impl ForgejoClient {
             }),
             404 => Err(ForgejoError::NotFound {
                 what: path.to_owned(),
+                hint: page_path_hint(&self.base),
             }),
             status if !(200..=299).contains(&status) => Err(ForgejoError::Server {
                 status,
@@ -777,6 +781,28 @@ pub fn normalise_url(url: &str) -> Result<String, ForgejoError> {
         });
     }
     Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+/// A correction when a configured base URL includes a page path.
+///
+/// A browser address such as `https://forgejo.example.org/explore/repos` is a page,
+/// not the instance root the API lives under. The failure says that plainly, with
+/// the root it can see, instead of only naming an API path the person never typed.
+fn page_path_hint(base: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => return String::new(),
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return String::new();
+    };
+    if host.is_empty() || path.is_empty() {
+        return String::new();
+    }
+    format!(
+        " — {base} includes the page path /{path}; use the instance root {scheme}://{host} instead"
+    )
 }
 
 /// The host of a base URL, without the scheme or any path.

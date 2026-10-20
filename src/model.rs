@@ -273,23 +273,34 @@ pub enum ModelError {
         /// The status the endpoint answered with.
         status: u16,
     },
-    /// The endpoint does not serve that model, or the configured address is a base
-    /// rather than the completions path a run POSTs to.
-    #[error(
-        "the endpoint's models list does not include the model {model:?} (HTTP {status}); the request address must still be the full completions path, for example https://host/v1/chat/completions"
-    )]
+    /// The endpoint's models list answered and does not carry the model. The model id
+    /// is the field to correct; the completions path already answered. This sentence
+    /// states the fact only: the screen's recovery clause is the one correction.
+    #[error("the endpoint's models list does not include the model {model:?} (HTTP {status})")]
     ModelNotFound {
         /// The model the agent asked for.
         model: String,
         /// The status the endpoint answered with.
         status: u16,
     },
-    /// The endpoint answered 404 at the configured path, and its models list did not
-    /// answer without the model — or did not answer at all. The path is what to fix.
-    #[error(
-        "the endpoint has no completions route at {endpoint} (HTTP {status}); the address must be the full completions URL, for example https://host/v1/chat/completions — if that path is right, the endpoint did not list the model {model:?} when asked"
-    )]
+    /// The endpoint answered 404 at the configured path and its models list did not
+    /// answer at all, so the model was never disproved. Only the path is named — the
+    /// product must not claim a model fact it never learned. The correction is added
+    /// once by the screen, not restated here.
+    #[error("the endpoint has no completions route at {endpoint} (HTTP {status})")]
     RouteNotFound {
+        /// The endpoint as configured.
+        endpoint: String,
+        /// The status the endpoint answered with.
+        status: u16,
+    },
+    /// The endpoint answered 404 at the configured path while its models list did
+    /// answer and did carry the model. The path is the only thing wrong. The fact
+    /// that the model was listed is kept; the correction is added once by the screen.
+    #[error(
+        "the endpoint has no completions route at {endpoint} (HTTP {status}); the endpoint's models list does contain the model {model:?}"
+    )]
+    RouteNotFoundListed {
         /// The endpoint as configured.
         endpoint: String,
         /// The model the agent asked for.
@@ -346,7 +357,9 @@ impl ModelError {
             ModelError::MissingKey => "missing_key",
             ModelError::BadKey { .. } => "bad_key",
             ModelError::ModelNotFound { .. } => "model_not_found",
-            ModelError::RouteNotFound { .. } => "route_not_found",
+            ModelError::RouteNotFound { .. } | ModelError::RouteNotFoundListed { .. } => {
+                "route_not_found"
+            }
             ModelError::RateLimited { .. } => "rate_limited",
             ModelError::Server { .. } => "server_error",
             ModelError::MalformedReply { .. } => "malformed_reply",
@@ -445,9 +458,13 @@ pub fn chat(
                     model: config.model.clone(),
                     status,
                 },
-                _ => ModelError::RouteNotFound {
+                Some(true) => ModelError::RouteNotFoundListed {
                     endpoint: config.endpoint.clone(),
                     model: config.model.clone(),
+                    status,
+                },
+                None => ModelError::RouteNotFound {
+                    endpoint: config.endpoint.clone(),
                     status,
                 },
             });
@@ -798,7 +815,19 @@ mod tests {
             .expect_err("the model is refused");
         assert_eq!(error.class(), "model_not_found");
         assert!(error.to_string().contains("example-model"));
-        assert!(error.to_string().contains("/chat/completions"), "{error}");
+        assert!(
+            error.to_string().contains("does not include the model"),
+            "the model failure does not state the model fact: {error}"
+        );
+        // The correction belongs to the screen once, not to the stored failure fact.
+        assert!(
+            !error.to_string().contains("the correction is"),
+            "the model failure states its correction twice: {error}"
+        );
+        assert!(
+            !error.to_string().contains("full completions path"),
+            "the model failure still tells the person to change the endpoint path: {error}"
+        );
         let requests = stub.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].method, "GET");
@@ -814,7 +843,14 @@ mod tests {
         let error = chat(&config(&stub.url()), &[Message::user("hi")], &[], None)
             .expect_err("the path is wrong");
         assert_eq!(error.class(), "route_not_found");
-        assert!(error.to_string().contains("/v1/chat/completions"), "{error}");
+        assert!(
+            error.to_string().contains("/v1/chat/completions"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("full completions path"),
+            "the route failure states the screen's correction itself: {error}"
+        );
     }
 
     #[test]
