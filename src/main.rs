@@ -15,6 +15,7 @@
 //! with the first, and the person's own `git` asks the second for an agent's token.
 
 use std::io::{self, IsTerminal, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +37,9 @@ use gewu_multiverse::engine::{self, EngineOptions};
 use gewu_multiverse::engine_api::Desired;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::workspace;
+use nix::fcntl::OFlag;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::unistd::pipe2;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use signal_hook::SigId;
@@ -98,7 +102,9 @@ fn main() -> ExitCode {
             match outcome {
                 Ok(quit_line) => {
                     if let Some(line) = quit_line {
-                        println!("{line}");
+                        // A lost terminal has no one to read this; do not panic on a
+                        // dead standard output after the shutdown has finished.
+                        let _ = writeln!(io::stdout(), "{line}");
                     }
                     ExitCode::SUCCESS
                 }
@@ -211,13 +217,15 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(StartupError::NotATerminal);
     }
+    // The signal handlers are installed before the slow open: a terminal lost during
+    // recovery records the request, and the loop ends and stops everything at once.
+    let termination = Termination::install()?;
     let layout = layout_for(&cli)?;
     let data_root = bundled_forgejo::data_root().map_err(StartupError::Engine)?;
     let options = EngineOptions::new(layout, data_root).map_err(StartupError::Engine)?;
     let engine = engine::open_with(options).map_err(StartupError::Engine)?;
     let mut board = Board::new(engine);
     let mut screen = Screen::enter()?;
-    let termination = Termination::install()?;
     let drawn = event_loop(&mut screen, &mut board, Some(&termination));
     // The number of agents whose choice is started *now*, not when the board opened:
     // the person may have started one during this visit.
@@ -229,7 +237,13 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
         .count();
     // Stop every session and Forgejo before the terminal comes back.
     board.shutdown();
-    let left = screen.leave();
+    // A lost terminal has nothing to restore; asking for the mode back on a dead
+    // pseudo-terminal would only fail after the shutdown has already done the work.
+    let lost = matches!(drawn, Ok(LoopEnd::Lost));
+    if lost {
+        screen.abandon();
+    }
+    let left = if lost { Ok(()) } else { screen.leave() };
     drawn.and(left)?;
     Ok((started > 0).then(|| {
         format!(
@@ -248,9 +262,148 @@ fn run_demo() -> Result<(), StartupError> {
     let drawn = event_loop(&mut screen, &mut board, None);
     // Stop every scripted session and Forgejo before the terminal comes back.
     board.shutdown();
-    let left = screen.leave();
+    let lost = matches!(drawn, Ok(LoopEnd::Lost));
+    if lost {
+        screen.abandon();
+    }
+    let left = if lost { Ok(()) } else { screen.leave() };
     drawn.and(left)?;
     Ok(())
+}
+
+/// How a run of the board ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopEnd {
+    /// The person quit, or a signal asked the program to stop.
+    Finished,
+    /// The terminal went away: end-of-file, `EIO`, `SIGHUP`, or a closed session.
+    Lost,
+}
+
+/// How one wait for the terminal ended.
+enum InputRead {
+    Event(Event),
+    Idle,
+    Closed,
+}
+
+/// The terminal input the board loop reads. The tests replace it with a scripted
+/// source that ends or fails on demand.
+trait TerminalInput {
+    fn read(&mut self, timeout: Duration) -> io::Result<InputRead>;
+}
+
+struct CrosstermInput;
+
+impl TerminalInput for CrosstermInput {
+    fn read(&mut self, timeout: Duration) -> io::Result<InputRead> {
+        match event::poll(timeout) {
+            Ok(true) => event::read().map(InputRead::Event),
+            Ok(false) => Ok(InputRead::Idle),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(InputRead::Idle),
+            Err(error) if terminal_is_gone(&error) => Ok(InputRead::Closed),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Whether an I/O error means this terminal has ended rather than a passing problem.
+fn terminal_is_gone(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    ) || matches!(error.raw_os_error(), Some(5 | 6 | 25))
+}
+
+/// What the loop does with the terminal around the board.
+trait BoardUi {
+    fn draw(&mut self, board: &mut Board) -> io::Result<()>;
+    fn handoff(
+        &mut self,
+        board: &mut Board,
+        handoff: &gewu_multiverse::board::Handoff,
+        stop: &dyn Fn() -> bool,
+    ) -> io::Result<()>;
+}
+
+struct ScreenUi<'a> {
+    screen: &'a mut Screen,
+}
+
+impl BoardUi for ScreenUi<'_> {
+    fn draw(&mut self, board: &mut Board) -> io::Result<()> {
+        self.screen.terminal.draw(|frame| board.draw(frame))?;
+        Ok(())
+    }
+
+    fn handoff(
+        &mut self,
+        board: &mut Board,
+        handoff: &gewu_multiverse::board::Handoff,
+        stop: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        let outcome = hand_to_the_user(self.screen, handoff, stop)?;
+        board.handoff_finished();
+        if outcome.interrupted {
+            board.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        }
+        if let Some(status) = outcome.status {
+            status?;
+        }
+        Ok(())
+    }
+}
+
+/// Draw and read keys until the board says to leave, a signal asks the program to
+/// stop, or the terminal ends. `shutdown` runs exactly once on every way out.
+fn run_board(
+    board: &mut Board,
+    stop: &dyn Fn() -> bool,
+    input: &mut dyn TerminalInput,
+    ui: &mut dyn BoardUi,
+) -> io::Result<LoopEnd> {
+    let outcome = (|| -> io::Result<LoopEnd> {
+        loop {
+            if stop() {
+                return Ok(LoopEnd::Finished);
+            }
+            board.tick();
+            if ui.draw(board).is_err() {
+                // A dead standard output is a lost terminal, not a reason to keep
+                // drawing frames nobody can see.
+                return Ok(LoopEnd::Lost);
+            }
+            if board.should_quit() {
+                return Ok(LoopEnd::Finished);
+            }
+            match input.read(TICK) {
+                Ok(InputRead::Event(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    board.on_key(key);
+                }
+                Ok(InputRead::Event(Event::Paste(text))) => {
+                    // A paste into the model form is ordinary text. The board's
+                    // fields are edited one key at a time, so a paste is delivered
+                    // as its characters in order.
+                    for ch in text.chars().filter(|ch| !ch.is_control()) {
+                        board.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                    }
+                }
+                Ok(InputRead::Event(_)) | Ok(InputRead::Idle) => {}
+                // End-of-file and every input error end the board: a loop that
+                // retried a dead terminal is what used to spin at full CPU.
+                Ok(InputRead::Closed) | Err(_) => return Ok(LoopEnd::Lost),
+            }
+            if let Some(handoff) = board.take_handoff() {
+                ui.handoff(board, &handoff, stop)?;
+            }
+        }
+    })();
+    board.shutdown();
+    outcome
 }
 
 /// Draw, then wait for a key, until the board says to leave or a terminal signal
@@ -259,60 +412,130 @@ fn event_loop(
     screen: &mut Screen,
     board: &mut Board,
     termination: Option<&Termination>,
-) -> io::Result<()> {
-    loop {
-        if termination.is_some_and(Termination::requested) {
-            return Ok(());
+) -> io::Result<LoopEnd> {
+    // A pseudo-terminal whose other end closed turns reads into `EIO`; crossterm's
+    // Unix reader retries that error forever. The watcher notices the hang-up and
+    // points standard input at an idle non-blocking pipe, so the reader returns, the
+    // loop sees the loss, and `shutdown` runs once instead of a spin.
+    let hangup = Hangup::install();
+    let stop = || {
+        termination.is_some_and(Termination::requested) || hangup.as_ref().is_some_and(Hangup::lost)
+    };
+    let mut input = CrosstermInput;
+    let mut ui = ScreenUi { screen };
+    let result = run_board(board, &stop, &mut input, &mut ui);
+    if hangup.as_ref().is_some_and(Hangup::lost) {
+        return Ok(LoopEnd::Lost);
+    }
+    result
+}
+
+/// A watcher for the terminal's own hang-up, and the idle pipe its input is moved to.
+struct Hangup {
+    lost: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    // Kept open: standard input is moved to `read`, and `write` keeps it idle
+    // instead of at end-of-file.
+    _read: OwnedFd,
+    _write: OwnedFd,
+}
+
+impl Hangup {
+    fn install() -> Option<Self> {
+        if !io::stdin().is_terminal() {
+            return None;
         }
-        board.tick();
-        screen.terminal.draw(|frame| board.draw(frame))?;
-        if board.should_quit() {
-            return Ok(());
-        }
-        let polled = event::poll(TICK);
-        match polled {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => board.on_key(key),
-                Ok(Event::Paste(text)) => {
-                    // A paste into the model form is ordinary text. The board's
-                    // fields are edited one key at a time, so a paste is delivered
-                    // as its characters in order.
-                    for ch in text.chars().filter(|ch| !ch.is_control()) {
-                        board.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-                    }
+        let (read, write) = pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).ok()?;
+        let lost = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_read = read.try_clone().ok()?;
+        let thread_lost = Arc::clone(&lost);
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let stdin = io::stdin();
+            loop {
+                if thread_stop.load(Ordering::SeqCst) {
+                    return;
                 }
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            },
-            Ok(false) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-        if let Some(handoff) = board.take_handoff() {
-            let outcome = hand_to_the_user(screen, &handoff)?;
-            board.handoff_finished();
-            if outcome.interrupted {
-                board.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+                let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::empty())];
+                match poll(&mut fds, PollTimeout::from(50u16)) {
+                    Ok(0) => continue,
+                    Ok(_) => {
+                        let hung_up = fds[0].revents().is_some_and(|events| {
+                            events.intersects(
+                                PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL,
+                            )
+                        });
+                        if !hung_up {
+                            continue;
+                        }
+                        thread_lost.store(true, Ordering::SeqCst);
+                        let _ = nix::unistd::dup2_stdin(&thread_read);
+                        return;
+                    }
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(_) => return,
+                }
             }
-            outcome.status?;
+        });
+        Some(Self {
+            lost,
+            stop,
+            thread: Some(thread),
+            _read: read,
+            _write: write,
+        })
+    }
+
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Hangup {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
 
 /// What came back from a hand-off: whether the board caught a `^C` while the
-/// person's program owned the terminal, and how that program ended.
+/// person's program owned the terminal, and how that program ended. `status` is
+/// `None` when the stop predicate won before a program was started.
 struct Handoff {
     interrupted: bool,
-    status: io::Result<std::process::ExitStatus>,
+    status: Option<io::Result<std::process::ExitStatus>>,
 }
 
 /// Step out of the board, hand a path to `$EDITOR` or the pager, and step back in.
+///
+/// `stop` is the same terminating-signal/lost-terminal predicate the board loop
+/// uses. The editor wait polls it; when it turns true the program is ended and reaped
+/// and this returns at once, so `run_board` reaches its one `shutdown`.
 fn hand_to_the_user(
     screen: &mut Screen,
     handoff: &gewu_multiverse::board::Handoff,
+    stop: &dyn Fn() -> bool,
 ) -> io::Result<Handoff> {
-    screen.suspend()?;
+    if stop() {
+        return Ok(Handoff {
+            interrupted: false,
+            status: None,
+        });
+    }
+    if let Err(error) = screen.suspend() {
+        if stop() {
+            screen.abandon();
+            return Ok(Handoff {
+                interrupted: false,
+                status: None,
+            });
+        }
+        return Err(error);
+    }
     let guard = SigintGuard::install();
     let status = match handoff.kind {
         HandoffKind::Edit => {
@@ -322,7 +545,7 @@ fn hand_to_the_user(
                 editor::editor()
             );
             let _ = io::stdout().flush();
-            editor::edit(&handoff.path)
+            editor::edit_with_stop(&handoff.path, stop)
         }
         HandoffKind::View => {
             println!(
@@ -330,7 +553,7 @@ fn hand_to_the_user(
                 handoff.label
             );
             let _ = io::stdout().flush();
-            editor::view(&handoff.path)
+            editor::view_with_stop(&handoff.path, stop)
         }
     };
     let interrupted = guard
@@ -338,10 +561,18 @@ fn hand_to_the_user(
         .map(|guard| guard.interrupted())
         .unwrap_or(false);
     drop(guard);
-    screen.resume()?;
+    // A lost terminal has nothing to resume; a caught signal may or may not have
+    // taken the terminal with it. Try only when the terminal is still usable.
+    if stop() {
+        if screen.resume().is_err() {
+            screen.abandon();
+        }
+    } else {
+        screen.resume()?;
+    }
     Ok(Handoff {
         interrupted,
-        status,
+        status: Some(status),
     })
 }
 
@@ -455,6 +686,12 @@ impl Screen {
         self.terminal.clear()
     }
 
+    /// The terminal is gone: there is nothing left to restore, and asking for the
+    /// cursor or the mode back would only fail on a dead pseudo-terminal.
+    fn abandon(&mut self) {
+        self.active = false;
+    }
+
     /// Put the terminal back for good. Safe to call more than once.
     fn leave(&mut self) -> io::Result<()> {
         if !self.active {
@@ -503,6 +740,102 @@ mod tests {
         assert!(guard.interrupted());
     }
 
+    /// A scripted terminal input: one outcome per read, then idle.
+    enum FakeRead {
+        Closed,
+        Error(io::Error),
+        Key(KeyCode),
+    }
+
+    struct ScriptedInput {
+        reads: Vec<FakeRead>,
+    }
+
+    impl TerminalInput for ScriptedInput {
+        fn read(&mut self, _timeout: Duration) -> io::Result<InputRead> {
+            match self.reads.pop() {
+                Some(FakeRead::Closed) => Ok(InputRead::Closed),
+                Some(FakeRead::Error(error)) => Err(error),
+                Some(FakeRead::Key(code)) => Ok(InputRead::Event(Event::Key(KeyEvent::from(code)))),
+                None => Ok(InputRead::Idle),
+            }
+        }
+    }
+
+    struct NoUi;
+
+    impl BoardUi for NoUi {
+        fn draw(&mut self, _board: &mut Board) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn handoff(
+            &mut self,
+            _board: &mut Board,
+            _handoff: &gewu_multiverse::board::Handoff,
+            _stop: &dyn Fn() -> bool,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn end_of_file_ends_the_board_and_shuts_down_once() {
+        let mut board = Board::new(FakeEngine::new());
+        let mut input = ScriptedInput {
+            reads: vec![FakeRead::Closed],
+        };
+        let end = run_board(&mut board, &|| false, &mut input, &mut NoUi)
+            .expect("a lost terminal is a clean end");
+        assert_eq!(end, LoopEnd::Lost);
+        assert_eq!(
+            board.shutdown_calls(),
+            1,
+            "shutdown ran {board:?}",
+            board = "board"
+        );
+    }
+
+    #[test]
+    fn an_input_error_ends_the_board_and_shuts_down_once() {
+        let mut board = Board::new(FakeEngine::new());
+        let mut input = ScriptedInput {
+            reads: vec![FakeRead::Error(io::Error::from_raw_os_error(5))],
+        };
+        let end = run_board(&mut board, &|| false, &mut input, &mut NoUi)
+            .expect("EIO is a lost terminal, not a crash");
+        assert_eq!(end, LoopEnd::Lost);
+        assert_eq!(board.shutdown_calls(), 1);
+    }
+
+    #[test]
+    fn a_terminal_signal_flag_is_honoured_without_waiting_for_a_key() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&flag);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let mut board = Board::new(FakeEngine::new());
+        let mut input = ScriptedInput { reads: Vec::new() };
+        let began = std::time::Instant::now();
+        let end = run_board(
+            &mut board,
+            &|| flag.load(Ordering::SeqCst),
+            &mut input,
+            &mut NoUi,
+        )
+        .expect("the loop ends");
+        let elapsed = began.elapsed();
+        handle.join().expect("the setter ends");
+        assert_eq!(end, LoopEnd::Finished);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the flag took {elapsed:?} to end the loop"
+        );
+        assert_eq!(board.shutdown_calls(), 1);
+    }
+
     /// The terminal-signal guard records the two signals a closing terminal sends.
     #[test]
     fn a_terminal_signal_is_recorded() {
@@ -519,5 +852,162 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(guard.requested());
+    }
+
+    /// A stop requested while the board is in a hand-off ends the person's program,
+    /// reaps it, returns to the loop, and shuts the engine down exactly once.
+    #[test]
+    fn a_stop_during_a_hand_off_ends_the_child_and_shuts_down_once() {
+        use gewu_multiverse::engine_api::{Command, EngineApi};
+
+        let mut engine = FakeEngine::new();
+        engine.send(Command::AcknowledgeTerms).expect("terms");
+        engine
+            .send(Command::SetEndpoint {
+                url: "https://model.example/v1/chat/completions".to_owned(),
+                model: "demo-model".to_owned(),
+                key: Some("demo-key".to_owned()),
+            })
+            .expect("endpoint");
+        engine
+            .send(Command::CreateAgents { count: 1 })
+            .expect("one agent");
+        engine.send(Command::StartForgejo).expect("Forgejo");
+        for _ in 0..122 {
+            engine.tick();
+        }
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("start");
+        engine.tick();
+        let _ = engine.board();
+
+        let mut board = Board::new(engine);
+        board.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            board.screen(),
+            gewu_multiverse::board::Screen::Agent,
+            "the board did not reach the agent screen"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "gewu-main-handoff-stop-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).expect("the test root");
+        let pid_file = root.join("editor.pid");
+        let script = root.join("fake-editor.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\ntrap '' TERM HUP\nprintf '%s' \"$$\" > '{}'\nwhile :; do read -t 1 _ || true; done\n",
+                pid_file.display()
+            ),
+        )
+        .expect("the fake editor is written");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("the fake editor metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&script, permissions).expect("the fake editor is executable");
+
+        struct HandoffUi {
+            stop: Arc<AtomicBool>,
+            script: std::path::PathBuf,
+            path: std::path::PathBuf,
+            status: Option<io::Result<std::process::ExitStatus>>,
+        }
+
+        impl BoardUi for HandoffUi {
+            fn draw(&mut self, _board: &mut Board) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn handoff(
+                &mut self,
+                _board: &mut Board,
+                _handoff: &gewu_multiverse::board::Handoff,
+                _stop: &dyn Fn() -> bool,
+            ) -> io::Result<()> {
+                let stop = Arc::clone(&self.stop);
+                self.status = Some(editor::handoff_with(
+                    self.script.to_str().expect("a UTF-8 path"),
+                    &self.path,
+                    false,
+                    &|| stop.load(Ordering::SeqCst),
+                ));
+                Ok(())
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut ui = HandoffUi {
+            stop: Arc::clone(&stop),
+            script: script.clone(),
+            path: root.join("instruction.md"),
+            status: None,
+        };
+        let setter = {
+            let stop = Arc::clone(&stop);
+            let pid_file = pid_file.clone();
+            let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !pid_file.is_file() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                stop.store(true, Ordering::SeqCst);
+                let _ = stopped_tx.send(std::time::Instant::now());
+            });
+            (handle, stopped_rx)
+        };
+        let mut input = ScriptedInput {
+            reads: vec![FakeRead::Key(KeyCode::Char('e'))],
+        };
+        let end = run_board(
+            &mut board,
+            &|| stop.load(Ordering::SeqCst),
+            &mut input,
+            &mut ui,
+        )
+        .expect("the hand-off ends cleanly");
+        let stopped_at = setter
+            .1
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the stop was requested");
+        setter.0.join().expect("the setter ends");
+
+        assert_eq!(end, LoopEnd::Finished);
+        assert_eq!(
+            board.shutdown_calls(),
+            1,
+            "shutdown did not run exactly once"
+        );
+        let status = ui
+            .status
+            .expect("the hand-off ran")
+            .expect("the hand-off returns");
+        assert!(!status.success(), "the stopped editor exited successfully");
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the editor wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the hand-off child {pid} was left behind"
+        );
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(1),
+            "the stop took {:?} to end the hand-off and reach shutdown",
+            stopped_at.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

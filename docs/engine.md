@@ -101,6 +101,19 @@ start a fresh Forgejo, so two servers never share one data directory.
 screen, and print one line when an agent was started (it resumes when the program is
 opened again).
 
+A quit while the Forgejo is still starting is handled too: the start job records the
+child's pid immediately after spawning it, `shutdown` signals that pid as well as the
+stored child, and it waits a bounded time for the start job to stop and reap its child.
+The Forgejo access-token helper at the first `● running` frame is recorded the same way,
+and its output is drained while it runs, so `shutdown` can end and reap it and a large
+answer cannot stall the start.
+A lost terminal — `SIGHUP`, `SIGTERM`, end-of-file, or `EIO` on a closed pseudo-terminal —
+ends the input loop at once: `shutdown` runs once, the screen is not restored on a dead
+terminal, and the program exits instead of retrying the dead input. An instruction-editor
+or log-pager hand-off watches that same stop predicate: a caught signal or lost terminal
+ends the hand-off program politely and then by force, reaps it, and returns so the board
+runs that one `shutdown`; a normal hand-off still waits for the person's own program.
+
 ## Older files are left alone
 
 The engine's own settings are `multiverse.toml` in the configuration root:

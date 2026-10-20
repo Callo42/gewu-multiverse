@@ -634,6 +634,21 @@ pub fn prepare_instance(
     binary: &Path,
     admin_login: &str,
 ) -> Result<PreparedInstance, String> {
+    prepare_instance_checked(data_root, binary, admin_login, || false)
+}
+
+/// The same preparation, checking `cancelled` before and after every step and while a
+/// Forgejo CLI command runs. A quit during `migrate` or the administrator command
+/// stops that child and reaps it rather than leaving it behind.
+pub fn prepare_instance_checked(
+    data_root: &Path,
+    binary: &Path,
+    admin_login: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<PreparedInstance, String> {
+    if cancelled() {
+        return Err("the start was called off".to_owned());
+    }
     let paths = InstancePaths::under(data_root);
     paths.ensure()?;
     let existing = fs::read_to_string(&paths.app_ini).ok();
@@ -672,8 +687,14 @@ pub fn prepare_instance(
     let password = fs::read_to_string(&paths.admin_password)
         .map_err(|error| format!("the administrator password cannot be read: {error}"))?;
     let password = password.trim().to_owned();
-    forgejo_command(binary, &paths, &["migrate"])?;
-    ensure_admin(binary, &paths, &kept_login, &password)?;
+    if cancelled() {
+        return Err("the start was called off".to_owned());
+    }
+    forgejo_command_checked(binary, &paths, &["migrate"], &cancelled)?;
+    ensure_admin(binary, &paths, &kept_login, &password, &cancelled)?;
+    if cancelled() {
+        return Err("the start was called off".to_owned());
+    }
     // A local install may run the CLI before the web process has ever started; that is
     // the point of `migrate`. Read the version this binary reports without starting it.
     Ok(PreparedInstance {
@@ -691,9 +712,10 @@ fn ensure_admin(
     paths: &InstancePaths,
     login: &str,
     password: &str,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let email = format!("{login}@agents.invalid");
-    let output = forgejo_output(
+    let output = forgejo_output_checked(
         binary,
         paths,
         &[
@@ -709,6 +731,7 @@ fn ensure_admin(
             "--admin",
             "--must-change-password=false",
         ],
+        cancelled,
     )?;
     let text = format!(
         "{}\n{}",
@@ -728,7 +751,7 @@ fn ensure_admin(
     }
     // The account was made by an earlier start. Hold the password file and the
     // account together, without ever putting the password in an error line.
-    let output = forgejo_output(
+    let output = forgejo_output_checked(
         binary,
         paths,
         &[
@@ -741,6 +764,7 @@ fn ensure_admin(
             password,
             "--must-change-password=false",
         ],
+        cancelled,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -758,9 +782,25 @@ pub fn generate_admin_token(
     data_root: &Path,
     login: &str,
 ) -> Result<Secret, String> {
+    generate_admin_token_checked(binary, data_root, login, &|| false, |_| {})
+}
+
+/// The same token command, with the helper's pid reported as soon as it exists and
+/// the engine's stop predicate checked while it runs.
+///
+/// The engine records the pid under its state lock, so `shutdown` can end a token
+/// helper that is still running. `on_spawn` runs before the command's output is read
+/// for the first time.
+pub fn generate_admin_token_checked(
+    binary: &Path,
+    data_root: &Path,
+    login: &str,
+    cancelled: &dyn Fn() -> bool,
+    on_spawn: impl FnOnce(u32),
+) -> Result<Secret, String> {
     let paths = InstancePaths::under(data_root);
     let name = format!("gewu-engine-admin-{}", crate::time::now_unix_ms());
-    let output = forgejo_output(
+    let output = forgejo_output_tracked(
         binary,
         &paths,
         &[
@@ -775,6 +815,8 @@ pub fn generate_admin_token(
             "all",
             "--raw",
         ],
+        cancelled,
+        on_spawn,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -789,8 +831,13 @@ pub fn generate_admin_token(
     Ok(Secret::new(token))
 }
 
-fn forgejo_command(binary: &Path, paths: &InstancePaths, args: &[&str]) -> Result<(), String> {
-    let output = forgejo_output(binary, paths, args)?;
+fn forgejo_command_checked(
+    binary: &Path,
+    paths: &InstancePaths,
+    args: &[&str],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    let output = forgejo_output_checked(binary, paths, args, cancelled)?;
     if output.status.success() {
         return Ok(());
     }
@@ -801,12 +848,32 @@ fn forgejo_command(binary: &Path, paths: &InstancePaths, args: &[&str]) -> Resul
     ))
 }
 
-fn forgejo_output(
+fn forgejo_output_checked(
     binary: &Path,
     paths: &InstancePaths,
     args: &[&str],
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<std::process::Output, String> {
-    Command::new(binary)
+    forgejo_output_tracked(binary, paths, args, cancelled, |_| {})
+}
+
+/// Run one Forgejo CLI helper, report its pid as soon as it exists, and keep reading
+/// its output while it runs.
+///
+/// Reading both pipes concurrently is what keeps a helper that writes more than a
+/// pipe buffer from blocking before it exits. `on_spawn` is called before the first
+/// read, so the engine can put the pid where `shutdown` will see it.
+fn forgejo_output_tracked(
+    binary: &Path,
+    paths: &InstancePaths,
+    args: &[&str],
+    cancelled: &dyn Fn() -> bool,
+    on_spawn: impl FnOnce(u32),
+) -> Result<std::process::Output, String> {
+    if cancelled() {
+        return Err("the start was called off".to_owned());
+    }
+    let mut child = Command::new(binary)
         .args(args)
         .arg("--config")
         .arg(&paths.app_ini)
@@ -817,8 +884,63 @@ fn forgejo_output(
         .env("GITEA_WORK_DIR", &paths.root)
         .env("HOME", &paths.home)
         .env("GIT_CONFIG_GLOBAL", &paths.git_config)
-        .output()
-        .map_err(|error| format!("the Forgejo command could not be run: {error}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("the Forgejo command could not be run: {error}"))?;
+    on_spawn(child.id());
+    // Drain both pipes while the command runs. Waiting without reading stalls a
+    // helper whose output is larger than the pipe buffer.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "the Forgejo command has no output pipe".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "the Forgejo command has no error pipe".to_owned())?;
+    let stdout = std::thread::spawn(move || read_all(stdout));
+    let stderr = std::thread::spawn(move || read_all(stderr));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout.join().unwrap_or_default();
+                let stderr = stderr.join().unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                signal_group(child.id(), nix::sys::signal::Signal::SIGKILL);
+                let _ = child.wait();
+                return Err(format!("the Forgejo command could not be checked: {error}"));
+            }
+        }
+        if cancelled() {
+            // Ask the CLI politely, then end its group; the wait below reaps it.
+            signal_group(child.id(), nix::sys::signal::Signal::SIGTERM);
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline && child.try_wait().ok().flatten().is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            signal_group(child.id(), nix::sys::signal::Signal::SIGKILL);
+            let _ = child.wait();
+            return Err("the start was called off".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Read a pipe to its end as bytes.
+fn read_all(mut pipe: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = pipe.read_to_end(&mut bytes);
+    bytes
 }
 
 /// Write one instance's running pid at 0600.
@@ -1022,7 +1144,7 @@ impl Drop for RunningForgejo {
     }
 }
 
-/// Start one prepared instance and wait until `/api/v1/version` answers.
+/// Start one instance from scratch and wait until `/api/v1/version` answers.
 pub fn start_instance(
     binary: &Path,
     data_root: &Path,
@@ -1032,8 +1154,7 @@ pub fn start_instance(
 }
 
 /// The same start, with a cancellation check made before the child is spawned and on
-/// each readiness poll. The engine uses it so closing the program during a slow
-/// install or prepare cannot leave a server behind.
+/// each readiness poll.
 pub fn start_instance_checked(
     binary: &Path,
     data_root: &Path,
@@ -1044,6 +1165,26 @@ pub fn start_instance_checked(
         return Err("the start was called off".to_owned());
     }
     let prepared = prepare_instance(data_root, binary, &admin_login_from_env())?;
+    if cancelled() {
+        return Err("the start was called off".to_owned());
+    }
+    spawn_prepared(prepared, binary, ready_timeout, |_pid| {}, cancelled)
+}
+
+/// Spawn one already-prepared instance and wait until `/api/v1/version` answers.
+///
+/// `on_spawn` is called with the child's pid immediately after the child exists and
+/// before the pid record is written or any readiness poll is made. The engine records
+/// that pid under its state lock, so `shutdown` can signal a server whose start has
+/// not returned yet. The readiness loop checks `cancelled` before every poll and stops
+/// and reaps its own child when it is called off.
+pub fn spawn_prepared(
+    prepared: PreparedInstance,
+    binary: &Path,
+    ready_timeout: Duration,
+    on_spawn: impl FnOnce(u32),
+    cancelled: impl Fn() -> bool,
+) -> Result<RunningForgejo, String> {
     if cancelled() {
         return Err("the start was called off".to_owned());
     }
@@ -1073,6 +1214,11 @@ pub fn start_instance_checked(
         })?))
         .stderr(Stdio::from(log))
         .process_group(0);
+    // The last cancellation check before the child exists. Once it is spawned the
+    // caller has its pid and the job stops it if the shutdown wins the race.
+    if cancelled() {
+        return Err("the start was called off".to_owned());
+    }
     let child = command
         .spawn()
         .map_err(|error| format!("the bundled Forgejo could not be started: {error}"))?;
@@ -1086,6 +1232,13 @@ pub fn start_instance_checked(
         started: Instant::now(),
         stopping: false,
     };
+    // The caller records the child here, before the readiness wait. A quit from this
+    // moment on must find something to signal.
+    on_spawn(pid);
+    if cancelled() {
+        server.stop(Duration::from_secs(2));
+        return Err("the start was called off".to_owned());
+    }
     // Written before the readiness wait: a program killed during the wait must leave
     // a record a later start can find and stop.
     if let Err(reason) = write_pid_file(&server.pid_file, pid) {
@@ -1130,6 +1283,27 @@ pub fn start_instance_checked(
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A `RunningForgejo` around a child a test started, so the tests can exercise a start
+/// that blocks before readiness without launching the real server.
+#[cfg(test)]
+pub(crate) fn test_server(
+    child: Child,
+    url: String,
+    log: PathBuf,
+    pid_file: PathBuf,
+) -> RunningForgejo {
+    let pid = child.id();
+    RunningForgejo {
+        child,
+        pid,
+        url,
+        log,
+        pid_file,
+        started: Instant::now(),
+        stopping: false,
     }
 }
 
@@ -1308,5 +1482,66 @@ mod tests {
         assert!(stage.exists());
         let _ = fs::remove_file(&stage);
         assert!(!stage.exists());
+    }
+
+    /// A plain executable fixture for the command paths.
+    fn fake_helper(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, body).expect("the fake helper is written");
+        crate::mode::set_mode(&path, 0o755).expect("the fake helper is executable");
+        path
+    }
+
+    /// A helper that writes more than a pipe buffer must be read while it runs; a
+    /// wait that only checks `try_wait` lets it block for ever on a full pipe.
+    #[test]
+    fn a_helper_with_large_output_is_drained_while_it_runs() {
+        let root = crate::test_support::scratch_root("bundled-helper-drain");
+        let paths = InstancePaths::under(&root);
+        paths.ensure().expect("the instance paths");
+        let helper = fake_helper(
+            &root,
+            "big-output.sh",
+            "#!/bin/sh\nhead -c 1048576 /dev/zero | tr '\\0' x\nprintf '\\n'\n",
+        );
+        let began = Instant::now();
+        let output = forgejo_output_checked(&helper, &paths, &[], &|| false)
+            .expect("a large output is drained");
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout.len(),
+            1048576 + 1,
+            "the helper output was cut short"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the helper took {:?}; its pipe was not drained",
+            began.elapsed()
+        );
+    }
+
+    /// The token path reports the helper's pid before reading its output, and after
+    /// the call the helper has ended and been reaped.
+    #[test]
+    fn a_token_helper_reports_its_pid_and_leaves_no_child() {
+        let root = crate::test_support::scratch_root("bundled-helper-token");
+        let paths = InstancePaths::under(&root);
+        paths.ensure().expect("the instance paths");
+        let helper = fake_helper(
+            &root,
+            "fake-forgejo-token.sh",
+            "#!/bin/sh\nprintf 'token-abc\\n'\n",
+        );
+        let mut seen = 0;
+        let token = generate_admin_token_checked(&helper, &root, "tester", &|| false, |pid| {
+            seen = pid;
+        })
+        .expect("the token is read");
+        assert_eq!(token.expose(), "token-abc");
+        assert!(seen > 0, "the helper pid was never reported");
+        assert!(
+            !Path::new(&format!("/proc/{seen}")).exists(),
+            "the token helper {seen} was left running or unreaped"
+        );
     }
 }
