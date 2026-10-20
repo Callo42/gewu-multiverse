@@ -41,8 +41,12 @@ pub fn choose_pager(pager: Option<String>) -> String {
 /// who set no editor is exactly the person who does not know it, so a friendlier
 /// editor is preferred when the machine has one.
 pub fn editor() -> String {
-    let editor = env::var("EDITOR").ok().filter(|value| !value.trim().is_empty());
-    let visual = env::var("VISUAL").ok().filter(|value| !value.trim().is_empty());
+    let editor = env::var("EDITOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let visual = env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     if editor.is_some() || visual.is_some() {
         return choose_editor(editor, visual);
     }
@@ -133,10 +137,8 @@ impl Scratch {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "{SCRATCH_PREFIX}{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{}-{nanos}", std::process::id()));
         // `create_dir_all` makes the directory with the process umask (`0775` here),
         // not the `0700` every other directory the product makes is held to. The
         // scratch holds a program's own state, so it gets the same custody (O2).
@@ -180,7 +182,7 @@ pub fn sweep_stale_scratch() {
         let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
-        if !crate::supervisor::process_alive(pid) {
+        if !crate::run::process_alive(pid) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -209,16 +211,16 @@ fn handoff_plan(
         // `less` writes `~/.lesshst` unless it is told not to (H-6).
         env.push(("LESSHISTFILE".to_owned(), "/dev/null".to_owned()));
     }
-    if matches!(name, "vi" | "vim" | "nvim" | "ex" | "vim.tiny" | "vim.basic") {
+    if matches!(
+        name,
+        "vi" | "vim" | "nvim" | "ex" | "vim.tiny" | "vim.basic"
+    ) {
         // vim writes `~/.viminfo` on exit; `-i NONE` suppresses it.
         program.push_str(" -i NONE");
     }
     if name == "nano" {
         // nano writes `$XDG_DATA_HOME/nano` (default `~/.local/share/nano`).
-        env.push((
-            "XDG_DATA_HOME".to_owned(),
-            scratch.display().to_string(),
-        ));
+        env.push(("XDG_DATA_HOME".to_owned(), scratch.display().to_string()));
     }
     (program, env)
 }
@@ -277,7 +279,6 @@ mod tests {
         assert_eq!(choose_editor(Some("vi".to_owned()), None), "vi");
         assert_eq!(choose_editor(Some("emacs".to_owned()), None), "emacs");
     }
-
 
     #[test]
     fn a_pager_hand_off_writes_no_history_into_the_users_home() {

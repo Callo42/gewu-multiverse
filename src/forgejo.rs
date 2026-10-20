@@ -25,23 +25,46 @@
 //! failure — a bad URL, a bad token, a token without the rights the configuration
 //! expects, an operation outside the token's rights — without repeating a message.
 
+use std::cell::Cell;
 use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Role;
 use crate::credentials::{REDACTED, Secret};
-use crate::words;
 
 /// How long one Forgejo request may take.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How many repositories the role check lists at most.
+/// How many repositories one listing asks for at most.
 pub const MAX_REPOSITORIES: usize = 200;
+
+/// How many assigned issues one search may return.
+pub const MAX_ISSUES: usize = 50;
+
+/// How many comments one read may return.
+pub const MAX_COMMENTS: usize = 20;
 
 /// The name the tool gives an agent identity, before the agent's own name.
 pub const LOGIN_PREFIX: &str = "gewu-";
+
+/// The issue right a read needs.
+pub const ISSUE_READ_SCOPE: &str = "read:issue";
+
+/// The issue right a write needs.
+pub const ISSUE_WRITE_SCOPE: &str = "write:issue";
+
+/// The rights a managed agent token is made with: repository and user rights for the
+/// clone and the identity, and issue rights for the tools. A token made before the
+/// issue tools existed carries the first four only.
+pub const AGENT_TOKEN_SCOPES: [&str; 6] = [
+    "write:repository",
+    "write:user",
+    "read:user",
+    "read:repository",
+    ISSUE_READ_SCOPE,
+    ISSUE_WRITE_SCOPE,
+];
 
 /// The description the tool writes on an identity it creates, so a later run can
 /// tell its own machine identity from a person who happens to have that name.
@@ -51,38 +74,6 @@ pub const IDENTITY_DESCRIPTION: &str = "Machine identity created by gewu-multive
 /// reserved and can never resolve, so a commit authored with it cannot be mistaken
 /// for mail.
 pub const IDENTITY_EMAIL_DOMAIN: &str = "agents.invalid";
-
-/// What one request needs: where the instance is, which token, how long to wait.
-#[derive(Clone)]
-pub struct ForgejoConfig {
-    /// The base URL, for example `https://forgejo.example.org`.
-    pub url: String,
-    /// The token, from the credentials file and nowhere else.
-    pub token: Secret,
-    /// How long one request may take.
-    pub timeout: Duration,
-}
-
-impl ForgejoConfig {
-    /// A configuration with the default timeout.
-    pub fn new(url: impl Into<String>, token: Secret) -> Self {
-        Self {
-            url: url.into(),
-            token,
-            timeout: DEFAULT_TIMEOUT,
-        }
-    }
-}
-
-impl fmt::Debug for ForgejoConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ForgejoConfig")
-            .field("url", &self.url)
-            .field("token", &self.token)
-            .field("timeout", &self.timeout)
-            .finish()
-    }
-}
 
 /// The account a token belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -201,126 +192,66 @@ impl PullRequest {
     }
 }
 
-/// The result of the role check: who the token is, and what it can see.
+/// One issue, as the instance reports it. A pull request is also an issue, and its
+/// `pull_request` marker says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoleCheck {
-    /// The instance that was asked.
-    pub url: String,
-    /// The role the configuration expects the token to have.
-    pub role: Role,
-    /// The account the token belongs to.
-    pub viewer: Viewer,
-    /// The repositories the token can see.
-    pub repositories: Vec<Repository>,
-    /// How many of those are private: the visible difference between the
-    /// administrative view and an ordinary one.
-    pub private_visible: usize,
+pub struct Issue {
+    /// The instance's number for it.
+    pub number: u64,
+    /// Its title.
+    pub title: String,
+    /// Its body, when it has one.
+    pub body: Option<String>,
+    /// `open`, `closed`.
+    pub state: String,
+    /// The web address, when the instance gives one.
+    pub html_url: Option<String>,
+    /// Its labels' names.
+    pub labels: Vec<String>,
+    /// When it was last updated, as the instance writes it.
+    pub updated_at: Option<String>,
+    /// The login that opened it, when the instance names one.
+    pub author: Option<String>,
+    /// The number of comments the instance counts.
+    pub comments: u64,
+    /// `owner/name`, when the reply names the repository.
+    pub repository: Option<String>,
+    /// The pull-request marker's web address, when this issue is a pull request.
+    pub pull_request_url: Option<String>,
 }
 
-impl RoleCheck {
-    /// Whether this is the administrative view.
-    pub fn administrative(&self) -> bool {
-        self.role == Role::Admin
-    }
-
-    /// One line for the status bar.
-    ///
-    /// The role comes first, so a narrow footer clips the counts rather than the word
-    /// that says which view this is.
-    pub fn summary(&self) -> String {
-        self.summary_with_admin(true)
-    }
-
-    /// The same summary, knowing whether an administrator token exists.
-    ///
-    /// A successful check with an ordinary role token can reveal that the token
-    /// belongs to an administrator. Naming `C` is only true when an administrator
-    /// token is configured; without one the product says what the token is and names
-    /// the route that can supply it (`A`/the add form), instead of a dead key
-    /// (w53 F8).
-    pub fn summary_with_admin(&self, admin_token_present: bool) -> String {
-        // The word for the view leads, so a narrow footer clips the counts rather than
-        // the word that says which view this is; the counts are compact so the checked
-        // panel still gives the repository list more than one row at 80×24 even when
-        // the token belongs to an administrator.
-        let mut text = format!(
-            "as {}, {} sees {}, {} private",
-            if self.administrative() {
-                "an administrator"
-            } else {
-                "an ordinary member"
-            },
-            self.viewer.login,
-            words::counted(self.repositories.len(), "repository", "repositories"),
-            self.private_visible,
-        );
-        // The label comes from the configured role, but the token may belong to an
-        // administrator. Saying only "ordinary member" beside an administrator's name
-        // is a contradiction the user cannot resolve; say what the token actually is
-        // and name the key that shows the other view only when that key can work.
-        if self.viewer.is_admin && !self.administrative() {
-            if admin_token_present {
-                text.push_str(&format!(
-                    "; `{}` is an administrator — press C for that view",
-                    self.viewer.login
-                ));
-            } else {
-                text.push_str(&format!(
-                    "; `{}` is an administrator — press A on the Credentials screen to add that token for the administrative view",
-                    self.viewer.login
-                ));
-            }
-        }
-        text
+impl Issue {
+    /// `owner/repo#number`, the way a person writes it.
+    pub fn reference(&self, repository: &str) -> String {
+        format!("{repository}#{}", self.number)
     }
 }
 
-/// One repository's state, as the tool offers to show it.
+/// One comment on an issue or pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepositoryState {
-    /// The repository itself.
-    pub repository: Repository,
-    /// Its open pull requests.
-    pub open_pull_requests: Vec<PullRequest>,
-    /// Its branches.
-    pub branches: Vec<String>,
+pub struct Comment {
+    /// The instance's id for it.
+    pub id: u64,
+    /// Its text.
+    pub body: String,
+    /// The web address, when the instance gives one.
+    pub html_url: Option<String>,
+    /// The login that wrote it, when the instance names one.
+    pub author: Option<String>,
+    /// When it was written, as the instance writes it.
+    pub created_at: Option<String>,
 }
 
-impl RepositoryState {
-    /// A few lines for a screen.
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![format!(
-            "{} ({}), default branch {}",
-            self.repository.full_name,
-            if self.repository.private {
-                "private"
-            } else {
-                "public"
-            },
-            self.repository
-                .default_branch
-                .as_deref()
-                .unwrap_or("unknown"),
-        )];
-        lines.push(format!(
-            "{}: {}",
-            words::counted(self.branches.len(), "branch", "branches"),
-            if self.branches.is_empty() {
-                "none".to_owned()
-            } else {
-                self.branches.join(", ")
-            }
-        ));
-        lines.push(words::counted(
-            self.open_pull_requests.len(),
-            "open pull request",
-            "open pull requests",
-        ));
-        for pull in &self.open_pull_requests {
-            lines.push(format!("  {}", pull.line()));
-        }
-        lines
-    }
+/// One team of an organisation, as far as the bundled engine needs it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Team {
+    /// The instance's id for the team, used to add and remove members.
+    pub id: u64,
+    /// The team's name, e.g. `agents`.
+    pub name: String,
+    /// `read`, `write` or `admin`.
+    #[serde(default)]
+    pub permission: String,
 }
 
 /// Why a Forgejo request did not produce an answer.
@@ -343,14 +274,6 @@ pub enum ForgejoError {
         /// The status the instance answered with.
         status: u16,
     },
-    /// The token belongs to an ordinary account, but the configuration says admin.
-    #[error(
-        "the token belongs to `{login}`, who is not an administrator, but the configuration says role = \"admin\""
-    )]
-    NotAdmin {
-        /// The account the token belongs to.
-        login: String,
-    },
     /// The token does not have the rights this operation needs.
     #[error("the token is not allowed to do this (HTTP {status}): {message}")]
     Forbidden {
@@ -358,6 +281,18 @@ pub enum ForgejoError {
         status: u16,
         /// A bounded, redacted excerpt of what the instance said.
         message: String,
+    },
+    /// The token does not carry the scope the operation needs.
+    ///
+    /// Forgejo names the missing right in the refusal body; that name is kept, and
+    /// the rest of the body is never carried forward. An empty list means the
+    /// instance refused for scope reasons but named no right.
+    #[error("the Forgejo token is missing the right(s) {} (HTTP {status})", rights.join(", "))]
+    MissingScope {
+        /// The status the instance answered with.
+        status: u16,
+        /// The rights the instance named as missing.
+        rights: Vec<String>,
     },
     /// The thing asked for is not there, or the token may not see it.
     #[error("the Forgejo has nothing at {what} (HTTP 404){hint}")]
@@ -402,8 +337,8 @@ impl ForgejoError {
             ForgejoError::BadUrl { .. } => "bad_url",
             ForgejoError::MissingToken => "missing_token",
             ForgejoError::BadToken { .. } => "bad_token",
-            ForgejoError::NotAdmin { .. } => "not_admin",
             ForgejoError::Forbidden { .. } => "forbidden",
+            ForgejoError::MissingScope { .. } => "missing_scope",
             ForgejoError::NotFound { .. } => "not_found",
             ForgejoError::Server { .. } => "server_error",
             ForgejoError::MalformedReply { .. } => "malformed_reply",
@@ -418,6 +353,15 @@ pub struct ForgejoClient {
     base: String,
     token: Secret,
     agent: ureq::Agent,
+    /// Whether the newest request that produced an answer was answered with a 2xx.
+    ///
+    /// A write can be accepted by the instance and still carry a body this client
+    /// cannot read as JSON (a proxy truncation, another reply shape). The write
+    /// nevertheless happened, so the tools count it against their bound from this
+    /// flag rather than from whether the reply parsed. [`ForgejoClient::begin_write`]
+    /// clears it before a write, so an earlier read's 2xx can never be mistaken for a
+    /// write's.
+    last_2xx: Cell<bool>,
 }
 
 impl ForgejoClient {
@@ -433,12 +377,24 @@ impl ForgejoClient {
             .user_agent("gewu-multiverse")
             .build()
             .new_agent();
-        Ok(Self { base, token, agent })
+        Ok(Self {
+            base,
+            token,
+            agent,
+            last_2xx: Cell::new(false),
+        })
     }
 
-    /// The base URL, without a trailing slash.
-    pub fn base(&self) -> &str {
-        &self.base
+    /// Note that a request is about to be a write, so an earlier read's 2xx cannot
+    /// stand in for the write's answer.
+    pub fn begin_write(&self) {
+        self.last_2xx.set(false);
+    }
+
+    /// Whether the newest answered request was a 2xx. A transport failure leaves the
+    /// flag as it was, so callers clear it first with [`ForgejoClient::begin_write`].
+    pub fn last_2xx(&self) -> bool {
+        self.last_2xx.get()
     }
 
     /// The `Authorization` header. The one place a token value leaves this module.
@@ -478,39 +434,6 @@ impl ForgejoClient {
         }
     }
 
-    /// One repository's state: the repository, its branches and its open pulls.
-    pub fn repository_state(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<RepositoryState, ForgejoError> {
-        let repository =
-            self.repository(namespace, name)?
-                .ok_or_else(|| ForgejoError::NotFound {
-                    what: format!("{namespace}/{name}"),
-                    hint: String::new(),
-                })?;
-        let branches = self.branches(namespace, name)?;
-        let open_pull_requests = self.pull_requests(namespace, name)?;
-        Ok(RepositoryState {
-            repository,
-            open_pull_requests,
-            branches,
-        })
-    }
-
-    /// The branches of one repository.
-    pub fn branches(&self, namespace: &str, name: &str) -> Result<Vec<String>, ForgejoError> {
-        let path = format!(
-            "/api/v1/repos/{}/{}/branches?limit=200",
-            segment(namespace),
-            segment(name)
-        );
-        let body = self.get(&path)?;
-        let wire: Vec<WireBranch> = parse(&body, &path)?;
-        Ok(wire.into_iter().map(|branch| branch.name).collect())
-    }
-
     /// The open pull requests of one repository.
     pub fn pull_requests(
         &self,
@@ -525,6 +448,89 @@ impl ForgejoClient {
         let body = self.get(&path)?;
         let wire: Vec<WirePull> = parse(&body, &path)?;
         Ok(wire.into_iter().map(PullRequest::from).collect())
+    }
+
+    /// One issue or pull request by number, with its own facts and comment count.
+    pub fn issue(&self, namespace: &str, name: &str, number: u64) -> Result<Issue, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues/{number}",
+            segment(namespace),
+            segment(name)
+        );
+        let body = self.get(&path)?;
+        let mut issue: Issue = parse::<WireIssue>(&body, &path)?.into();
+        // The issue reply does not repeat the repository; the caller's request does.
+        issue.repository = Some(format!("{namespace}/{name}"));
+        Ok(issue)
+    }
+
+    /// Open one issue, as the token's account. Used by the bundled engine's tests and
+    /// by a person-facing setup step to leave one piece of work for an agent.
+    pub fn create_issue(
+        &self,
+        namespace: &str,
+        name: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Issue, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues",
+            segment(namespace),
+            segment(name)
+        );
+        let payload = serde_json::json!({ "title": title, "body": body }).to_string();
+        let reply = self.post(&path, &payload)?;
+        let mut issue: Issue = parse::<WireIssue>(&reply, &path)?.into();
+        issue.repository = Some(format!("{namespace}/{name}"));
+        Ok(issue)
+    }
+
+    /// The open issues assigned to the token's own account, across every repository
+    /// the token can see. The caller narrows them to its cloned repositories.
+    pub fn assigned_issues(&self) -> Result<Vec<Issue>, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/issues/search?state=open&assigned=true&type=issues&limit={}",
+            MAX_ISSUES
+        );
+        let body = self.get(&path)?;
+        let wire: Vec<WireIssue> = parse(&body, &path)?;
+        Ok(wire.into_iter().map(Issue::from).collect())
+    }
+
+    /// The comments of one issue or pull request, oldest first, bounded.
+    pub fn issue_comments(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+        limit: usize,
+    ) -> Result<Vec<Comment>, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues/{number}/comments?limit={}",
+            segment(namespace),
+            segment(name),
+            limit.min(MAX_COMMENTS)
+        );
+        let body = self.get(&path)?;
+        let wire: Vec<WireComment> = parse(&body, &path)?;
+        Ok(wire.into_iter().map(Comment::from).collect())
+    }
+
+    /// Write one comment on an issue or pull request, as the token's account.
+    pub fn comment_on_issue(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<Comment, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues/{number}/comments",
+            segment(namespace),
+            segment(name)
+        );
+        let reply = self.post(&path, &serde_json::json!({ "body": body }).to_string())?;
+        Ok(parse::<WireComment>(&reply, &path)?.into())
     }
 
     /// Who an account is, when the token may see it.
@@ -582,12 +588,31 @@ impl ForgejoClient {
         let path = format!("/api/v1/admin/users/{}/tokens", segment(login));
         let body = serde_json::json!({
             "name": name,
-            "scopes": ["write:repository", "write:user", "read:user", "read:repository"],
+            "scopes": AGENT_TOKEN_SCOPES,
         })
         .to_string();
         let reply = self.post(&path, &body)?;
         let wire: WireToken = parse(&reply, &path)?;
         Ok(Secret::new(wire.sha1))
+    }
+
+    /// Delete an access token of an account, as an administrator.
+    ///
+    /// This is how a renewal revokes the credential it replaces rather than merely
+    /// leaving it behind: the name recorded when the token was made names the key to
+    /// remove. A token that is already gone is not an error, because the thing the
+    /// caller wanted — that token no longer answers — is already true.
+    pub fn delete_token_for(&self, login: &str, name: &str) -> Result<bool, ForgejoError> {
+        let path = format!(
+            "/api/v1/admin/users/{}/tokens/{}",
+            segment(login),
+            segment(name)
+        );
+        match self.delete(&path) {
+            Ok(()) => Ok(true),
+            Err(ForgejoError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Open a pull request, as the token's account.
@@ -645,6 +670,161 @@ impl ForgejoClient {
         Ok(parse::<WirePull>(&reply, &path)?.into())
     }
 
+    /// Create the one organisation, treating an existing name as success.
+    pub fn ensure_organisation(&self, name: &str) -> Result<(), ForgejoError> {
+        let path = "/api/v1/orgs";
+        let body = serde_json::json!({
+            "username": name,
+            "full_name": name,
+            "visibility": "private",
+        })
+        .to_string();
+        match self.post(path, &body) {
+            Ok(_) => Ok(()),
+            Err(ForgejoError::Server { status, message })
+                if (status == 409 || status == 422) && message.contains("already exists") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The teams of one organisation.
+    pub fn teams(&self, organisation: &str) -> Result<Vec<Team>, ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/teams", segment(organisation));
+        let body = self.get(&path)?;
+        let wire: Vec<WireTeam> = parse(&body, &path)?;
+        Ok(wire.into_iter().map(Team::from).collect())
+    }
+
+    /// The team named `name` in one organisation, creating it with write permission
+    /// over all the organisation's repositories when it is not there yet.
+    pub fn ensure_team(&self, organisation: &str, name: &str) -> Result<Team, ForgejoError> {
+        if let Some(team) = self
+            .teams(organisation)?
+            .into_iter()
+            .find(|team| team.name == name)
+        {
+            return Ok(team);
+        }
+        let path = format!("/api/v1/orgs/{}/teams", segment(organisation));
+        let body = serde_json::json!({
+            "name": name,
+            "description": "Agents of gewu-multiverse",
+            "permission": "write",
+            "includes_all_repositories": true,
+            "can_create_org_repo": false,
+            // Forgejo requires the unit permissions to be named; `write` alone is not
+            // enough for a team that must comment, open pull requests and push code.
+            // Forgejo derives the team's summary permission from the *minimum* unit,
+            // so only the units the agent tools need are named, all with write. A
+            // read-only unit here would make the whole team read.
+            "units": [
+                "repo.code",
+                "repo.issues",
+                "repo.pulls",
+                "repo.projects",
+            ],
+            "units_map": {
+                "repo.code": "write",
+                "repo.issues": "write",
+                "repo.pulls": "write",
+                "repo.projects": "write",
+            },
+        })
+        .to_string();
+        let reply = match self.post(&path, &body) {
+            Ok(reply) => reply,
+            // A second program cannot be here (the data lock forbids it), but a
+            // retried request after a lost reply can be: read the team it made.
+            Err(ForgejoError::Server { status: 409, .. }) => {
+                return self
+                    .teams(organisation)?
+                    .into_iter()
+                    .find(|team| team.name == name)
+                    .ok_or_else(|| ForgejoError::Server {
+                        status: 409,
+                        message: "the team exists but could not be read".to_owned(),
+                    });
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(parse::<WireTeam>(&reply, &path)?.into())
+    }
+
+    /// The members of one team.
+    pub fn team_members(&self, team_id: u64) -> Result<Vec<Viewer>, ForgejoError> {
+        let path = format!("/api/v1/teams/{team_id}/members");
+        let body = self.get(&path)?;
+        parse(&body, &path)
+    }
+
+    /// Add an account to a team. Adding a member twice is not an error.
+    pub fn add_team_member(&self, team_id: u64, login: &str) -> Result<(), ForgejoError> {
+        let path = format!("/api/v1/teams/{team_id}/members/{}", segment(login));
+        let response = self
+            .agent
+            .put(&format!("{}{path}", self.base))
+            .header("Accept", "application/json")
+            .header("Authorization", self.authorization())
+            .send_empty();
+        match self.finish(response, &path) {
+            Ok(_) => Ok(()),
+            // The account is already a member: the state the caller asked for.
+            Err(ForgejoError::Server { status, .. }) if status == 409 || status == 422 => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Remove an account from a team. An account that is not a member is not an error.
+    pub fn remove_team_member(&self, team_id: u64, login: &str) -> Result<(), ForgejoError> {
+        let path = format!("/api/v1/teams/{team_id}/members/{}", segment(login));
+        match self.delete(&path) {
+            Ok(()) | Err(ForgejoError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The repositories of one organisation, as the token sees them.
+    pub fn organisation_repositories(
+        &self,
+        organisation: &str,
+    ) -> Result<Vec<Repository>, ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/repos?limit=50", segment(organisation));
+        let body = self.get(&path)?;
+        let wire: Vec<WireRepo> = parse(&body, &path)?;
+        Ok(wire.into_iter().map(Repository::from).collect())
+    }
+
+    /// Create the organisation's starter repository, initialised with a README.
+    /// An existing repository is not an error.
+    pub fn ensure_organisation_repository(
+        &self,
+        organisation: &str,
+        name: &str,
+    ) -> Result<Repository, ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/repos", segment(organisation));
+        let body = serde_json::json!({
+            "name": name,
+            "description": "The agents' shared work",
+            "private": false,
+            "auto_init": true,
+            "default_branch": "main",
+        })
+        .to_string();
+        match self.post(&path, &body) {
+            Ok(reply) => Ok(parse::<WireRepo>(&reply, &path)?.into()),
+            Err(ForgejoError::Server { status, .. }) if status == 409 || status == 422 => self
+                .repository(organisation, name)?
+                .ok_or_else(|| ForgejoError::Server {
+                    status,
+                    message: "the repository exists but could not be read".to_owned(),
+                }),
+            Err(error) => Err(error),
+        }
+    }
+
     /// `GET` a path and return its body, or a classified failure.
     fn get(&self, path: &str) -> Result<String, ForgejoError> {
         let url = format!("{}{path}", self.base);
@@ -683,6 +863,18 @@ impl ForgejoClient {
         self.finish(response, path)
     }
 
+    /// `DELETE` a path. The reply's body is not used, but its status is classified.
+    fn delete(&self, path: &str) -> Result<(), ForgejoError> {
+        let url = format!("{}{path}", self.base);
+        let response = self
+            .agent
+            .delete(&url)
+            .header("Accept", "application/json")
+            .header("Authorization", self.authorization())
+            .call();
+        self.finish(response, path).map(|_| ())
+    }
+
     /// Turn a transport result into a status and a body, or a classified failure.
     fn finish(
         &self,
@@ -717,12 +909,19 @@ impl ForgejoClient {
                         .redact(&format!("the reply body cannot be read: {error}")),
                 })?;
         let body = self.token.redact(&text);
+        // Ask first whether the instance accepted the request, before naming any
+        // failure: a 2xx whose body this client cannot parse is still an accepted
+        // write, and the tools' bound must count it (B2).
+        self.last_2xx.set((200..=299).contains(&status));
         match status {
             401 => Err(ForgejoError::BadToken { status }),
-            403 => Err(ForgejoError::Forbidden {
-                status,
-                message: reply_message(&body, 300),
-            }),
+            403 => match missing_scopes(&body) {
+                Some(rights) => Err(ForgejoError::MissingScope { status, rights }),
+                None => Err(ForgejoError::Forbidden {
+                    status,
+                    message: reply_message(&body, 300),
+                }),
+            },
             404 => Err(ForgejoError::NotFound {
                 what: path.to_owned(),
                 hint: page_path_hint(&self.base),
@@ -743,26 +942,6 @@ impl fmt::Debug for ForgejoClient {
             .field("token", &REDACTED)
             .finish()
     }
-}
-
-/// How the role check ended, as the TUI and the tests carry it.
-pub fn role_check(config: &ForgejoConfig, role: Role) -> Result<RoleCheck, ForgejoError> {
-    let client = ForgejoClient::new(&config.url, config.token.clone(), config.timeout)?;
-    let viewer = client.viewer()?;
-    if role == Role::Admin && !viewer.is_admin {
-        return Err(ForgejoError::NotAdmin {
-            login: viewer.login.clone(),
-        });
-    }
-    let repositories = client.repositories()?;
-    let private_visible = repositories.iter().filter(|repo| repo.private).count();
-    Ok(RoleCheck {
-        url: client.base().to_owned(),
-        role,
-        viewer,
-        repositories,
-        private_visible,
-    })
 }
 
 /// Check that a URL is a usable base URL and return it without a trailing slash.
@@ -836,6 +1015,25 @@ fn segment(text: &str) -> String {
 }
 
 /// Parse a JSON body, naming the path when it is not the expected shape.
+/// The rights Forgejo named as missing in a scope refusal, when it named any.
+///
+/// Forgejo answers `403` with a body like
+/// `{"message":"token does not have at least one of required scope(s): [read:issue]"}`.
+/// Only the bracketed names are kept; the rest of the body is not carried forward.
+fn missing_scopes(body: &str) -> Option<Vec<String>> {
+    let marker = "required scope(s):";
+    let after = &body[body.find(marker)? + marker.len()..];
+    let open = after.find('[')?;
+    let close = after[open + 1..].find(']')?;
+    let rights: Vec<String> = after[open + 1..open + 1 + close]
+        .split(',')
+        .map(str::trim)
+        .filter(|right| !right.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!rights.is_empty()).then_some(rights)
+}
+
 fn parse<T: serde::de::DeserializeOwned>(body: &str, what: &str) -> Result<T, ForgejoError> {
     serde_json::from_str(body).map_err(|error| ForgejoError::MalformedReply {
         problem: format!("{what} did not answer with JSON of the expected shape: {error}"),
@@ -916,12 +1114,6 @@ impl From<WireRepo> for Repository {
     }
 }
 
-/// The wire shape of one branch.
-#[derive(Debug, Deserialize)]
-struct WireBranch {
-    name: String,
-}
-
 /// The wire shape of one pull request.
 #[derive(Debug, Deserialize)]
 struct WirePull {
@@ -934,6 +1126,85 @@ struct WirePull {
     base: WireRef,
     #[serde(default)]
     user: Option<WireUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireLabel {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePullMarker {
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireIssue {
+    number: u64,
+    title: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    labels: Vec<WireLabel>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    user: Option<WireUser>,
+    #[serde(default)]
+    comments: u64,
+    #[serde(default)]
+    repository: Option<WireRepoName>,
+    #[serde(default)]
+    pull_request: Option<WirePullMarker>,
+}
+
+impl From<WireIssue> for Issue {
+    fn from(wire: WireIssue) -> Self {
+        Self {
+            number: wire.number,
+            title: wire.title,
+            body: wire.body,
+            state: wire.state,
+            html_url: wire.html_url,
+            labels: wire.labels.into_iter().map(|label| label.name).collect(),
+            updated_at: wire.updated_at,
+            author: wire.user.and_then(|user| user.login),
+            comments: wire.comments,
+            repository: wire.repository.and_then(|repo| repo.full_name),
+            pull_request_url: wire.pull_request.and_then(|marker| marker.html_url),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WireComment {
+    id: u64,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    user: Option<WireUser>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+impl From<WireComment> for Comment {
+    fn from(wire: WireComment) -> Self {
+        Self {
+            id: wire.id,
+            body: wire.body,
+            html_url: wire.html_url,
+            author: wire.user.and_then(|user| user.login),
+            created_at: wire.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -958,9 +1229,7 @@ struct WireUser {
 
 impl WireRef {
     fn full_name(&self) -> Option<String> {
-        self.repo
-            .as_ref()
-            .and_then(|repo| repo.full_name.clone())
+        self.repo.as_ref().and_then(|repo| repo.full_name.clone())
     }
 }
 
@@ -987,31 +1256,28 @@ struct WireToken {
     sha1: String,
 }
 
+/// The wire shape of one team.
+#[derive(Debug, Deserialize)]
+struct WireTeam {
+    id: u64,
+    name: String,
+    #[serde(default)]
+    permission: String,
+}
+
+impl From<WireTeam> for Team {
+    fn from(wire: WireTeam) -> Self {
+        Self {
+            id: wire.id,
+            name: wire.name,
+            permission: wire.permission,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_administrators_token_checked_as_a_member_is_not_called_a_member() {
-        // W-8: the label comes from the configured role, but the token may be an
-        // administrator's; the summary must not call the administrator an ordinary
-        // member without a word about the contradiction.
-        let check = RoleCheck {
-            url: "https://forgejo.example.org".to_owned(),
-            role: crate::config::Role::Member,
-            viewer: Viewer {
-                login: "uxadmin".to_owned(),
-                email: None,
-                description: None,
-                is_admin: true,
-            },
-            repositories: Vec::new(),
-            private_visible: 0,
-        };
-        let summary = check.summary();
-        assert!(summary.contains("administrator"), "{summary}");
-        assert!(summary.contains("press C"), "{summary}");
-    }
 
     #[test]
     fn a_url_without_a_scheme_is_refused() {
@@ -1113,28 +1379,5 @@ mod tests {
         assert!(line.contains("root/demo"), "{line}");
         assert!(line.contains("private"), "{line}");
         assert!(line.contains("write"), "{line}");
-    }
-
-    #[test]
-    fn the_role_check_summary_leads_with_the_role() {
-        // F-F: a narrow footer must clip the counts, never the word that says which
-        // view this is. The private count appears once, not twice.
-        let check = RoleCheck {
-            url: "https://forgejo.example.org".to_owned(),
-            role: Role::Admin,
-            viewer: Viewer {
-                login: "root".to_owned(),
-                email: None,
-                description: None,
-                is_admin: true,
-            },
-            repositories: Vec::new(),
-            private_visible: 3,
-        };
-        assert_eq!(
-            check.summary(),
-            "as an administrator, root sees 0 repositories, 3 private"
-        );
-        assert_eq!(check.summary().matches("private").count(), 1);
     }
 }

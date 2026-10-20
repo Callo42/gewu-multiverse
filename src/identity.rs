@@ -1,20 +1,11 @@
-//! One identity per agent, derived from configuration.
+//! One Forgejo account per agent, derived from the agent's own name.
 //!
-//! An agent works on the Forgejo as *itself*, not as the person who runs the tool.
-//! Which account that is comes from the configuration and the credentials file, never
-//! from an edit to this source:
-//!
-//! - With an **administrator token** (`forgejo_admin_token`), the tool creates and
-//!   manages one Forgejo account per agent, named from the agent's own name, and
-//!   stores the token it makes for that account in the credentials file.
-//! - **Without** one, the user supplies each agent's token under
-//!   `[forgejo_agent_tokens]`, and the tool records that this is the path in use.
-//!
-//! Either way the same thing comes out: an [`AgentIdentity`] naming the account a
-//! commit will be authored by. The account's login is
-//! `gewu-<agent>` — [`LOGIN_PREFIX`] plus the agent's validated name — so a machine
-//! identity is never mistaken for a person, and a person who happens to have that
-//! name is refused rather than taken over.
+//! An agent works on the Forgejo as *itself*, not as the person who runs the product.
+//! The bundled instance's administrator key makes one account per agent, named
+//! `gewu-<agent>`, and stores the token it makes for that account in the credentials
+//! file. The account is marked when it is made, so a machine identity is never
+//! mistaken for a person and a person who happens to have that name is refused rather
+//! than taken over.
 //!
 //! The identity's token never leaves the credentials file on its way to git: git
 //! asks this same program for it through `GIT_ASKPASS` (see [`crate::workspace`]), so
@@ -22,53 +13,20 @@
 
 use std::io::Read;
 
-use crate::config::Role;
-use crate::credentials::{self, CredentialsError, Secret};
+use crate::credentials::{self, CredentialsError};
 use crate::forgejo::{
     DEFAULT_TIMEOUT, ForgejoClient, ForgejoError, IDENTITY_DESCRIPTION, IDENTITY_EMAIL_DOMAIN,
     LOGIN_PREFIX,
 };
 use crate::naming::agent_name_problem;
 
-/// Which path is making an agent's identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityMode {
-    /// An administrator token is configured: the tool made the account and its token.
-    Managed,
-    /// The user supplied the token; the tool records which account it belongs to.
-    Supplied,
-}
-
-impl IdentityMode {
-    /// The word the credentials file and the screens use.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            IdentityMode::Managed => "managed",
-            IdentityMode::Supplied => "supplied",
-        }
-    }
-
-    /// Read the word back. An unknown word is `None`, never a guess.
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "managed" => Some(IdentityMode::Managed),
-            "supplied" => Some(IdentityMode::Supplied),
-            _ => None,
-        }
-    }
-
-    /// A sentence for a screen.
-    pub fn describe(self) -> &'static str {
-        match self {
-            IdentityMode::Managed => {
-                "an administrator token is configured, so the tool creates and manages one account per agent"
-            }
-            IdentityMode::Supplied => {
-                "no administrator token is configured, so each agent's token is supplied by you"
-            }
-        }
-    }
-}
+/// The rights version a managed token must carry before it is reused for the tools.
+///
+/// It is the product's own marker, written when `i` has made (or confirmed) a token
+/// with the issue rights. A managed identity settled before this marker existed is
+/// told that `i` renews its token; it is never silently taken to have rights it may
+/// not have.
+pub const TOOL_RIGHTS_VERSION: &str = "issue-tools-v1";
 
 /// One agent's Forgejo identity: the account its commits are authored by.
 ///
@@ -82,8 +40,6 @@ pub struct AgentIdentity {
     pub login: String,
     /// The email recorded for that account, used as the commit email.
     pub email: String,
-    /// Which path produced it.
-    pub mode: IdentityMode,
     /// Whether this call created the account (as opposed to finding it).
     pub created: bool,
     /// When the tool created the account, in unix seconds, when it knows.
@@ -97,10 +53,9 @@ impl AgentIdentity {
     /// One line for a screen.
     pub fn line(&self) -> String {
         format!(
-            "{} as `{}` ({})",
+            "{} as `{}`",
             crate::words::identity_pair(&self.login, &self.email),
             self.agent,
-            self.mode.as_str(),
         )
     }
 }
@@ -122,30 +77,17 @@ pub enum IdentityError {
     // A-2's class: a refusal a user acts on names the product's own keys for the fix
     // (`A` for the administrator token, `v` for the agent's), never a file and a TOML
     // section. The credentials file is still named on the Credentials screen.
-    #[error(
-        "no administrator token is configured, so no agent identity can be created; press A on the Credentials screen to add one, or v on the Forgejo screen to supply the agent's own token"
-    )]
+    #[error("the bundled Forgejo administrator key is not ready yet; the product tries again")]
     NoAdminToken,
-    /// The role check needs `forgejo_token`, and none is recorded.
-    ///
-    // T-4: the sibling of `NoAgentToken`. A refusal a user acts on names the
-    // product's own keys for the fix (`f` on the Credentials screen writes
-    // `forgejo_token`), never a file and a TOML section; the credentials file is
-    // still named on the Credentials screen itself.
+    /// The agent's token lacks rights the Forgejo tools need.
     #[error(
-        "role token absent — press 5 and then f on the Credentials screen to add one"
+        "the agent token for `{agent}` is missing the Forgejo rights {rights}; the product makes a new token when it sets the agent up again"
     )]
-    NoRoleToken,
-    /// No token was supplied for this agent, and there is no administrator token.
-    ///
-    // N-3: the surviving sibling of the round-9 class. The refusal a user acts on
-    // opens with the thing that is missing and names the product's own key for the
-    // fix (`v` on the Forgejo screen), never a file and a TOML section; the
-    // credentials file is still named on the Credentials screen itself.
-    #[error("the agent token for `{agent}` is absent — press v on the Forgejo screen to supply it")]
-    NoAgentToken {
-        /// The agent whose token is absent.
+    MissingRights {
+        /// The agent whose token lacks them.
         agent: String,
+        /// The missing rights, comma-separated, as Forgejo named them.
+        rights: String,
     },
     /// The account exists but was not made by this tool, so it is not taken over.
     #[error(
@@ -172,12 +114,8 @@ impl IdentityError {
         match self {
             IdentityError::UnsafeName { .. } => "unsafe_name",
             IdentityError::NoAdminToken => "no_admin_token",
-            // F-3: the class always names the thing that is missing. `credentials` is
-            // the class for a credentials file that cannot be read, and a person who
-            // reads it there can take the file for broken; the missing role token is
-            // its own class, beside `no_agent_token` and `missing_admin_token`.
-            IdentityError::NoRoleToken => "no_role_token",
-            IdentityError::NoAgentToken { .. } => "no_agent_token",
+            // The class always names the thing that is absent.
+            IdentityError::MissingRights { .. } => "missing_scope",
             IdentityError::NotOurs { .. } => "not_ours",
             IdentityError::Credentials(_) => "credentials",
             IdentityError::Forgejo(error) => error.class(),
@@ -200,38 +138,6 @@ pub fn login_for(agent: &str) -> Result<String, IdentityError> {
 /// The email an identity created by the tool uses.
 pub fn email_for(login: &str) -> String {
     format!("{login}@{IDENTITY_EMAIL_DOMAIN}")
-}
-
-/// Settle the identity of one agent, creating or finding it as the path requires.
-///
-/// An administrator token means the tool manages the account; without one, the token
-/// the user supplied is checked and its account recorded. Either way the credentials
-/// file ends up naming the login and email a commit will use.
-pub fn resolve(
-    url: &str,
-    agent: &str,
-    credentials_path: &std::path::Path,
-) -> Result<AgentIdentity, IdentityError> {
-    if credentials::forgejo_admin_token(credentials_path)?.is_some() {
-        manage(url, agent, credentials_path)
-    } else {
-        supplied(url, agent, credentials_path)
-    }
-}
-
-/// Which identity path the credentials file is on, when it can be told.
-pub fn recorded_mode(
-    credentials_path: &std::path::Path,
-) -> Result<Option<IdentityMode>, IdentityError> {
-    if let Some(word) = credentials::recorded_identity_mode(credentials_path)? {
-        if let Some(mode) = IdentityMode::parse(&word) {
-            return Ok(Some(mode));
-        }
-    }
-    if credentials::forgejo_admin_token(credentials_path)?.is_some() {
-        return Ok(Some(IdentityMode::Managed));
-    }
-    Ok(None)
 }
 
 /// The recorded login for an agent, when one was recorded.
@@ -275,8 +181,14 @@ pub fn manage(
         }
     }
 
-    // Reuse a token that already works, so a second resolve does not churn tokens.
-    if existing.is_some() {
+    // Reuse a token that already works **and** was recorded with the rights the
+    // tools need, so a second resolve does not churn tokens. A token made before the
+    // issue tools existed has no marker (or an old one): `i` renews it below instead
+    // of reusing a token whose rights are not known.
+    let rights_recorded = credentials::recorded_agent_identity_rights(credentials_path, agent)?
+        .as_deref()
+        == Some(TOOL_RIGHTS_VERSION);
+    if existing.is_some() && rights_recorded {
         if let Some(token) = credentials::forgejo_agent_token_optional(credentials_path, agent)? {
             if let Ok(existing_client) = ForgejoClient::new(url, token, DEFAULT_TIMEOUT) {
                 if let Ok(viewer) = existing_client.viewer() {
@@ -292,7 +204,7 @@ pub fn manage(
                             None,
                             &login,
                             &email,
-                            IdentityMode::Managed.as_str(),
+                            "managed",
                             None,
                         )?;
                         let created_at =
@@ -301,7 +213,6 @@ pub fn manage(
                             agent: agent.to_owned(),
                             login,
                             email,
-                            mode: IdentityMode::Managed,
                             created: false,
                             created_at,
                         });
@@ -320,10 +231,47 @@ pub fn manage(
     // The mark is written on every manage, so a fresh account can be recognised
     // afterwards and an old one is not mistaken for a person.
     client.mark_identity(&login, &format!("{LOGIN_PREFIX}{agent}"))?;
-    let token = client.create_token_for(&login, &format!("{LOGIN_PREFIX}{agent}"))?;
+    // A renewal makes a second token, and Forgejo refuses a duplicate token name:
+    // the creation keeps the account's own name, while a renewal gets a name that
+    // says it was made for the issue rights and when.
+    let token_name = if created {
+        format!("{LOGIN_PREFIX}{agent}")
+    } else {
+        format!(
+            "{LOGIN_PREFIX}{agent}-{TOOL_RIGHTS_VERSION}-{}",
+            crate::time::now_unix_ms()
+        )
+    };
+    // The token this renewal supersedes. A managed identity made before token names
+    // were recorded can only have the deterministic first name. Renaming is not
+    // revoking: the old name is deleted on the server below (B1).
+    let superseded = if created {
+        None
+    } else {
+        Some(
+            credentials::recorded_agent_token_name(credentials_path, agent)?
+                .unwrap_or_else(|| format!("{LOGIN_PREFIX}{agent}")),
+        )
+    };
+    let token = client.create_token_for(&login, &token_name)?;
     // The password was only ever needed to make the account; it is dropped here, and
     // only the token is written down.
     password.clear();
+    // Prove the new token can read issues before the marker says it has the rights:
+    // a Forgejo that silently drops a scope must not be recorded as if it kept it.
+    let probe = ForgejoClient::new(url, token.clone(), DEFAULT_TIMEOUT)?;
+    probe
+        .assigned_issues()
+        .map_err(|error| scope_error(agent, error))?;
+    // Revoke the credential this renewal replaces, on the server, before the new one
+    // is recorded as the agent's. A person who renews to revoke must not be left with
+    // an old key that still answers. A 404 means it was already gone, which is the
+    // same thing for the caller; any other refusal is reported, not swallowed.
+    if let Some(name) = &superseded {
+        if name != &token_name {
+            client.delete_token_for(&login, name)?;
+        }
+    }
     // The account's creation time is written down the moment it is made, so the
     // report can age instead of repeating `now` (H-3).
     let created_at = if created {
@@ -337,76 +285,30 @@ pub fn manage(
         Some(&token),
         &login,
         &email,
-        IdentityMode::Managed.as_str(),
+        "managed",
         created_at,
     )?;
+    credentials::record_agent_identity_rights(credentials_path, agent, TOOL_RIGHTS_VERSION)?;
+    credentials::record_agent_token_name(credentials_path, agent, &token_name)?;
     Ok(AgentIdentity {
         agent: agent.to_owned(),
         login,
         email,
-        mode: IdentityMode::Managed,
         created,
         created_at,
     })
 }
 
-/// Check the token the user supplied for one agent and record whose it is.
-pub fn supplied(
-    url: &str,
-    agent: &str,
-    credentials_path: &std::path::Path,
-) -> Result<AgentIdentity, IdentityError> {
-    let login_hint = login_for(agent)?;
-    let _ = login_hint;
-    let token = credentials::forgejo_agent_token(credentials_path, agent).map_err(|error| {
-        if matches!(error, CredentialsError::MissingToken { .. }) {
-            IdentityError::NoAgentToken {
+/// Turn a scope refusal into the one sentence naming the missing right.
+fn scope_error(agent: &str, error: ForgejoError) -> IdentityError {
+    match error {
+        ForgejoError::MissingScope { rights, .. } if !rights.is_empty() => {
+            IdentityError::MissingRights {
                 agent: agent.to_owned(),
+                rights: rights.join(", "),
             }
-        } else {
-            IdentityError::Credentials(error)
         }
-    })?;
-    let client = ForgejoClient::new(url, token, DEFAULT_TIMEOUT)?;
-    let viewer = client.viewer()?;
-    let login = viewer.login.clone();
-    let email = viewer
-        .email
-        .clone()
-        .filter(|email| !email.is_empty())
-        .unwrap_or_else(|| email_for(&login));
-    credentials::record_agent_identity(
-        credentials_path,
-        agent,
-        None,
-        &login,
-        &email,
-        IdentityMode::Supplied.as_str(),
-        None,
-    )?;
-    Ok(AgentIdentity {
-        agent: agent.to_owned(),
-        login,
-        email,
-        mode: IdentityMode::Supplied,
-        created: false,
-        created_at: None,
-    })
-}
-
-/// The role check token, and whether it should be an administrator's.
-///
-/// The token in `forgejo_token` is the one the role check uses. When the
-/// configuration says `role = "admin"` and that token is absent, the administrator
-/// token is used instead, so one token can serve both purposes.
-pub fn role_token(credentials_path: &std::path::Path, role: Role) -> Result<Secret, IdentityError> {
-    match credentials::forgejo_token(credentials_path) {
-        Ok(token) => Ok(token),
-        Err(CredentialsError::MissingToken { .. }) if role == Role::Admin => {
-            credentials::forgejo_admin_token(credentials_path)?.ok_or(IdentityError::NoAdminToken)
-        }
-        Err(CredentialsError::MissingToken { .. }) => Err(IdentityError::NoRoleToken),
-        Err(error) => Err(IdentityError::Credentials(error)),
+        other => IdentityError::Forgejo(other),
     }
 }
 
@@ -439,68 +341,5 @@ mod tests {
             error.to_string().contains("cannot name a directory")
                 || error.to_string().contains("not allowed")
         );
-    }
-
-    #[test]
-    fn the_mode_words_round_trip() {
-        for mode in [IdentityMode::Managed, IdentityMode::Supplied] {
-            assert_eq!(IdentityMode::parse(mode.as_str()), Some(mode));
-        }
-        assert_eq!(IdentityMode::parse("something-else"), None);
-    }
-
-    #[test]
-    fn the_login_prefix_keeps_a_machine_identity_apart_from_a_person() {
-        let login = login_for("scribe").expect("accepted");
-        assert!(login.starts_with(LOGIN_PREFIX));
-        // Longest accepted agent name still fits a Forgejo login (40 characters).
-        let longest = "a".repeat(crate::naming::MAX_AGENT_NAME_LEN);
-        let login = login_for(&longest).expect("accepted");
-        assert!(login.len() <= 40, "{login}");
-    }
-
-    #[test]
-    fn an_identity_line_names_the_account_and_the_path() {
-        let identity = AgentIdentity {
-            agent: "scribe".to_owned(),
-            login: "gewu-scribe".to_owned(),
-            email: "gewu-scribe@agents.invalid".to_owned(),
-            mode: IdentityMode::Managed,
-            created: true,
-            created_at: Some(1_700_000_000),
-        };
-        let line = identity.line();
-        assert!(line.contains("gewu-scribe"), "{line}");
-        assert!(line.contains("managed"), "{line}");
-    }
-
-    #[test]
-    fn every_token_refusal_names_the_key_a_person_can_press() {
-        // N-3: the refusal class has had survivors in three rounds because the sweep
-        // followed the finding's own file rather than the code. This guard reads the
-        // refusal strings themselves: a sentence about a missing token must name the
-        // product's own key and must not send a person to a file or a TOML section.
-        let refusals = [
-            IdentityError::NoRoleToken.to_string(),
-            IdentityError::NoAgentToken {
-                agent: "scribe".to_owned(),
-            }
-            .to_string(),
-            IdentityError::NoAdminToken.to_string(),
-        ];
-        for refusal in &refusals {
-            assert!(
-                refusal.contains("absent") || refusal.contains("no administrator token"),
-                "a token refusal does not say what is missing: {refusal}"
-            );
-            assert!(
-                !refusal.contains(".toml") && !refusal.contains("credentials file"),
-                "a token refusal sends a person to a file: {refusal}"
-            );
-            assert!(
-                refusal.contains("press"),
-                "a token refusal names no key: {refusal}"
-            );
-        }
     }
 }

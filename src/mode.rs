@@ -80,7 +80,11 @@ pub fn hold_tree_private(root: &Path) {
         }
         if file_type.is_dir() {
             let _ = set_mode(&path, PRIVATE_DIR_MODE);
-            if path.file_name().map(|name| name == "workspace").unwrap_or(false) {
+            if path
+                .file_name()
+                .map(|name| name == "workspace")
+                .unwrap_or(false)
+            {
                 continue;
             }
             hold_tree_private(&path);
@@ -101,15 +105,43 @@ pub fn render(mode: u32) -> String {
 /// existed with a wider mode does not keep it.
 pub fn write_private(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
     let path = path.as_ref();
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(SECRET_FILE_MODE)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    set_mode(path, SECRET_FILE_MODE)
+    // A configuration file may be a symlink the person made on purpose. Write the
+    // file it points at, so the link survives the atomic rename.
+    let path = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    // A rename into a writable directory can replace a read-only file, which the old
+    // truncate-and-write could not do. Keep the refusal a read-only target earned:
+    // the caller's one sentence says the file cannot be written.
+    if let Ok(metadata) = fs::metadata(&path) {
+        if metadata.permissions().readonly() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is read-only", path.display()),
+            ));
+        }
+    }
+    // Write a temporary file beside the target and rename it into place, so another
+    // process reading a secret while it is rewritten sees either the old file or the
+    // new one, never a half-written line.
+    let stage = path.with_extension(format!("part-{}", std::process::id()));
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(SECRET_FILE_MODE)
+            .open(&stage)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        set_mode(&stage, SECRET_FILE_MODE)?;
+        fs::rename(&stage, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&stage);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -133,7 +165,7 @@ mod tests {
         let clone = workspace.join("notes");
         fs::create_dir_all(&run).expect("the run directory");
         fs::create_dir_all(&clone).expect("the clone directory");
-        let config = root.join("config.toml");
+        let config = root.join("multiverse.toml");
         fs::write(&config, "x\n").expect("a file");
         let transcript = run.join("transcript.jsonl");
         fs::write(&transcript, "{}\n").expect("a file");

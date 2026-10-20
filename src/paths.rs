@@ -2,9 +2,8 @@
 //!
 //! There are two roots.
 //!
-//! - The **configuration root** holds the files the skeleton already keeps there:
-//!   `config.toml`, `credentials.toml`, the first-run acknowledgment, and — below
-//!   `agents/` — one directory per agent, holding that agent's instruction, its
+//! - The **configuration root** holds `multiverse.toml` and `credentials.toml`, and —
+//!   below `agents/` — one directory per agent, holding that agent's instruction, its
 //!   skills and its workspace. On a Linux machine the root is
 //!   `~/.config/gewu-multiverse`, or `$XDG_CONFIG_HOME/gewu-multiverse` when that is
 //!   set. `--config-dir` moves it for one run.
@@ -41,6 +40,16 @@ pub enum PathError {
         "no configuration directory could be found: set HOME or XDG_CONFIG_HOME, or pass --config-dir"
     )]
     NoConfigDir,
+    /// A relative root could not be made absolute because the current directory
+    /// cannot be read.
+    #[error("the directory {path} cannot be made absolute: {source}")]
+    AbsoluteRoot {
+        /// The directory that was given.
+        path: PathBuf,
+        /// The reason from the filesystem.
+        #[source]
+        source: io::Error,
+    },
     /// The root directory could not be created.
     #[error("the directory {path} cannot be created: {source}")]
     Root {
@@ -75,37 +84,38 @@ impl Layout {
     /// Both roots under the user's own directories.
     pub fn in_user_config_dir() -> Result<Self, PathError> {
         let base = BaseDirs::new().ok_or(PathError::NoConfigDir)?;
-        let root = base.config_dir().join("gewu-multiverse");
+        let root = absolute_root(base.config_dir().join("gewu-multiverse"))?;
         // `state_dir` is absent on some systems; the data directory is the honest
         // fallback, and it is still the user's own directory.
-        let state_root = base
-            .state_dir()
-            .unwrap_or_else(|| base.data_dir())
-            .join("gewu-multiverse");
+        let state_root = absolute_root(
+            base.state_dir()
+                .unwrap_or_else(|| base.data_dir())
+                .join("gewu-multiverse"),
+        )?;
         Ok(Self { root, state_root })
     }
 
     /// A configuration root the caller chose, which is what `--config-dir` and the
     /// tests pass. The state root follows it, so one moved directory is one whole
     /// installation; [`Layout::with_state_root`] separates them again.
-    pub fn rooted_at(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
+    pub fn rooted_at(root: impl Into<PathBuf>) -> Result<Self, PathError> {
+        let root = absolute_root(root.into())?;
         let state_root = root.join("state");
-        Self { root, state_root }
+        Ok(Self { root, state_root })
     }
 
     /// Put the run records somewhere else.
-    pub fn with_state_root(mut self, state_root: impl Into<PathBuf>) -> Self {
-        self.state_root = state_root.into();
-        self
+    pub fn with_state_root(mut self, state_root: impl Into<PathBuf>) -> Result<Self, PathError> {
+        self.state_root = absolute_root(state_root.into())?;
+        Ok(self)
     }
 
-    /// The configuration directory.
+    /// The configuration directory. It is always absolute.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The run-record directory.
+    /// The run-record directory. It is always absolute.
     pub fn state_root(&self) -> &Path {
         &self.state_root
     }
@@ -118,30 +128,6 @@ impl Layout {
     /// The one credentials file. Its contents are never read by the tool.
     pub fn credentials_file(&self) -> PathBuf {
         self.root.join("credentials.toml")
-    }
-
-    /// The record of the first-run risk acknowledgment.
-    pub fn acknowledgment_file(&self) -> PathBuf {
-        self.root.join("risk-acknowledgment.toml")
-    }
-
-    /// The endpoint tests, one per agent, so a test's stamp survives a restart and
-    /// ages instead of vanishing with the session (LIB-2). It holds no secret.
-    pub fn endpoint_tests_file(&self) -> PathBuf {
-        self.root.join("endpoint-tests.toml")
-    }
-
-    /// The role check's stamp, so the fact that a check ran survives a restart the
-    /// way the endpoint test does (W37-1). It holds no secret.
-    pub fn role_checks_file(&self) -> PathBuf {
-        self.root.join("role-checks.toml")
-    }
-
-    /// The newest version that has opened this configuration, written on every start
-    /// (U3). A record a newer build left is kept when an older build starts, so the
-    /// reverse of an upgrade says what it is. It holds no secret.
-    pub fn last_seen_file(&self) -> PathBuf {
-        self.root.join("last-seen.toml")
     }
 
     /// The directory holding one directory per agent.
@@ -178,14 +164,13 @@ impl Layout {
 /// The directories of one agent, all derived from its name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPaths {
-    name: String,
     root: PathBuf,
-    state_root: PathBuf,
     config_dir: PathBuf,
     instruction: PathBuf,
     skills_dir: PathBuf,
     steps_file: PathBuf,
     workspace: PathBuf,
+    state_root: PathBuf,
     state_dir: PathBuf,
 }
 
@@ -202,50 +187,17 @@ impl AgentPaths {
             });
         }
         let config_dir = layout.agents_dir().join(name);
+        let state_root = layout.state_root().to_path_buf();
         Ok(Self {
-            name: name.to_owned(),
             root: layout.root().to_path_buf(),
-            state_root: layout.state_root().to_path_buf(),
             instruction: config_dir.join("instruction.md"),
             skills_dir: config_dir.join("skills"),
             steps_file: config_dir.join("steps.txt"),
             workspace: config_dir.join("workspace"),
-            state_dir: layout.state_root().join(name),
+            state_dir: state_root.join(name),
+            state_root,
             config_dir,
         })
-    }
-
-    /// The same agent, reading the instruction document the configuration names.
-    ///
-    /// The instruction path is relative to the configuration directory and is checked
-    /// when the configuration is read (no absolute path, no `..`), so joining it to
-    /// the root can only reach inside the configuration directory. The common case —
-    /// the form writes `agents/<name>/instruction.md` — is the derived default, but a
-    /// hand-written configuration may point the field elsewhere, and then every screen
-    /// and the run must read that file (P-3).
-    pub fn with_instruction(mut self, instruction: PathBuf) -> Self {
-        self.instruction = instruction;
-        self
-    }
-
-    /// The agent's name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The configuration root this agent lives under.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// The state root this agent's run records live under.
-    pub fn state_root(&self) -> &Path {
-        &self.state_root
-    }
-
-    /// The agent's configuration directory: its instruction, skills and workspace.
-    pub fn config_dir(&self) -> &Path {
-        &self.config_dir
     }
 
     /// The instruction document a run reads.
@@ -278,13 +230,15 @@ impl AgentPaths {
         self.state_dir.join(run_id)
     }
 
-    /// Create the configuration directory, the skills directory and the workspace.
+    /// Create the configuration directory, the skills directory, the workspace and
+    /// the agent's state directory.
     ///
     /// A configured instruction may live in a directory of its own (for example
     /// `instructions/scribe.md`), so the instruction's parent is created too: the
     /// editor writes the file there, and `e` must not fail because the directory the
     /// configuration named does not exist yet. Every directory on the way, from the
-    /// configuration root down, is held to 0700 (F-1).
+    /// configuration root down, is held to 0700 (F-1), and the state root and the
+    /// agent's state directory are created with the same mode before the first run.
     pub fn ensure(&self) -> Result<(), PathError> {
         ensure_private_dir_below(&self.root, &self.config_dir)?;
         ensure_private_dir_below(&self.root, &self.skills_dir)?;
@@ -292,22 +246,20 @@ impl AgentPaths {
         if let Some(parent) = self.instruction.parent() {
             ensure_private_dir_below(&self.root, parent)?;
         }
+        ensure_private_dir(&self.state_root)?;
+        ensure_private_dir_below(&self.state_root, &self.state_dir)?;
         Ok(())
     }
+}
 
-    /// Create this agent's run-record directory, holding every directory from the
-    /// state root down to it to 0700 (F-1).
-    pub fn ensure_state_dir(&self) -> Result<(), PathError> {
-        ensure_private_dir_below(&self.state_root, &self.state_dir)
+/// Make a root absolute when the layout is built, so every path derived from it is
+/// absolute too and a child started in another working directory still reads the same
+/// files (the run process runs in the agent's workspace).
+fn absolute_root(path: PathBuf) -> Result<PathBuf, PathError> {
+    if path.is_absolute() {
+        return Ok(path);
     }
-
-    /// Create one run's record directory, holding every directory from the state
-    /// root down to it to 0700 (F-1).
-    pub fn ensure_run_dir(&self, run_id: &str) -> Result<PathBuf, PathError> {
-        let run_dir = self.run_dir(run_id);
-        ensure_private_dir_below(&self.state_root, &run_dir)?;
-        Ok(run_dir)
-    }
+    std::path::absolute(&path).map_err(|source| PathError::AbsoluteRoot { path, source })
 }
 
 /// Create a directory if it is not there yet, and hold it to mode 0700.
@@ -342,8 +294,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn the_three_files_sit_in_the_root() {
-        let layout = Layout::rooted_at("/tmp/example-root");
+    fn the_two_files_sit_in_the_root() {
+        let layout = Layout::rooted_at("/tmp/example-root").expect("absolute");
         assert_eq!(
             layout.config_file(),
             Path::new("/tmp/example-root/config.toml")
@@ -352,16 +304,12 @@ mod tests {
             layout.credentials_file(),
             Path::new("/tmp/example-root/credentials.toml")
         );
-        assert_eq!(
-            layout.acknowledgment_file(),
-            Path::new("/tmp/example-root/risk-acknowledgment.toml")
-        );
     }
 
     #[test]
     fn ensure_root_creates_the_directory_once_and_keeps_it_private() {
         let root = scratch_root("layout");
-        let layout = Layout::rooted_at(root.join("nested"));
+        let layout = Layout::rooted_at(root.join("nested")).expect("absolute");
         layout.ensure_root().expect("the root is created");
         layout.ensure_root().expect("a second call is harmless");
         assert!(layout.root().is_dir());
@@ -374,12 +322,11 @@ mod tests {
 
     #[test]
     fn every_directory_of_an_agent_is_derived_from_its_name() {
-        let layout = Layout::rooted_at("/tmp/example-root").with_state_root("/tmp/example-state");
+        let layout = Layout::rooted_at("/tmp/example-root")
+            .expect("absolute")
+            .with_state_root("/tmp/example-state")
+            .expect("absolute");
         let agent = layout.agent("scribe").expect("a safe name is accepted");
-        assert_eq!(
-            agent.config_dir(),
-            Path::new("/tmp/example-root/agents/scribe")
-        );
         assert_eq!(
             agent.instruction(),
             Path::new("/tmp/example-root/agents/scribe/instruction.md")
@@ -405,7 +352,7 @@ mod tests {
 
     #[test]
     fn a_name_that_cannot_name_a_directory_is_refused_with_a_sentence() {
-        let layout = Layout::rooted_at("/tmp/example-root");
+        let layout = Layout::rooted_at("/tmp/example-root").expect("absolute");
         for name in ["", "..", "a/b", "Upper", "a--b", "-a"] {
             let error = layout.agent(name).expect_err("the name is refused");
             let message = error.to_string();
@@ -416,7 +363,7 @@ mod tests {
 
     #[test]
     fn distinct_names_never_share_a_workspace() {
-        let layout = Layout::rooted_at("/tmp/example-root");
+        let layout = Layout::rooted_at("/tmp/example-root").expect("absolute");
         let mut seen: Vec<PathBuf> = Vec::new();
         for name in ["a", "b", "agent-1", "agent-2", "scribe", "checker"] {
             let workspace = layout
@@ -433,7 +380,7 @@ mod tests {
     fn one_agent_never_sits_inside_another() {
         // Because a name is one path component with no separator, no agent's
         // directory can contain another agent's directory.
-        let layout = Layout::rooted_at("/tmp/example-root");
+        let layout = Layout::rooted_at("/tmp/example-root").expect("absolute");
         let scribe = layout.agent("scribe").expect("accepted");
         let scribe2 = layout.agent("scribe2").expect("accepted");
         assert!(!scribe2.workspace().starts_with(scribe.workspace()));
@@ -443,7 +390,7 @@ mod tests {
     #[test]
     fn ensuring_an_agent_creates_only_its_own_private_directories() {
         let root = scratch_root("ensure-agent");
-        let layout = Layout::rooted_at(root.clone());
+        let layout = Layout::rooted_at(root.clone()).expect("absolute");
         let agent = layout
             .ensure_agent("scribe")
             .expect("the agent is prepared");
@@ -451,9 +398,15 @@ mod tests {
         // carry the same 0700 as the directories inside it.
         for dir in [
             layout.agents_dir(),
-            agent.config_dir().to_path_buf(),
+            agent
+                .workspace()
+                .parent()
+                .expect("the agent directory")
+                .to_path_buf(),
             agent.skills_dir().to_path_buf(),
             agent.workspace().to_path_buf(),
+            layout.state_root().to_path_buf(),
+            agent.state_dir().to_path_buf(),
         ] {
             assert!(dir.is_dir(), "{dir:?} must exist");
             let mode = fs::metadata(&dir)
@@ -463,34 +416,23 @@ mod tests {
             assert_eq!(mode & 0o777, PRIVATE_DIR_MODE, "{dir:?}");
         }
         assert!(!agent.instruction().exists(), "no instruction is invented");
-        assert!(!agent.state_dir().exists(), "no run record is created yet");
+        assert!(
+            !agent.run_dir("run-1").exists(),
+            "no run record is created yet"
+        );
     }
 
     #[test]
-    fn every_state_directory_the_product_makes_is_private() {
-        // F-1: the state root, the per-agent state directory and the per-run record
-        // directory were left at the umask default while the agent's configuration
-        // directory was 0700.
-        let root = scratch_root("ensure-state");
-        let layout = Layout::rooted_at(root.clone());
-        let agent = layout
-            .ensure_agent("scribe")
-            .expect("the agent is prepared");
-        agent.ensure_state_dir().expect("the state directory is made");
-        let run_dir = agent
-            .ensure_run_dir("run-1")
-            .expect("the run directory is made");
-        for dir in [
-            layout.state_root(),
-            agent.state_dir(),
-            run_dir.as_path(),
-        ] {
-            assert!(dir.is_dir(), "{dir:?} must exist");
-            let mode = fs::metadata(dir)
-                .expect("the directory can be described")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, PRIVATE_DIR_MODE, "{dir:?}");
-        }
+    fn relative_roots_are_made_absolute_when_the_layout_is_built() {
+        let cwd = std::env::current_dir().expect("the current directory is readable");
+        let layout = Layout::rooted_at("relative-root").expect("the relative root is accepted");
+        assert_eq!(layout.root(), cwd.join("relative-root"));
+        assert!(layout.root().is_absolute());
+        assert!(layout.state_root().is_absolute());
+        let layout = layout
+            .with_state_root("../elsewhere")
+            .expect("the relative state root is accepted");
+        assert!(layout.state_root().is_absolute());
+        assert_eq!(layout.state_root(), cwd.join("../elsewhere"));
     }
 }

@@ -280,12 +280,7 @@ pub fn inspect(workspace: &Path) -> Result<Option<WorkspaceState>, WorkspaceErro
     let head = run_git(&["log", "-1", "--format=%h%n%ct"], workspace, None).unwrap_or_default();
     let mut head_lines = head.lines();
     let commit = head_lines.next().unwrap_or("").trim().to_owned();
-    let committed_at = head_lines
-        .next()
-        .unwrap_or("0")
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let committed_at = head_lines.next().unwrap_or("0").trim().parse().unwrap_or(0);
     let status = run_git(&["status", "--porcelain"], workspace, None)?;
     let changed = status
         .lines()
@@ -311,6 +306,88 @@ pub fn inspect(workspace: &Path) -> Result<Option<WorkspaceState>, WorkspaceErro
         changed,
         local_identity,
     }))
+}
+
+/// `owner/name` from a repository's `origin` URL, when the URL names one.
+///
+/// The clone the product makes puts the agent's login in an `http(s)` URL; a person's
+/// own clone may use an SSH URL. Only the last two path segments are kept, so a
+/// Forgejo served under a path still names the repository the same way. A URL that
+/// does not hold two segments is not guessed.
+pub fn remote_full_name(repository: &Path) -> Option<String> {
+    let url = remote_url(repository)?;
+    full_name_from_remote(&url)
+}
+
+/// The repository's `origin` URL, when git can read one.
+pub fn remote_url(repository: &Path) -> Option<String> {
+    let url = run_git(&["config", "--get", "remote.origin.url"], repository, None).ok()?;
+    let url = url.trim();
+    (!url.is_empty()).then(|| url.to_owned())
+}
+
+/// The host and `owner/name` one clone URL names, in one read.
+///
+/// The clone URL is the only fact the product has about which repository a directory
+/// holds; parsing both parts together keeps a screen from running git twice for one
+/// answer.
+pub fn remote_parts(url: &str) -> Option<(String, String)> {
+    let full_name = full_name_from_remote(url)?;
+    let host = if let Some((_, rest)) = url.split_once("://") {
+        let host = rest.split('/').next()?;
+        host.rsplit('@').next().unwrap_or(host).to_owned()
+    } else {
+        let (host, _) = url.split_once(':')?;
+        host.rsplit('@').next().unwrap_or(host).to_owned()
+    };
+    Some((host, full_name))
+}
+
+/// The `owner/name` a clone URL names, when it names one.
+pub fn full_name_from_remote(url: &str) -> Option<String> {
+    let path = if let Some((_, rest)) = url.split_once("://") {
+        rest.split_once('/').map(|(_, path)| path)?
+    } else if let Some((_, path)) = url.split_once(':') {
+        path
+    } else {
+        return None;
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.rsplit('/');
+    let name = parts.next()?;
+    let owner = parts.next()?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+/// The host (and port, when one is written) of a repository's `origin` URL.
+///
+/// Used to keep a clone of another instance out of this instance's tool list: a
+/// repository is only "in the configured Forgejo" when the clone came from it.
+pub fn remote_host(repository: &Path) -> Option<String> {
+    let url = remote_url(repository)?;
+    remote_parts(&url).map(|(host, _)| host)
+}
+
+/// The clone's default branch, from the remote-tracking `origin/HEAD` it carries.
+///
+/// The product does not fetch to answer this: a clone without `origin/HEAD` has no
+/// recorded default branch, and the caller says it does not know rather than guessing
+/// `main`.
+pub fn default_branch_of(repository: &Path) -> Option<String> {
+    let head = run_git(
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        repository,
+        None,
+    )
+    .ok()?;
+    let head = head.trim();
+    head.strip_prefix("origin/")
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
 }
 
 /// The branch a workspace's repository is on.
@@ -393,7 +470,13 @@ pub fn commit_subjects_ahead(
     };
     let range = format!("{measured}..{branch}");
     let text = run_git(
-        &["log", "--format=%s", "-n", &limit.max(1).to_string(), &range],
+        &[
+            "log",
+            "--format=%s",
+            "-n",
+            &limit.max(1).to_string(),
+            &range,
+        ],
         repository,
         None,
     )?;
@@ -469,6 +552,16 @@ pub fn cloned_repositories(workspace: &Path) -> Vec<ClonedRepository> {
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found
+}
+
+/// Fetch every remote ref into an existing clone, without touching local work.
+///
+/// The session loop calls this before a session when the repository is already in the
+/// agent's workspace. It updates the remote-tracking refs only: no branch is reset,
+/// checked out or discarded, so uncommitted work and local commits stay as they are.
+pub fn fetch(repository: &Path, credential: &GitCredential<'_>) -> Result<(), WorkspaceError> {
+    run_git(&["fetch", "--all", "--prune"], repository, Some(credential))?;
+    Ok(())
 }
 
 /// Push the current branch to `origin`, as the agent.
@@ -583,7 +676,7 @@ pub fn watch_push(workspace: &Path) -> PushWatch {
 /// before-picture: a pull or an earlier push in the same run may precede the push
 /// that produced the current object. A reflog that is absent or unreadable leaves no
 /// evidence, so no claim is made.
-pub fn pushed_during(watch: &PushWatch) -> Option<(String, String)> {
+pub fn pushed_during(watch: &PushWatch) -> Option<PushedRef> {
     for snapshot in &watch.repositories {
         let Some((heads, remotes)) = refs_of(&snapshot.root) else {
             continue;
@@ -605,11 +698,26 @@ pub fn pushed_during(watch: &PushWatch) -> Option<(String, String)> {
                 continue;
             }
             if reflog_records_push(&snapshot.root, refname, object, watch.started_unix) {
-                return Some((branch.to_owned(), refname.clone()));
+                return Some(PushedRef {
+                    branch: branch.to_owned(),
+                    remote_ref: refname.clone(),
+                    repository: snapshot.root.clone(),
+                });
             }
         }
     }
     None
+}
+
+/// One branch a run pushed, with the clone whose refs proved it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushedRef {
+    /// The local branch the pushed remote-tracking ref corresponds to.
+    pub branch: String,
+    /// The remote-tracking ref whose object changed.
+    pub remote_ref: String,
+    /// The clone the push was read from, so the witness can name its repository.
+    pub repository: PathBuf,
 }
 
 /// Whether git's reflog for `refname` says the run pushed it.
@@ -811,11 +919,16 @@ mod tests {
         std::fs::create_dir_all(&repository).expect("the repository directory");
         git(&repository, &["init", "-q", "-b", "main"]);
         git(&repository, &["config", "user.name", "gewu-scribe"]);
-        git(&repository, &["config", "user.email", "gewu-scribe@agents.invalid"]);
+        git(
+            &repository,
+            &["config", "user.email", "gewu-scribe@agents.invalid"],
+        );
         std::fs::write(repository.join("README"), "mine\n").expect("a file");
         git(&repository, &["add", "."]);
         git(&repository, &["commit", "-q", "-m", "mine"]);
-        let state = inspect(&repository).expect("git runs").expect("a repository");
+        let state = inspect(&repository)
+            .expect("git runs")
+            .expect("a repository");
         assert_eq!(state.branch, "main");
         assert!(!state.commit.is_empty(), "the commit is named");
         assert!(state.committed_at > 0, "the commit has a time");
@@ -830,7 +943,9 @@ mod tests {
         assert_eq!(inspect(&plain).expect("git is not even asked"), None);
         // A change is counted.
         std::fs::write(repository.join("README"), "changed\n").expect("an edit");
-        let state = inspect(&repository).expect("git runs").expect("a repository");
+        let state = inspect(&repository)
+            .expect("git runs")
+            .expect("a repository");
         assert_eq!(state.changed, 1);
     }
 

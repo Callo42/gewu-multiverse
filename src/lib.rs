@@ -1,75 +1,61 @@
-//! `gewu-multiverse` — a local, single-Universe Matrixverse.
+//! `gewu-multiverse` — one Forgejo on your machine, and the agents you run on it.
 //!
-//! This crate is the terminal application: it opens the UI, reads one configuration
-//! file, prepares one credentials file, records the first-run risk acknowledgment,
-//! and runs agents as ordinary local child processes. An agent may instead run as a
-//! user unit of the user's own systemd, which the tool writes and starts; that mode is
-//! opt-in per agent and leaves the default behaviour unchanged. A run reads an
-//! instruction, a
-//! skill set and a declared list of shell steps, and leaves a log and an append-only
-//! JSONL transcript. A run then calls the model at its own configured endpoint,
-//! executes the tool calls the model asks for inside the agent's workspace, and stops
-//! when the model finishes or a declared bound is reached. The tool also talks to one
-//! Forgejo: it checks what the configured token can see, gives each agent its own
-//! Forgejo identity, and lets an agent work on a repository so its commits are
-//! authored by the agent rather than by the user.
+//! Install the program and it brings its own Forgejo. The terminal board draws the
+//! one Forgejo and the agents wired to it; each agent has its own Forgejo account,
+//! one shared model and an instruction you write. Starting an agent keeps one run
+//! after another going until you stop it. A run reads the instruction, calls the
+//! model, uses the declared shell and Forgejo tools, and leaves a log and an
+//! append-only JSONL transcript under the state root.
 //!
 //! The modules are:
 //!
 //! - [`cli`] — the arguments the program accepts;
 //! - [`naming`] — what an agent name may be, because directories derive from it;
 //! - [`paths`] — the two roots and every path derived from an agent's name;
-//! - [`config`] — the configuration file and its validation;
 //! - [`mode`] — the file modes the private files are held to;
-//! - [`machine`] — which machine a fact was learned on, so a copied record is not
-//!   read as this machine's own (W32-2, W32-6);
 //! - [`credentials`] — the credentials file, and the secrets it hands out;
-//! - [`risk`] — the first-run risk acknowledgment and its record;
 //! - [`time`] — the clock, and how an instant is written down;
-//! - [`version`] — the newest version that has opened the configuration, and how two
-//!   versions compare (U3);
 //! - [`transcript`] — the append-only record of a run;
 //! - [`run`] — a run's identity, its plan and its outcome;
-//! - [`model`] — the direct model client, and its error taxonomy;
-//! - [`forgejo`] — the Forgejo client, the role check and its error taxonomy;
-//! - [`identity`] — one Forgejo identity per agent, derived from configuration;
+//! - [`model`] — the model client, and its error words;
+//! - [`forgejo`] — the one Forgejo's client and its error taxonomy;
+//! - [`forgejo_tools`] — the six Forgejo tools a run may declare, and their refusals;
+//! - [`identity`] — one Forgejo account per agent, derived from its name;
+//! - [`pull_gate`] — the open/update rules the Forgejo tools share;
 //! - [`workspace`] — git work in an agent's workspace, under that identity;
 //! - [`agent_run`] — the agent process itself, one run at a time;
-//! - [`supervisor`] — starting, watching and stopping agent processes;
-//! - [`systemd`] — the opt-in mode in which an agent runs as a user unit;
+//! - [`bundled_forgejo`] — the pinned Forgejo: download, instance, recovery;
+//! - [`engine`] — the board's engine: Forgejo, accounts and the session loop;
+//! - [`engine_api`] — the contract between the board and the engine;
+//! - [`board`] — the picture and the keys;
 //! - [`words`] — the product's plain-text sentences (counts with the right noun);
-//! - [`editor`] — handing a file to the user's own editor or pager;
-//! - [`ui`] — drawing the screens;
-//! - [`app`] — the state behind the screens and the key bindings.
-
+//! - [`editor`] — handing a file to the user's own editor or pager.
 #[cfg(not(unix))]
 compile_error!(
     "gewu-multiverse targets Unix-like systems: it needs a terminal and 0600 file modes."
 );
 
 pub mod agent_run;
-pub mod app;
+pub mod board;
+pub mod bundled_forgejo;
 pub mod cli;
-pub mod config;
 pub mod credentials;
 pub mod editor;
+pub mod engine;
+pub mod engine_api;
 pub mod forgejo;
+pub mod forgejo_tools;
 pub mod identity;
-pub mod machine;
 pub mod mode;
 pub mod model;
 pub mod naming;
 pub mod paths;
-pub mod risk;
+pub mod pull_gate;
 pub mod run;
-pub mod supervisor;
-pub mod systemd;
 pub mod time;
 pub mod transcript;
-pub mod ui;
-pub mod version;
-pub mod workspace;
 pub mod words;
+pub mod workspace;
 
 /// A tiny local HTTP server for the tests and demonstrations only; the application
 /// never starts it and never listens on a socket.

@@ -233,6 +233,59 @@ pub enum Record {
         /// The message, which never holds the key.
         message: String,
     },
+    /// A model-asked Forgejo tool is about to run.
+    ///
+    /// The record names the tool, the repository and the number it acts on, and a
+    /// bounded description of the act. It never carries a token, a request body or a
+    /// reply body.
+    ForgejoCall {
+        /// When.
+        ts: String,
+        /// Which model turn asked for it.
+        turn: u32,
+        /// Which tool call this is.
+        index: u32,
+        /// The declared tool's name.
+        tool: String,
+        /// `owner/name`, when one repository is the subject.
+        #[serde(default)]
+        repository: Option<String>,
+        /// The issue or pull request number, when one is the subject.
+        #[serde(default)]
+        number: Option<u64>,
+        /// A bounded description of what the call asks for.
+        detail: String,
+    },
+    /// A model-asked Forgejo tool finished.
+    ///
+    /// The outcome is one bounded sentence, or `ok`. A successful write carries its
+    /// action word (`commented`, `opened`, `updated`) and the web URL of what it
+    /// changed, so the Runs note can show the person what happened without reading
+    /// the raw reply.
+    ForgejoResult {
+        /// When.
+        ts: String,
+        /// Which model turn asked for it.
+        turn: u32,
+        /// Which tool call this is.
+        index: u32,
+        /// The declared tool's name.
+        tool: String,
+        /// `owner/name`, when one repository is the subject.
+        #[serde(default)]
+        repository: Option<String>,
+        /// The issue or pull request number, when one is the subject.
+        #[serde(default)]
+        number: Option<u64>,
+        /// `ok`, or one bounded refusal sentence.
+        outcome: String,
+        /// The web URL of what a successful write changed.
+        #[serde(default)]
+        url: Option<String>,
+        /// `commented`, `opened` or `updated` for a successful write.
+        #[serde(default)]
+        action: Option<String>,
+    },
     /// The run is over. Written by the process that supervised the run, once, last.
     RunFinished {
         /// When.
@@ -409,6 +462,51 @@ impl Record {
         }
     }
 
+    /// The record of a Forgejo tool about to run.
+    pub fn forgejo_call(
+        turn: u32,
+        index: u32,
+        tool: &str,
+        repository: Option<&str>,
+        number: Option<u64>,
+        detail: &str,
+    ) -> Self {
+        Record::ForgejoCall {
+            ts: stamp(),
+            turn,
+            index,
+            tool: tool.to_owned(),
+            repository: repository.map(str::to_owned),
+            number,
+            detail: detail.to_owned(),
+        }
+    }
+
+    /// The record of a Forgejo tool that finished.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forgejo_result(
+        turn: u32,
+        index: u32,
+        tool: &str,
+        repository: Option<&str>,
+        number: Option<u64>,
+        outcome: &str,
+        url: Option<&str>,
+        action: Option<&str>,
+    ) -> Self {
+        Record::ForgejoResult {
+            ts: stamp(),
+            turn,
+            index,
+            tool: tool.to_owned(),
+            repository: repository.map(str::to_owned),
+            number,
+            outcome: outcome.to_owned(),
+            url: url.map(str::to_owned),
+            action: action.map(str::to_owned),
+        }
+    }
+
     /// The terminal record of a run.
     pub fn run_finished(
         run_id: &str,
@@ -441,6 +539,8 @@ impl Record {
             Record::ModelRequest { .. } => "model_request",
             Record::ModelReply { .. } => "model_reply",
             Record::ModelCallFailed { .. } => "model_call_failed",
+            Record::ForgejoCall { .. } => "forgejo_call",
+            Record::ForgejoResult { .. } => "forgejo_result",
             Record::RunFinished { .. } => "run_finished",
         }
     }
@@ -459,6 +559,8 @@ impl Record {
             | Record::ModelRequest { ts, .. }
             | Record::ModelReply { ts, .. }
             | Record::ModelCallFailed { ts, .. }
+            | Record::ForgejoCall { ts, .. }
+            | Record::ForgejoResult { ts, .. }
             | Record::RunFinished { ts, .. } => ts,
         }
     }
@@ -592,6 +694,46 @@ pub fn terminal_record_checked(run_dir: &Path) -> io::Result<Option<Record>> {
 /// [`terminal_record_checked`] instead.
 pub fn terminal_record(run_dir: &Path) -> Option<Record> {
     terminal_record_checked(run_dir).ok().flatten()
+}
+
+/// Write a run's terminal record, unless the run wrote one itself, and hand back the
+/// outcome the transcript actually holds.
+///
+/// A run that was killed before it could write its own ending gets one written for it,
+/// so every run has exactly one ending decided by something that saw it. A run that
+/// wrote its own ending keeps it: this never overwrites the process's own record.
+pub fn record_outcome_if_missing(
+    run_dir: &Path,
+    run_id: &str,
+    outcome: RunOutcome,
+    reason: Option<String>,
+    duration_ms: u64,
+) -> (RunOutcome, Option<String>, u64) {
+    let existing = terminal_record(run_dir);
+    if existing.is_none() {
+        if let Ok(mut transcript) = Transcript::open(run_dir) {
+            let _ = transcript.append(&Record::run_finished(
+                run_id,
+                outcome,
+                None,
+                duration_ms,
+                reason.clone(),
+            ));
+        }
+    }
+    match existing {
+        Some(Record::RunFinished {
+            outcome,
+            reason,
+            duration_ms,
+            ..
+        }) => (
+            RunOutcome::parse(&outcome).unwrap_or(RunOutcome::Failed),
+            reason,
+            duration_ms,
+        ),
+        _ => (outcome, reason, duration_ms),
+    }
 }
 
 /// The timestamp of the run's opening record, when it is there.

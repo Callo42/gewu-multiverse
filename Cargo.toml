@@ -3,11 +3,11 @@ name = "gewu-multiverse"
 version = "0.1.29"
 edition = "2024"
 rust-version = "1.85"
-description = "A local, single-Universe Matrixverse: one Forgejo, the agents you define, and a terminal UI."
+description = "One bundled Forgejo on your machine and the agents you run on it, drawn as a terminal board."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/Callo42/gewu-multiverse"
-keywords = ["tui", "forgejo", "agents"]
+keywords = ["tui", "forgejo", "agents", "local"]
 categories = ["command-line-utilities"]
 
 [dependencies]
@@ -15,26 +15,27 @@ categories = ["command-line-utilities"]
 ratatui = "0.29"
 # crossterm — the terminal backend and key-event reader that ratatui draws into.
 crossterm = "0.28"
-# serde — turns the configuration file into typed values, refusing unknown fields.
+# serde — turns the settings and credentials files into typed values, refusing
+# unknown fields.
 serde = { version = "1", features = ["derive"] }
-# toml — the configuration file format, chosen because it takes comments and is hand-editable.
+# toml — the settings and credentials format, chosen because it takes comments and is
+# hand-editable.
 toml = "1"
-# directories — finds the user's own configuration directory on each platform.
+# directories — finds the user's own configuration, state and data directories.
 directories = "6"
 # thiserror — derives the error types, so a bad file is a clear message and never a panic.
 thiserror = "2"
 # serde_json — writes the run plan and the append-only JSONL transcript of every run.
 serde_json = "1"
 # nix — sends a signal to an agent's whole process group, so stopping one stops its children too.
-nix = { version = "0.30", default-features = false, features = ["signal"] }
+nix = { version = "0.30", default-features = false, features = ["signal", "fs"] }
 # ureq — one blocking HTTPS request at a time to the model endpoint, with rustls and no async runtime.
 ureq = "3"
 # signal-hook — a safe signal handler, so a hand-off's `^C` does not kill the product
 # (E-3). It is already in the tree through crossterm; naming it here makes the use direct.
 signal-hook = "0.3"
-# sha2 — the digest of the acknowledgment terms text, so the product can tell whether the
-# terms it now shows are the ones the record was made under (C-4). It is a check, not a
-# signature: the record stays an unsigned file and says so.
+# sha2 — checks the pinned Forgejo download against its published digest before the
+# binary is renamed into place.
 sha2 = "0.10"
 
 [lints.rust]
