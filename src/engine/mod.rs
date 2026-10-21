@@ -41,6 +41,8 @@ use crate::mode::{SECRET_FILE_MODE, set_mode};
 use crate::paths::Layout;
 use crate::run::process_alive;
 use crate::run::{self, LOG_FILE};
+use std::os::unix::process::ExitStatusExt;
+
 use crate::transcript::{self, TRANSCRIPT_FILE};
 
 use self::clock::{RealClock, SharedClock};
@@ -81,14 +83,16 @@ pub const FORGEJO_RESTART_MAX: Duration = Duration::from_secs(60);
 /// How long to wait before retrying an account that could not be provisioned.
 pub const PROVISION_RETRY: Duration = Duration::from_secs(5);
 
-/// How often the organisation's repositories are listed again.
-pub const REPOSITORY_REFRESH: Duration = Duration::from_secs(5);
+/// How often the organisation's repositories are listed again. Two seconds keeps a
+/// deletion's stale window short on a local server, and the count is replaced in the
+/// same tick as its event (W31-8).
+pub const REPOSITORY_REFRESH: Duration = Duration::from_secs(2);
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.
 pub const TERMS: &[&str] = &[
     "Agents use this computer with your permissions.",
-    "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
+    "When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.",
     "Each has its own login on your Forgejo.",
     "Started agents keep going until you stop them.",
     "Their work is sent to your model provider.",
@@ -311,8 +315,19 @@ fn build(
 /// What the one upgrade screen should say, when this is the first open by a newer
 /// build. A fresh installation, a same-version open and a downgrade have no screen.
 fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> Option<UpgradeView> {
-    let from = last_seen::read(layout.root())?;
-    if !last_seen::is_older(&from, env!("CARGO_PKG_VERSION")) {
+    // Builds before 0.1.31 wrote no marker at all, so a real upgrade from 0.1.30 has
+    // none. An existing installation (its settings file, or the older text screens'
+    // config.toml) still deserves the one screen: the installer writes the exact old
+    // version before it replaces the binary, and this fallback covers a binary
+    // replaced by other means. A fresh root writes neither file, so it stays silent.
+    let from = match last_seen::read(layout.root()) {
+        Some(version) => version,
+        None if settings_path.is_file() || layout.config_file().is_file() => {
+            "an earlier version".to_owned()
+        }
+        None => return None,
+    };
+    if from != "an earlier version" && !last_seen::is_older(&from, env!("CARGO_PKG_VERSION")) {
         return None;
     }
     let mut instructions = 0;
@@ -417,6 +432,9 @@ struct AgentRuntime {
     email: Option<String>,
     session: SessionState,
     sessions_since_start: u64,
+    /// Every run record found on open plus every run started since; never reset by a
+    /// Start. This is what the card's `run N` shows.
+    runs_total: u64,
     session_number: u64,
     recent: VecDeque<SessionEnd>,
     instruction_chars: usize,
@@ -426,10 +444,12 @@ struct AgentRuntime {
     activity: Option<String>,
     activity_at: Option<SystemTime>,
     last_error: Option<String>,
+    last_result: Option<String>,
     last_failure: Option<String>,
     current_tool: Option<String>,
     current_tool_since: Option<SystemTime>,
     last_work: Vec<String>,
+    no_assigned_work: bool,
     activity_refresh_at: Option<Instant>,
     newest_run: Option<PathBuf>,
     running: Option<RunningState>,
@@ -737,10 +757,23 @@ impl AgentRuntime {
                 })
         });
         let last_failure = newest_run.as_deref().and_then(run::read_failure);
-        let last_work = newest_run
+        // The work block stays until a later run does new work: a read-only check
+        // run must not erase the pull request, branch and comment a work run left
+        // (W31-3). A run whose own log says nothing was assigned gets the plain
+        // empty-work sentence on the Agent screen (F2).
+        let last_work = run::latest_work(&runs);
+        let last_result = runs.last().and_then(|summary| match summary.outcome {
+            Some(
+                run::RunOutcome::Succeeded
+                | run::RunOutcome::Refused
+                | run::RunOutcome::NoWork
+                | run::RunOutcome::Warned,
+            ) => summary.reason.clone(),
+            _ => None,
+        });
+        let no_assigned_work = newest_run
             .as_deref()
-            .map(run::work_summary)
-            .unwrap_or_default();
+            .is_some_and(|dir| run::says_no_assigned_work(dir, &format!("gewu-{name}")));
         Self {
             name: name.to_owned(),
             desired,
@@ -749,6 +782,7 @@ impl AgentRuntime {
             email,
             session: SessionState::Idle,
             sessions_since_start: 0,
+            runs_total: runs.len() as u64,
             session_number: 0,
             recent,
             instruction_chars: chars,
@@ -758,10 +792,12 @@ impl AgentRuntime {
             activity,
             activity_at,
             last_error,
+            last_result,
             last_failure,
             current_tool: None,
             current_tool_since: None,
             last_work,
+            no_assigned_work,
             activity_refresh_at: None,
             newest_run,
             running: None,
@@ -799,6 +835,30 @@ impl AgentRuntime {
 fn end_from_outcome(summary: &run::RunSummary) -> Option<SessionEnd> {
     match summary.outcome? {
         run::RunOutcome::Succeeded => Some(SessionEnd::Succeeded),
+        run::RunOutcome::Refused => Some(SessionEnd::Refused {
+            reason: crate::forgejo_tools::sentence(
+                summary
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "the run refused the instruction".to_owned()),
+            ),
+        }),
+        run::RunOutcome::NoWork => Some(SessionEnd::NoWork {
+            reason: crate::forgejo_tools::sentence(
+                summary
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "the run had no work".to_owned()),
+            ),
+        }),
+        run::RunOutcome::Warned => Some(SessionEnd::Warned {
+            reason: crate::forgejo_tools::sentence(
+                summary
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "a command failed".to_owned()),
+            ),
+        }),
         run::RunOutcome::Failed => Some(SessionEnd::Failed {
             reason: crate::forgejo_tools::sentence(
                 summary
@@ -829,15 +889,27 @@ fn instruction_facts(path: &Path) -> (usize, Option<String>, usize, Option<Syste
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(|line| {
-            let full = line.chars().count();
-            let mut line: String = line.chars().take(120).collect();
-            if full > 120 {
-                line.push('…');
-            }
-            line
-        });
+        .map(first_line_at_a_word);
     (chars, first, lines, mtime)
+}
+
+/// The first line of an instruction, cut at 120 characters on a word.
+///
+/// A card is read as a sentence. Cutting the stored line at a character count and
+/// leaving the renderer to ellipsize what it received made `extraordinary` render as
+/// `extraord…` at 80 columns (review B3). The cap is applied here, to the whole
+/// first line, and the cut falls back to the last whole word before it.
+fn first_line_at_a_word(line: &str) -> String {
+    const CAP: usize = 120;
+    let full = line.chars().count();
+    if full <= CAP {
+        return line.to_owned();
+    }
+    let mut cut: String = line.chars().take(CAP).collect();
+    if let Some(at) = cut.rfind(char::is_whitespace) {
+        cut.truncate(at);
+    }
+    format!("{}…", cut.trim_end())
 }
 
 fn backoff_for_quick_failure(failures: u32) -> Duration {
@@ -1008,7 +1080,10 @@ impl Inner {
                 } else if run.timed_out {
                     SessionEnd::TimedOut
                 } else if status.success() {
-                    SessionEnd::Succeeded
+                    // Exit 0 is not the whole outcome: the run's own terminal record
+                    // says whether its last sentence refused the instruction or found
+                    // no work (F4). The record is written before the process exits.
+                    session_success_end(&run.run_dir)
                 } else {
                     SessionEnd::Failed {
                         reason: session_failure_reason(&run.run_dir, status),
@@ -1022,8 +1097,9 @@ impl Inner {
             self.agents[index].running = None;
             self.agents[index].starting = false;
             self.agents[index].activity_refresh_at = None;
+            let state_root = self.options.layout.state_root().to_path_buf();
             let agent = &mut self.agents[index];
-            finish_session(agent, end, now, started);
+            finish_session(agent, end, now, started, &state_root);
         } else if let Some(run_dir) = self.agents[index]
             .running
             .as_ref()
@@ -1234,6 +1310,7 @@ impl Inner {
                 self.agents[index].starting_since = Some(now);
                 self.agents[index].session_number =
                     self.agents[index].session_number.saturating_add(1);
+                self.agents[index].runs_total = self.agents[index].runs_total.saturating_add(1);
                 self.agents[index].sessions_since_start =
                     self.agents[index].sessions_since_start.saturating_add(1);
                 self.agents[index].session = SessionState::Running {
@@ -1323,19 +1400,85 @@ fn backoff_for_restart(failures: u32) -> Duration {
 }
 
 fn session_failure_reason(run_dir: &Path, status: std::process::ExitStatus) -> String {
-    if let Some(sentence) = last_run_log_line(run_dir) {
+    // The run's own terminal record holds the cause it ended with (a model transport
+    // failure, a tool's refusal, a declared step's output). The log's last line is
+    // the process-exit line the product itself appends, so it is never the reason
+    // (W31-7, F3).
+    if let Some(transcript::Record::RunFinished {
+        reason: Some(reason),
+        ..
+    }) = transcript::terminal_record(run_dir)
+    {
+        let reason = crate::forgejo_tools::sentence(reason);
+        if !reason.is_empty() {
+            return reason;
+        }
+    }
+    if status.signal().is_some() {
+        return "run was killed".to_owned();
+    }
+    if let Some(sentence) = last_meaningful_log_line(run_dir) {
         return sentence;
     }
     match status.code() {
-        Some(code) => format!("the session exited with code {code}"),
-        None => "the session was ended by a signal".to_owned(),
+        Some(code) => format!("the run exited with code {code}"),
+        None => "the run was ended by a signal".to_owned(),
     }
 }
 
-fn last_run_log_line(run_dir: &Path) -> Option<String> {
+/// The ending a cleanly exited run recorded for itself.
+fn session_success_end(run_dir: &Path) -> SessionEnd {
+    if let Some(transcript::Record::RunFinished {
+        outcome, reason, ..
+    }) = transcript::terminal_record(run_dir)
+    {
+        let reason = crate::forgejo_tools::sentence(reason.unwrap_or_default());
+        match crate::run::RunOutcome::parse(&outcome) {
+            Some(crate::run::RunOutcome::Refused) => return SessionEnd::Refused { reason },
+            Some(crate::run::RunOutcome::NoWork) => return SessionEnd::NoWork { reason },
+            Some(crate::run::RunOutcome::Warned) => return SessionEnd::Warned { reason },
+            _ => {}
+        }
+    }
+    SessionEnd::Succeeded
+}
+
+/// The last log line that carries a cause, skipping the product's own progress and
+/// process-exit lines. A command echo (`[turn 1 tool 1] sleep 60`) is not a reason.
+fn last_meaningful_log_line(run_dir: &Path) -> Option<String> {
     let text = fs::read_to_string(run_dir.join(LOG_FILE)).ok()?;
-    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    Some(crate::forgejo_tools::sentence(line.trim().to_owned()))
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let cause = |line: &str| {
+        let lower = line.to_ascii_lowercase();
+        line.starts_with('✗')
+            || lower.contains("failed")
+            || lower.contains("refused")
+            || lower.contains("cannot")
+            || lower.contains("could not")
+            || lower.contains("error")
+            || lower.contains("permission denied")
+            || lower.contains("timed out")
+    };
+    if let Some(line) = lines.iter().rev().find(|line| cause(line)) {
+        return Some(crate::forgejo_tools::sentence((*line).to_owned()));
+    }
+    let line = lines.iter().rev().find(|line| {
+        !line.starts_with("agent process exiting")
+            && !line.starts_with("[turn ")
+            && !line.starts_with("[step ")
+            && !line.starts_with("run ")
+            && !line.starts_with("workspace:")
+            && !line.starts_with("model:")
+            && !line.starts_with("instruction read:")
+            && !line.starts_with("forgejo tools:")
+            && !line.starts_with("skills installed:")
+            && !line.starts_with("confinement:")
+    })?;
+    Some(crate::forgejo_tools::sentence((*line).to_owned()))
 }
 
 /// One Forgejo action in the words the card uses: `commented on #12`,
@@ -1364,7 +1507,13 @@ fn plain_activity(sentence: &str) -> String {
     sentence.to_owned()
 }
 
-fn finish_session(agent: &mut AgentRuntime, mut end: SessionEnd, now: Instant, started: Instant) {
+fn finish_session(
+    agent: &mut AgentRuntime,
+    mut end: SessionEnd,
+    now: Instant,
+    started: Instant,
+    state_root: &Path,
+) {
     if agent.desired == Desired::Stopped {
         end = SessionEnd::Stopped;
     }
@@ -1378,6 +1527,12 @@ fn finish_session(agent: &mut AgentRuntime, mut end: SessionEnd, now: Instant, s
         SessionEnd::Failed { reason } => Some(reason.clone()),
         _ => None,
     };
+    let mut result = match &end {
+        SessionEnd::Refused { reason }
+        | SessionEnd::NoWork { reason }
+        | SessionEnd::Warned { reason } => Some(crate::forgejo_tools::sentence(reason.clone())),
+        _ => None,
+    };
     agent.current_tool = None;
     agent.current_tool_since = None;
     if let Some(dir) = agent.newest_run.clone() {
@@ -1386,14 +1541,38 @@ fn finish_session(agent: &mut AgentRuntime, mut end: SessionEnd, now: Instant, s
             agent.activity_at = Some(SystemTime::now());
         }
         agent.last_failure = run::read_failure(&dir);
-        agent.last_work = run::work_summary(&dir);
+        let mut runs = run::runs_of_agent(state_root, &agent.name);
+        runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        agent.last_work = run::latest_work(&runs);
+        agent.no_assigned_work = run::says_no_assigned_work(
+            &dir,
+            &agent
+                .login
+                .clone()
+                .unwrap_or_else(|| format!("gewu-{}", agent.name)),
+        );
+        // A clean success keeps the model's own final summary from its terminal
+        // record, so `✓` carries the result row too (review B2). The record is
+        // written before the process exits; this reads the same row the reopen
+        // reads at startup.
+        if matches!(&end, SessionEnd::Succeeded | SessionEnd::Warned { .. }) {
+            result = runs
+                .iter()
+                .rev()
+                .find(|summary| summary.dir == dir)
+                .and_then(|summary| summary.reason.clone())
+                .map(crate::forgejo_tools::sentence);
+        }
     }
+    agent.last_result = result;
     if agent.desired == Desired::Stopped || end == SessionEnd::Stopped {
         agent.session = SessionState::Idle;
         agent.next_at = None;
         return;
     }
-    let delay = if end == SessionEnd::Succeeded || ran >= LONG_SESSION {
+    let delay = if matches!(end, SessionEnd::Succeeded | SessionEnd::Warned { .. })
+        || ran >= LONG_SESSION
+    {
         agent.quick_failures = 0;
         RESTART_DELAY
     } else {
@@ -1459,6 +1638,7 @@ impl EngineApi for Engine {
                 desired: agent.desired,
                 session: agent.session.clone(),
                 sessions_since_start: agent.sessions_since_start,
+                runs_total: agent.runs_total,
                 recent: agent.recent.iter().cloned().collect(),
                 instruction_chars: agent.instruction_chars,
                 instruction_first_line: agent.instruction_first_line.clone(),
@@ -1466,6 +1646,7 @@ impl EngineApi for Engine {
                 activity: agent.activity.clone(),
                 activity_at: agent.activity_at,
                 last_error: agent.last_error.clone(),
+                last_result: agent.last_result.clone(),
                 last_failure: agent.last_failure.clone(),
                 current_tool: agent.current_tool.clone(),
                 current_tool_seconds: agent
@@ -1474,6 +1655,7 @@ impl EngineApi for Engine {
                     .map(|elapsed| elapsed.as_secs())
                     .unwrap_or(0),
                 last_work: agent.last_work.clone(),
+                no_assigned_work: agent.no_assigned_work,
             })
             .collect();
         BoardView {
@@ -2320,7 +2502,10 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
         .and_then(|client| client.organisation_repositories(bundled_forgejo::ORGANISATION));
     if let Ok(mut inner) = inner.lock() {
         inner.forgejo.repositories_inflight = false;
-        inner.forgejo.repositories_refreshed_at = Some(Instant::now());
+        // A failed fetch is retried on the next tick rather than after a full poll
+        // interval: the board must not keep an old count for two intervals because
+        // one request failed (W31-8).
+        inner.forgejo.repositories_refreshed_at = result.is_ok().then(Instant::now);
         if let Ok(repositories) = result {
             // The administration API's own repository list is polled; a name that
             // disappeared or appeared between two polls is an event on the board, so
@@ -2468,8 +2653,15 @@ fn session_job(
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
             let started = guard.agents[index].starting_since.unwrap_or(now);
+            let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];
-            finish_session(agent, SessionEnd::Failed { reason }, now, started);
+            finish_session(
+                agent,
+                SessionEnd::Failed { reason },
+                now,
+                started,
+                &state_root,
+            );
             return;
         }
     };
@@ -2541,10 +2733,22 @@ fn session_job(
                 Some(reason.clone()),
                 0,
             );
+            let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];
-            finish_session(agent, SessionEnd::Failed { reason }, now, started);
+            finish_session(
+                agent,
+                SessionEnd::Failed { reason },
+                now,
+                started,
+                &state_root,
+            );
         }
     }
+}
+
+/// The post-removal line, short enough for an 80-column board (F16).
+fn removed_note(name: &str) -> String {
+    format!("`{name}` was removed; login deactivated, history kept")
 }
 
 fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
@@ -2625,9 +2829,7 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                 if let Err(error) = inner.save_settings() {
                     inner.note(format!("`{name}` was removed, but {error}"));
                 } else {
-                    inner.note(format!(
-                        "`{name}` was removed; its login is deactivated, its token revoked, its history kept"
-                    ));
+                    inner.note(removed_note(&name));
                 }
             }
             Err(_reason) => {
@@ -2670,28 +2872,11 @@ fn endpoint_test_job(
     }
 }
 
-/// One endpoint failure in the words the model screen uses. No HTTP status, raw body
-/// or engine word reaches the person.
+/// One endpoint failure in the words the model screen uses. The suffix check and the
+/// empty-key check say nothing was sent; a provider's refusal names its status and
+/// the first clause of its own message. No raw body or engine word reaches the person.
 fn plain_endpoint_failure(error: &crate::model::ModelError, model: &str) -> String {
-    use crate::model::ModelError;
-    match error {
-        ModelError::BadUrl { .. }
-        | ModelError::RouteNotFound { .. }
-        | ModelError::RouteNotFoundListed { .. } => {
-            "wrong address — it should end in /chat/completions".to_owned()
-        }
-        ModelError::MissingKey | ModelError::BadKey { .. } => "the API key was refused".to_owned(),
-        ModelError::ModelNotFound { .. } => {
-            format!("no model called {model} at this address")
-        }
-        ModelError::Timeout { secs } => format!("no answer within {secs} s"),
-        ModelError::RateLimited { .. } => "the model is busy — try again".to_owned(),
-        ModelError::Server { .. } => "the model answered with an error".to_owned(),
-        ModelError::MalformedReply { .. } => "the model's answer could not be read".to_owned(),
-        ModelError::Transport { .. } => {
-            "the model could not be reached — check the internet connection".to_owned()
-        }
-    }
+    crate::model::failure_words(error, model)
 }
 
 fn sentence(error: &impl std::fmt::Display) -> String {
@@ -3218,12 +3403,31 @@ mod tests {
             TERMS,
             [
                 "Agents use this computer with your permissions.",
-                "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
+                "When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.",
                 "Each has its own login on your Forgejo.",
                 "Started agents keep going until you stop them.",
                 "Their work is sent to your model provider.",
             ]
         );
+        // One plain sentence per item; the mechanism names live in the docs and in
+        // the shell tool's description, which names the run's actual method (F10,
+        // W31-9). The second item is true under every mechanism because it says
+        // "when runs are confined".
+        for term in TERMS {
+            assert_eq!(
+                term.matches(". ").count(),
+                0,
+                "the item holds more than one sentence: {term}"
+            );
+            assert!(term.ends_with('.'), "{term}");
+            let lower = term.to_ascii_lowercase();
+            for mechanism in ["landlock", "bwrap", "unshare", "gewu_confinement"] {
+                assert!(
+                    !lower.contains(mechanism),
+                    "the consent line names {mechanism}: {term}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3251,7 +3455,7 @@ mod tests {
             ),
             (
                 ModelError::BadKey { status: 401 },
-                "the API key was refused",
+                "the provider refused the API key",
             ),
             (ModelError::Timeout { secs: 15 }, "no answer within 15 s"),
             (
@@ -3265,8 +3469,9 @@ mod tests {
         for (error, wanted) in cases {
             let sentence = plain_endpoint_failure(&error, "lab-chat-1");
             assert!(sentence.contains(wanted), "{sentence}");
-            for banned in ["HTTP", "endpoint", "session", "token", "2xx"] {
-                assert!(!sentence.contains(banned), "{sentence} has {banned}");
+            let words = sentence.to_ascii_lowercase();
+            for banned in ["endpoint", "session", "token", "2xx"] {
+                assert!(!words.contains(banned), "{sentence} has {banned}");
             }
         }
     }
@@ -3894,5 +4099,164 @@ mod tests {
         );
         let board = engine.board();
         assert!(matches!(board.agents[0].session, SessionState::Idle));
+    }
+
+    #[test]
+    fn a_failed_runs_reason_is_the_cause_not_the_process_exit_line() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let root = scratch_root("engine-failure-reason");
+        let run_dir = root.join("run-1700000000000-0001");
+        fs::create_dir_all(&run_dir).expect("the run directory");
+        let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("the transcript");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-1700000000000-0001",
+                crate::run::RunOutcome::Failed,
+                Some(1),
+                1,
+                Some(
+                    "the model could not be reached: Connection refused (os error 111) — model x at http://127.0.0.1:1"
+                        .to_owned(),
+                ),
+            ))
+            .expect("the terminal record");
+        fs::write(
+            run_dir.join(LOG_FILE),
+            "the model could not be reached: Connection refused (os error 111)\nagent process exiting with code 1\n",
+        )
+        .expect("the log");
+        let status = std::process::Command::new("false")
+            .status()
+            .expect("false runs");
+        let reason = session_failure_reason(&run_dir, status);
+        assert!(
+            reason.contains("Connection refused"),
+            "the process-exit line won: {reason}"
+        );
+        assert!(!reason.contains("agent process exiting"), "{reason}");
+
+        // A child killed by a signal with no terminal record names the kill, never a
+        // stale tool-echo line from the log.
+        let killed_dir = root.join("run-1700000000000-0002");
+        fs::create_dir_all(&killed_dir).expect("the killed run directory");
+        fs::write(
+            killed_dir.join(LOG_FILE),
+            "[turn 1 tool 1] sleep 60\nagent process exiting with code 1\n",
+        )
+        .expect("the killed log");
+        let signal = std::process::ExitStatus::from_raw(9);
+        assert_eq!(
+            session_failure_reason(&killed_dir, signal),
+            "run was killed"
+        );
+    }
+
+    #[test]
+    fn a_long_instruction_first_line_is_cut_on_a_word() {
+        let root = scratch_root("engine-instruction-word");
+        let path = root.join("instruction.md");
+        // 112 cells, then a single 13-letter word whose sixth letter is the 120th
+        // character: the old cut stored `extra` as a whole word and the renderer
+        // then said `extraord…` at 80 columns (review B3).
+        let prefix = "one two ".repeat(14);
+        fs::write(&path, format!("{prefix}extraordinary result\n")).expect("the instruction");
+        let (_chars, first, _lines, _mtime) = instruction_facts(&path);
+        let first = first.expect("a first line");
+        assert!(first.ends_with('…'), "{first}");
+        assert!(
+            !first.contains("extra"),
+            "the cut split `extraordinary`: {first}"
+        );
+        assert!(first.starts_with("one two one two"), "{first}");
+        assert!(
+            first.chars().count() <= 121,
+            "the stored line is longer than the cap: {first}"
+        );
+
+        let short = "fix the flaky login test";
+        fs::write(&path, format!("{short}\n")).expect("the short instruction");
+        let (_chars, first, _lines, _mtime) = instruction_facts(&path);
+        assert_eq!(first.as_deref(), Some(short));
+    }
+
+    #[test]
+    fn the_post_removal_line_fits_eighty_columns() {
+        let line = crate::board::status::plain(&removed_note("agent-2"));
+        assert!(line.contains("removed"), "{line}");
+        assert!(line.contains("login deactivated"), "{line}");
+        assert!(line.contains("history kept"), "{line}");
+        assert!(
+            line.chars().count() <= 78,
+            "the line is {} chars: {line}",
+            line.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_clean_exits_terminal_record_decides_its_mark() {
+        let root = scratch_root("engine-clean-ending");
+        let run_dir = root.join("run-1700000000000-0001");
+        fs::create_dir_all(&run_dir).expect("the run directory");
+        let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("the transcript");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-1700000000000-0001",
+                crate::run::RunOutcome::NoWork,
+                Some(0),
+                1,
+                Some("There are no open issues assigned to me.".to_owned()),
+            ))
+            .expect("the terminal record");
+        assert_eq!(
+            session_success_end(&run_dir),
+            SessionEnd::NoWork {
+                reason: "There are no open issues assigned to me.".to_owned()
+            }
+        );
+        let refused_dir = root.join("run-1700000000000-0002");
+        fs::create_dir_all(&refused_dir).expect("the second run");
+        let mut transcript =
+            crate::transcript::Transcript::open(&refused_dir).expect("the transcript");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-1700000000000-0002",
+                crate::run::RunOutcome::Refused,
+                Some(0),
+                1,
+                Some("I could not delete it.".to_owned()),
+            ))
+            .expect("the terminal record");
+        assert!(matches!(
+            session_success_end(&refused_dir),
+            SessionEnd::Refused { .. }
+        ));
+        let warned_dir = root.join("run-1700000000000-0003");
+        fs::create_dir_all(&warned_dir).expect("the third run");
+        let mut transcript =
+            crate::transcript::Transcript::open(&warned_dir).expect("the transcript");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-1700000000000-0003",
+                crate::run::RunOutcome::Warned,
+                Some(0),
+                1,
+                Some("The review is complete.".to_owned()),
+            ))
+            .expect("the terminal record");
+        assert_eq!(
+            session_success_end(&warned_dir),
+            SessionEnd::Warned {
+                reason: "The review is complete.".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_repository_poll_is_short_enough_for_a_deletion_event() {
+        assert!(
+            REPOSITORY_REFRESH <= Duration::from_secs(2),
+            "the board can stay stale for {REPOSITORY_REFRESH:?}"
+        );
     }
 }

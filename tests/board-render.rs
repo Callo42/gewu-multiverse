@@ -987,13 +987,14 @@ fn a_wide_window_caps_the_picture_at_about_one_hundred_columns() {
             }
         }
     }
-    // The frame is 100 wide, centred: the drawn cells sit inside 50..150 of 200.
+    // The frame is 160 wide, centred: the drawn cells sit inside 20..180 of 200, and
+    // the extra width is used rather than left as margin.
     assert!(
-        left >= 45 && right <= 155,
+        left >= 15 && right <= 185,
         "the 200x60 picture spans {left}..{right}"
     );
     assert!(
-        right - left <= 104,
+        right - left <= 164,
         "the picture is {} columns wide",
         right - left
     );
@@ -1104,8 +1105,9 @@ impl EngineApi for RichEngine {
                     .to_owned(),
             );
             agent.last_work = vec![
-                "issue team/website#2 · PR #5".to_owned(),
-                "branch fix/contributing-link · commented".to_owned(),
+                "issue #2".to_owned(),
+                "pull request #5 from fix/contributing-link".to_owned(),
+                "comment on #2".to_owned(),
             ];
             agent.last_failure = Some("shell: exit 128: fatal: could not read".to_owned());
             agent.activity = Some("opened pull request #5".to_owned());
@@ -1136,6 +1138,15 @@ impl EngineApi for RichEngine {
     }
 }
 
+/// Whether the frame contains `needle` across a wrapped line boundary.
+fn flat_contains(frame: &str, needle: &str) -> bool {
+    frame
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .contains(needle)
+}
+
 #[test]
 fn the_forgejo_page_names_repositories_permissions_and_the_team() {
     let mut board = Board::new(RichEngine(endpoint_engine(3)));
@@ -1144,7 +1155,11 @@ fn the_forgejo_page_names_repositories_permissions_and_the_team() {
     assert!(frame.contains("team/workspace"), "{frame}");
     assert!(frame.contains("team/website"), "{frame}");
     assert!(frame.contains("write to team repositories only"), "{frame}");
-    assert!(frame.contains("/orgs/team/teams/agents"), "{frame}");
+    assert!(frame.contains("/org/team/teams/agents"), "{frame}");
+    assert!(
+        frame.contains("only on issues assigned to them — assign an issue in Forgejo"),
+        "{frame}"
+    );
     assert!(frame.contains("kept from an earlier setup"), "{frame}");
     assert!(frame.contains("team/scratch was deleted"), "{frame}");
     // The board's own box names the repositories at a roomy size.
@@ -1158,12 +1173,15 @@ fn a_card_names_its_last_work_and_its_remaining_instruction() {
     let mut board = Board::new(RichEngine(endpoint_engine(3)));
     press(&mut board, KeyCode::Enter);
     let frame = text(&draw(&mut board, 120, 40));
-    assert!(frame.contains("issue team/website#2"), "{frame}");
-    assert!(frame.contains("PR #5"), "{frame}");
-    assert!(frame.contains("branch fix/contributing-link"), "{frame}");
+    assert!(flat_contains(&frame, "issue #2"), "{frame}");
+    assert!(
+        flat_contains(&frame, "pull request #5 from fix/contributing-link"),
+        "{frame}"
+    );
+    assert!(flat_contains(&frame, "comment on #2"), "{frame}");
     assert!(frame.contains("more lines"), "{frame}");
     // The last failure is on the card; the stale activity is marked `last:`.
-    assert!(frame.contains("✗ shell:"), "{frame}");
+    assert!(frame.contains("⚠ shell:"), "{frame}");
     let flat = frame.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains("last: opened pull request #5"), "{flat}");
     assert!(flat.contains("2m ago"), "{flat}");
@@ -1420,6 +1438,89 @@ fn the_run_strip_is_bounded_with_a_legend_and_a_count() {
     assert!(flat.contains("run "), "no run count: {flat}");
 }
 
+struct SuccessResultEngine(FakeEngine);
+
+impl EngineApi for SuccessResultEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        if let Some(agent) = view.agents.first_mut() {
+            agent.recent = vec![gewu_multiverse::engine_api::SessionEnd::Succeeded];
+            agent.last_result = Some("I fixed the flaky login test.".to_owned());
+            agent.session = gewu_multiverse::engine_api::SessionState::Idle;
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick()
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace)
+    }
+}
+
+#[test]
+fn a_successful_runs_own_summary_is_beside_the_tick() {
+    // Review B2: the result row used to be drawn only for refused/no-work, so a
+    // green tick said nothing about what the run did.
+    let mut board = Board::new(SuccessResultEngine(running_engine(1)));
+    press(&mut board, KeyCode::Enter);
+    let frame = text(&draw(&mut board, 80, 24));
+    assert!(
+        frame.contains("result: I fixed the flaky login test"),
+        "the success has no result row:
+{frame}"
+    );
+}
+
+#[test]
+fn the_run_legend_is_whole_at_the_floor() {
+    // Review N4: the padded legend was cut to `◷ t…` on the 72-column card.
+    let mut board = Board::new(StripEngine(running_engine(1)));
+    press(&mut board, KeyCode::Enter);
+    let frame = flat(&draw(&mut board, 72, 18));
+    assert!(
+        frame.contains("⊘ refused"),
+        "the legend lost the refusal word:\n{frame}"
+    );
+    assert!(
+        frame.contains("◷ timed out"),
+        "the legend is cut at the floor:\n{frame}"
+    );
+}
+
+#[test]
+fn the_warning_mark_is_in_the_legend_at_every_size() {
+    // Correction 4: the new `⚠` mark must be in the legend at every promised size,
+    // not only where there is room for the long word.
+    let mut board = Board::new(StripEngine(running_engine(1)));
+    press(&mut board, KeyCode::Enter);
+    for (width, height) in SIZES {
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("⚠ cmd"),
+            "{width}x{height}: the warning entry is not in the legend:\n{frame}"
+        );
+        assert!(
+            frame.contains("⊘ refused") && frame.contains("◷ timed out"),
+            "{width}x{height}: the legend lost an earlier word:\n{frame}"
+        );
+    }
+}
+
 #[test]
 fn the_home_card_keeps_its_few_words_at_72_and_80() {
     for (width, height) in [(72, 18), (80, 24)] {
@@ -1451,4 +1552,194 @@ fn one_four_and_twelve_agents_are_whole_at_72_and_80() {
             check_frame(&mut board, width, height, &format!("count {count}"));
         }
     }
+}
+
+#[test]
+fn the_floor_forgejo_page_keeps_every_fact_and_the_assignment_rule() {
+    let mut board = Board::new(RichEngine(endpoint_engine(3)));
+    press(&mut board, KeyCode::Char('f'));
+    let frame = text(&draw(&mut board, 72, 18));
+    let flat = flat(&draw(&mut board, 72, 18));
+    assert!(
+        flat.contains("only on issues assigned to them — assign an issue in Forgejo"),
+        "the assignment rule is not whole at 72x18:\n{flat}"
+    );
+    for wanted in [
+        "17.0.0",
+        "organisation",
+        "team",
+        "team page",
+        "/org/team/teams/agents",
+        "only on issues assigned",
+        "your login:",
+    ] {
+        assert!(
+            frame.contains(wanted),
+            "{wanted} missing at 72x18:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn the_agent_count_screen_labels_itself_a_preview() {
+    let mut board = picker_board();
+    assert_eq!(board.screen(), Screen::Picker);
+    let frame = text(&draw(&mut board, 80, 24));
+    assert!(frame.contains("preview"), "{frame}");
+    assert!(
+        !frame.contains("● running"),
+        "the preview shows a running server before create:\n{frame}"
+    );
+}
+
+#[test]
+fn the_selected_card_has_a_non_colour_mark() {
+    let mut board = Board::new(endpoint_engine(3));
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(frame.contains("▸ agent-1"), "{frame}");
+    press(&mut board, KeyCode::Right);
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(frame.contains("▸ agent-2"), "{frame}");
+    assert!(!frame.contains("▸ agent-1"), "{frame}");
+}
+
+#[test]
+fn a_wide_window_uses_its_width_for_repositories_and_cards() {
+    let mut board = Board::new(RichEngine(endpoint_engine(3)));
+    let frame = text(&draw(&mut board, 200, 60));
+    assert!(
+        frame.contains("team/workspace") && frame.contains("team/website"),
+        "a repository is still truncated at 200 columns:\n{frame}"
+    );
+    assert!(!frame.contains("team/workspa…"), "{frame}");
+    let flat = flat(&draw(&mut board, 200, 60));
+    assert!(flat.contains("your login: mei"), "{flat}");
+}
+
+#[test]
+fn the_password_row_says_how_long_the_value_is_shown() {
+    let mut board = Board::new(LongPasswordEngine {
+        inner: endpoint_engine(3),
+        revealed: false,
+    });
+    press(&mut board, KeyCode::Char('f'));
+    let frame = text(&draw(&mut board, 80, 24));
+    assert!(frame.contains("shown for 10 s"), "{frame}");
+    assert!(frame.contains("old stops"), "{frame}");
+    press(&mut board, KeyCode::Char('p'));
+    let revealed = text(&draw(&mut board, 80, 24));
+    assert!(revealed.contains("Gw-0123456789abcdef"), "{revealed}");
+}
+
+/// An engine whose newest run found no assigned issue: the Agent screen names the
+/// rule instead of showing an empty work block (F2).
+struct EmptyWorkEngine(FakeEngine);
+
+impl EngineApi for EmptyWorkEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        if let Some(agent) = view.agents.first_mut() {
+            agent.last_work.clear();
+            agent.no_assigned_work = true;
+            agent.activity = None;
+            agent.last_failure = None;
+            agent.last_error = None;
+            agent.session = gewu_multiverse::engine_api::SessionState::Idle;
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick()
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace)
+    }
+}
+
+#[test]
+fn the_agent_screen_names_the_assignment_rule_when_no_issue_is_assigned() {
+    let mut board = Board::new(EmptyWorkEngine(endpoint_engine(1)));
+    press(&mut board, KeyCode::Enter);
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(
+        frame.contains("no issues assigned to gewu-agent-1 yet"),
+        "{frame}"
+    );
+}
+
+/// An engine whose newest clean run refused the instruction: the card must carry the
+/// run's own summary beside a refused mark, not a green tick (F4).
+struct RefusedEngine(FakeEngine);
+
+impl EngineApi for RefusedEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        if let Some(agent) = view.agents.first_mut() {
+            agent.recent = vec![
+                gewu_multiverse::engine_api::SessionEnd::Succeeded,
+                gewu_multiverse::engine_api::SessionEnd::Refused {
+                    reason: "I could not delete team/library: the account has no permission."
+                        .to_owned(),
+                },
+            ];
+            agent.last_result =
+                Some("I could not delete team/library: the account has no permission.".to_owned());
+            agent.last_failure = None;
+            agent.last_error = None;
+            agent.activity = Some("opened pull request #4".to_owned());
+            agent.session = gewu_multiverse::engine_api::SessionState::Idle;
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick()
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace)
+    }
+}
+
+#[test]
+fn a_refused_run_is_not_a_green_tick_and_carries_its_summary() {
+    let mut board = Board::new(RefusedEngine(endpoint_engine(1)));
+    press(&mut board, KeyCode::Enter);
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(frame.contains("⊘"), "the refused mark is missing:\n{frame}");
+    assert!(
+        frame.contains("⊘ refused"),
+        "the legend lacks refused:\n{frame}"
+    );
+    assert!(frame.contains("result: I could not delete"), "{frame}");
+    assert!(
+        !frame.contains("last runs ✓ ✓"),
+        "the refusal still reads as a green run:\n{frame}"
+    );
 }

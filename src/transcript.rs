@@ -51,6 +51,21 @@ pub struct ModelToolCall {
     pub arguments: String,
 }
 
+/// One simple command inside one shell tool call, with the status the shell itself
+/// reported for it.
+///
+/// The product runs the command under `bash` with a `DEBUG` trap (correction 5); the
+/// shell writes each completed command and its status to a private channel the product
+/// owns, never to the model's output. The record is what lets the card mark a failed
+/// write behind a later successful segment without reading words in the output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandSegment {
+    /// The command text the shell was about to run, bounded.
+    pub command: String,
+    /// The status the shell reported for it.
+    pub status: i32,
+}
+
 /// The tokens a model reply used, as the endpoint reported them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelUsage {
@@ -136,6 +151,12 @@ pub enum Record {
         /// A bounded, redacted excerpt of what the tool printed.
         #[serde(default)]
         output: Option<String>,
+        /// The simple commands the shell completed, with its own status for each.
+        ///
+        /// Empty when the recorder could not run (a `/bin/sh`-only host); the output
+        /// heuristics are then the fallback (correction 5).
+        #[serde(default)]
+        segments: Vec<CommandSegment>,
     },
     /// The agent process itself is about to exit.
     ChildExit {
@@ -356,6 +377,30 @@ impl Record {
         duration_ms: u64,
         output: Option<String>,
     ) -> Self {
+        Self::tool_result_with_segments(
+            turn,
+            index,
+            tool,
+            exit_code,
+            signal,
+            duration_ms,
+            output,
+            Vec::new(),
+        )
+    }
+
+    /// The record of a tool that has finished, with the shell's per-command record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tool_result_with_segments(
+        turn: Option<u32>,
+        index: u32,
+        tool: &str,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        duration_ms: u64,
+        output: Option<String>,
+        segments: Vec<CommandSegment>,
+    ) -> Self {
         Record::ToolResult {
             ts: stamp(),
             turn,
@@ -365,6 +410,7 @@ impl Record {
             signal,
             duration_ms,
             output,
+            segments,
         }
     }
 

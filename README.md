@@ -44,11 +44,40 @@ requests are its own. The board shows the whole thing at a glance:
 - **A card for each agent.** A filled circle means working, a half circle means waiting
   for its next run, an empty ring means stopped or not started. The board card keeps
   the few words: the agent's name, its Forgejo login, its state, one last line and its
-  run count. Open it with `⏎` for the Agent screen: the last work block (issue, branch,
-  pull request, comment), the instruction's first line or `… (N more lines)`, the
-  bounded run marks with their legend, the last tool failure and the newest failed
-  run's first reason. Started agents keep a visible idle between runs
-  (`next run in 5s`).
+  run count. `run N` is the total from the run records, so it does not reset when an
+  agent starts again or the program reopens. Open it with `⏎` for the Agent screen:
+  the last work block (typed, and kept until a later run does new work), the
+  instruction's first line or `… (N more lines)`, the bounded run marks with their
+  legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`), the last
+  tool failure and the newest run's reason. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
+  every element of `PIPESTATUS`, so a failed command in a pipeline, a condition or a
+  nested `bash -c`/`#!/bin/bash` script that reads the prelude can never hide behind
+  a zero-exit wrapper, and
+  no line starts with the shell's own `<name>:` diagnostic prefix. Any
+  failed status is `⚠` with its cause as the row, or `⊘ refused` when it was a write; a
+  write inside a compound whose status the shell hides is `⊘` when the operating
+  system's own diagnostic is in the output, when the shell itself prints a line in its
+  own `<name>:` prefix (the shell's own name, the name of a nested `bash` that reads
+  `BASH_ENV`, or a sourced file's —
+  whatever the message — `ambiguous redirect`, `cannot overwrite
+  existing file`, …, or a recorded write's plain target named by the line), or when
+  any program's diagnostic is read — any
+  system error message the C library prints, not a list of programs or a list of error
+  strings. (Limits **(a)**–**(g)** in `docs/board.md`: a model that forges
+  the record or masks a failure, a `curl` without `-f` whose 200 body says `Forbidden`,
+  the conservative rule that only ever lowers the mark, a host without `bash`, a
+  nested interpreter that does not load the recorder (a non-bash interpreter, or
+  `bash` in POSIX or privileged mode), a failure that leaves neither a status nor any
+  diagnostic text, and a failure inside a piped or negated condition reported only by
+  a program's own free-form message.) A run that exited 0 but whose own
+  summary says it could not do the instruction, or whose tool results show a refused
+  write, is `⊘ refused`; one that found nothing assigned is `∅ no work`; one whose tool
+  results include a failed command is `⚠` with the command's cause as its row. None of
+  those is `✓`. The
+  summary is drawn on a `result:` line. Started agents keep
+  a visible idle between runs (`next run in 5s`). The selected card is marked `▸`, and
+  a window from 140 to 160 columns uses its width for the repository names and card
+  detail; a wider one centres the same picture in 160.
 
 The program keeps the Forgejo running while it is open. When an agent is started, it
 runs its instruction, and when that run ends it starts another one after a short
@@ -75,7 +104,9 @@ confined on this computer`.
 After an upgrade, the first open shows one screen: the version this installation was,
 the version this is, what was found (settings, agents, instructions and runs) and what
 is reused or ignored, with the release page address. The next open goes straight to
-the board.
+the board. The installer records the old version before it replaces the binary, and a
+home whose old build wrote no version marker (0.1.30 and earlier) still gets the
+screen, naming the version as an earlier one when it cannot know it exactly.
 
 ## Install
 
@@ -117,13 +148,18 @@ and you can change any of them later.
    proven on a real user-namespace host. Press `y` after you have read every one.
 2. **Set the model.** Give the full model address (it ends in `/chat/completions`), the
    model name, and the key. Press `t` to test it; `✓ the model answered` means it
-   works. Press `⏎` to go on.
+   works. The address suffix and an empty key are checked before anything is sent;
+   every other failure names the provider's status and the first clause of its own
+   message (a 404 on a `/chat/completions` address without `/v1` says so). Press `⏎`
+   to go on.
 3. **Choose how many agents.** `←` / `→` changes the number from 1 to 12. Press `⏎` to
    create them. The board shows `downloading n%`, `setting up`, `starting`, then
    `● running` while your Forgejo is prepared.
 4. **Write each agent's instruction.** Pick a card with `←` / `→` and press `⏎`, then
    `e`. Your own editor opens `instruction.md`; write what the agent should do and
-   save. Press `s` to start it. Press `s` again to stop it.
+   save. Press `s` to start it. Press `s` again to stop it. **Assign an issue in
+   Forgejo first:** an agent works only on the issues assigned to its own Forgejo
+   account, so an unassigned issue produces a run with nothing to do.
 
 After the first setup, `+` adds an agent and `−` removes the selected one (it asks
 once). `m` opens the model settings, `f` opens the Forgejo page, `?` lists every key,
@@ -142,7 +178,9 @@ and `q` quits.
 | The Forgejo administrator password | not on disk: `p` on the Forgejo page resets it through Forgejo's administration API and shows the new one |
 
 The Forgejo address is on the board and on the Forgejo page, for example
-`http://127.0.0.1:3000`. On the Forgejo page (`f`) your login is shown next to
+`http://127.0.0.1:3000`. The page also says `agents work only on issues assigned to them
+— assign an issue in Forgejo`, and its team link is
+`/org/<organisation>/teams/<team>`. On the Forgejo page (`f`) your login is shown next to
 `your login:`, the repositories are listed by name, and the agents' one-line
 permission summary is there with the team page address. A new installation uses the
 fixed login `owner`, not your computer account name; an installation made by an
@@ -151,9 +189,10 @@ setup)`.
 
 The password is never written down. Open the Forgejo page and press `p`: the product
 resets it through Forgejo's administration API, with the new value in the request body,
-and the new value is shown, wrapped in full, for a few seconds. The one-line
-consequence is a static row on the page: the password shown before that moment stops
-working.
+and the new value is shown, wrapped in full, for ten seconds — deliberately two lines
+at 80 columns, never cut. The one-line consequence is a static row on the page:
+`p resets it — shown for 10 s, old stops`, so the password shown before that moment no
+longer works.
 
 `--config-dir <dir>` moves the settings, keys and agent folders; `--state-dir <dir>` moves the run records.
 A relative folder is taken from the folder you started the program in.
@@ -196,13 +235,15 @@ Nothing else is installed: no service, no system-wide file, no other account.
   Check the connection and start the program again, or run
   `gewu-multiverse --install-forgejo` and watch the percentage. Nothing partly
   downloaded is kept.
-- **The model test fails.** The board gives one line:
-  `✗ wrong address — it should end in /chat/completions` (the address must be the full
-  completions address), `✗ the API key was refused` (check the key),
-  `✗ no model called <name> at this address` (check the model name), or
-  `✗ no answer within 15 s` (the provider did not answer; try again).
+- **The model test fails.** The board gives one line. `✗ wrong address — it should end
+  in /chat/completions` and `✗ the API key is empty` mean nothing was sent. Any other
+  line is the provider's answer: `✗ the provider refused the API key (HTTP 401)`
+  (check the key), `✗ no model called <name> at this address (HTTP 404)` (check the
+  model name), `✗ the provider answered HTTP 404: …` (check the address; on a
+  `/chat/completions` path without `/v1`, add `/v1`), or `✗ no answer within 15 s`
+  (the provider did not answer; try again).
 - **An agent keeps failing.** Its card shows `next run in Ns` and its last runs as
-  `✓` and `✗`. Open it with `⏎`; `l` opens the newest log and `t` the full record in
+  `✓`, `⊘`, `∅`, `⚠`, `✗`, `■` and `◷`. Open it with `⏎`; `l` opens the newest log and `t` the full record in
   your pager. The wait between attempts starts at 10 seconds and doubles up to 5
   minutes, so a broken instruction does not spin. Fix the instruction with `e` or the
   model with `m`, then stop and start the agent with `s`.

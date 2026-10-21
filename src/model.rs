@@ -150,38 +150,79 @@ pub struct FunctionSpec {
 }
 
 /// The declared tools of every agent: exactly one, `shell`.
+///
+/// The old signature declares an unconfined run; a real run uses
+/// [`tools_with`] and passes the method its plan actually has, so the
+/// description never says "not confinement" about a confined run (W31-9).
 pub fn tools() -> Vec<ToolSpec> {
-    vec![ToolSpec {
+    tools_with(false, crate::confinement::Method::None)
+}
+
+/// The `shell` description for the mechanism the run actually has.
+fn shell_description(method: crate::confinement::Method) -> &'static str {
+    use crate::confinement::Method;
+    match method {
+        Method::Landlock => {
+            "Run one shell command with the agent's workspace as its working directory. \
+             The run is confined with Landlock: it can read its workspace, this run's \
+             private temporary directory, the system tools, /etc, /proc, /sys and /run, \
+             but not the product's saved keys, your home or another run's files. It is \
+             not a container."
+        }
+        Method::Bwrap => {
+            "Run one shell command with the agent's workspace as its working directory. \
+             The run is confined with bubblewrap (user and mount namespaces): it can \
+             read its workspace, this run's private temporary directory and the system \
+             tools, but not the product's saved keys, your home or another run's files. \
+             It is not a container."
+        }
+        Method::Unshare => {
+            "Run one shell command with the agent's workspace as its working directory. \
+             The run is confined with user and mount namespaces (unshare): it can read \
+             its workspace, this run's private temporary directory and the system tools, \
+             but not the product's saved keys, your home or another run's files. It is \
+             not a container."
+        }
+        Method::None => {
+            "Run one shell command with the agent's workspace as its working directory. \
+             This run is not confined on this computer: the command runs with your own \
+             rights and can read what you can read. The workspace is a directory, not a \
+             sandbox."
+        }
+    }
+}
+
+/// The declared tools of a run: `shell`, plus the Forgejo tools when the run's
+/// context says the agent can use them.
+pub fn tools_with(forgejo: bool, method: crate::confinement::Method) -> Vec<ToolSpec> {
+    let mut declared = vec![ToolSpec {
         kind: "function",
         function: FunctionSpec {
             name: SHELL_TOOL,
-            description: "Run one shell command with the agent's workspace as its working directory. \
-                 The command's output is returned to you. The workspace is a directory, not \
-                 a sandbox: it is not confinement, and the command runs with the user's own \
-                 rights.",
+            description: shell_description(method),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to run, as one line handed to /bin/sh -c."
+                        "description": "The shell command to run, as one line handed to bash -c (or /bin/sh -c on a host without bash)."
                     }
                 },
                 "required": ["command"],
                 "additionalProperties": false
             }),
         },
-    }]
-}
-
-/// The declared tools of a run: `shell`, plus the Forgejo tools when the run's context
-/// says the agent can use them.
-pub fn tools_with_forgejo(forgejo: bool) -> Vec<ToolSpec> {
-    let mut declared = tools();
+    }];
     if forgejo {
         declared.extend(forgejo_tools());
     }
     declared
+}
+
+/// The declared tools with no confinement named, kept for callers that do not have a
+/// run method (tests and the model's own tool-schema checks).
+pub fn tools_with_forgejo(forgejo: bool) -> Vec<ToolSpec> {
+    tools_with(forgejo, crate::confinement::Method::None)
 }
 
 /// The six Forgejo tools, with the limits their descriptions state.
@@ -425,6 +466,13 @@ pub enum ModelError {
         /// What is wrong with it.
         problem: String,
     },
+    /// The address does not name the completions route. This is checked before a
+    /// request is sent, so the screen can say "nothing was sent" truthfully.
+    #[error("the endpoint {endpoint:?} does not end in /chat/completions")]
+    BadAddress {
+        /// The endpoint as configured.
+        endpoint: String,
+    },
     /// The credentials file records no key for this agent.
     #[error("the credentials file records no model key for this agent")]
     MissingKey,
@@ -448,18 +496,21 @@ pub enum ModelError {
     /// answer at all, so the model was never disproved. Only the path is named — the
     /// product must not claim a model fact it never learned. The correction is added
     /// once by the screen, not restated here.
-    #[error("the endpoint has no completions route at {endpoint} (HTTP {status})")]
+    #[error("the endpoint has no completions route at {endpoint} (HTTP {status}{detail})", detail = if .message.is_empty() { String::new() } else { format!(": {}", .message) })]
     RouteNotFound {
         /// The endpoint as configured.
         endpoint: String,
         /// The status the endpoint answered with.
         status: u16,
+        /// The provider's own message, bounded to one line, or empty.
+        message: String,
     },
     /// The endpoint answered 404 at the configured path while its models list did
     /// answer and did carry the model. The path is the only thing wrong. The fact
     /// that the model was listed is kept; the correction is added once by the screen.
     #[error(
-        "the endpoint has no completions route at {endpoint} (HTTP {status}); the endpoint's models list does contain the model {model:?}"
+        "the endpoint has no completions route at {endpoint} (HTTP {status}{detail}); the endpoint's models list does contain the model {model:?}",
+        detail = if .message.is_empty() { String::new() } else { format!(": {}", .message) }
     )]
     RouteNotFoundListed {
         /// The endpoint as configured.
@@ -468,6 +519,8 @@ pub enum ModelError {
         model: String,
         /// The status the endpoint answered with.
         status: u16,
+        /// The provider's own message, bounded to one line, or empty.
+        message: String,
     },
     /// The endpoint is rate-limiting the requests.
     #[error("the endpoint rate-limited the request (HTTP {status}{retry})", retry = match .retry_after_secs {
@@ -519,6 +572,7 @@ impl ModelError {
     pub fn class(&self) -> &'static str {
         match self {
             ModelError::BadUrl { .. } => "bad_url",
+            ModelError::BadAddress { .. } => "bad_address",
             ModelError::MissingKey => "missing_key",
             ModelError::BadKey { .. } => "bad_key",
             ModelError::ModelNotFound { .. } => "model_not_found",
@@ -546,6 +600,14 @@ pub fn chat(
         return Err(ModelError::BadUrl {
             endpoint: endpoint.to_owned(),
             problem: "it must start with http:// or https://".to_owned(),
+        });
+    }
+    // The suffix is the product's own check: it can refuse before a request is
+    // sent. A provider's 404 is a different fact and is reported with the
+    // provider's status and message in the 404 arm below.
+    if !names_completions(endpoint) {
+        return Err(ModelError::BadAddress {
+            endpoint: endpoint.to_owned(),
         });
     }
     if config.api_key.is_empty() {
@@ -640,6 +702,7 @@ pub fn chat(
             // URL or a missing `/v1` produces. Only say `model_not_found` when the
             // endpoint's models list answers and does not contain the id. A list that
             // cannot answer leaves the model unproved, so the route is the correction.
+            let message = provider_message(&redacted_body).unwrap_or_default();
             return Err(match model_list_answer(config) {
                 Some(false) => ModelError::ModelNotFound {
                     model: config.model.clone(),
@@ -649,10 +712,12 @@ pub fn chat(
                     endpoint: config.endpoint.clone(),
                     model: config.model.clone(),
                     status,
+                    message,
                 },
                 None => ModelError::RouteNotFound {
                     endpoint: config.endpoint.clone(),
                     status,
+                    message,
                 },
             });
         }
@@ -724,6 +789,96 @@ pub fn probe(config: &ModelConfig) -> Result<Reply, ModelError> {
     Ok(exchange.reply)
 }
 
+/// The provider's first clause, bounded and ending at a word boundary.
+///
+/// A screen shows the provider's own words, but only the first clause: the status is
+/// the fact the product adds, and a Provider's full paragraph does not fit one line.
+pub fn first_clause(text: &str, limit: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = one_line.len();
+    for needle in [". ", "; ", " — ", " - "] {
+        if let Some(at) = one_line.find(needle) {
+            end = end.min(at);
+        }
+    }
+    let clause = one_line[..end].trim();
+    if clause.chars().count() <= limit {
+        return clause.to_owned();
+    }
+    let cut = clause
+        .char_indices()
+        .nth(limit)
+        .map(|(at, _)| at)
+        .unwrap_or(clause.len());
+    let cut = clause[..cut].rfind(' ').unwrap_or(cut);
+    format!("{}…", clause[..cut].trim_end())
+}
+
+/// The one line the model screen shows for a failed test.
+///
+/// The suffix check and the empty-key check happen before a request is sent; every
+/// other arm is the provider's refusal and names the provider's status and first
+/// clause. A 404 on a `/chat/completions` path names the `/v1` correction, because
+/// that is the mistake a full completions address without `/v1` produces.
+pub fn failure_words(error: &ModelError, model: &str) -> String {
+    match error {
+        ModelError::BadUrl { .. } | ModelError::BadAddress { .. } => {
+            "wrong address — it should end in /chat/completions".to_owned()
+        }
+        ModelError::MissingKey => "the API key is empty".to_owned(),
+        ModelError::BadKey { status } => {
+            format!("the provider refused the API key (HTTP {status})")
+        }
+        ModelError::ModelNotFound { status, .. } => {
+            format!("no model called {model} at this address (HTTP {status})")
+        }
+        ModelError::RouteNotFound {
+            endpoint,
+            status,
+            message,
+        }
+        | ModelError::RouteNotFoundListed {
+            endpoint,
+            status,
+            message,
+            ..
+        } => {
+            // Put the repair first. The form draws this line in a narrow field; if
+            // `add /v1` trails the provider's paragraph it is the first thing an
+            // 80-column screen loses, which is exactly the person who needs it
+            // (review B1).
+            let repair = names_completions(endpoint) && !endpoint.contains("/v1/");
+            let mut line = if repair {
+                "add /v1 — ".to_owned()
+            } else {
+                String::new()
+            };
+            line.push_str(&format!("the provider answered HTTP {status}"));
+            if !message.is_empty() {
+                line.push_str(": ");
+                line.push_str(&first_clause(message, 72));
+            }
+            line
+        }
+        ModelError::RateLimited { status, .. } => {
+            format!("the model is busy — try again (HTTP {status})")
+        }
+        ModelError::Server { status, message } => {
+            let detail = if message.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", first_clause(message, 72))
+            };
+            format!("the provider answered HTTP {status}{detail}")
+        }
+        ModelError::Timeout { secs } => format!("no answer within {secs} s"),
+        ModelError::MalformedReply { .. } => "the model's answer could not be read".to_owned(),
+        ModelError::Transport { .. } => {
+            "the model could not be reached — check the internet connection".to_owned()
+        }
+    }
+}
+
 /// The wire shape of a reply, as far as this client understands it.
 #[derive(Debug, Deserialize)]
 struct WireReply {
@@ -748,6 +903,17 @@ struct WireMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// Whether the configured address names the completions route.
+///
+/// This is deliberately a path check, not a request: the product can say "nothing
+/// was sent" only while it has not sent anything.
+fn names_completions(endpoint: &str) -> bool {
+    let without_fragment = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
+    without_fragment
+        .trim_end_matches('/')
+        .ends_with("/chat/completions")
 }
 
 /// The models URL that belongs to a completions URL.
@@ -1137,6 +1303,34 @@ mod tests {
             chat(&config, &[Message::user("hi")], &[], None).expect_err("the empty key is refused");
         assert_eq!(error.class(), "missing_key");
         assert_eq!(stub.requests().len(), 0, "nothing was sent");
+    }
+
+    #[test]
+    fn the_shell_description_names_the_runs_actual_mechanism() {
+        use crate::confinement::Method;
+        let cases = [
+            (Method::Landlock, "confined with Landlock"),
+            (Method::Bwrap, "confined with bubblewrap"),
+            (Method::Unshare, "confined with user and mount namespaces"),
+            (Method::None, "not confined on this computer"),
+        ];
+        for (method, wanted) in cases {
+            let declared = tools_with(false, method);
+            let shell = &declared[0].function;
+            assert_eq!(shell.name, SHELL_TOOL);
+            assert!(
+                shell.description.contains(wanted),
+                "{method:?} says {:?}",
+                shell.description
+            );
+        }
+        for method in [Method::Landlock, Method::Bwrap, Method::Unshare] {
+            let declared = tools_with(false, method);
+            assert!(
+                !declared[0].function.description.contains("not confinement"),
+                "a confined run still says it is not confinement"
+            );
+        }
     }
 
     #[test]

@@ -16,8 +16,9 @@ The design rules are short:
   product's own background.
 - **The smallest window is 72×18.** At 72×18 the cards are one vertical list with one
   spine; from 100×30 they grow and the Forgejo box shows its facts.
-- **A wide window gets a capped picture.** Past about 140 columns the same drawing is
-  centred in 100 columns instead of stretching across the screen.
+- **A wide window gets a capped picture.** Up to 160 columns the drawing uses the
+  width (the repository line and the card detail grow); past that the same picture is
+  centred in 160 columns instead of stretching across the screen.
 
 ## Screens
 
@@ -93,15 +94,16 @@ The first run is one picture filling in: terms, model, agents, then the build.
 
 ### 1. Before you start
 
-The engine supplies the terms, one short item each. The product shows exactly these
-five, and a sixth — `Runs are not confined on this computer.` — only when the host
-offers no automatic confinement (Landlock) or the layout cannot be confined. The
-second item names the mechanism: Landlock is automatic; `bwrap` and `unshare` are
-opt-in with `GEWU_CONFINEMENT` and are tested, not yet proven on a real host:
+The engine supplies the terms, one short plain sentence each. The product shows
+exactly these five, and a sixth — `Runs are not confined on this computer.` — only
+when the host offers no automatic confinement or the layout cannot be confined. The
+mechanism names (Landlock, `bwrap`, `unshare`) are in this document and in
+`docs/engine.md`, not on the consent screen; the second item is true under every
+mechanism because it says *when runs are confined*:
 
 ```
 Agents use this computer with your permissions.
-Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.
+When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.
 Each has its own login on your Forgejo.
 Started agents keep going until you stop them.
 Their work is sent to your model provider.
@@ -137,8 +139,16 @@ changed.
 
 Three fields, one selected. `e` edits the selected field; `⏎` keeps it. `↑`/`↓` or
 `tab` move. `t` saves the model and tests it: `✓ the model answered`, or `✗` with one
-short reason (`✗ wrong address — it should end in /chat/completions`, `✗ the API key was
-refused`, `✗ no model called <name> at this address`, `✗ no answer within 15 s`).
+short reason. The address suffix and the empty key are checked **before any request**:
+`✗ wrong address — it should end in /chat/completions`, `✗ the API key is empty`.
+Every other line is the provider's refusal and names its status and the first clause
+of its own message (`✗ the provider answered HTTP 404: Add /v1 to the base URL`,
+`✗ the provider refused the API key (HTTP 401)`,
+`✗ no model called <name> at this address (HTTP 404)`, `✗ no answer within 15 s`). A
+404 on a `/chat/completions` path whose address has no `/v1` says the repair first —
+`✗ add /v1 — the provider answered HTTP 404: …` — so the correction is on screen at
+80×24 even when the provider's clause is long. The test line wraps to a second row
+when the form has room, instead of cutting the end of the sentence.
 `⏎` when no field is being edited saves and goes on. The verb is always `⏎ next`,
 whether the screen was opened on the first run or by `m`. An empty key with no stored
 key is its own error — `✗ the API key is empty` — and sends nothing; a provider that
@@ -162,8 +172,9 @@ the model is saved when its own validation failed. `esc` leaves.
 
 The count is 3 by default and stays between 1 and 12. `+`/`-` or `←`/`→` change it;
 that many empty cards are drawn under the Forgejo box, wired to it with the same bus
-and spine. `⏎` sends `CreateAgents` and `StartForgejo` and shows the build. `esc`
-returns to the model.
+and spine. The box says `◐ preview`, never `● running`: no server and no agent exists
+until `⏎` sends `CreateAgents` and `StartForgejo` and shows the build. `esc` returns
+to the model.
 
 ### 4. Setting up
 
@@ -191,15 +202,117 @@ the login and `run N` in the middle, one status on the bottom border). Cards tha
 not fit scroll with the selection.
 
 At 80×24 the cards are three rows in up to three columns; the login row also carries
-`run N` on the right, and the bottom border carries the status. From 100×30 a board
+the total `run N` on the right, and the bottom border carries the status. From 100×30 a board
 card is taller: state symbol and name and `run N` on the first row, the login, the
-status, and the newest activity (`last: … · 2m ago` after a run ends).
+status, and the newest activity (`last: … · 2m ago` after a run ends). From 140
+columns the picture grows with the window: the Forgejo box widens to 100 cells (so
+every repository name fits) and cards widen to 60; above 160 the whole picture is
+centred in 160 columns, as above.
 
 **The rich details are on the Agent screen, not on the board card.** The board keeps
-the few words — name, login, state, one last line, run count. `⏎` on a card opens the
-Agent screen, which carries the last work block (issue, pull request, branch, comment),
-a tool in flight (`shell · 12s`), a failed tool call (`✗ shell: …`), the newest failed
-run's first reason, and the instruction. The instruction is the first line or
+the few words — name, login, state, one last line, run count. `run N` is the total from
+the run records, not a session counter: it does not reset when an agent starts again
+or the program reopens. `⏎` on a card opens the Agent screen, which carries the last
+work block (`work` + up to three typed rows: `issue #4`,
+`pull request #5 from fix/x`, `comment on #1`, or `branch fix/x` when the run pushed
+without opening a request or commenting), a tool in flight (`shell · 12s`), a
+failed tool call (`⚠ shell: …`, or `✗` when the run itself failed), the newest run's
+reason and the instruction. A tool's failure row is the tool's own line (the run's
+key is already redacted), so a file name in a refusal is not translated into a
+different name. The
+work block is kept until a later run does new work; a read-only check run does not
+erase it. Every cleanly finished run carries its own final summary as a `result: …` line
+beside the mark — `✓` included. `✓` means every status the shell itself reported was 0: each record's `$?` and every
+element of every `PIPESTATUS`, not only the statuses the reader managed to pair with a
+command. The shell reports every simple command it completes to the product — under
+`bash`, through a `DEBUG` trap installed with `set -T` and inherited by subshells,
+command substitutions and functions (with an inherited no-op `ERR` trap so a failing
+last command there reports itself too). The recorder is installed by a product-owned
+`BASH_ENV` prelude, so a nested non-interactive `bash` that reads `BASH_ENV` —
+`bash -c …`, `bash script.sh`, a `#!/bin/bash` script — installs the same recorder
+into the same file; a nested shell
+marks its own frame with `NEST`/`NESTSTART`/`NESTEND`, and its records are paired
+inside that frame. A one-command record also carries `PIPESTATUS[0]`, so a condition's
+own failure (`if rm …`, `while rm …`, `! rm …`) is not lost to the enclosing
+compound's 0. A pipeline record's `PIPESTATUS` is paired inside that shell's frame, fills an
+unpaired command, and never replaces a non-zero status an earlier record paired; a
+duplicate record from the inherited `ERR` trap is collapsed to one segment. The
+records are written to a private file the model's stdout/stderr never carry and
+recorded in the transcript as `segments` (`command`, `status`). If any raw status is
+non-zero, the newest mark is `⚠` (legend `⚠ cmd`) with the failed command's cause as
+its row (`⚠ shell: …`) — never `✓`; it is `⊘` when the failed command is a recognised
+write or its output carries refusal evidence. When the pairing cannot name the failed
+command, the run stays `⚠` with the raw status's output line as the cause, never `✓`.
+A write whose enclosing compound hides its status — `if rm …; then …; fi | cat` — is
+`⊘` when the operating system's own diagnostic is in the output, and any program's
+diagnostic is a witness, not just a list of programs: a line in the POSIX form
+`<program-or-shell>: [line N: ][<path>: ]<strerror>` ending in any error message the
+C library itself prints — `Permission denied`, `Read-only file system`, `Too many
+levels of symbolic links`, `File name too long` and every other errno text — or
+`cannot create`/`cannot remove`/`cannot open`/`cannot stat`/`cannot access` naming a
+path, or a line in the shell's own diagnostic prefix, lowers the mark to `⊘` when the
+command names a recognised write and to `⚠` otherwise. When a mixed failure prints
+more than one diagnostic, the failed write's own line is the cause row.
+The shell's own voice is the third witness. The product launches the shell, so it
+knows the exact `<name>: ` with which bash prefixes its own errors and warnings: the
+outer shell's name and the `$0` of every nested `bash` that reads `BASH_ENV` arrive
+through the recorder's `SHELLNAME` record, the trap reports `BASH_SOURCE[0]` (the
+name bash uses for a sourced command or a function defined there), and a function
+defined on the `-c` line is named `environment`.
+Any output line in that form — `<name>: line N: <message>` or `<name>: <message>` —
+is shell-reported trouble whatever the text says, so no message list is kept:
+`ambiguous redirect`, `cannot overwrite existing file` and every other shell wording
+are seen. With an all-zero raw record it makes the run `⚠`, or `⊘` when the command
+names a recognised write or when the shell's record names a write whose plain target
+the diagnostic carries (a noclobber overwrite inside `bash script.sh`); it can only
+lower the mark.
+A failure that leaves neither a status nor any diagnostic text the system or the
+shell prints cannot be seen: limits (f) and (g) below. A recognised shell write is a
+`DELETE`/`PUT`/`POST`/`PATCH` in any standard curl spelling, a non-GET `--data`, a git
+write read by subcommand position (`push`, `rm`, `mv`, `add`, `commit`, `stash`,
+`pull`, `fetch`, `branch`/`tag` changes, and the commands that move HEAD or the
+working tree; `git show push` is a read), `rm`, `rmdir`, `unlink`, `mv`, `cp`, `tee`,
+`truncate`, `sed -i`, or a `>` redirection into a file. A write whose command exits
+non-zero is a refusal whatever its output says; a failed command that is not a write
+is `⚠`. On a host without `bash` the shell is `/bin/sh` and the product falls back to
+reading the output: a compound command is split on `;`, `&&`, `||`, `|` and newlines
+outside quotes, and a write segment plus a failure-context line (`fatal:`, `error:`,
+`remote rejected`, `failed to push`, `Permission denied`, `denied`, an HTTP 4xx/5xx
+status line, `curl: (22)`) is a refusal even when the wrapper exits 0; the run log
+says the recorder is off. A `curl` without `-f` exits 0 on a 4xx/5xx, so that one
+call's output is always read for a status line (`HTTP/1.1 404`, a whole-line `-w`
+code) or an HTTP error phrase (`Forbidden`, `Unauthorized`, `permission denied`); a
+write that succeeded is not otherwise re-read for words — a success body that says
+`not found` or `404`, and a file named `refused`, are not refusals. Seven limits are
+stated as built: **(a)** a model that forges or truncates the record file, closes the
+recorder (unsets or overrides `BASH_ENV`), masks a failure in a tool that prints
+nothing, or suppresses both the status and the output of a write hidden inside a
+compound, defeats the mark (the transcript and `l` keep what the tool printed,
+which may be nothing); **(b)** a `curl`
+without `-f` whose 200 body literally says `Forbidden` is called refused — the safe
+direction, and contrived; **(c)** the rule is deliberately conservative and can only
+lower the mark, so a condition that failed and was recovered from (`if false; …`), a
+system error string from a command that did not fail, or a line that merely happens
+to start with a shell name may read `⚠` — never the other way; **(d)** on a host
+without `bash` the shell is `/bin/sh` and
+the product falls back to the output heuristics above (the run log says the recorder
+is off); **(e)** a nested interpreter that does not load the product's recorder — any
+non-bash interpreter (`sh -c` when `/bin/sh` is not bash, `python -c`, `perl -e`), or
+`bash` in POSIX or privileged mode (`--posix`, `-p`, `POSIXLY_CORRECT=1`) — runs
+outside the record, so its failed write is seen only through the outer command's exit
+status and the output heuristics;
+**(f)** a failure that leaves neither a raw status nor any diagnostic text — a
+program that fails silently inside a piped condition — cannot be seen; and **(g)** a
+failure inside a piped or negated condition reported only by a program's own
+free-form message (neither a system error string nor a line in the shell's own
+prefix), with an all-zero raw record, cannot be seen. In (f) and (g) the transcript
+and `l` keep what there was.
+A destructive instruction answered
+only in prose — `I left it in place`, `I did not delete it`, `deleting it is not safe`
+— also gets `⊘`, so a refusal without a tool call is not mistaken for success; a keep
+phrase beside a success verb for the destructive act (`I deleted the stale branch and
+kept the docs as is`) stays `✓`. When the newest run's log says no issue was assigned to the agent, the work area
+says `no issues assigned to gewu-agent-1 yet`. The instruction is the first line or
 `… (N more lines)`; its section has a rule row of its own, the text never shares a row
 with that rule, and a long one-line instruction is signposted too: the wrapped display
 rows are counted and `… (N more lines)` names what did not fit. At the 72×18 floor
@@ -234,7 +347,9 @@ f Forgejo   m model   ? help   q quit
 
 When this computer cannot confine an agent's shell, the line under the keys says
 `runs are not confined on this computer`; the same sentence is the sixth warning item
-on the first-run screen. `BoardView.notice` is drawn once on the line under the keys. It is cleaned before it
+on the first-run screen. The selected card carries `▸` before its name on the border,
+so a colour-blind or monochrome reader can see which card `←→` targets; the tint is
+only reinforcement. `BoardView.notice` is drawn once on the line under the keys. It is cleaned before it
 is drawn: the engine writes names in backticks, the board removes them, so a notice
 reads `agent-4 is connected as gewu-agent-4` and never shows the marks.
 
@@ -253,7 +368,7 @@ reads `agent-4 is connected as gewu-agent-4` and never shows the marks.
 │        │ instruction                          │      │
 │        │ fix the flaky login test             │      │
 │        │                                      │      │
-│        │ last runs  ✓ ✓ ✗            run 4    │      │
+│        │ last runs  ✓ ⊘ ∅ ✗          run 7    │      │
 │        ╰──────────────────────────────────────╯      │
 │  s stop   e instruction   l log   t transcript       │
 │  d remove   esc back                                 │
@@ -262,13 +377,16 @@ reads `agent-4 is connected as gewu-agent-4` and never shows the marks.
 
 The big card carries state, login, the last work block, the instruction's first
 lines (or `no instruction — e writes one`) and a strip of the newest run ends: `✓`
-succeeded, `✗` failed, `◷` timed out, `■` stopped. The label is `last runs`, at most
-five marks then `+N`, a one-line legend, and the count `run 4`.
+succeeded, `⊘` refused, `∅` no work, `⚠` finished with a failed command, `✗` failed,
+`◷` timed out, `■` stopped. The label is `last runs`, at most five marks then `+N`, a
+one-line legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`, one
+space between entries, with `■ stop` at the 72-column floor), and the total count
+`run 7`.
 
 `s` starts or stops; `e` hands `instruction_path` to `$EDITOR`; `l` and `t` hand the
 newest run's log or transcript from `session_files` to the pager. `d` draws the
-consequence in one sentence before it acts: `remove agent-1? token revoked, account
-deactivated, history and folder kept — y/n`. The account row and its history stay;
+consequence and the keys before it acts: `remove agent-1? login revoked, account
+deactivated, history kept` on one line and `y remove   n keep` under it. The account row and its history stay;
 the Forgejo account is deactivated, so a web sign-in is refused too. `esc` returns to
 the board. A hand-off steps out of the terminal and restores it exactly.
 
@@ -282,9 +400,10 @@ the board. A hand-off steps out of the terminal and restores it exactly.
 │  organisation   team                                 │
 │  repositories   3                                    │
 │  your login:    owner                                │
-│  password       ••••••••••   p resets it — old stops │
+│  password       ••••••••••  p resets it — 10 s, old…│
 │  agents can     write to team repositories only      │
-│  team page      http://127.0.0.1:3000/orgs/team/…    │
+│  agents work    only on issues assigned to them — … │
+│  team page      http://127.0.0.1:3000/org/team/…    │
 │  agents         gewu-agent-1 · gewu-agent-2          │
 │                                                      │
 │  open the address in a browser to see their work.    │
@@ -295,18 +414,23 @@ the board. A hand-off steps out of the terminal and restores it exactly.
 
 The screen uses the state words above. While Forgejo is not installed, `address` says
 `not set up yet`, not an address. `repositories` lists the organisation's repositories
-by name; `agents can` is the one-line permission summary; `team page` is the address of
-the team the agents belong to. A login kept from an installation made by an earlier
+by name; `agents can` is the one-line permission summary; `agents work only on issues
+assigned to them — assign an issue in Forgejo` is the work rule (the list tool shows
+only its own assigned issues; a write outside that scope is refused); `team page` is
+`/org/<organisation>/teams/<team>` (never `/orgs/`, which is a 404). At 72×18 the page
+keeps every row, wrapping the two long ones instead of dropping version, organisation
+or the team page. A login kept from an installation made by an earlier
 version says `(kept from an earlier setup)`. Repository changes seen between two
 administration-API polls appear on the page and on the board: `team/scratch was
 deleted`, `team/website was created`.
 
 `p` sends `RevealAdminPassword`; the engine resets the password through Forgejo's
 administration API (the value travels in the request body, never in a process
-argument) and the new value is shown in the next view only, for about ten seconds. It
-wraps whole at 80 columns and is never cut with `…`. The consequence is a static row,
-not a transient notice: `p resets it — the old one stops working`. The agents' own
-logins are listed, never their keys.
+argument) and the new value is shown in the next view only, for ten seconds. It wraps
+whole at 80 columns — deliberately two lines at that width, never cut with `…` — and
+the static row says `p resets it — shown for 10 s, old stops`: the password shown
+before that moment no longer works. The agents' own logins are listed, never their
+keys.
 
 ## Model and keys
 

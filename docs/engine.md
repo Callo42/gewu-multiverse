@@ -68,10 +68,13 @@ produced by the CLI, read only to be discarded, and wiped from the captured outp
 the `PATCH` body, and puts it in the next view only. The consequence is a static line:
 the password shown before that moment stops working.
 
-The administrator API's repository list is polled every five seconds. A name that
+The administrator API's repository list is polled every two seconds. A name that
 disappeared or appeared between polls becomes an event on the board and on the Forgejo
 page (`team/scratch was deleted`, `team/website was created`), so a destroyed
-repository is never traceless. The process runs as `web` in
+repository is never traceless. The count and the event are replaced in the same tick;
+a failed poll is retried on the next tick instead of keeping an old count for another
+interval (W31-8). The administrator's list includes private repositories, so a private
+repository's deletion produces the same event. The process runs as `web` in
 its own process group. It is ready when `/api/v1/version` answers.
 
 Provisioning through the administration API is idempotent: organisation `team`, team
@@ -235,6 +238,14 @@ build, the first open shows one Upgrade screen: the version it was, the version 
 how many agents, instructions and runs were found, what is reused, that the old
 `config.toml` is ignored, and the release page address.
 
+Builds before 0.1.31 wrote no marker, so a real upgrade from 0.1.30 has none. The
+installer reads the installed binary's `--version` before replacing it and writes the
+marker, which gives the exact old version. If a binary is replaced by other means, an
+existing `multiverse.toml` (or the old text screens' `config.toml`) still gets the one
+screen, with `this installation was an earlier version`; a fresh root gets no screen.
+The engine writes the marker at open, so the next open goes straight to the board.
+This is also why the marker is read *before* it is written in `upgrade_view` (W31-1).
+
 The secrets are in `credentials.toml` beside it, created with mode 0600: the bundled
 Forgejo's administrator token, the one model key (top-level `model_key`), and each
 agent's own Forgejo token under `[forgejo_agent_tokens]`. A value is read only when it
@@ -301,13 +312,114 @@ and the agent is still started, the next one is scheduled:
 the engine sends `SIGKILL`. It clears any scheduled run, so nothing new starts. A run
 that overruns the session timeout is stopped the same way and recorded as `TimedOut`.
 
-`recent` is the newest ten endings, reconstructed from the run records on open and
-updated as runs end. `activity` is the newest Forgejo action of the newest run, read from
+`runs_total` is every run record on disk plus every run started while the engine is
+open; it is what the card's `run N` shows and it never resets on Start or reopen
+(W31-5, F5). `recent` is the newest ten endings, reconstructed from the run records on
+open and updated as runs end. `activity` is the newest Forgejo action of the newest run, read from
 that run's transcript; after the run ends it is drawn as `last: … · 2m ago`. The run
 writes `current-tool` while a tool call is in flight (so the card can say `shell · 12s`)
-and `last-failure` when one fails (so the card and the log carry
-`✗ <tool>: <first clause>`). `last_work` is the issue, pull request, branch and comment
+and `last-failure` when one fails (so the card carries the failed command's cause in
+its row: `⚠ <tool>: <first clause>` for a warned run, `✗` for a failed one; the log
+keeps `✗`). `last_work` is the issue, pull request, branch and comment
 the newest run named, read from its transcript and push witness.
+
+A clean exit is not automatically `✓`. The mark reads the shell's raw record: it is
+`✓` only when every status the shell reported — each trap record's `$?` and every
+element of every `PIPESTATUS` — is 0, and the wrapper exited 0. Pairing only supplies
+the words and the `⊘`/`⚠` distinction; a non-zero raw status the pairing could not
+attach to a command makes the run `⚠`, never `✓`.
+
+The run's own tool results are read first: a refused Forgejo write, or a shell write
+that fails, marks the run `refused` even when the model's last sentence is phrased
+positively. The shell reports every simple command it completes to the product: the
+command runs under `bash` (when the host has it) with a `DEBUG` trap installed under
+`set -T`, so subshells, command substitutions and functions are covered; an inherited
+no-op `ERR` trap under `set -E` also makes a failing last command inside a subshell or
+command substitution report itself. The recorder is installed by a product-owned
+`BASH_ENV` prelude, so a nested non-interactive `bash` that reads `BASH_ENV` — `bash
+-c …`, a `bash script.sh`, a `#!/bin/bash` script — installs the same recorder in the
+same file; a nested shell marks its own frame with `NEST`/`NESTSTART`/`NESTEND`, and
+its records are paired inside that frame. Each trap record carries the status of the command that just
+ended and `PIPESTATUS`; for a one-element record a non-zero `PIPESTATUS[0]` wins, so
+the failing condition of `if`/`while`/`until`/`!` is not lost to the enclosing
+compound's 0. A pipeline record's `PIPESTATUS` is paired inside that shell's frame, fills an
+unpaired command, and never replaces a non-zero status already paired with a command; a duplicate
+record from the inherited `ERR` trap is collapsed to one segment. The trap body
+captures those values as arguments before turning `set -x` off for its own line and
+restoring it, so a model's `set -x` shows the recorder's call but not the record's
+format. The records go to a private file under the run's 0700 temporary root (or its
+run directory when the shell is unconfined), never to the model's stdout or stderr,
+and the tool result carries them as `segments: [{command, status}]`. Any non-zero raw
+status makes the run `warned` (`⚠`) with the failed command's cause as its row; a
+failed command that is a recognised write makes it `refused` (`⊘`), whatever the
+model says. When the pairing cannot name the failed command, the raw status's output
+line is the `⚠` cause, and the run is never `✓`. A write whose enclosing compound
+hides its status — `if rm …; then …; fi | cat` — is `⊘` when the operating system's
+own diagnostic is in the output; any program's POSIX diagnostic
+(`<program-or-shell>: [line N: ][<path>: ]<strerror>`, ending in any error message the
+C library itself prints — `Permission denied`, `Read-only file system`, `File name too
+long`, `Too many levels of symbolic links` and every other errno text — or
+`cannot create`/`cannot remove`/`cannot open`/`cannot stat`/`cannot access` naming a
+path) is a witness, so an unlisted program's failure there is `⚠`. When a mixed
+failure prints more than one diagnostic, the failed write's own line is the cause
+row. The shell's own voice is the third witness. Every shell that reads the prelude
+reports its `$0` — the outer shell and every nested `bash` that reads `BASH_ENV` —
+and the trap reports `BASH_SOURCE[0]`, the name bash uses for a sourced command or a
+function defined there; bash prefixes its own errors and warnings with that exact
+`<name>: ` (`<name>: line
+N: <message>` and `<name>: <message>`), and a function defined on the `-c` line is
+named `environment`. Any output line in that form is shell-reported trouble whatever
+the text says, so no message list is kept: `ambiguous redirect`, `cannot overwrite
+existing file` and every other shell wording are seen. An all-zero raw record then
+makes the run `⚠`, or `⊘` when the command names a recognised write or when the
+shell's record names a write whose plain target the diagnostic carries; the rule can
+only lower the mark. A failure that leaves neither a status nor any diagnostic text
+the system or the shell prints is limit (f) or (g) below. A write that exits non-zero
+is a refusal whatever its output says. A failed
+Forgejo read is also a failed call and marks the run `warned`, so "every tool call" is
+true as written. On a host without `bash` the shell is `/bin/sh`; when the private
+record cannot be opened the run continues without it. In both cases the product falls
+back to reading the output: a compound command is split on `;`, `&&`, `||`, `|` and
+newlines outside quotes, and a write segment plus a failure-context line (`fatal:`,
+`error:`, `remote rejected`, `failed to push`, `Permission denied`, `denied`, an HTTP
+4xx/5xx status line, `curl: (22)`) is a refusal even when the wrapper exits 0; the run
+log says the recorder is off. A `curl` without `-f` exits 0 on a 4xx/5xx, so that one
+call's output is also read for a status line or an HTTP error phrase; a write that
+succeeded is not otherwise re-read for words. Seven limits are stated as built: **(a)**
+a model that forges or truncates the record file, closes the recorder (unsets or
+overrides `BASH_ENV`), masks a failure in a tool that prints nothing, or suppresses
+both the status and the output of a write hidden inside a compound, defeats the mark
+(the transcript and `l` keep what the tool printed, which may be nothing); **(b)** a `curl` without `-f` whose 200 body
+literally says `Forbidden` is called refused — the safe direction, and contrived;
+**(c)** the rule is deliberately conservative and only lowers the mark: a condition
+that failed and was recovered from, a system error string printed by a command
+that did not fail, or a line that merely starts with a shell name may read `⚠`
+(never the reverse); **(d)** on a host without
+`bash` the shell is `/bin/sh` and the product falls back to
+the output heuristics above (the run log says the recorder is off); **(e)** a
+nested interpreter that does not load the product's recorder — any non-bash
+interpreter (`sh -c` when `/bin/sh` is not bash, `python -c`, `perl -e`), or `bash`
+in POSIX or privileged mode (`--posix`, `-p`, `POSIXLY_CORRECT=1`) — runs outside the
+record and its failed write is seen only through the outer command's exit status and
+the output heuristics; **(f)** a failure that
+leaves neither a raw status nor any diagnostic text — a program that fails silently
+inside a piped condition — cannot be seen; and **(g)** a failure inside a piped or
+negated condition reported only by a program's own free-form message (neither a
+system error string nor a line in the shell's own prefix), with an all-zero raw
+record, cannot be seen. In (f) and (g) the transcript and `l` keep what there was.
+Any other failed tool call — a non-zero
+exit or a signal, not a recognised write, with no refusal evidence in its output —
+marks the run `warned` (`⚠`), with the failed command's cause as its row; it is never
+`✓`. Otherwise the last sentence decides between `refused`, `no work` (an empty
+assignment), `warned` (a tool call failed) and `succeeded`; a review that found no
+problem and says the work is complete stays a success. A destructive instruction answered only in prose (`I left it
+in place`, `I did not delete it`, `deleting it is not safe`) is also a refusal,
+because there is no tool result to read and the run's own sentence says the work was
+not done; a keep phrase beside a success verb for the destructive act stays a success.
+The final sentence is kept as the terminal record's reason for every clean finish, so
+the card can draw it beside `✓` as well as `⊘`/`∅`/`⚠`.
+An instruction's stored first line is cut at 120 characters **on a word boundary**, so
+the card never renders `extraord…` from a word the engine itself halved.
 
 ## Threads, ticks and the contract
 
@@ -325,8 +437,12 @@ and during a back-off, `Blocked` and its release, and resume after reopening.
 
 ## The words on screen
 
-The terms the board shows are the five fixed sentences in `engine::TERMS`, plus the
-one-sentence confinement warning when the host offers no confinement; the
+The terms the board shows are the five fixed plain sentences in `engine::TERMS`, plus
+the one-sentence confinement warning when the host offers no confinement; the
+mechanism names (Landlock, bwrap, unshare) are in this document and the shell tool's
+description, not on the consent screen. The model test distinguishes its own suffix
+and empty-key checks (nothing sent) from a provider refusal (status and first clause of
+the provider's message); a 404 on a `/chat/completions` path names the `/v1` form. The
 engine's reasons, notices, activities and model-test lines are written in the same
 plain words the board uses, so no technical word reaches a screen from either side.
 `src/board/status.rs` is the one cleaner for free text and also removes the backticks

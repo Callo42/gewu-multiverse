@@ -35,10 +35,11 @@
 //! run can be read afterwards without any secret being recoverable.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,22 @@ pub struct RunEnd {
     pub exit_code: i32,
     /// What ended it, when there is something to say. Also printed to the log.
     pub reason: Option<String>,
+    /// The run's own final summary, when it was a clean exit that refused the
+    /// instruction or found no work. It is what the card marks instead of `✓`.
+    pub ending: RunEnding,
+}
+
+/// What a clean exit means, from the run's own last summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEnding {
+    /// The model finished without saying it could not do the instruction.
+    Succeeded,
+    /// The model's own summary says it could not do the instruction.
+    Refused,
+    /// The model's own summary says there was nothing assigned to do.
+    NoWork,
+    /// The model finished, but at least one tool call failed. It is never `✓`.
+    Warned,
 }
 
 impl RunEnd {
@@ -80,14 +97,47 @@ impl RunEnd {
         Self {
             exit_code: 0,
             reason: None,
+            ending: RunEnding::Succeeded,
         }
     }
 
-    /// A run that finished with something to say, such as "the model finished".
+    /// A run that finished with the model's own final summary.
+    ///
+    /// The summary is kept even for a success, so the card can show what the run
+    /// says it did beside `✓`, not only beside a refusal (review B2).
     pub fn completed(reason: impl Into<String>) -> Self {
         Self {
             exit_code: 0,
             reason: Some(reason.into()),
+            ending: RunEnding::Succeeded,
+        }
+    }
+
+    /// A run that exited cleanly but whose own summary refused the instruction.
+    pub fn refused(summary: impl Into<String>) -> Self {
+        Self {
+            exit_code: 0,
+            reason: Some(summary.into()),
+            ending: RunEnding::Refused,
+        }
+    }
+
+    /// A run that exited cleanly and found nothing assigned to do.
+    pub fn no_work(summary: impl Into<String>) -> Self {
+        Self {
+            exit_code: 0,
+            reason: Some(summary.into()),
+            ending: RunEnding::NoWork,
+        }
+    }
+
+    /// A clean run whose tool results include a failed command. The reason is the
+    /// failed command's cause; the card draws it beside `⚠`, never `✓`.
+    pub fn warned(reason: impl Into<String>) -> Self {
+        Self {
+            exit_code: 0,
+            reason: Some(reason.into()),
+            ending: RunEnding::Warned,
         }
     }
 
@@ -96,13 +146,1104 @@ impl RunEnd {
         Self {
             exit_code: 1,
             reason: Some(reason.into()),
+            ending: RunEnding::Succeeded,
         }
     }
 
-    /// Whether this run did everything it was asked to do.
+    /// Whether this run exited cleanly.
     pub fn is_success(&self) -> bool {
         self.exit_code == 0
     }
+}
+
+/// What the run's own tool results prove, independent of its final sentence.
+///
+/// Two facts are kept. A refused write is a refusal: a Forgejo write the tool
+/// refused, or a shell write that failed. A failed call that is not a write is not a
+/// refusal, but the run is never `✓`: the card marks it `⚠` with this cause. A
+/// compound shell command is judged per segment, and only a `curl` without `-f` has
+/// its success body read for a status, because only that call hides the HTTP status
+/// in a zero exit code (review correction 4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunEvidence {
+    /// The last write the run attempted and a tool refused, in one sentence.
+    refused_write: Option<String>,
+    /// The first failed tool call that was not a refused write, in one sentence.
+    failed_call: Option<String>,
+    /// The cause row for the newest hidden failure, when one was recorded.
+    cause: Option<String>,
+}
+
+impl RunEvidence {
+    /// The refusal sentence, when a write was refused.
+    pub fn refused_write(&self) -> Option<&str> {
+        self.refused_write.as_deref()
+    }
+
+    /// The first failed call that was not a refusal, when there was one.
+    pub fn failed_call(&self) -> Option<&str> {
+        self.failed_call.as_deref()
+    }
+
+    /// The card's cause row for a failure hidden behind a zero-exit wrapper.
+    pub fn cause(&self) -> Option<&str> {
+        self.cause.as_deref()
+    }
+
+    /// A Forgejo tool ended. A refused **write** is a refusal; a failed read is a
+    /// failed call, so the run is `⚠` and never `✓` ("every tool call" is true as
+    /// written; correction 5, N1).
+    fn note_forgejo(&mut self, tool: &str, problem: &str) {
+        if crate::forgejo_tools::is_write_tool(tool) {
+            self.refused_write = Some(problem.to_owned());
+        } else if self.failed_call.is_none() {
+            self.failed_call = Some(format!("a Forgejo read failed: {problem}"));
+        }
+    }
+
+    /// A shell command ended. The mark reads the shell's raw record: a run is never
+    /// `✓` when any status the shell reported — each record's `$?` or any element of
+    /// `PIPESTATUS` — is non-zero, even if the pairing could not name the command
+    /// (correction 7). Pairing only supplies the words and the `⊘`/`⚠` distinction.
+    /// A failed write is a refusal whatever its output says; any other failed call is
+    /// the `⚠` row. A `curl` without `-f` is the one tool whose zero exit hides a
+    /// 4xx/5xx, so its output is read for a status.
+    fn note_shell(&mut self, command: &str, outcome: &ToolOutcome) -> bool {
+        let raw_failure = outcome
+            .raw_failures
+            .iter()
+            .copied()
+            .find(|status| *status != 0);
+        let wrapper_failed = outcome.signal.is_some() || outcome.exit_code != Some(0);
+        let reason = format!(
+            "{}: {}",
+            describe_end(outcome.exit_code, outcome.signal),
+            summarise_output(&outcome.excerpt)
+        );
+        let failing: Vec<&transcript::CommandSegment> = outcome
+            .segments
+            .iter()
+            .filter(|segment| segment.status != 0)
+            .collect();
+        let failed_write = failing
+            .iter()
+            .any(|segment| segment_writes(&segment.command));
+        // The write's own diagnostic, when the output carries one: a mixed failure can
+        // print a read's diagnostic after the write's, and the write is the cause a
+        // person needs (review correction 9, NB-A).
+        let write_line = if shell_writes(command) {
+            write_diagnostic(command, &outcome.excerpt)
+        } else {
+            None
+        };
+        // When a write failed, its own diagnostic is the card's cause, even when a
+        // later command's error line is the last one in the output (correction 5,
+        // N5). Without one, the last error line stays the cause, but a hidden write's
+        // own line wins over a paired read's (review correction 9, NB-A).
+        let cause = if failed_write {
+            failing_write_cause(&failing, outcome.exit_code.unwrap_or(1), &outcome.excerpt)
+        } else {
+            write_line
+                .clone()
+                .unwrap_or_else(|| summarise_output(&outcome.excerpt))
+        };
+        if wrapper_failed {
+            // Which call failed comes from the shell's record when it ran: a write
+            // that failed is a refusal, but a different call failing beside a
+            // successful write is `⚠`, not a refusal of the write (correction 5).
+            if !failing.is_empty() {
+                if failed_write {
+                    self.refused_write = Some(format!("a shell write was refused: {cause}"));
+                } else if refusal_evidence(&outcome.excerpt) {
+                    self.refused_write = Some(format!("a shell command was refused: {cause}"));
+                } else if self.failed_call.is_none() {
+                    self.failed_call = Some(reason);
+                }
+                return false;
+            }
+            // The wrapper failed. The shell's raw record may name the command; when
+            // it cannot, the output and the command still decide the sentence.
+            if let Some(status) = raw_failure {
+                let raw_cause = write_line
+                    .clone()
+                    .unwrap_or_else(|| failing_cause(status, &outcome.excerpt));
+                if shell_writes(command) && write_failure_context(&outcome.excerpt) {
+                    self.refused_write = Some(format!("a shell write was refused: {raw_cause}"));
+                } else if self.failed_call.is_none() {
+                    self.failed_call = Some(raw_cause);
+                }
+                return false;
+            }
+            if shell_writes(command) {
+                self.refused_write = Some(format!("a shell write was refused: {cause}"));
+            } else if refusal_evidence(&outcome.excerpt) {
+                self.refused_write = Some(format!("a shell command was refused: {cause}"));
+            } else if self.failed_call.is_none() {
+                self.failed_call = Some(reason);
+            }
+            return false;
+        }
+        // The shell exited 0 and reported a failure the pairing could not attach to
+        // a command. It is never `✓`, but without a failed command it is `⚠`, not
+        // `⊘`: only a paired write (or a write's own hidden diagnostic below) is a
+        // refusal (review correction 7, decision 2).
+        if failing.is_empty() && raw_failure.is_some() {
+            let status = raw_failure.unwrap_or(1);
+            let raw_cause = write_line
+                .clone()
+                .unwrap_or_else(|| failing_cause(status, &outcome.excerpt));
+            if self.failed_call.is_none() {
+                self.failed_call = Some(raw_cause.clone());
+            }
+            self.cause = Some(raw_cause);
+            return true;
+        }
+        // The shell exited 0, but the shell itself reports every simple command it
+        // completed. Any non-zero segment is a failed tool call: a write is a
+        // refusal, anything else is `⚠`. This is the rule that closes `rm …; echo
+        // done`, `rm … || true`, a failed command in a pipeline, in a subshell and in
+        // a command substitution without reading words in the output (correction 5).
+        if !failing.is_empty() {
+            let status = failing.last().map(|segment| segment.status).unwrap_or(1);
+            // The failed segment's own error line is the cause. When it printed no
+            // error, the exit status is the cause: a later successful segment's
+            // stdout is never passed off as the reason (correction 5). When several
+            // commands failed, a failed write's own line wins (N5).
+            let segment_cause = if failed_write {
+                failing_write_cause(&failing, status, &outcome.excerpt)
+            } else if let Some(line) = write_line.clone() {
+                line
+            } else {
+                failing
+                    .last()
+                    .map(|segment| failing_segment_cause(segment, status, &outcome.excerpt))
+                    .unwrap_or_else(|| failing_cause(status, &outcome.excerpt))
+            };
+            if failed_write {
+                self.refused_write = Some(format!("a shell write was refused: {segment_cause}"));
+                self.cause = Some(segment_cause);
+            } else if refusal_evidence(&outcome.excerpt) {
+                self.refused_write = Some(format!("a shell command was refused: {segment_cause}"));
+                self.cause = Some(segment_cause);
+            } else {
+                if self.failed_call.is_none() {
+                    self.failed_call = Some(segment_cause.clone());
+                }
+                self.cause = Some(segment_cause);
+            }
+            return true;
+        }
+        // The operating system's own diagnostic is the second witness (correction
+        // 8). When the raw record is all zero but a line has the POSIX diagnostic
+        // form — `<program-or-shell>: [line N: ][<path>: ]<strerror>` — the run is
+        // never `✓`: a write named by the command makes it `⊘`, anything else `⚠`.
+        // The error strings are the system's, not a list of programs, and the rule
+        // only ever lowers the mark (a false `⚠` is boundary (c)).
+        if let Some(cause) = write_line
+            .clone()
+            .or_else(|| system_diagnostic(&outcome.excerpt))
+        {
+            if shell_writes(command) {
+                self.refused_write = Some(format!("a shell write was refused: {cause}"));
+            } else if self.failed_call.is_none() {
+                self.failed_call = Some(cause.clone());
+            }
+            self.cause = Some(cause);
+            return true;
+        }
+        // The shell's own voice is the third witness (correction 10). The product
+        // launched the shell, so it knows the exact `<name>: ` prefix the shell uses
+        // for its own errors and warnings — the outer shell's, the `$0` of every
+        // nested `bash` that reads `BASH_ENV`, and bash's `environment` pseudo-source
+        // for a function defined on the command line. Any line in that form is
+        // shell-reported trouble, whatever its text: no message list is kept. With
+        // an all-zero raw record a write named by the command — or by a command the
+        // shell recorded, when its diagnostic names that write's concrete target —
+        // makes it `⊘`, anything else `⚠`; it can only lower the mark.
+        if let Some(line) = shell_voice_line(outcome) {
+            let cause = shell_diagnostic_clause(line);
+            if shell_writes(command) || recorded_write_named(outcome, line) {
+                self.refused_write = Some(format!("a shell write was refused: {cause}"));
+            } else if self.failed_call.is_none() {
+                self.failed_call = Some(cause.clone());
+            }
+            self.cause = Some(cause);
+            return true;
+        }
+        // A write inside a compound can also be hidden from the shell's status: in
+        // `if rm …; then …; fi | cat` the condition's `1` is the enclosing
+        // compound's 0 and the pipeline reports 0, so no raw record carries it. A
+        // program-prefixed diagnostic that is not one of the system strings above is
+        // still the write's witness (the named round-6 pipeline family). Without a
+        // status or a diagnostic the failure cannot be seen: limit (f).
+        if let Some(cause) = hidden_write_cause(command, &outcome.excerpt) {
+            self.refused_write = Some(format!("a shell write was refused: {cause}"));
+            self.cause = Some(cause);
+            return true;
+        }
+        // The wrapper exited 0. A curl without `-f` may still have been answered with
+        // a 4xx/5xx; its output is the only witness. A GET is a read even when it is
+        // refused (review correction 3, non-blocking 3).
+        if shell_writes(command) && curl_without_fail(command) && output_refused(&outcome.excerpt) {
+            self.refused_write = Some(format!("a shell write was refused: {cause}"));
+            self.cause = Some(cause);
+            return true;
+        }
+        // `/bin/sh`-only fallback: a compound command can keep a failed write's exit
+        // code down and there is no per-command record, so the output is the witness
+        // when the shell could not report itself (correction 5).
+        if outcome.segments.is_empty()
+            && shell_segments(command).len() > 1
+            && shell_writes(command)
+            && write_failure_context(&outcome.excerpt)
+        {
+            self.refused_write = Some(format!("a shell write failed: {cause}"));
+            self.cause = Some(cause);
+            return true;
+        }
+        false
+    }
+}
+
+/// The one-line cause of a failed shell segment.
+///
+/// When the output names an error, that line is the cause (the last such line, as
+/// before). When it names none, the failed segment's exit status is the cause and the
+/// output is described honestly: `no output` or `no error line`, never the stdout of
+/// a later segment that happened to succeed.
+fn failing_cause(status: i32, output: &str) -> String {
+    if output_names_error(output) {
+        summarise_output(output)
+    } else if output.trim().is_empty() {
+        format!("exit {status}: no output")
+    } else {
+        format!("exit {status}: no error line")
+    }
+}
+
+/// The cause row when a write failed: that write's own diagnostic, not the last
+/// error line of a different failed command (correction 5, N5).
+///
+/// With several failures the newest failed write is preferred. When its output
+/// cannot be tied to it, the ordinary summariser is the fallback, so the row is
+/// never empty.
+fn failing_write_cause(
+    failing: &[&transcript::CommandSegment],
+    status: i32,
+    output: &str,
+) -> String {
+    for segment in failing
+        .iter()
+        .rev()
+        .filter(|segment| segment_writes(&segment.command))
+    {
+        if let Some(line) = segment_error_line(&segment.command, output) {
+            return line;
+        }
+    }
+    failing_cause(status, output)
+}
+
+/// The cause of a paired failed call that is not a write.
+///
+/// The failing segment's own program-prefixed line is preferred (`cat: missing.txt:
+/// No such file or directory`), including a diagnostic whose text is not in the
+/// error-word list; only when the output carries no line of that command does the
+/// status wording remain (review correction 7, NB1).
+fn failing_segment_cause(
+    segment: &transcript::CommandSegment,
+    status: i32,
+    output: &str,
+) -> String {
+    segment_error_line(&segment.command, output).unwrap_or_else(|| failing_cause(status, output))
+}
+
+/// The error line a failed command itself printed, when the output can be tied to
+/// the command: by the program's own `name:` prefix (`rm: cannot remove …`,
+/// `curl: (22) …`) or by an argument the line names (`cannot stat 'missing.txt'`).
+fn segment_error_line(command: &str, output: &str) -> Option<String> {
+    let words = shell_words(command);
+    let at = words
+        .iter()
+        .position(|word| !word.starts_with('-') && !word.contains('='))?;
+    let program = words[at].rsplit('/').next().unwrap_or(words[at]);
+    let prefix = format!("{}:", program.to_ascii_lowercase());
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_error_line(line))
+        .collect();
+    if let Some(line) = lines
+        .iter()
+        .rev()
+        .find(|line| line.to_ascii_lowercase().starts_with(&prefix))
+    {
+        return Some(first_clause(line, 160));
+    }
+    // A failing program's own `<program>:` line is its diagnostic even when the text
+    // is not one of the words `is_error_line` knows (review correction 7, NB1).
+    if let Some(line) = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .find(|line| line.to_ascii_lowercase().starts_with(&prefix))
+    {
+        return Some(first_clause(line, 160));
+    }
+    for argument in words[at + 1..]
+        .iter()
+        .rev()
+        .filter(|word| !word.starts_with('-') && !word.contains('='))
+    {
+        if let Some(line) = lines.iter().rev().find(|line| line.contains(argument)) {
+            return Some(first_clause(line, 160));
+        }
+    }
+    None
+}
+
+/// The card's cause when a recognised write failed inside a construct whose status
+/// hides it (`if rm …; then …; fi | cat`): that write program's own diagnostic line.
+///
+/// The shell's raw record is the primary rule. This is the narrow fallback for a
+/// write whose enclosing compound returns 0, so neither `$?` nor `PIPESTATUS` at the
+/// next record carries its status. It requires the program's own `name:` line (or,
+/// for `git`, its `fatal:`/`error:` line), so a success body that merely says `error`
+/// is not evidence. A failure whose status and output are both absent is limit (f)
+/// in the docs; a model that suppresses them deliberately is limit (a).
+fn hidden_write_cause(command: &str, output: &str) -> Option<String> {
+    const PROGRAMS: [&str; 10] = [
+        "rm", "rmdir", "mv", "cp", "unlink", "tee", "truncate", "sed", "curl", "git",
+    ];
+    let stripped = strip_descriptor_redirections(command);
+    for segment in shell_segments(&stripped) {
+        if !segment_writes(&segment) {
+            continue;
+        }
+        let words = shell_words(&segment);
+        for program in PROGRAMS {
+            if !words.iter().any(|word| is_program(word, program)) {
+                continue;
+            }
+            let prefix = format!("{program}:");
+            if let Some(line) = output
+                .lines()
+                .map(str::trim)
+                .rev()
+                .find(|line| line.to_ascii_lowercase().starts_with(&prefix))
+            {
+                return Some(first_clause(line, 160));
+            }
+            // git writes report through `fatal:`/`error:` rather than `git:`.
+            if program == "git" && write_failure_context(output) {
+                return Some(summarise_output(output));
+            }
+        }
+    }
+    None
+}
+
+/// Split a shell command where a new command can begin, outside quotes.
+///
+/// `;`, `&&`, `||`, `|` and a newline separate segments; a separator inside single
+/// or double quotes is part of the text. The split is what lets `git push …; echo
+/// done` be judged by the failed push, not by the wrapper's last status (correction
+/// 4, rule 2).
+fn shell_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                current.push(c);
+                if c == '\\' && q == '"' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    current.push(c);
+                } else if c == '\\' {
+                    current.push(c);
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                } else if c == ';' || c == '\n' {
+                    push_segment(&mut segments, &mut current);
+                } else if c == '&' && chars.peek() == Some(&'&') {
+                    chars.next();
+                    push_segment(&mut segments, &mut current);
+                } else if c == '|' {
+                    if chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                    push_segment(&mut segments, &mut current);
+                } else {
+                    current.push(c);
+                }
+            }
+        }
+    }
+    push_segment(&mut segments, &mut current);
+    segments
+}
+
+fn push_segment(segments: &mut Vec<String>, current: &mut String) {
+    let segment = current.trim();
+    if !segment.is_empty() {
+        segments.push(segment.to_owned());
+    }
+    current.clear();
+}
+
+/// The words of one shell command, split where a new command can begin.
+fn shell_words(command: &str) -> Vec<&str> {
+    command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`'))
+        .filter(|word| !word.is_empty())
+        .map(|word| word.trim_matches(['"', '\'']))
+        .collect()
+}
+
+/// Whether a word names the program `name`, at any path (`git`, `/usr/bin/git`).
+fn is_program(word: &str, name: &str) -> bool {
+    let word = word.trim_end_matches('/');
+    word == name || word.ends_with(&format!("/{name}"))
+}
+
+/// Whether a `curl` call lets the HTTP status decide its exit code.
+///
+/// `curl` exits 0 on a 4xx/5xx body unless `-f`/`--fail` is given, so only a call
+/// without that flag needs its output read for the status (review correction 3).
+fn curl_without_fail(command: &str) -> bool {
+    let words = shell_words(command);
+    let Some(at) = words.iter().position(|word| is_program(word, "curl")) else {
+        return false;
+    };
+    !words[at + 1..].iter().any(|word| {
+        let lower = word.to_ascii_lowercase();
+        // A short curl flag cluster such as `-fsS` carries `-f` (fail); uppercase
+        // `-F` is the form option, so the check is case-sensitive.
+        lower == "--fail"
+            || lower == "--fail-with-body"
+            || (word.starts_with('-') && !word.starts_with("--") && word[1..].contains('f'))
+    })
+}
+
+/// Remove redirections whose target is a descriptor or a device (`2>/dev/null`,
+/// `2>&1`, `&>/dev/null`) before a command is classed as a write.
+///
+/// A redirection to a real file stays in the text; that one can change the
+/// repository. The read-only forms must not turn a refused read into a refused write
+/// (review correction 3, non-blocking 3).
+fn strip_descriptor_redirections(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let is_amp_gt = chars[i] == '&' && chars.get(i + 1) == Some(&'>');
+        if chars[i].is_ascii_digit() || chars[i] == '>' || is_amp_gt {
+            let start = i;
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let operator = if chars.get(j) == Some(&'>') {
+                j += 1;
+                if chars.get(j) == Some(&'>') {
+                    j += 1;
+                }
+                true
+            } else if is_amp_gt {
+                j = i + 2;
+                true
+            } else {
+                false
+            };
+            if operator {
+                let mut k = j;
+                while k < chars.len() && chars[k] == ' ' {
+                    k += 1;
+                }
+                let target_start = k;
+                while k < chars.len()
+                    && !chars[k].is_whitespace()
+                    && !matches!(chars[k], ';' | '|' | '&' | '(' | ')' | '`')
+                {
+                    k += 1;
+                }
+                let target: String = chars[target_start..k].iter().collect();
+                let descriptor =
+                    target.is_empty() || target.starts_with('&') || target.starts_with("/dev/");
+                if descriptor {
+                    // Drop the redirect, including its descriptor number.
+                    i = k;
+                    continue;
+                }
+                out.extend(&chars[start..k]);
+                i = k;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Whether a shell command is a write.
+///
+/// The command is split into segments first (correction 4, rule 2), so a write that
+/// is one part of `git push …; echo done` is still seen. The spellings are the
+/// standard curl forms (`-X DELETE`, `-XDELETE`, `--request DELETE`, the same for
+/// PUT/POST/PATCH), a body flag with a method that is not GET, a git write by
+/// subcommand position (`push`, `rm`, `mv`, `branch`/`tag` changes, and the commands
+/// that move HEAD or the working tree), `sed -i`, `cp`, `rm`, `mv`, `truncate`, and a
+/// redirection into a file. Recognising a write never turns a successful command into
+/// a refusal by itself.
+fn shell_writes(command: &str) -> bool {
+    let stripped = strip_descriptor_redirections(command);
+    shell_segments(&stripped)
+        .iter()
+        .any(|segment| segment_writes(segment))
+}
+
+fn segment_writes(segment: &str) -> bool {
+    let words = shell_words(segment);
+    let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
+    let next_is = |index: usize, name: &str| lower.get(index + 1).is_some_and(|word| word == name);
+
+    for method in ["delete", "put", "post", "patch"] {
+        let long = format!("--request={method}");
+        let short = format!("-x{method}");
+        for (index, word) in lower.iter().enumerate() {
+            if *word == long
+                || *word == short
+                || (*word == "--request" && next_is(index, method))
+                || (*word == "-x" && next_is(index, method))
+                // `-sXDELETE` carries the method joined onto another short flag.
+                || (word.starts_with('-') && word.ends_with(&format!("x{method}")))
+            {
+                return true;
+            }
+        }
+    }
+
+    // `-G`/`--get` is case-sensitive: `-g` is `--globoff`, not a method. A curl GET
+    // may carry `--data` and still be a read (review correction 3, non-blocking 3).
+    let get = words.iter().enumerate().any(|(index, word)| {
+        *word == "-G"
+            || lower[index] == "--get"
+            || (lower[index] == "-x" && next_is(index, "get"))
+            || (lower[index] == "--request" && next_is(index, "get"))
+            || lower[index].starts_with("--request=get")
+            || lower[index].ends_with("xget")
+            || (word.starts_with('-') && !word.starts_with("--") && word[1..].contains('G'))
+    });
+    if !get
+        && lower
+            .iter()
+            .any(|word| word.starts_with("--data") || *word == "-d" || word.starts_with("-d@"))
+    {
+        return true;
+    }
+
+    if git_writes(&lower) {
+        return true;
+    }
+    if lower.iter().any(|word| {
+        is_program(word, "rm")
+            || is_program(word, "mv")
+            || is_program(word, "truncate")
+            || is_program(word, "cp")
+            || is_program(word, "rmdir")
+            || is_program(word, "unlink")
+            || is_program(word, "tee")
+    }) {
+        return true;
+    }
+    if sed_in_place(&lower) {
+        return true;
+    }
+    // A redirection to a real file writes wherever it points; descriptor
+    // redirections were removed above, so `2>/dev/null` alone is not a write.
+    has_redirection(segment)
+}
+
+/// Whether a `git` call is a write, by the subcommand's position.
+///
+/// The first non-option token after `git` and its global options is the subcommand,
+/// so `git show push` is a read of a ref named `push`, while `git -C . push` and
+/// `/usr/bin/git push` are writes (review correction 4, non-blocking 3A).
+fn git_writes(words: &[String]) -> bool {
+    let Some(at) = words.iter().position(|word| is_program(word, "git")) else {
+        return false;
+    };
+    let mut index = at + 1;
+    while index < words.len() {
+        let word = &words[index];
+        if word.starts_with('-') {
+            let consumes_next = matches!(
+                word.as_str(),
+                "-C" | "-c"
+                    | "--git-dir"
+                    | "--work-tree"
+                    | "--namespace"
+                    | "--exec-path"
+                    | "--config-env"
+                    | "--super-prefix"
+            );
+            index += if consumes_next { 2 } else { 1 };
+            continue;
+        }
+        let rest = &words[index + 1..];
+        return match word.as_str() {
+            "push" | "rm" | "mv" | "reset" | "checkout" | "switch" | "restore" | "merge"
+            | "rebase" | "cherry-pick" | "apply" | "am" | "clean" | "add" | "commit" | "stash"
+            | "pull" | "fetch" | "clone" | "init" | "gc" | "prune" => true,
+            "branch" => branch_writes(rest),
+            "tag" => tag_writes(rest),
+            _ => false,
+        };
+    }
+    false
+}
+
+/// `git branch` is a write when it deletes, moves, copies, forces or creates a branch;
+/// `git branch --list`, `--show-current` and the other read forms are not.
+fn branch_writes(rest: &[String]) -> bool {
+    const WRITE: [&str; 13] = [
+        "-d",
+        "--delete",
+        "-m",
+        "--move",
+        "-c",
+        "--copy",
+        "--force",
+        "-f",
+        "-u",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "--edit-description",
+        "--create-reflog",
+    ];
+    if rest.iter().any(|word| WRITE.contains(&word.as_str())) {
+        return true;
+    }
+    const READ: [&str; 18] = [
+        "-l",
+        "--list",
+        "--show-current",
+        "-a",
+        "--all",
+        "-r",
+        "--remotes",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "-v",
+        "-vv",
+        "--verbose",
+        "--column",
+        "--sort",
+        "--format",
+        "--points-at",
+    ];
+    if rest.iter().any(|word| READ.contains(&word.as_str())) {
+        return false;
+    }
+    rest.iter().any(|word| !word.starts_with('-'))
+}
+
+/// `git tag` is a write when it creates, deletes, signs or forces a tag; a plain
+/// `git tag` or `git tag --list` only reads.
+fn tag_writes(rest: &[String]) -> bool {
+    const WRITE: [&str; 11] = [
+        "-d",
+        "--delete",
+        "-a",
+        "--annotate",
+        "-s",
+        "--sign",
+        "-m",
+        "--message",
+        "-f",
+        "--force",
+        "--create-reflog",
+    ];
+    if rest.iter().any(|word| WRITE.contains(&word.as_str())) {
+        return true;
+    }
+    const READ: [&str; 9] = [
+        "-l",
+        "--list",
+        "-n",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--column",
+    ];
+    if rest.iter().any(|word| READ.contains(&word.as_str())) {
+        return false;
+    }
+    rest.iter().any(|word| !word.starts_with('-'))
+}
+
+/// `sed -i` edits a file in place. `-i.bak`, `-ni` and `--in-place=.bak` are the same
+/// write; a plain `sed 's/x/y/' file` only prints.
+fn sed_in_place(words: &[String]) -> bool {
+    let Some(at) = words.iter().position(|word| is_program(word, "sed")) else {
+        return false;
+    };
+    words[at + 1..].iter().any(|word| {
+        word == "--in-place"
+            || word.starts_with("--in-place=")
+            || (word.starts_with('-') && !word.starts_with("--") && word[1..].contains('i'))
+    })
+}
+
+/// Whether a `>` or `>>` appears outside quotes. Descriptor redirections were removed
+/// before this is called, so `2>/dev/null` is not here.
+fn has_redirection(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' && q == '"' {
+                    chars.next();
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                } else if c == '>' {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether a failed call's output carries refusal evidence (correction 4, rule 1).
+///
+/// The call already failed, so a bare `denied`/`refused` is in a failure context and
+/// counts, unlike in a successful write's body.
+fn refusal_evidence(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    // HTTP refusal words and curl's own `-f` error. These are narrow on purpose: a
+    // compiler's `conflicting implementations` is a failed command, not a refusal.
+    const PHRASES: [&str; 8] = [
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "not permitted",
+        "access denied",
+        "not allowed",
+        "authentication failed",
+        "curl: (22)",
+    ];
+    if PHRASES.iter().any(|needle| lower.contains(needle)) || http_error_status(&lower) {
+        return true;
+    }
+    let status_in_error = output.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        (lower.contains("error") || lower.contains("status") || lower.contains("http"))
+            && lower.split(|c: char| !c.is_ascii_digit()).any(|token| {
+                token.len() == 3
+                    && token
+                        .parse::<u16>()
+                        .is_ok_and(|code| (400..=599).contains(&code))
+            })
+    });
+    status_in_error
+        || ["denied", "refused"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+}
+
+/// The failure-context lines that make a failed write inside a compound command
+/// evidence even when the wrapper exited 0 (correction 4, rule 2).
+fn write_failure_context(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    const PHRASES: [&str; 7] = [
+        "fatal:",
+        "error:",
+        "remote rejected",
+        "failed to push",
+        "permission denied",
+        "denied",
+        "curl: (22)",
+    ];
+    PHRASES.iter().any(|needle| lower.contains(needle)) || http_error_status(&lower)
+}
+
+/// Whether a `curl` output names a refused write.
+///
+/// This is only consulted for a `curl` call without `-f`, whose exit code hides the
+/// HTTP status. A status line or a whole-line `-w` code is direct evidence; a bare
+/// provider phrase (`Forbidden`, `Unauthorized`) is the reason phrase of the same
+/// refused request. `not found` is not here: a success body may say it, and it is not
+/// a refusal by itself (review correction 3, non-blocking 5).
+fn output_refused(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    const PHRASES: &[&str] = &[
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "not permitted",
+        "bad request",
+        "method not allowed",
+        "conflict",
+        "too many requests",
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+    ];
+    PHRASES.iter().any(|needle| lower.contains(needle)) || http_error_status(&lower)
+}
+
+/// A 4xx/5xx status in a failure context: a status line (`HTTP/1.1 404 …`), a
+/// whole-line `curl -w '%{http_code}'` code, or a `status`/`http_code` line.
+///
+/// A three-digit number in an ordinary success body is not evidence (review
+/// correction 3, non-blocking 5); the write's non-zero exit is read separately.
+fn http_error_status(text: &str) -> bool {
+    let is_error_code = |token: &str| {
+        token.len() == 3
+            && token
+                .parse::<u16>()
+                .is_ok_and(|code| (400..=599).contains(&code))
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if is_error_code(line) {
+            return true;
+        }
+        let lower = line.to_ascii_lowercase();
+        let status_context = lower.starts_with("http")
+            || lower.starts_with("status")
+            || lower.starts_with("http_code")
+            || lower.starts_with("http code")
+            || lower.starts_with("error code")
+            || lower.starts_with("code:");
+        if !status_context {
+            continue;
+        }
+        if lower
+            .split(|c: char| !c.is_ascii_digit())
+            .any(is_error_code)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read the model's own last summary as the run's outcome.
+///
+/// `✓` must not mean "exit 0" when a tool refused a write or the model said it could
+/// not do the instruction (F4, review B2). The tool results decide first: a refused
+/// write can never look like success. The sentence is then classified for the
+/// refusals and empty lists no tool call can show. A review that reports finding no
+/// problem *and* says the work is complete is a success, not a refusal.
+pub fn ending_for(summary: &str) -> RunEnding {
+    ending_with_evidence(summary, &RunEvidence::default())
+}
+
+/// [`ending_for`] with the run's tool results as the first witness.
+pub fn ending_with_evidence(summary: &str, evidence: &RunEvidence) -> RunEnding {
+    ending_for_instruction("", summary, evidence)
+}
+
+/// [`ending_with_evidence`] with the instruction the run was given.
+///
+/// The instruction matters only for a refusal that exists in prose alone: a
+/// destructive instruction answered with "I left it in place ..." has no tool result
+/// to read, yet the run's own sentence says it did not do the work. The phrase check
+/// is bounded to a destructive instruction and explicit wording, so a report that
+/// merely mentions a file it kept is not read as a refusal (correction 2,
+/// non-blocking 2).
+pub fn ending_for_instruction(
+    instruction: &str,
+    summary: &str,
+    evidence: &RunEvidence,
+) -> RunEnding {
+    if evidence.refused_write.is_some() {
+        return RunEnding::Refused;
+    }
+    let lower = summary.to_ascii_lowercase();
+    let finds_nothing = [
+        "could not find any",
+        "couldn't find any",
+        "did not find any",
+        "found no",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    // "Could not find any problems/bugs/typos/errors" is a review that found
+    // nothing to fix, not a refusal: the model is reporting the result of a search.
+    // An "issue" is only read this way when the same sentence says the work is
+    // complete, because "could not find any issues assigned" is a no-work report.
+    let nothing_to_fix = ["problem", "bug", "typo", "error"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        || (lower.contains("issue")
+            && ["complete", "correct", "fixed", "done", "no changes"]
+                .iter()
+                .any(|needle| lower.contains(needle)));
+    if finds_nothing && nothing_to_fix {
+        return if evidence.failed_call().is_some() {
+            RunEnding::Warned
+        } else {
+            RunEnding::Succeeded
+        };
+    }
+    let no_work = [
+        "no open issue",
+        "no issue is assigned",
+        "no issues assigned",
+        "no assigned issue",
+        "nothing to do",
+        "nothing was assigned",
+        "no typos",
+        "no typo",
+        "there are no open",
+        "there is no open",
+        "no changes",
+        "nothing to commit",
+    ];
+    if no_work.iter().any(|needle| lower.contains(needle)) {
+        return if evidence.failed_call().is_some() {
+            RunEnding::Warned
+        } else {
+            RunEnding::NoWork
+        };
+    }
+    let refused = [
+        "i could not",
+        "i couldn't",
+        "i cannot",
+        "i can't",
+        "i was unable",
+        "i wasn't able",
+        "could not do",
+        "was refused",
+        "were refused",
+        "refused the request",
+        "not permitted",
+        "no permission",
+        "not allowed",
+        "permission denied",
+        // A positively phrased refusal: the model says what it left in place and
+        // why. It is still a refusal (review B2's first wording).
+        "does not have that permission",
+        "do not have that permission",
+        "does not have permission",
+    ];
+    if refused.iter().any(|needle| lower.contains(needle)) {
+        return RunEnding::Refused;
+    }
+    if destructive_instruction(instruction) && refused_in_prose(&lower) {
+        return RunEnding::Refused;
+    }
+    // A failed call that was not itself a refusal still means the run did not
+    // cleanly do the instruction: never `✓` (correction 4, rule 1).
+    if evidence.failed_call().is_some() {
+        return RunEnding::Warned;
+    }
+    RunEnding::Succeeded
+}
+
+/// Whether the instruction asked for something to be removed or replaced.
+///
+/// "Do not delete ..." and "without deleting ..." are instructions *not* to destroy;
+/// they must not arm the prose-refusal check.
+fn destructive_instruction(instruction: &str) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    if [
+        "do not delete",
+        "don't delete",
+        "do not remove",
+        "don't remove",
+        "without deleting",
+        "not delete anything",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return false;
+    }
+    ["delet", "remov", "destroy", "wipe", "eras", "truncate"]
+        .iter()
+        .any(|stem| lower.contains(stem))
+        || lower
+            .split(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '.' | ',' | ':' | '!')
+            })
+            .any(|word| matches!(word, "drop" | "kill" | "rm" | "mv") || word.ends_with("/rm"))
+}
+
+/// A refusal that exists only in the model's prose: explicit wording, close enough
+/// together to be one statement, and only read when the instruction was destructive.
+///
+/// A keep phrase alone is not a refusal: "I deleted the stale branch and kept the
+/// docs as is" reports a success. It needs a refusal cue (`not`, `rather than`,
+/// `instead`, `safe`) or no success verb for the destructive act (review correction
+/// 3, non-blocking 4).
+fn refused_in_prose(lower: &str) -> bool {
+    let between = |start: &str, end: &str| {
+        lower
+            .find(start)
+            .is_some_and(|at| lower[at..].find(end).is_some_and(|gap| gap <= 80))
+    };
+    let kept = between("left", "in place")
+        || between("kept", "in place")
+        || between("kept", "unchanged")
+        || between("kept", "as is");
+    let refusal_cue = ["not ", "n't", "rather than", "instead", "safe"]
+        .iter()
+        .any(|cue| lower.contains(cue));
+    let did_destroy = [
+        "deleted",
+        "removed",
+        "destroyed",
+        "wiped",
+        "erased",
+        "truncated",
+        "dropped",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb));
+    (kept && (refusal_cue || !did_destroy))
+        || [
+            "did not delete",
+            "didn't delete",
+            "without deleting",
+            "rather than delet",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        || (lower.contains("not safe")
+            && ["delet", "remov", "destroy", "wipe", "eras"]
+                .iter()
+                .any(|needle| lower.contains(needle)))
 }
 
 /// Ask the kernel to signal this process when the parent that started it dies.
@@ -207,6 +1348,20 @@ impl RunLog {
         );
         self.line(&format!("✗ {line}"));
     }
+
+    /// A failed command hidden inside a zero-exit compound, or a `curl` without
+    /// `-f` answered with a 4xx/5xx. The process succeeded but the work did not:
+    /// the card gets the same cause row, with `⚠` rather than `✗` (correction 4).
+    fn tool_warning(&mut self, tool: &str, detail: &str) {
+        let clause = first_clause(detail, 120);
+        let line = format!("{tool}: {clause}");
+        let redacted = self.secret.redact(&line);
+        let _ = crate::mode::write_private(
+            self.dir.join(crate::run::FAILURE_FILE),
+            redacted.as_bytes(),
+        );
+        self.line(&format!("⚠ {line}"));
+    }
 }
 
 /// The first clause of a tool error: no raw body and no second sentence on a card.
@@ -219,12 +1374,404 @@ fn first_clause(text: &str, limit: usize) -> String {
     }
     let clause = text[..cut].trim();
     if clause.chars().count() > limit {
-        let mut short: String = clause.chars().take(limit.saturating_sub(1)).collect();
-        short.push('…');
-        short
+        // Never end a card's sentence in the middle of a word: keep whole words and
+        // show that the tail was left out.
+        let whole: String = clause.chars().take(limit.saturating_sub(1)).collect();
+        let cut = whole.rfind(' ').unwrap_or(whole.len());
+        format!("{}…", whole[..cut].trim_end())
     } else {
         clause.to_owned()
     }
+}
+
+/// One line that explains a failed command: the last line that names an error, else
+/// the last non-empty line. Git prints `On branch docs/geting` before `nothing to
+/// commit`; the first line is context, not the reason (F11).
+fn summarise_output(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if let Some(line) = lines.iter().rev().find(|line| is_error_line(line)) {
+        // A git/curl HTTP failure's long URL is not the cause a reader needs; the
+        // status is. Turn `… The requested URL returned error: 403` into one whole
+        // clause that fits the card row.
+        if let Some(code) = http_status(line) {
+            return format!("the server answered HTTP {code}");
+        }
+        return first_clause(line, 160);
+    }
+    match lines.last() {
+        Some(line) => first_clause(line, 160),
+        None => "no output".to_owned(),
+    }
+}
+
+/// Every error string the C library can print, lower-case: errno 1..133.
+///
+/// The set is the operating system's complete error vocabulary, built from the C
+/// library itself with [`std::io::Error::from_raw_os_error`], not a hand-kept list
+/// (`Too many levels of symbolic links`, `File name too long` and the rest). It is
+/// the second witness for a failure whose status the shell did not report; the rule
+/// names error texts, not programs (review correction 9).
+fn system_error_texts() -> &'static [String] {
+    static TEXTS: LazyLock<Vec<String>> = LazyLock::new(|| {
+        (1..=133)
+            .map(|errno| {
+                let full = std::io::Error::from_raw_os_error(errno).to_string();
+                // `Permission denied (os error 13)` → `Permission denied`.
+                let text = match full.split_once(" (os error ") {
+                    Some((head, _)) => head,
+                    None => full.as_str(),
+                };
+                text.trim().to_ascii_lowercase()
+            })
+            .filter(|text| !text.is_empty())
+            .collect()
+    });
+    &TEXTS
+}
+
+/// Build the operating system's error vocabulary now.
+///
+/// The set is filled on first use, and the binary calls this once at startup so a
+/// run's first failed tool call never pays for it.
+pub fn init_system_errors() {
+    let _ = system_error_texts();
+}
+
+/// The bounded coreutils messages that print a phrase instead of the errno string
+/// alone. They are a diagnostic only when they name a path (see
+/// [`is_system_diagnostic`]).
+const SYSTEM_PHRASES: [&str; 5] = [
+    "cannot create",
+    "cannot remove",
+    "cannot open",
+    "cannot stat",
+    "cannot access",
+];
+
+/// The operating system's diagnostic for a recognised write's own target, when the
+/// output carries one (review correction 9, NB-A).
+///
+/// A mixed failure can print a read's diagnostic after the write's. The write's line
+/// is the cause a person needs, so a diagnostic that names a target of a recognised
+/// write wins over one that only names a read's argument. Only a POSIX diagnostic is
+/// considered, so a success body that quotes an error phrase cannot become one.
+fn write_diagnostic(command: &str, output: &str) -> Option<String> {
+    let stripped = strip_descriptor_redirections(command);
+    let mut targets: Vec<String> = Vec::new();
+    for segment in shell_segments(&stripped) {
+        if segment_writes(&segment) {
+            targets.extend(write_targets(&segment));
+        }
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    output
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| {
+            is_system_diagnostic(line)
+                && targets.iter().any(|target| line_names_target(line, target))
+        })
+        .map(diagnostic_clause)
+}
+
+/// The file targets a write segment names: its redirection targets and the file
+/// operands of the write programs (`rm`, `cp`, `mv`, `tee`, …). A URL, a descriptor
+/// and a program name are not targets.
+fn write_targets(segment: &str) -> Vec<String> {
+    const FILE_PROGRAMS: [&str; 8] = [
+        "rm", "rmdir", "unlink", "mv", "cp", "truncate", "tee", "sed",
+    ];
+    let words = shell_words(segment);
+    let mut targets = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let redirection = if *word == ">" || *word == ">>" {
+            words.get(index + 1).copied()
+        } else {
+            word.find('>').map(|at| &word[at..])
+        };
+        if let Some(target) = redirection {
+            let target = target.trim_start_matches('>').trim_matches(['"', '\'']);
+            if !target.is_empty() && !target.starts_with('&') && !target.starts_with("/dev/") {
+                targets.push(target.to_owned());
+            }
+        }
+    }
+    if let Some(at) = words.iter().position(|word| {
+        FILE_PROGRAMS
+            .iter()
+            .any(|program| is_program(word, program))
+    }) {
+        for word in &words[at + 1..] {
+            if !word.starts_with('-') && !word.contains('=') {
+                targets.push(word.trim_matches(['"', '\'']).to_owned());
+            }
+        }
+    }
+    targets
+}
+
+/// Whether a diagnostic line names one of the write's targets. The forms are the
+/// shell's `…: ro/file: Permission denied` and a program's quoted path
+/// (`'ro/file'`, `"ro/file"`).
+fn line_names_target(line: &str, target: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let target = target.to_ascii_lowercase();
+    !target.is_empty()
+        && (lower.contains(&format!("{target}:"))
+            || lower.contains(&format!("'{target}'"))
+            || lower.contains(&format!("\"{target}\""))
+            || lower.contains(&format!(" {target} ")))
+}
+
+/// The last operating-system diagnostic in a tool output, when there is one.
+///
+/// The POSIX form is `<program-or-shell>: [line N: ][<path>: ]<strerror>`: a program
+/// or shell prefix, then any number of context segments, ending in any error string
+/// the C library prints (`/bin/bash: line 1: ro/file: Permission denied`,
+/// `install: cannot create regular file 'ro/a': Permission denied`). The rule is not
+/// a program list and not a fixed error list, so an unlisted program's refusal is
+/// seen too; it can only lower the mark (corrections 8 and 9).
+fn system_diagnostic(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| is_system_diagnostic(line))
+        .map(diagnostic_clause)
+}
+
+/// The card's one-line cause for a POSIX diagnostic.
+///
+/// A long path can push the system's own words off a one-line cut. The program and
+/// the error tail are what a person needs, so a shortened diagnostic keeps them
+/// (`/bin/bash: …: File name too long`) instead of ending on the path.
+fn diagnostic_clause(line: &str) -> String {
+    let clause = first_clause(line, 160);
+    if !clause.ends_with('…') {
+        return clause;
+    }
+    let line = line.trim();
+    let lower = line.to_ascii_lowercase();
+    let Some(error) = system_error_texts()
+        .iter()
+        .find(|error| lower.ends_with(error.as_str()))
+    else {
+        return clause;
+    };
+    let tail = &line[line.len() - error.len()..];
+    let program = line
+        .split_once(": ")
+        .map_or("", |(program, _)| program.trim());
+    if program.is_empty() || program.len() > 80 {
+        return clause;
+    }
+    format!("{program}: …: {tail}")
+}
+
+/// The longest shell or source name the recorder can report.
+///
+/// A Linux path is allowed up to `PATH_MAX` (4096); a longer line is not a name.
+/// The bound is only a sanity limit on the private record, never a cap that drops a
+/// name the recorder reported (correction 11).
+const SHELL_NAME_LIMIT: usize = 4096;
+
+/// The names a shell writes its own diagnostics with.
+///
+/// The product launches the shell, so it knows the outer shell's `$0`; the `BASH_ENV`
+/// prelude reports the same name and the `$0` of every nested `bash` that reads
+/// `BASH_ENV`, and the trap reports `BASH_SOURCE[0]`, which is the name bash uses for
+/// a sourced file or a function defined there (`lib.sh: line 1: …`) (correction 10).
+/// Bash also names a function defined on its `-c` command line `environment`
+/// (`environment: line 1: $n: ambiguous redirect`); that pseudo-source is added only
+/// when the recorder actually ran, so a program that merely prints `environment:` on
+/// a host without the recorder is not called the shell's own voice.
+fn shell_voice_prefixes(outcome: &ToolOutcome) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let program = crate::confinement::shell_program();
+    if !program.is_empty() {
+        prefixes.push(program.to_owned());
+    }
+    for name in &outcome.shell_prefixes {
+        if !name.is_empty()
+            && name.len() <= SHELL_NAME_LIMIT
+            && !prefixes.iter().any(|prefix| prefix == name)
+        {
+            prefixes.push(name.clone());
+        }
+    }
+    if !outcome.shell_prefixes.is_empty() && !prefixes.iter().any(|prefix| prefix == "environment")
+    {
+        prefixes.push("environment".to_owned());
+    }
+    prefixes
+}
+
+/// The last line in the shell's own diagnostic prefix, when there is one.
+///
+/// The form is the exact `<name>: ` the shell uses for its own errors and warnings —
+/// `<argv0>: line N: <message>` and `<argv0>: <message>` both begin with it. The
+/// product keeps no list of messages: whatever bash prints under its own name is
+/// shell-reported trouble, so the rule can only lower the mark (correction 10).
+fn shell_voice_line(outcome: &ToolOutcome) -> Option<&str> {
+    let prefixes: Vec<String> = shell_voice_prefixes(outcome)
+        .into_iter()
+        .map(|prefix| format!("{prefix}: "))
+        .collect();
+    if prefixes.is_empty() {
+        return None;
+    }
+    outcome
+        .excerpt
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+}
+
+/// The card's one-line version of the shell's diagnostic.
+///
+/// A short line is kept whole. A long one — usually a script path longer than a card
+/// row — keeps a short program name and the last two `: ` clauses, so the target and
+/// the message survive (`s.sh: …: f: cannot overwrite existing file`) instead of a
+/// cut path that says nothing (correction 11).
+fn shell_diagnostic_clause(line: &str) -> String {
+    let clause = first_clause(line, 160);
+    if !clause.ends_with('…') {
+        return clause;
+    }
+    let line = line.trim();
+    let parts: Vec<&str> = line.split(": ").collect();
+    if parts.len() < 3 {
+        return clause;
+    }
+    let program = parts[0].trim();
+    let program = if program.len() > 40 {
+        std::path::Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("shell")
+    } else {
+        program
+    };
+    let tail = parts[parts.len() - 2..].join(": ");
+    format!("{program}: …: {tail}")
+}
+
+/// Whether a command the shell recorded is a write whose plain target the shell's
+/// own diagnostic names.
+///
+/// This is the recorded-write case behind a hidden condition — `if echo x > f; …` in
+/// a script — where the outer tool text (`if bash script.sh; …`) names no write but
+/// the shell's own record does, and its diagnostic names the same concrete target. A
+/// variable or glob target is left to `⚠`: the command never formed a file target
+/// (correction 11).
+fn recorded_write_named(outcome: &ToolOutcome, line: &str) -> bool {
+    outcome
+        .segments
+        .iter()
+        .filter(|segment| segment_writes(&segment.command))
+        .flat_map(|segment| write_targets(&segment.command))
+        .any(|target| {
+            !target.is_empty()
+                && !target.contains(['$', '*', '?', '{', '[', '`', '"', '\''])
+                && line_names_target(line, &target)
+        })
+}
+
+/// Whether a line has the POSIX diagnostic form and ends in a system error string.
+fn is_system_diagnostic(line: &str) -> bool {
+    let Some((program, rest)) = line.split_once(": ") else {
+        return false;
+    };
+    let program = program.trim();
+    if program.is_empty()
+        || program.len() > 80
+        || !program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        return false;
+    }
+    // The error string ends the diagnostic: `…: ro/file: Permission denied`. One
+    // system string itself contains a colon (`Too many references: cannot splice`),
+    // so the whole remainder is checked as a suffix, not only the last colon's tail.
+    // A status line that merely quotes an error phrase in its middle is not one.
+    let lower_rest = rest.trim().to_ascii_lowercase();
+    if system_error_texts()
+        .iter()
+        .any(|error| lower_rest.ends_with(error.as_str()))
+    {
+        return true;
+    }
+    // `cannot create`/`cannot remove`/`cannot open`/`cannot stat`/`cannot access` is
+    // a diagnostic when it names a path (`rm: cannot remove 'ro/file'`), not when a
+    // success body merely prints the words (`rm: cannot remove this line from the
+    // report`).
+    SYSTEM_PHRASES.iter().any(|phrase| {
+        lower_rest.find(phrase).is_some_and(|at| {
+            let after = &rest[at + phrase.len()..];
+            after.contains('\'')
+                || after.contains('"')
+                || after.contains('`')
+                || after.contains('/')
+        })
+    })
+}
+
+/// Whether one line of tool output names an error.
+fn is_error_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    system_error_texts()
+        .iter()
+        .any(|error| lower.contains(error.as_str()))
+        || SYSTEM_PHRASES.iter().any(|phrase| lower.contains(phrase))
+        || lower.starts_with("fatal:")
+        || lower.starts_with("error:")
+        || lower.contains("error")
+        || lower.contains("fatal")
+        || lower.contains("nothing to commit")
+        || lower.contains("refused")
+        || lower.contains("denied")
+        || lower.contains("not found")
+        || lower.contains("cannot")
+        || lower.contains("could not")
+        || lower.contains("couldn't")
+        || lower.contains("failed")
+        || lower.contains("failure")
+        || lower.contains("unable to")
+}
+
+/// Whether the output has any line that names an error.
+fn output_names_error(output: &str) -> bool {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .any(is_error_line)
+}
+
+/// A 4xx/5xx status named by a line, when there is one.
+fn http_status(line: &str) -> Option<u16> {
+    for marker in ["returned error: ", "HTTP/1.1 ", "HTTP/1.0 ", "HTTP "] {
+        if let Some(rest) = line.split(marker).nth(1) {
+            if let Some(code) = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .find_map(|token| token.parse::<u16>().ok())
+            {
+                if (400..=599).contains(&code) {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Run one agent run whose plan is already written in `run_dir`.
@@ -284,10 +1831,15 @@ pub fn execute(run_dir: &Path) -> RunEnd {
     let _ = transcript.append(&Record::child_exit(Some(end.exit_code), None));
     let _ = transcript.append(&Record::run_finished(
         &plan.run_id,
-        if end.is_success() {
-            RunOutcome::Succeeded
-        } else {
+        if !end.is_success() {
             RunOutcome::Failed
+        } else {
+            match end.ending {
+                RunEnding::Succeeded => RunOutcome::Succeeded,
+                RunEnding::Refused => RunOutcome::Refused,
+                RunEnding::NoWork => RunOutcome::NoWork,
+                RunEnding::Warned => RunOutcome::Warned,
+            }
         },
         Some(end.exit_code),
         started.elapsed().as_millis() as u64,
@@ -544,11 +2096,11 @@ fn run_declared_step(
     if outcome.signal.is_some() || outcome.exit_code != Some(0) {
         log.tool_failure(
             model::SHELL_TOOL,
-            &format!("{end}: {}", outcome.excerpt.trim()),
+            &format!("{end}: {}", summarise_output(&outcome.excerpt)),
         );
     }
     log.line(&format!("[step {index}] {end} after {duration_ms} ms"));
-    if let Err(error) = transcript.append(&Record::tool_result(
+    if let Err(error) = transcript.append(&Record::tool_result_with_segments(
         None,
         index,
         model::SHELL_TOOL,
@@ -556,6 +2108,7 @@ fn run_declared_step(
         outcome.signal,
         duration_ms,
         Some(outcome.excerpt.clone()),
+        outcome.segments.clone(),
     )) {
         return Err(RunEnd::failed(format!(
             "the transcript cannot be written: {error}"
@@ -565,20 +2118,19 @@ fn run_declared_step(
         // A failure that says only `declared step 1 exit 128` hides the command, the
         // directory and git's own `fatal:` line behind `o`. Put all three in the
         // reason the note area draws (w52 F3).
-        let excerpt = outcome.excerpt.trim();
-        let output = if excerpt.is_empty() {
-            "no output".to_owned()
-        } else {
-            crate::model::excerpt(excerpt, 400)
-        };
+        // The cause comes first so the card's first clause is what went wrong; the
+        // command and directory follow for the log (F11). `On branch …` is context,
+        // not a reason, so the output is summarised to its error line.
+        let output = summarise_output(&outcome.excerpt);
         return Err(RunEnd {
             exit_code: outcome
                 .exit_code
                 .filter(|code| (1..=125).contains(code))
                 .unwrap_or(1),
             reason: Some(format!(
-                "declared step {index} {end} — command `{command}` in {workspace} — output: {output}"
+                "{output} — declared step {index} {end}: command `{command}` in {workspace}"
             )),
+            ending: RunEnding::Succeeded,
         });
     }
     Ok(())
@@ -599,11 +2151,14 @@ fn model_loop(
     let instruction_text = String::from_utf8_lossy(instruction).into_owned();
     let mut messages = vec![
         Message::system(system_prompt(plan, forgejo.as_ref())),
-        Message::user(instruction_text),
+        Message::user(instruction_text.clone()),
     ];
-    let declared_tools = model::tools_with_forgejo(forgejo.is_some());
+    let declared_tools = model::tools_with(forgejo.is_some(), shell.method);
     let deadline = Instant::now() + Duration::from_secs(plan.timeout_secs);
     let mut turn: u32 = 0;
+    // What the run's own tool results prove about its outcome, so a positive
+    // sentence cannot hide a refused write (review B2).
+    let mut evidence = RunEvidence::default();
 
     loop {
         if turn >= plan.max_turns {
@@ -651,13 +2206,33 @@ fn model_loop(
             Ok(exchange) => exchange,
             Err(error) => {
                 let class = error.class();
-                // Every failure class names the endpoint and the model in the same
-                // phrase, so a person with two agents knows which address answered
+                // The cause comes first, so the card's first clause is the cause
+                // (W31-7, F3). The address and model stay in the sentence after a
+                // separator, so a person with two agents still knows which one failed
                 // (K-7/F14). The screen adds the recovery route; the log keeps this.
-                let reason = format!(
-                    "the model call failed ({class}) at endpoint {} — model {}: {error}",
-                    plan.endpoint, plan.model
-                );
+                // A transport's own sentence starts with the address, which would
+                // push "Connection refused" past the card's width. The cause comes
+                // first in the product's words, then the address and model.
+                let cause = match &error {
+                    model::ModelError::Transport { message, .. } => {
+                        let detail = message
+                            .split_once(": ")
+                            .map(|(_, rest)| rest)
+                            .unwrap_or(message.as_str());
+                        format!("the model could not be reached: {detail}")
+                    }
+                    other => other.to_string(),
+                };
+                let reason = if matches!(error, model::ModelError::Transport { .. }) {
+                    // The card has one line; the cause fits only without the
+                    // internal class prefix. The class stays in the transcript.
+                    format!("{cause} (model {}) at {}", plan.model, plan.endpoint)
+                } else {
+                    format!(
+                        "the model call failed ({class}): {cause} — model {} at {}",
+                        plan.model, plan.endpoint
+                    )
+                };
                 // Written once, by `execute`, from the run's own reason.
                 let _ = transcript.append(&Record::model_call_failed(
                     &plan.run_id,
@@ -735,10 +2310,48 @@ fn model_loop(
         ));
 
         if reply.tool_calls.is_empty() {
-            return RunEnd::completed(format!(
+            // Exit 0 is not the whole outcome: the model's own last sentence decides
+            // whether it refused the instruction or found no work (F4). The sentence
+            // is bounded at a word boundary, not cut mid-word on the card.
+            let final_text = reply.content.as_deref().unwrap_or("").trim();
+            let summary = model::first_clause(final_text, 160);
+            let finished = format!(
                 "the model finished after {}",
                 words::counted(turn as usize, "turn", "turns")
-            ));
+            );
+            return match ending_for_instruction(&instruction_text, final_text, &evidence) {
+                RunEnding::Refused => RunEnd::refused(if summary.is_empty() {
+                    evidence
+                        .refused_write()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| "the run refused the instruction".to_owned())
+                } else {
+                    summary
+                }),
+                RunEnding::NoWork => RunEnd::no_work(if summary.is_empty() {
+                    "there was no assigned work".to_owned()
+                } else {
+                    summary
+                }),
+                // The failed command's cause is already the `⚠` row from the
+                // failure file; the run's own sentence stays beside it as the
+                // result, so the mark is never the whole claim (review B2).
+                RunEnding::Warned => RunEnd::warned(if summary.is_empty() {
+                    evidence
+                        .failed_call()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| finished.clone())
+                } else {
+                    summary
+                }),
+                // The final summary is the run's own result row for every clean
+                // finish, not only the refused and no-work ones (review B2).
+                RunEnding::Succeeded => RunEnd::completed(if summary.is_empty() {
+                    finished
+                } else {
+                    summary
+                }),
+            };
         }
 
         for call in &reply.tool_calls {
@@ -752,6 +2365,7 @@ fn model_loop(
                 shell,
                 transcript,
                 log,
+                &mut evidence,
             ) {
                 Ok(content) => content,
                 Err(end) => return end,
@@ -772,11 +2386,12 @@ fn run_model_tool(
     shell: &Shell,
     transcript: &mut Transcript,
     log: &mut RunLog,
+    evidence: &mut RunEvidence,
 ) -> Result<String, RunEnd> {
     let forgejo_declared = forgejo.is_some();
     if forgejo_tools::is_forgejo_tool(&call.function.name) {
         return match forgejo {
-            Some(tools) => run_forgejo_tool(call, turn, index, tools, transcript, log),
+            Some(tools) => run_forgejo_tool(call, turn, index, tools, transcript, log, evidence),
             None => {
                 refuse_undeclared_tool(call, turn, index, plan, forgejo_declared, transcript, log)
             }
@@ -838,13 +2453,26 @@ fn run_model_tool(
     if outcome.signal.is_some() || outcome.exit_code != Some(0) {
         log.tool_failure(
             model::SHELL_TOOL,
-            &format!("{end}: {}", outcome.excerpt.trim()),
+            &format!("{end}: {}", summarise_output(&outcome.excerpt)),
         );
     }
     log.line(&format!(
         "[turn {turn} tool {index}] {end} after {duration_ms} ms"
     ));
-    if let Err(error) = transcript.append(&Record::tool_result(
+    // A failed write whose own output names the refusal is evidence for the run's
+    // outcome, before the model's final sentence is read (review B2). A refusal
+    // hidden in a zero-exit compound or behind `curl` without `-f` also gets the
+    // card's cause row (correction 4).
+    if evidence.note_shell(&command, &outcome) {
+        // The evidence carries the failed segment's own cause: its error line, or
+        // its exit status when it printed none (correction 5).
+        let cause = evidence
+            .cause()
+            .map(str::to_owned)
+            .unwrap_or_else(|| summarise_output(&outcome.excerpt));
+        log.tool_warning(model::SHELL_TOOL, &cause);
+    }
+    if let Err(error) = transcript.append(&Record::tool_result_with_segments(
         Some(turn),
         index,
         model::SHELL_TOOL,
@@ -852,6 +2480,7 @@ fn run_model_tool(
         outcome.signal,
         duration_ms,
         Some(outcome.excerpt.clone()),
+        outcome.segments.clone(),
     )) {
         return Err(RunEnd::failed(format!(
             "the transcript cannot be written: {error}"
@@ -928,6 +2557,7 @@ fn run_forgejo_tool(
     tools: &mut ForgejoTools,
     transcript: &mut Transcript,
     log: &mut RunLog,
+    evidence: &mut RunEvidence,
 ) -> Result<String, RunEnd> {
     let facts = forgejo_tools::call_facts(&call.function.name, &call.function.arguments);
     // A list call spans repositories; its transcript record names the repositories it
@@ -1025,6 +2655,10 @@ fn run_forgejo_tool(
             }
             log.line(&format!("[turn {turn} tool {index}] refused: {problem}"));
             log.tool_failure(&call.function.name, &problem);
+            // A refused comment, pull request or update is evidence that the run
+            // did not do what it was asked, whatever its final sentence says
+            // (review B2). Reads that fail are not.
+            evidence.note_forgejo(&call.function.name, &problem);
             Ok(problem)
         }
     }
@@ -1095,6 +2729,18 @@ struct ToolOutcome {
     signal: Option<i32>,
     /// A bounded, redacted excerpt of the tool's output.
     excerpt: String,
+    /// The simple commands the shell completed, with its own status for each, when
+    /// the shell could report them (correction 5). Empty on a `/bin/sh`-only host.
+    segments: Vec<transcript::CommandSegment>,
+    /// Every non-zero status the shell itself reported, before any pairing: each
+    /// record's `$?` and every element of every `PIPESTATUS` (correction 7). The
+    /// mark reads this, so a pairing defect cannot turn a failed command into `✓`.
+    raw_failures: Vec<i32>,
+    /// The names the shell uses in its own diagnostics: the outer shell's `$0` and
+    /// the `$0` of every nested `bash` that reads `BASH_ENV`, written by the prelude
+    /// (correction 10).
+    /// A line starting with one of these names is the shell's own voice.
+    shell_prefixes: Vec<String>,
 }
 
 /// The shell of one run: how it is confined, and the private directory it owns.
@@ -1114,6 +2760,10 @@ struct Shell {
     login: Option<String>,
     root: Option<std::path::PathBuf>,
     stage: Option<std::path::PathBuf>,
+    /// Where the shell writes its per-command status record (correction 5). It is in
+    /// the run's private temporary root when the shell is confined, and in the run
+    /// directory when it is not; the shell opens it, never the model's output.
+    segments: Option<std::path::PathBuf>,
     /// Why a plan's promised boundary could not be kept. It is never swallowed: the
     /// plan is rewritten, a marker is left for the engine and the run does not
     /// execute a command on an unconfined fallback (B9-R-R).
@@ -1193,6 +2843,7 @@ impl Shell {
                 login: None,
                 root: None,
                 stage: None,
+                segments: Some(run_dir.join("shell-segments")),
                 refused,
             });
         }
@@ -1247,12 +2898,15 @@ impl Shell {
             method,
             workspace,
             hide,
-            temp: Some(temp),
+            temp: Some(temp.clone()),
             home: Some(home),
             askpass,
             login,
             root: Some(root),
             stage,
+            // The private temporary root is writable under every confinement
+            // mechanism, unlike the engine's run directory (which a namespace hides).
+            segments: Some(temp.join("shell-segments")),
             refused,
         })
     }
@@ -1307,6 +2961,15 @@ fn run_shell(
     if let Some(reason) = shell.refused.as_deref() {
         return Err(format!("the command was not run — {reason}"));
     }
+    // Correction 5: the shell reports every simple command's own status to the
+    // product, on a private file the model's stdout/stderr never carry. Correction 6:
+    // the recorder is installed through the product's `BASH_ENV` prelude, so a nested
+    // non-interactive `bash` (and a `#!/bin/bash` script it runs) installs the same
+    // recorder into the same file. The recorder is used only when the host has
+    // `bash`; `/bin/sh` stays the fallback, where the output heuristics below are the
+    // only witness.
+    let recorder = prepare_shell_recorder(shell, log);
+    let script = command.to_owned();
     let mut child_command = if shell.method.confined() {
         let exe = std::env::current_exe()
             .map_err(|error| format!("the confined shell cannot be found: {error}"))?;
@@ -1320,7 +2983,7 @@ fn run_shell(
         command_line
             .arg("--confined-shell")
             .env(crate::confinement::ENV_METHOD, shell.method.as_str())
-            .env(crate::confinement::ENV_COMMAND, command)
+            .env(crate::confinement::ENV_COMMAND, &script)
             .env(crate::confinement::ENV_WORKSPACE, &shell.workspace);
         if shell.method.namespace() {
             if let Some(root) = shell.root.as_ref() {
@@ -1350,14 +3013,20 @@ fn run_shell(
         }
         command_line
     } else {
-        let mut command_line = Command::new("/bin/sh");
+        let mut command_line = Command::new(crate::confinement::shell_program());
         command_line.env_clear();
         for (key, value) in crate::confinement::safe_environment(std::env::vars_os()) {
             command_line.env(key, value);
         }
-        command_line.arg("-c").arg(command);
+        command_line.arg("-c").arg(&script);
         command_line
     };
+    if let Some(recorder) = recorder.as_ref() {
+        child_command
+            .env(crate::confinement::ENV_SEGMENTS_FILE, &recorder.segments)
+            .env("BASH_ENV", &recorder.prelude)
+            .env("GEWU_SEGMENTS_TOP", "1");
+    }
     if let Some(home) = shell.home.as_ref() {
         child_command.env("HOME", home);
     } else if let Some(home) = std::env::var_os("HOME") {
@@ -1425,11 +3094,386 @@ fn run_shell(
     // Redact before the output is written anywhere or shown to the model.
     let redacted = log.secret().redact(&text);
     log.block(&redacted);
+    let record = recorder
+        .as_ref()
+        .map(|recorder| read_shell_record(&recorder.segments))
+        .unwrap_or_default();
+    if let Some(recorder) = recorder.as_ref() {
+        let _ = fs::remove_file(&recorder.segments);
+        let _ = fs::remove_file(&recorder.prelude);
+    }
     Ok(ToolOutcome {
         exit_code: status.code(),
         signal: signal_of(status),
         excerpt: model::excerpt(&redacted, model::MAX_TOOL_OUTPUT),
+        segments: record.segments,
+        raw_failures: record.raw_failures,
+        shell_prefixes: record.shell_prefixes,
     })
+}
+
+/// The two files the shell recorder needs for one command.
+///
+/// `segments` is the record the product reads; `prelude` is the `BASH_ENV` file a
+/// non-interactive `bash` sources, so the top-level shell and every nested `bash` that
+/// reads `BASH_ENV` install the same recorder into the same file.
+struct ShellRecorder {
+    segments: std::path::PathBuf,
+    prelude: std::path::PathBuf,
+}
+
+/// Open the shell's own record channel for one command.
+///
+/// The recorder needs `bash` (the product runs the command under it when present) and
+/// a writable path the shell can reach under its confinement. Both files are written
+/// here and removed after the record is read; a failure disables the recorder rather
+/// than failing the command, and the output heuristics stay the fallback.
+fn prepare_shell_recorder(shell: &Shell, log: &mut RunLog) -> Option<ShellRecorder> {
+    if crate::confinement::bash_program().is_none() {
+        log.line(
+            "shell recorder: off — this computer has no bash; a failure's reason is read from the output",
+        );
+        return None;
+    }
+    let path = shell.segments.as_ref()?;
+    let prelude = path.with_extension("prelude");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => {}
+        Err(error) => {
+            log.line(&format!(
+                "shell recorder: off — {} cannot be written: {error}",
+                path.display()
+            ));
+            return None;
+        }
+    }
+    if let Err(error) = crate::mode::write_private(&prelude, SHELL_RECORDER_PRELUDE.as_bytes()) {
+        log.line(&format!(
+            "shell recorder: off — {} cannot be written: {error}",
+            prelude.display()
+        ));
+        let _ = fs::remove_file(path);
+        return None;
+    }
+    Some(ShellRecorder {
+        segments: path.clone(),
+        prelude,
+    })
+}
+
+/// The recorder prelude, sourced through `BASH_ENV` by the top-level shell and by
+/// every nested non-interactive `bash` that reads `BASH_ENV`.
+///
+/// It writes one record per trap event: `status`, `PIPESTATUS`, `BASH_SUBSHELL`,
+/// `command` and the source file (`BASH_SOURCE[0]`), separated by unit/record
+/// separators. The top-level `EXIT` trap is a
+/// no-op: it makes the shell run one last `DEBUG` record, which closes the command
+/// that just ended without adding a command of its own. The top-level shell starts
+/// with `START`; a nested bash starts with `NEST` before its prelude and `NESTSTART`
+/// after it, and writes `NESTEND` from its own `EXIT` trap, so its records are paired
+/// inside its own frame and the outer shell's pipeline statuses never overwrite them. The
+/// `DEBUG` trap is installed under `set -T`, so it is inherited by subshells, command
+/// substitutions and functions. The trap body calls a function with `$?`,
+/// `${PIPESTATUS[*]}`, `BASH_SUBSHELL`, `BASH_COMMAND` and `${BASH_SOURCE[0]}` as
+/// arguments, so the values
+/// are captured before anything else runs; the function turns xtrace off for its own
+/// record line and restores it afterwards, so a model's `set -x` shows the recorder's
+/// call but not the record's format or arguments. An inherited no-op `ERR` trap
+/// through `set -E` makes a failing last command inside a subshell or command
+/// substitution report itself before that handler runs, so `echo $(false)` is not
+/// silent. Each shell also reports its own `$0` as a `SHELLNAME` record before the
+/// trap is installed: bash writes its own diagnostics with that exact prefix
+/// (`/bin/bash: line 1: …`, `bash: line 1: …`) and names a sourced file or a function
+/// defined there with that file (`lib.sh: line 1: …`), so the product can recognise
+/// the shell's voice by form, without a message list (correction 10). The records go
+/// to the file in `GEWU_SEGMENTS_FILE`; the model's stdout/stderr never carry them.
+const SHELL_RECORDER_PRELUDE: &str = r#"if [ -n "${GEWU_SEGMENTS_FILE:-}" ] && [ -z "${__gewu_recorder:-}" ]; then
+__gewu_recorder=1
+if [ -n "${GEWU_SEGMENTS_TOP:-}" ]; then
+__gewu_marker=START
+__gewu_nested=
+unset GEWU_SEGMENTS_TOP
+else
+__gewu_marker=NESTSTART
+__gewu_nested=1
+printf 'NEST\036' >>"$GEWU_SEGMENTS_FILE"
+fi
+printf 'SHELLNAME\037%s\036' "$0" >>"$GEWU_SEGMENTS_FILE"
+set -T
+set -E
+trap ':' ERR
+__gewu_write() {
+case $- in *x*) __gewu_x=1; set +x;; *) __gewu_x=;; esac
+printf "%s\037%s\037%s\037%s\037%s\036" "$1" "$2" "$3" "$4" "$5" >>"$GEWU_SEGMENTS_FILE"
+if [ -n "$__gewu_x" ]; then set -x; fi
+return 0
+}
+trap '__gewu_write "$?" "${PIPESTATUS[*]}" "$BASH_SUBSHELL" "$BASH_COMMAND" "${BASH_SOURCE[0]}" 2>/dev/null' DEBUG
+if [ -n "$__gewu_nested" ]; then
+trap 'printf "NESTEND\036" >>"$GEWU_SEGMENTS_FILE"' EXIT
+else
+trap ':' EXIT
+fi
+printf '%s\036' "$__gewu_marker" >>"$GEWU_SEGMENTS_FILE"
+fi"#;
+
+/// What the shell's own record says for one command.
+///
+/// `segments` is the paired view the transcript carries (`command`, `status`);
+/// `raw_failures` is every non-zero status the shell itself reported, before any
+/// pairing. The mark reads `raw_failures`, so a pairing defect cannot turn a failed
+/// command into a green tick (correction 7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ShellRecord {
+    segments: Vec<transcript::CommandSegment>,
+    raw_failures: Vec<i32>,
+    /// The `$0` of each non-interactive `bash` the prelude ran in — the outer shell
+    /// and every nested one (correction 10). Bash prefixes its own diagnostics with
+    /// this name, so it is the exact prefix the mark can trust.
+    shell_prefixes: Vec<String>,
+}
+
+/// One shell process in the record: the top-level shell, or a nested non-interactive
+/// `bash` that sourced the product's `BASH_ENV` prelude.
+#[derive(Debug, Default)]
+struct ShellFrame {
+    /// Commands started in this shell, with the order they were recorded and the
+    /// status a later record paired with them.
+    entries: Vec<(u64, String, Option<i32>)>,
+    last_subshell: Option<u32>,
+}
+
+/// Read the shell's record file and pair each status with the command it belongs to.
+///
+/// A trap record is written just before the next command starts, carrying the status
+/// of the previous one; a pipeline record carries one status per element in
+/// `PIPESTATUS`. Records before `START` are the prelude's own and are dropped. A
+/// nested `bash` writes `NEST` before its prelude and `NESTSTART` after it, and
+/// `NESTEND` when it exits, so its commands are paired inside its own frame and an
+/// outer pipeline's `PIPESTATUS` never overwrites them (correction 7). Pairing only
+/// names a failure and its command; the mark reads every raw status collected here.
+fn read_shell_record(path: &Path) -> ShellRecord {
+    // A long loop can make the record large; the most recent 4 MiB is enough to tell
+    // what failed last, and the read is bounded. A record that big has long passed
+    // the prelude, so its records are all the command's own.
+    const LIMIT: u64 = 4 * 1024 * 1024;
+    let Ok(metadata) = fs::metadata(path) else {
+        return ShellRecord::default();
+    };
+    let size = metadata.len();
+    let Ok(mut file) = fs::File::open(path) else {
+        return ShellRecord::default();
+    };
+    if size > LIMIT && file.seek(SeekFrom::Start(size - LIMIT)).is_err() {
+        return ShellRecord::default();
+    }
+    let mut bytes = Vec::new();
+    if file.take(LIMIT + 1).read_to_end(&mut bytes).is_err() {
+        return ShellRecord::default();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if size > LIMIT {
+        // The window starts in the middle of a record; drop that partial record.
+        text.split_once('\u{1e}')
+            .map(|(_, rest)| rest)
+            .unwrap_or("")
+    } else {
+        text.as_ref()
+    };
+    let mut after_start = size > LIMIT;
+    // `frames` holds the parent shells whose nested bash is running; `finished`
+    // holds the frames that have ended. Entries carry a global order, so the two
+    // lists are merged at the end without losing the transcript's order.
+    let mut frames: Vec<ShellFrame> = Vec::new();
+    let mut finished: Vec<ShellFrame> = Vec::new();
+    let mut current: Option<ShellFrame> = None;
+    let mut nested_skip = false;
+    let mut nested_entered = false;
+    let mut next_order: u64 = 0;
+    let mut raw_failures: Vec<i32> = Vec::new();
+    let mut shell_prefixes: Vec<String> = Vec::new();
+    for record in text.split('\u{1e}') {
+        // The prelude writes the shell's own `$0` once per shell, before the trap is
+        // installed — the top-level name is written before `START`, and a nested name
+        // between `NEST` and `NESTSTART`. The name is read before those markers, and
+        // it never enters a frame (correction 10).
+        if let Some(name) = record.strip_prefix("SHELLNAME\u{1f}") {
+            if !name.is_empty()
+                && name.len() <= SHELL_NAME_LIMIT
+                && !name.contains(['\u{1e}', '\u{1f}', '\n', '\r', '\0'])
+            {
+                shell_prefixes.push(name.to_owned());
+            }
+            continue;
+        }
+        if !after_start {
+            if record == "START" {
+                after_start = true;
+                current = Some(ShellFrame::default());
+            }
+            continue;
+        }
+        if record == "NEST" {
+            // A nested non-interactive bash starts its own frame. Its records are
+            // paired there, so the outer shell's pipeline statuses never touch them.
+            if let Some(frame) = current.take() {
+                frames.push(frame);
+            }
+            current = Some(ShellFrame::default());
+            nested_skip = true;
+            nested_entered = false;
+            continue;
+        }
+        if record == "NESTEND" {
+            if let Some(frame) = current.take() {
+                finished.push(frame);
+            }
+            current = frames.pop();
+            nested_skip = false;
+            nested_entered = false;
+            continue;
+        }
+        if nested_skip {
+            if record == "NESTSTART" {
+                nested_skip = false;
+                nested_entered = true;
+            }
+            continue;
+        }
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.split('\u{1f}');
+        let status = fields
+            .next()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        let pipeline: Vec<i32> = fields
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .filter_map(|value| value.parse::<i32>().ok())
+            .collect();
+        let subshell = fields
+            .next()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let command = fields.next().unwrap_or("").trim();
+        // Bash names the file a sourced command or a function defined there runs in
+        // in its own diagnostics (`lib.sh: line 1: …`). The trap reports that file
+        // beside each command, so the mark knows it without guessing (correction 10).
+        let source = fields.next().unwrap_or("").trim();
+        if !source.is_empty()
+            && source.len() <= SHELL_NAME_LIMIT
+            && !source.contains(['\u{1e}', '\u{1f}', '\n', '\r', '\0'])
+            && !shell_prefixes.iter().any(|prefix| prefix == source)
+        {
+            shell_prefixes.push(source.to_owned());
+        }
+        // The mark's rule: every raw status the shell reported, not just the ones
+        // the pairing managed to assign (correction 7).
+        if let Some(status) = status.filter(|status| *status != 0) {
+            raw_failures.push(status);
+        }
+        for value in pipeline.iter().filter(|value| **value != 0) {
+            raw_failures.push(*value);
+        }
+        let Some(frame) = current.as_mut() else {
+            continue;
+        };
+        let just_entered = std::mem::take(&mut nested_entered);
+        if pipeline.len() > 1 {
+            // A pipeline record carries one status per element. Pair it with the
+            // pipeline's own command entries: never overwrite a non-zero status an
+            // earlier record already paired (correction 7, B1).
+            let n = pipeline.len().min(frame.entries.len());
+            let start = frame.entries.len() - n;
+            for (offset, status) in pipeline[pipeline.len() - n..].iter().enumerate() {
+                let entry = &mut frame.entries[start + offset];
+                // A failure already paired by the command's own record is never
+                // overwritten. An unpaired entry, or one paired with 0, may take a
+                // non-zero status: losing a reported failure is the blocker.
+                if entry.2.is_none() || (entry.2 == Some(0) && *status != 0) {
+                    entry.2 = Some(*status);
+                }
+            }
+        } else if !just_entered {
+            // A one-element record carries `PIPESTATUS[0]` of the command that just
+            // ended. For a condition (`if rm …`, `while rm …`, `! rm …`) `$?` at the
+            // next trap is the enclosing compound's status, while `PIPESTATUS[0]`
+            // keeps the condition's own failure; without it a refused write behind a
+            // false condition would be a green tick (correction 6, B1). The same
+            // subshell guard as below applies: a child's first record inherits the
+            // parent's status and must not be credited to the previous command.
+            let effective = pipeline
+                .first()
+                .copied()
+                .filter(|status| *status != 0)
+                .or(status);
+            if let Some(status) = effective {
+                let descended = matches!((frame.last_subshell, subshell), (Some(before), Some(now)) if now > before);
+                if !descended {
+                    if let Some(entry) = frame
+                        .entries
+                        .iter_mut()
+                        .rev()
+                        .find(|entry| entry.2.is_none())
+                    {
+                        entry.2 = Some(status);
+                    }
+                }
+            }
+        }
+        frame.last_subshell = subshell.or(frame.last_subshell);
+        // The final DEBUG record carries the last command's status but the prelude's
+        // own text; its status was just paired, and the command is not a model
+        // command, so it is not pushed (correction 6).
+        let prelude_record = command.contains("GEWU_SEGMENTS_FILE") || command.contains("__gewu_");
+        if !command.is_empty() && !prelude_record {
+            frame.entries.push((next_order, command.to_owned(), None));
+            next_order += 1;
+        }
+        // A model cannot make the runner grow without bound.
+        if frame.entries.len() > 512 {
+            frame.entries.drain(..256);
+        }
+    }
+    if let Some(frame) = current.take() {
+        finished.push(frame);
+    }
+    let mut entries: Vec<(u64, String, Option<i32>)> = finished
+        .into_iter()
+        .flat_map(|frame| frame.entries)
+        .collect();
+    entries.sort_by_key(|entry| entry.0);
+    let mut segments: Vec<transcript::CommandSegment> = Vec::new();
+    for (_, command, status) in entries {
+        let Some(status) = status else {
+            continue;
+        };
+        let segment = transcript::CommandSegment { command, status };
+        if let Some(last) = segments.last_mut() {
+            if last.command == segment.command {
+                // The inherited ERR trap makes a failing command write a second
+                // record that the next record pairs again. Collapse the duplicate,
+                // keeping the failing status (review correction 6, NB1).
+                if last.status == 0 {
+                    *last = segment;
+                }
+                continue;
+            }
+        }
+        segments.push(segment);
+    }
+    ShellRecord {
+        segments,
+        raw_failures,
+        shell_prefixes,
+    }
 }
 
 /// Read at most [`MAX_TOOL_OUTPUT_BYTES`] from one stream.
@@ -2199,7 +4243,7 @@ mod tests {
             terminal,
             Record::RunFinished { ref outcome, ref reason, .. }
                 if outcome == "succeeded"
-                    && reason.as_deref().unwrap_or("").contains("the model finished")
+                    && reason.as_deref() == Some("all done")
         ));
     }
 
@@ -2891,5 +4935,1558 @@ mod tests {
             end.reason.as_ref().expect("a reason").contains("timeout"),
             "{end:?}"
         );
+    }
+
+    #[test]
+    fn a_tool_failure_uses_the_last_error_line_not_gits_first_line() {
+        let output = "On branch docs/geting\nnothing to commit, working tree clean\n";
+        assert_eq!(
+            summarise_output(output),
+            "nothing to commit, working tree clean"
+        );
+        assert_eq!(
+            summarise_output("fatal: could not read from remote repository"),
+            "fatal: could not read from remote repository"
+        );
+        // A git HTTP refusal is one whole clause naming the status, not a URL cut
+        // off at the card's width (correction 4).
+        assert_eq!(
+            summarise_output(
+                "fatal: unable to access 'http://127.0.0.1:1/team/repo.git/': The requested URL returned error: 403"
+            ),
+            "the server answered HTTP 403"
+        );
+    }
+
+    #[test]
+    fn a_clean_exit_that_refused_the_instruction_is_not_success() {
+        assert_eq!(
+            ending_for("I could not delete team/library."),
+            RunEnding::Refused
+        );
+        assert_eq!(
+            ending_for("There are no open issues assigned to me."),
+            RunEnding::NoWork
+        );
+        assert_eq!(ending_for("Done: the typo is fixed."), RunEnding::Succeeded);
+    }
+
+    #[test]
+    fn a_positive_refusal_is_not_a_success() {
+        // Review B2's first wording: the model says what it left in place and why.
+        let summary = "I left team/workspace in place rather than deleting it; my account does not have that permission.";
+        assert_eq!(ending_for(summary), RunEnding::Refused);
+        // A refused write is evidence even when the sentence sounds like a success.
+        let evidence = RunEvidence {
+            refused_write: Some("shell: HTTP 403 Forbidden".to_owned()),
+            ..RunEvidence::default()
+        };
+        assert_eq!(
+            ending_with_evidence("The requested change is complete.", &evidence),
+            RunEnding::Refused
+        );
+    }
+
+    #[test]
+    fn a_review_that_found_no_problem_is_a_success() {
+        // Review B2's second wording: "could not" is about finding, not about doing
+        // the work, which the sentence says is complete.
+        assert_eq!(
+            ending_for("I could not find any problems; the work is complete and correct."),
+            RunEnding::Succeeded
+        );
+        assert_eq!(
+            ending_for("I could not find any problems."),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn a_refused_shell_write_is_evidence_and_a_failed_read_is_not() {
+        let mut evidence = RunEvidence::default();
+        evidence.note_shell(
+            "curl -X DELETE http://127.0.0.1:3000/team/workspace",
+            &ToolOutcome {
+                exit_code: Some(1),
+                signal: None,
+                excerpt: "HTTP 403 Forbidden".to_owned(),
+                segments: Vec::new(),
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        );
+        assert!(evidence.refused_write().is_some());
+        assert_eq!(
+            ending_with_evidence("I left it in place.", &evidence),
+            RunEnding::Refused
+        );
+
+        // curl exits 0 on a 403 unless asked not to; the status is still a refusal.
+        let mut zero_exit = RunEvidence::default();
+        zero_exit.note_shell(
+            "curl -s -X DELETE http://127.0.0.1:3000/team/workspace",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "HTTP/1.1 403 Forbidden".to_owned(),
+                segments: Vec::new(),
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        );
+        assert!(zero_exit.refused_write().is_some());
+
+        let mut read = RunEvidence::default();
+        read.note_shell(
+            "git log --oneline",
+            &ToolOutcome {
+                exit_code: Some(128),
+                signal: None,
+                excerpt: "fatal: not a git repository".to_owned(),
+                segments: Vec::new(),
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        );
+        assert!(read.refused_write().is_none());
+        assert!(read.failed_call().is_some(), "the failed read is a warning");
+        assert_eq!(
+            ending_with_evidence("The work is complete.", &read),
+            RunEnding::Warned
+        );
+        // A failed read that carries a refusal status is refusal evidence: the call
+        // was refused, whatever its method (correction 4, rule 1).
+        let mut denied_read = RunEvidence::default();
+        denied_read.note_shell(
+            "curl -sf http://127.0.0.1:1/team/issues",
+            &failed_shell("curl: (22) The requested URL returned error: 403"),
+        );
+        assert!(denied_read.refused_write().is_some());
+    }
+
+    #[test]
+    fn a_system_diagnostic_is_a_second_witness_for_a_hidden_failure() {
+        // Correction 8: for a write nested in a piped condition the raw record is all
+        // zero; the shell's own diagnostic is then the witness. A recognised write is
+        // `⊘`, any other program's diagnostic is `⚠`, and both carry the line.
+        for (command, text, refused) in [
+            (
+                "if echo x > ro/file; then echo wrote; fi | cat",
+                "/bin/bash: line 1: ro/file: Permission denied\n",
+                true,
+            ),
+            (
+                "if echo x > ro/newfile; then :; fi | tail -1",
+                "bash: line 1: ro/newfile: Permission denied\n",
+                true,
+            ),
+            (
+                "while echo x > ro/file; do break; done | cat",
+                "bash: ro/file: Read-only file system\n",
+                true,
+            ),
+            (
+                "if install -m 600 a ro/; then :; fi | cat",
+                "install: cannot create regular file 'ro/a': Permission denied\n",
+                false,
+            ),
+            (
+                "cat missing.txt | cat",
+                "cat: missing.txt: No such file or directory\n",
+                false,
+            ),
+        ] {
+            let mut evidence = RunEvidence::default();
+            assert!(
+                evidence.note_shell(command, &shell_outcome(text)),
+                "{command}: no cause row"
+            );
+            assert_eq!(
+                evidence.refused_write().is_some(),
+                refused,
+                "{command}: wrong refusal class"
+            );
+            assert_eq!(
+                evidence.failed_call().is_some(),
+                !refused,
+                "{command}: wrong warning class"
+            );
+            assert!(
+                evidence
+                    .cause()
+                    .is_some_and(|cause| cause.contains("Permission denied")
+                        || cause.contains("Read-only")
+                        || cause.contains("No such file")),
+                "{command}: the cause is not the diagnostic: {:?}",
+                evidence.cause()
+            );
+        }
+        // Lines without the POSIX diagnostic form — a bare phrase, prose with spaces
+        // in the program position, or a JSON body — are not evidence by themselves.
+        for text in [
+            "Permission denied",
+            "the server answered: Permission denied",
+            "{\"error\": \"Permission denied\"}",
+        ] {
+            let mut evidence = RunEvidence::default();
+            assert!(
+                !evidence.note_shell("echo checked", &shell_outcome(text)),
+                "{text:?} was read as a diagnostic"
+            );
+            assert!(evidence.cause().is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_os_error_strings_are_a_form_not_a_program_list() {
+        for line in [
+            "/bin/bash: line 1: ro/file: Permission denied",
+            "install: cannot create regular file 'ro/a': Permission denied",
+            "cat: missing.txt: No such file or directory",
+            "mkdir: cannot create directory 'new': File exists",
+            "cp: cannot open 'x' for reading: Operation not permitted",
+        ] {
+            assert!(is_system_diagnostic(line), "{line} is a diagnostic");
+        }
+        for line in [
+            "Permission denied",
+            "the server answered: Permission denied",
+            "{\"error\": \"Permission denied\"}",
+            "error: purged 404 stale records",
+            "done: everything is fine",
+        ] {
+            assert!(!is_system_diagnostic(line), "{line} is not a diagnostic");
+        }
+    }
+
+    #[test]
+    fn every_errno_string_is_a_diagnostic() {
+        // Review correction 9: the second witness is the C library's whole error
+        // vocabulary, not a hand-kept list. Generate every errno string the way a
+        // POSIX program prints it and feed it to the classifier.
+        for errno in 1..=133 {
+            let full = std::io::Error::from_raw_os_error(errno).to_string();
+            let text = full
+                .split_once(" (os error ")
+                .map(|(head, _)| head)
+                .unwrap_or(full.as_str());
+            assert!(
+                is_system_diagnostic(&format!("bash: line 1: x: {text}")),
+                "errno {errno} ({text}) is not a diagnostic"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_system_error_strings_are_a_second_witness() {
+        // The reviewer's two shapes: a symlink loop and a too-long name. The shell's
+        // raw record is all zero; only the diagnostic distinguishes the failed write.
+        for (command, text) in [
+            (
+                "if echo x > loop; then echo wrote; fi | cat",
+                "bash: line 1: loop: Too many levels of symbolic links\n",
+            ),
+            (
+                "if echo x > aaaa; then echo wrote; fi | cat",
+                "bash: line 1: aaaa: File name too long\n",
+            ),
+        ] {
+            let mut evidence = RunEvidence::default();
+            assert!(evidence.note_shell(command, &shell_outcome(text)));
+            assert!(
+                evidence.refused_write().is_some(),
+                "{command}: not a refusal"
+            );
+            assert!(
+                evidence
+                    .cause()
+                    .is_some_and(|cause| cause.contains("Too many levels")
+                        || cause.contains("File name too long")),
+                "{command}: wrong cause {:?}",
+                evidence.cause()
+            );
+        }
+        // A long path must not push the system's own words off the card: the cause
+        // keeps the program and the error tail (``…: File name too long``).
+        let long = format!("bash: line 1: {}: File name too long\n", "a".repeat(300));
+        let mut evidence = RunEvidence::default();
+        assert!(evidence.note_shell(
+            "if echo x > aaaa; then echo wrote; fi | cat",
+            &shell_outcome(&long)
+        ));
+        assert!(
+            evidence
+                .cause()
+                .is_some_and(|cause| cause.contains("File name too long") && cause.len() < 100),
+            "the shortened cause lost the system words: {:?}",
+            evidence.cause()
+        );
+    }
+
+    #[test]
+    fn the_shells_own_voice_is_a_third_witness() {
+        // Correction 10: bash's own messages are not C-library strings — an unset or
+        // glob redirection target says `ambiguous redirect`, noclobber says `cannot
+        // overwrite existing file`. The text is irrelevant: a line in the exact
+        // `<name>: ` prefix the shell reports is shell-reported trouble. Every shape
+        // below had an all-zero raw record at the reviewed head and drew `✓`.
+        for (command, line, expected) in [
+            (
+                "n=; if echo x > $n; then echo wrote; fi | cat",
+                "/bin/bash: line 1: $n: ambiguous redirect\n",
+                "ambiguous redirect",
+            ),
+            (
+                "n=; if echo x >> $n; then echo wrote; fi | cat",
+                "/bin/bash: line 1: $n: ambiguous redirect\n",
+                "ambiguous redirect",
+            ),
+            (
+                "if echo x > *.dat; then echo wrote; fi | cat",
+                "/bin/bash: line 1: *.dat: ambiguous redirect\n",
+                "ambiguous redirect",
+            ),
+            (
+                "set -C; if echo x > f; then echo wrote; fi | cat",
+                "/bin/bash: line 1: f: cannot overwrite existing file\n",
+                "cannot overwrite existing file",
+            ),
+            (
+                "f() { echo x > $n; }; n=; if f; then echo wrote; fi | cat",
+                "environment: line 1: $n: ambiguous redirect\n",
+                "ambiguous redirect",
+            ),
+            (
+                "case 1 in 1) if echo x > $n; then echo wrote; fi;; esac | cat",
+                "/bin/bash: line 1: $n: ambiguous redirect\n",
+                "ambiguous redirect",
+            ),
+        ] {
+            let mut outcome = shell_outcome(line);
+            outcome.shell_prefixes = vec!["/bin/bash".to_owned()];
+            let mut evidence = RunEvidence::default();
+            assert!(evidence.note_shell(command, &outcome), "{command}");
+            assert!(
+                evidence.refused_write().is_some(),
+                "{command}: a named write is not a refusal"
+            );
+            assert!(
+                evidence
+                    .cause()
+                    .is_some_and(|cause| cause.contains(expected)),
+                "{command}: wrong cause {:?}",
+                evidence.cause()
+            );
+        }
+        // Any text after the prefix is the shell's voice, not a message to match.
+        let mut outcome = shell_outcome("/bin/bash: line 1: anything at all\n");
+        outcome.shell_prefixes = vec!["/bin/bash".to_owned()];
+        let mut evidence = RunEvidence::default();
+        assert!(evidence.note_shell("rm missing.txt", &outcome));
+        assert_eq!(evidence.cause(), Some("/bin/bash: line 1: anything at all"));
+    }
+
+    #[test]
+    fn a_shell_voice_line_without_a_write_is_warned_not_refused() {
+        let mut outcome = shell_outcome("bash: line 1: a warning the shell printed\n");
+        outcome.shell_prefixes = vec!["bash".to_owned()];
+        let mut evidence = RunEvidence::default();
+        assert!(evidence.note_shell("true", &outcome));
+        assert!(evidence.refused_write().is_none());
+        assert!(evidence.failed_call().is_some());
+        assert_eq!(
+            evidence.cause(),
+            Some("bash: line 1: a warning the shell printed")
+        );
+    }
+
+    #[test]
+    fn words_without_the_shell_prefix_are_not_its_voice() {
+        // The clean control: a command that merely prints the words stays `✓`.
+        for (command, text) in [
+            ("echo done", "ambiguous redirect\n"),
+            ("echo done", "the shell said ambiguous redirect\n"),
+            ("echo done", "bashful: line 1: ambiguous redirect\n"),
+            // `bash:` is a real shell name, but it is not one this run's shell
+            // reported; the prelude's names are the authority.
+            ("echo done", "bash: line 1: ambiguous redirect\n"),
+        ] {
+            let outcome = shell_outcome(text);
+            let mut evidence = RunEvidence::default();
+            assert!(!evidence.note_shell(command, &outcome), "{text:?}");
+            assert!(evidence.cause().is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_nested_shell_name_is_read_from_the_record() {
+        // Correction 10: each shell reports `$0`; a nested bash's name arrives between
+        // `NEST` and `NESTSTART` and must not become a command of the outer frame.
+        let root = crate::test_support::scratch_root("shell-name-record");
+        let path = root.join("segments");
+        let record = |status: &str, pipeline: &str, subshell: &str, command: &str| {
+            format!("{status}\u{1f}{pipeline}\u{1f}{subshell}\u{1f}{command}\u{1e}")
+        };
+        let text = format!(
+            "SHELLNAME\u{1f}/bin/bash\u{1e}START\u{1e}{}{}NEST\u{1e}SHELLNAME\u{1f}bash\u{1e}{}NESTSTART\u{1e}{}{}NESTEND\u{1e}{}",
+            record("0", "0", "0", "bash -c 'echo hi'"),
+            record("0", "0", "0", "printf 'START' >>\"$GEWU_SEGMENTS_FILE\""),
+            record("0", "0", "0", "printf 'prelude' >>\"$GEWU_SEGMENTS_FILE\""),
+            record("0", "0", "0", "echo hi"),
+            record("0", "0", "0", "printf 'prelude' >>\"$GEWU_SEGMENTS_FILE\""),
+            record("0", "0", "0", "true"),
+        );
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let parsed = read_shell_record(&path);
+        assert_eq!(
+            parsed.shell_prefixes,
+            vec!["/bin/bash".to_owned(), "bash".to_owned()]
+        );
+        assert!(
+            parsed
+                .segments
+                .iter()
+                .all(|segment| !segment.command.contains("SHELLNAME")),
+            "a name record leaked into the commands: {:?}",
+            parsed.segments
+        );
+        assert!(
+            parsed
+                .segments
+                .iter()
+                .any(|segment| segment.command == "echo hi" && segment.status == 0),
+            "the nested command was lost: {:?}",
+            parsed.segments
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_long_shell_name_is_read_up_to_path_max() {
+        // Correction 11, B2: a real script path can be longer than 512 bytes (Linux
+        // allows 4096); the reader must not drop the name the recorder reported.
+        let root = crate::test_support::scratch_root("long-shell-name-record");
+        let path = root.join("segments");
+        let name = format!("{}/s.sh", "a".repeat(602));
+        assert_eq!(name.len(), 607, "the reviewer's name length");
+        let text =
+            format!("SHELLNAME\u{1f}{name}\u{1e}START\u{1e}0\u{1f}0\u{1f}0\u{1f}true\u{1f}\u{1e}");
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let parsed = read_shell_record(&path);
+        assert_eq!(parsed.shell_prefixes, vec![name.clone()]);
+        let outcome = ToolOutcome {
+            exit_code: Some(0),
+            signal: None,
+            excerpt: format!("{name}: line 2: f: cannot overwrite existing file"),
+            segments: Vec::new(),
+            raw_failures: Vec::new(),
+            shell_prefixes: parsed.shell_prefixes,
+        };
+        assert!(
+            shell_voice_prefixes(&outcome).contains(&name),
+            "the 607-byte name was dropped again"
+        );
+        assert!(
+            shell_voice_line(&outcome).is_some(),
+            "the 607-byte line is not the shell's own voice"
+        );
+        // The sanity bound is PATH_MAX: a longer line is not a name.
+        let too_long = "a".repeat(4097);
+        let text = format!(
+            "SHELLNAME\u{1f}{too_long}\u{1e}START\u{1e}0\u{1f}0\u{1f}0\u{1f}true\u{1f}\u{1e}"
+        );
+        fs::write(&path, text.as_bytes()).expect("the record is rewritten");
+        assert!(read_shell_record(&path).shell_prefixes.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sourced_file_name_is_read_from_the_record() {
+        // Correction 10: bash names a sourced file (or a function defined there) in
+        // its diagnostics; the trap reports `BASH_SOURCE[0]` as the fifth field.
+        let root = crate::test_support::scratch_root("source-name-record");
+        let path = root.join("segments");
+        let text = "SHELLNAME\u{1f}/bin/bash\u{1e}START\u{1e}\
+                    0\u{1f}0\u{1f}0\u{1f}source lib.sh\u{1f}\u{1e}\
+                    0\u{1f}0\u{1f}0\u{1f}echo x > $n\u{1f}lib.sh\u{1e}\
+                    0\u{1f}0\u{1f}0\u{1f}true\u{1f}\u{1e}";
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let parsed = read_shell_record(&path);
+        assert!(
+            parsed.shell_prefixes.iter().any(|name| name == "lib.sh"),
+            "the source name was lost: {:?}",
+            parsed.shell_prefixes
+        );
+        assert!(
+            parsed
+                .segments
+                .iter()
+                .any(|segment| segment.command == "echo x > $n" && segment.status == 0),
+            "the sourced command was lost: {:?}",
+            parsed.segments
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_write_diagnostic_wins_over_a_later_read_line() {
+        // Review correction 9, NB-A: the read's line is last, but the card's cause is
+        // the failed write's own line (`echo x > ro/file` has no status of its own).
+        let mut evidence = RunEvidence::default();
+        assert!(
+            evidence.note_shell(
+                "if { cat missing.txt; echo x > ro/file; }; then echo wrote; fi | cat",
+                &ToolOutcome {
+                    exit_code: Some(0),
+                    signal: None,
+                    excerpt: "/bin/bash: line 1: ro/file: Permission denied\n\
+                          cat: missing.txt: No such file or directory\n"
+                        .to_owned(),
+                    segments: vec![
+                        transcript::CommandSegment {
+                            command: "cat missing.txt".to_owned(),
+                            status: 1,
+                        },
+                        transcript::CommandSegment {
+                            command: "echo x > ro/file".to_owned(),
+                            status: 0,
+                        },
+                    ],
+                    raw_failures: Vec::new(),
+                    shell_prefixes: Vec::new(),
+                },
+            )
+        );
+        assert!(evidence.refused_write().is_some(), "the run is a refusal");
+        assert_eq!(
+            evidence.cause(),
+            Some("/bin/bash: line 1: ro/file: Permission denied")
+        );
+    }
+
+    #[test]
+    fn a_paired_failed_read_names_its_own_diagnostic() {
+        // Review correction 7, NB1: `cat missing.txt | cat` is `⚠`, but the cause row
+        // said "exit 1: no error line" while the output carried the cat line.
+        let mut evidence = RunEvidence::default();
+        assert!(evidence.note_shell(
+            "cat missing.txt | cat",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "cat: missing.txt: No such file or directory\n".to_owned(),
+                segments: vec![transcript::CommandSegment {
+                    command: "cat missing.txt".to_owned(),
+                    status: 1,
+                }],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        ));
+        assert!(evidence.refused_write().is_none());
+        assert_eq!(
+            evidence.cause(),
+            Some("cat: missing.txt: No such file or directory")
+        );
+        assert_eq!(
+            ending_with_evidence("The review is complete.", &evidence),
+            RunEnding::Warned
+        );
+        // A silent failing segment still says its status, never a later segment's
+        // stdout (the round-5 guard).
+        let mut silent = RunEvidence::default();
+        assert!(silent.note_shell(
+            "ls missing; echo done",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "done\n".to_owned(),
+                segments: vec![transcript::CommandSegment {
+                    command: "ls missing".to_owned(),
+                    status: 2,
+                }],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        ));
+        assert_eq!(silent.cause(), Some("exit 2: no error line"));
+    }
+
+    fn shell_outcome(text: &str) -> ToolOutcome {
+        ToolOutcome {
+            exit_code: Some(0),
+            signal: None,
+            excerpt: text.to_owned(),
+            segments: Vec::new(),
+            raw_failures: Vec::new(),
+            shell_prefixes: Vec::new(),
+        }
+    }
+
+    fn failed_shell(text: &str) -> ToolOutcome {
+        ToolOutcome {
+            exit_code: Some(1),
+            signal: None,
+            excerpt: text.to_owned(),
+            segments: Vec::new(),
+            raw_failures: Vec::new(),
+            shell_prefixes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_standard_write_spelling_is_evidence() {
+        // Correction 2's blocking finding: `-XDELETE` was not a write, so a 403 was
+        // never read as a refusal. Correction 3 adds git global options. A failing
+        // write is evidence whatever its output says.
+        let commands = [
+            "curl -s -X DELETE http://127.0.0.1:1/team/workspace",
+            "curl -s -XDELETE http://127.0.0.1:1/team/workspace",
+            "curl -s -sXDELETE http://127.0.0.1:1/team/workspace",
+            "curl -s --request DELETE http://127.0.0.1:1/team/workspace",
+            "curl -s -X PUT -d '{}' http://127.0.0.1:1/team/workspace",
+            "curl -s -XPUT http://127.0.0.1:1/team/workspace",
+            "curl -s -X POST http://127.0.0.1:1/team/workspace",
+            "curl -s -XPOST http://127.0.0.1:1/team/workspace",
+            "curl -s -X PATCH http://127.0.0.1:1/team/workspace",
+            "curl -s --data '{\"a\":1}' http://127.0.0.1:1/team/workspace",
+            "git push origin main",
+            "git -C . push origin main",
+            "git -c protocol.version=2 push origin main",
+            "/usr/bin/git push origin main",
+            "env git --git-dir=.git push origin main",
+            "rm -rf workspace/tmp",
+            "/bin/rm -f workspace/tmp",
+            "mv workspace/README.md workspace/old.md",
+            "truncate -s 0 workspace/log.txt",
+            "echo 'x' > workspace/README.md",
+        ];
+        for command in commands {
+            let mut evidence = RunEvidence::default();
+            evidence.note_shell(command, &failed_shell("no refusal phrase in this output"));
+            assert!(
+                evidence.refused_write().is_some(),
+                "{command} was not recognised as a failed write"
+            );
+        }
+    }
+
+    #[test]
+    fn a_git_write_is_read_by_the_subcommand_position() {
+        // Correction 4, non-blocking 3A: `git show push` is a read of a ref named
+        // `push`, while a global option before `push` (or branch/tag) is a write.
+        for write in [
+            "git branch --delete stale",
+            "git branch -D stale",
+            "git branch --move old new",
+            "git tag --delete v1",
+            "git tag -d v1",
+            "git tag v1",
+            "git branch new",
+            "git rm stale.txt",
+            "git mv old new",
+            "git -C . branch --delete stale",
+            "/usr/bin/git tag -d v1",
+        ] {
+            assert!(shell_writes(write), "{write} was not a write");
+        }
+        for read in [
+            "git show push",
+            "git branch --list",
+            "git branch --show-current",
+            "git branch -a",
+            "git tag",
+            "git tag --list",
+            "git log --oneline",
+            "git show --stat",
+        ] {
+            assert!(!shell_writes(read), "{read} was called a write");
+        }
+    }
+
+    #[test]
+    fn the_file_write_spellings_are_writes_and_a_dry_read_is_not() {
+        // Correction 4 blocking 2: `sed -i` and `cp` were outside the old class, so a
+        // failed one was green beside `✗ shell`.
+        for write in [
+            "sed -i s/hello/goodbye/ locked/f.txt",
+            "sed -i.bak s/hello/goodbye/ locked/f.txt",
+            "sed --in-place s/hello/goodbye/ locked/f.txt",
+            "cp README.md locked/",
+            "/bin/cp README.md locked/",
+        ] {
+            assert!(shell_writes(write), "{write} was not a write");
+        }
+        for read in [
+            "sed 's/hello/goodbye/' locked/f.txt",
+            "sed -n '1,5p' locked/f.txt",
+        ] {
+            assert!(!shell_writes(read), "{read} was called a write");
+        }
+    }
+
+    #[test]
+    fn a_compound_command_is_judged_by_its_failed_write_segment() {
+        // Correction 4, rule 2: `; echo`, `|| true` and a pipeline keep the wrapper's
+        // exit 0; the failed write's own output is still the refusal.
+        for command in [
+            "git push origin main; echo done",
+            "git push origin main || true",
+            "git push origin main 2>&1 | tail -5",
+        ] {
+            let mut evidence = RunEvidence::default();
+            evidence.note_shell(
+                command,
+                &shell_outcome(
+                    "done\nremote: Forbidden\nfatal: unable to access 'http://127.0.0.1:1/team/repo.git/': The requested URL returned error: 403",
+                ),
+            );
+            assert!(
+                evidence.refused_write().is_some(),
+                "{command} hid its failed push"
+            );
+            assert_eq!(
+                ending_with_evidence("The work is pushed and complete.", &evidence),
+                RunEnding::Refused
+            );
+        }
+        // A compound command with no failed-write line is a success.
+        let mut clean = RunEvidence::default();
+        clean.note_shell(
+            "git push origin main; echo done",
+            &shell_outcome("Everything up-to-date\ndone"),
+        );
+        assert!(clean.refused_write().is_none());
+        assert!(clean.failed_call().is_none());
+        assert_eq!(
+            ending_with_evidence("The work is pushed and complete.", &clean),
+            RunEnding::Succeeded
+        );
+        // The hidden failure asks the run to write the cause row too.
+        let mut hidden = RunEvidence::default();
+        assert!(hidden.note_shell(
+            "git push origin main; echo done",
+            &shell_outcome("done\nfatal: unable to access: 403"),
+        ));
+        let mut shown = RunEvidence::default();
+        assert!(!shown.note_shell("git push origin main", &shell_outcome("up to date")));
+    }
+
+    #[test]
+    fn a_failed_call_that_is_not_a_write_is_a_warning_never_a_tick() {
+        // Correction 4, rule 1: any failed tool call makes the run `⚠`; an explicit
+        // refusal in the model's own sentence still wins as `⊘`.
+        let mut evidence = RunEvidence::default();
+        evidence.note_shell(
+            "git branch --list",
+            &failed_shell("error: not a git repository"),
+        );
+        assert!(evidence.refused_write().is_none());
+        assert!(evidence.failed_call().is_some());
+        assert_eq!(
+            ending_with_evidence("The work is complete.", &evidence),
+            RunEnding::Warned
+        );
+        assert_eq!(
+            ending_with_evidence("I could not do it.", &evidence),
+            RunEnding::Refused
+        );
+    }
+
+    #[test]
+    fn a_shell_reported_failed_simple_command_is_decided_without_reading_words() {
+        // Correction 5's blocker: `rm missing.txt; echo done` exits 0 and the old
+        // phrase list did not include the write's own failure line. The shell now
+        // reports the `rm` segment's status, so it is a refusal whatever it printed.
+        for command in [
+            "rm missing.txt; echo done",
+            "rm missing.txt || true",
+            "cp missing.txt locked/ || true",
+            "rmdir locked || true",
+            "sed -i s/hello/goodbye/ locked.txt || true",
+            "git branch --delete stale || true",
+        ] {
+            let mut evidence = RunEvidence::default();
+            let outcome = ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "done\n".to_owned(),
+                segments: vec![
+                    transcript::CommandSegment {
+                        command: command
+                            .trim_end_matches(" || true")
+                            .trim_end_matches("; echo done")
+                            .to_owned(),
+                        status: 1,
+                    },
+                    transcript::CommandSegment {
+                        command: "echo done".to_owned(),
+                        status: 0,
+                    },
+                ],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            };
+            assert!(
+                evidence.note_shell(command, &outcome),
+                "{command}: the failed segment writes no cause row"
+            );
+            assert!(
+                evidence.refused_write().is_some(),
+                "{command}: the failed write is not a refusal"
+            );
+            assert_eq!(
+                ending_with_evidence("The work is complete.", &evidence),
+                RunEnding::Refused
+            );
+        }
+        // A failed read segment is `⚠`, and a clean record is a success.
+        let mut read = RunEvidence::default();
+        assert!(read.note_shell(
+            "ls missing; echo done",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "done\n".to_owned(),
+                segments: vec![transcript::CommandSegment {
+                    command: "ls missing".to_owned(),
+                    status: 2,
+                }],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        ));
+        assert!(read.refused_write().is_none());
+        assert_eq!(
+            read.cause(),
+            Some("exit 2: no error line"),
+            "a silent failed segment's cause is its status, not a later segment's stdout"
+        );
+        assert_eq!(
+            ending_with_evidence("The review is complete.", &read),
+            RunEnding::Warned
+        );
+        let mut clean = RunEvidence::default();
+        assert!(!clean.note_shell(
+            "echo checked; printf 'ok\n'",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "checked\nok\n".to_owned(),
+                segments: vec![
+                    transcript::CommandSegment {
+                        command: "echo checked".to_owned(),
+                        status: 0,
+                    },
+                    transcript::CommandSegment {
+                        command: "printf 'ok\\n'".to_owned(),
+                        status: 0,
+                    },
+                ],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        ));
+        assert_eq!(
+            ending_with_evidence("The work is complete.", &clean),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn the_shell_record_pairs_each_status_with_its_command() {
+        // The record the prelude writes: status, PIPESTATUS, subshell, command,
+        // separated by unit/record separators. `START` ends the prelude.
+        let root = crate::test_support::scratch_root("shell-segments");
+        let path = root.join("segments");
+        let mut text = String::from("START\u{1e}");
+        for (status, pipeline, subshell, command) in [
+            ("0", "0", "0", "rm missing.txt"),
+            ("1", "1", "0", "echo done"),
+            ("0", "0", "0", "echo done"),
+            ("0", "0", "0", "false"),
+            ("0", "0", "0", "true"),
+            ("0", "1 0", "0", "echo done"),
+            ("1", "1", "0", "echo done"),
+        ] {
+            text.push_str(&format!(
+                "{status}\u{1f}{pipeline}\u{1f}{subshell}\u{1f}{command}\u{1e}"
+            ));
+        }
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let segments = read_shell_record(&path).segments;
+        assert_eq!(
+            segments.first(),
+            Some(&transcript::CommandSegment {
+                command: "rm missing.txt".to_owned(),
+                status: 1,
+            }),
+            "the failed write lost its own status: {segments:?}"
+        );
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.command == "false" && segment.status == 1),
+            "a failed pipeline element is missing: {segments:?}"
+        );
+        assert!(
+            segments.iter().all(|segment| segment.command != "START"),
+            "the prelude leaked into the record: {segments:?}"
+        );
+        // A record written inside a command substitution carries the child's
+        // inherited 0; it must not be credited to the assignment, and the child's
+        // own failure must be.
+        // A record before START is the prelude's own: neither the trap install nor
+        // the START printf may be reported as a command of the run.
+        let path = root.join("prelude");
+        let text = "0\u{1f}0\u{1f}0\u{1f}trap 'printf' EXIT\u{1e}\
+                    0\u{1f}0\u{1f}0\u{1f}printf 'START' >>\"$GEWU_SEGMENTS_FILE\"\u{1e}\
+                    START\u{1e}0\u{1f}0\u{1f}0\u{1f}echo hi\u{1e}0\u{1f}0\u{1f}0\u{1f}echo hi\u{1e}";
+        fs::write(&path, text.as_bytes()).expect("the prelude record");
+        let segments = read_shell_record(&path).segments;
+        assert!(
+            segments.iter().all(|segment| segment.command == "echo hi"),
+            "the prelude leaked into the record: {segments:?}"
+        );
+        let path = root.join("substitution");
+        let text = "START\u{1e}0\u{1f}0\u{1f}0\u{1f}x=$(false)\u{1e}\
+                    0\u{1f}0\u{1f}1\u{1f}false\u{1e}\
+                    1\u{1f}1\u{1f}0\u{1f}echo done\u{1e}";
+        fs::write(&path, text.as_bytes()).expect("the substitution record");
+        let segments = read_shell_record(&path).segments;
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.command == "false" && segment.status == 1),
+            "the child's failure was lost: {segments:?}"
+        );
+        assert!(
+            !segments
+                .iter()
+                .any(|segment| segment.command == "x=$(false)" && segment.status == 0),
+            "the child's inherited status was credited to the assignment: {segments:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_recorder_prelude_is_sourced_through_bash_env() {
+        // Correction 6: the same recorder is installed by the top-level shell and by
+        // a nested non-interactive bash, through BASH_ENV. It marks the top-level
+        // start and a nested start so the prelude's own records are dropped.
+        assert!(SHELL_RECORDER_PRELUDE.starts_with("if [ -n \"${GEWU_SEGMENTS_FILE:-}\" ]"));
+        assert!(SHELL_RECORDER_PRELUDE.contains("$GEWU_SEGMENTS_FILE"));
+        assert!(SHELL_RECORDER_PRELUDE.contains("BASH_COMMAND"));
+        assert!(SHELL_RECORDER_PRELUDE.contains("PIPESTATUS"));
+        assert!(SHELL_RECORDER_PRELUDE.contains("__gewu_marker=START"));
+        assert!(SHELL_RECORDER_PRELUDE.contains("__gewu_marker=NESTSTART"));
+        assert!(SHELL_RECORDER_PRELUDE.contains("printf 'NEST"));
+        assert!(SHELL_RECORDER_PRELUDE.contains("NESTEND"));
+        assert!(
+            SHELL_RECORDER_PRELUDE.contains("printf 'SHELLNAME\\037%s\\036' \"$0\""),
+            "the prelude must report the shell name for its own diagnostics"
+        );
+        assert!(
+            SHELL_RECORDER_PRELUDE.contains("${BASH_SOURCE[0]}")
+                && SHELL_RECORDER_PRELUDE.contains("\"%s\\037%s\\037%s\\037%s\\037%s\\036\""),
+            "the prelude must report the source file bash names in its diagnostics"
+        );
+        assert!(SHELL_RECORDER_PRELUDE.contains("set +x"));
+        assert!(
+            !SHELL_RECORDER_PRELUDE.contains("stdout")
+                && !SHELL_RECORDER_PRELUDE.contains("stderr"),
+            "the prelude must not name the model's streams"
+        );
+    }
+
+    #[test]
+    fn a_condition_status_keeps_the_failing_command() {
+        // Correction 6, B1: `if rm …` makes `$?` at the next trap the enclosing
+        // compound's 0; `PIPESTATUS[0]` keeps the failed `rm`. The failing command
+        // must not be recorded as a success.
+        let root = crate::test_support::scratch_root("condition-status");
+        let path = root.join("segments");
+        let record = |status: &str, pipeline: &str, subshell: &str, command: &str| {
+            format!("{status}\u{1f}{pipeline}\u{1f}{subshell}\u{1f}{command}\u{1e}")
+        };
+        let text = format!(
+            "START\u{1e}{}{}{}",
+            record("0", "0", "0", "rm ro/file"),
+            record("0", "1", "0", "echo done"),
+            record("0", "0", "0", "printf 'START' >>\"$GEWU_SEGMENTS_FILE\""),
+        );
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let segments = read_shell_record(&path).segments;
+        assert_eq!(
+            segments.first(),
+            Some(&transcript::CommandSegment {
+                command: "rm ro/file".to_owned(),
+                status: 1,
+            }),
+            "the condition's own failure was lost: {segments:?}"
+        );
+        assert_eq!(
+            segments
+                .iter()
+                .find(|segment| segment.command == "echo done")
+                .map(|segment| segment.status),
+            Some(0)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_nested_shell_record_is_paired_inside_its_own_shell() {
+        // Correction 6, B2: a nested bash writes NEST, its prelude records, then
+        // NESTSTART. The prelude's records are not paired; the nested command's own
+        // status is; and the outer `bash -c` entry still gets the outer status.
+        let root = crate::test_support::scratch_root("nested-record");
+        let path = root.join("segments");
+        let record = |status: &str, pipeline: &str, subshell: &str, command: &str| {
+            format!("{status}\u{1f}{pipeline}\u{1f}{subshell}\u{1f}{command}\u{1e}")
+        };
+        let text = format!(
+            "START\u{1e}{}NEST\u{1e}{}{}NESTSTART\u{1e}{}{}{}NESTEND\u{1e}{}",
+            record("0", "0", "0", "bash -c 'rm ro/file; echo done'"),
+            record("0", "0", "0", "set -T"),
+            record("0", "0", "0", "trap '__gewu_write' DEBUG"),
+            record("0", "0", "0", "rm ro/file"),
+            record("1", "1", "0", "echo done"),
+            record("0", "0", "0", "printf 'START' >>\"$GEWU_SEGMENTS_FILE\""),
+            record("0", "0", "0", "true"),
+        );
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let segments = read_shell_record(&path).segments;
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.command == "rm ro/file" && segment.status == 1),
+            "the nested failure was lost: {segments:?}"
+        );
+        assert!(
+            segments.iter().any(
+                |segment| segment.command == "bash -c 'rm ro/file; echo done'"
+                    && segment.status == 0
+            ),
+            "the outer command did not get the outer status: {segments:?}"
+        );
+        assert!(
+            segments
+                .iter()
+                .all(|segment| !segment.command.starts_with("set -T")),
+            "a nested prelude record leaked: {segments:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pipeline_status_does_not_overwrite_a_paired_failure() {
+        // Correction 7, B1: the outer pipeline's `PIPESTATUS` is paired with the
+        // pipeline's own commands only. A nested shell's `rm` was already paired
+        // with 1; the outer `0 0` must not replace it.
+        let root = crate::test_support::scratch_root("pipeline-pairing");
+        let path = root.join("segments");
+        let record = |status: &str, pipeline: &str, subshell: &str, command: &str| {
+            format!("{status}\u{1f}{pipeline}\u{1f}{subshell}\u{1f}{command}\u{1e}")
+        };
+        let text = format!(
+            "START\u{1e}{}{}NEST\u{1e}{}NESTSTART\u{1e}{}{}NESTEND\u{1e}{}{}",
+            record("0", "0", "0", "bash -c 'if rm ro/file; then echo x; fi'"),
+            record("0", "0", "0", "cat"),
+            record("0", "0", "0", "printf 'prelude' >>\"$GEWU_SEGMENTS_FILE\""),
+            record("0", "0", "0", "rm ro/file"),
+            record("0", "1", "0", "printf 'prelude' >>\"$GEWU_SEGMENTS_FILE\""),
+            record(
+                "0",
+                "0 0",
+                "0",
+                "printf 'prelude' >>\"$GEWU_SEGMENTS_FILE\""
+            ),
+            record("0", "0", "0", "true"),
+        );
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let record = read_shell_record(&path);
+        assert!(
+            record
+                .segments
+                .iter()
+                .any(|segment| segment.command == "rm ro/file" && segment.status == 1),
+            "the pipeline overwrote the nested failure: {:?}",
+            record.segments
+        );
+        assert!(
+            record.segments.iter().any(|segment| segment.command
+                == "bash -c 'if rm ro/file; then echo x; fi'"
+                && segment.status == 0),
+            "the outer pipeline command lost its status: {:?}",
+            record.segments
+        );
+        assert!(
+            record
+                .segments
+                .iter()
+                .any(|segment| segment.command == "cat" && segment.status == 0),
+            "the pipeline's second command lost its status: {:?}",
+            record.segments
+        );
+        assert_eq!(
+            record.raw_failures,
+            vec![1],
+            "the raw record did not keep the failure: {:?}",
+            record.raw_failures
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_raw_record_keeps_a_failure_the_pairing_cannot_place() {
+        // A raw status with no unpaired command is still a failure: the mark reads
+        // the raw record, never the pairing. Here the only command was paired with
+        // 0 by an earlier record, and the later `PIPESTATUS` carries 1.
+        let root = crate::test_support::scratch_root("raw-failure");
+        let path = root.join("segments");
+        let text = "START\u{1e}0\u{1f}0\u{1f}0\u{1f}check\u{1e}\
+                    0\u{1f}0\u{1f}0\u{1f}check\u{1e}\
+                    0\u{1f}1\u{1f}0\u{1f}after\u{1e}";
+        fs::write(&path, text.as_bytes()).expect("the record is written");
+        let record = read_shell_record(&path);
+        assert_eq!(record.raw_failures, vec![1]);
+        assert!(
+            record.segments.iter().any(|segment| segment.status == 1),
+            "the raw failure was not paired with any command: {:?}",
+            record.segments
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hidden_write_line_is_refusal_evidence_only_for_a_write() {
+        // Correction 7, B1: `if rm …; fi | cat` reports only 0 to the raw record,
+        // but the write's own `rm:` line names the refusal. A success body that
+        // happens to contain the same words is not a write's diagnostic.
+        let mut hidden = RunEvidence::default();
+        assert!(hidden.note_shell(
+            "if rm ro/file; then echo x; fi | cat",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "rm: cannot remove 'ro/file': Permission denied\n".to_owned(),
+                segments: Vec::new(),
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        ));
+        assert!(hidden.refused_write().is_some());
+        assert_eq!(
+            ending_with_evidence(
+                "I deleted the stale file and the work is complete.",
+                &hidden
+            ),
+            RunEnding::Refused
+        );
+        let mut words = RunEvidence::default();
+        assert!(!words.note_shell(
+            "echo 'rm: cannot remove this line from the report'",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "rm: cannot remove this line from the report\n".to_owned(),
+                segments: Vec::new(),
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        ));
+        assert!(words.refused_write().is_none());
+        assert_eq!(
+            ending_with_evidence("The review is complete.", &words),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn the_cause_row_prefers_the_failed_write_over_a_later_error() {
+        // Correction 5, N5: `rm` failed first and `ls` failed after it; the card's
+        // row must be the failed write's own line.
+        let mut evidence = RunEvidence::default();
+        evidence.note_shell(
+            "rm missing.txt; ls missing2; echo done",
+            &ToolOutcome {
+                exit_code: Some(0),
+                signal: None,
+                excerpt: "rm: cannot remove 'missing.txt': No such file or directory\nls: cannot access 'missing2': No such file or directory".to_owned(),
+                segments: vec![
+                    transcript::CommandSegment {
+                        command: "rm missing.txt".to_owned(),
+                        status: 1,
+                    },
+                    transcript::CommandSegment {
+                        command: "ls missing2".to_owned(),
+                        status: 2,
+                    },
+                    transcript::CommandSegment {
+                        command: "echo done".to_owned(),
+                        status: 0,
+                    },
+                ],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        );
+        assert!(evidence.refused_write().is_some());
+        let cause = evidence.cause().expect("the cause row");
+        assert!(
+            cause.contains("rm: cannot remove"),
+            "the cause named a different command: {cause}"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_beside_a_successful_write_is_a_warning_not_a_refusal() {
+        // The record names the failed call: the `rm` succeeded, the `ls` failed. The
+        // whole command containing a write must not turn the later read's failure
+        // into a refused write (correction 5, the general rule).
+        let mut evidence = RunEvidence::default();
+        evidence.note_shell(
+            "rm old.txt; ls missing",
+            &ToolOutcome {
+                exit_code: Some(2),
+                signal: None,
+                excerpt: "ls: cannot access 'missing': No such file or directory".to_owned(),
+                segments: vec![
+                    transcript::CommandSegment {
+                        command: "rm old.txt".to_owned(),
+                        status: 0,
+                    },
+                    transcript::CommandSegment {
+                        command: "ls missing".to_owned(),
+                        status: 2,
+                    },
+                ],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        );
+        assert!(
+            evidence.refused_write().is_none(),
+            "a successful write was called a refusal"
+        );
+        assert!(evidence.failed_call().is_some());
+        assert_eq!(
+            ending_with_evidence("The work is complete.", &evidence),
+            RunEnding::Warned
+        );
+        // The same command with the rm failing is still a refusal.
+        let mut refused = RunEvidence::default();
+        refused.note_shell(
+            "rm missing; ls missing",
+            &ToolOutcome {
+                exit_code: Some(2),
+                signal: None,
+                excerpt: "rm: cannot remove 'missing': No such file or directory\nls: cannot access 'missing': No such file or directory".to_owned(),
+                segments: vec![
+                    transcript::CommandSegment {
+                        command: "rm missing".to_owned(),
+                        status: 1,
+                    },
+                    transcript::CommandSegment {
+                        command: "ls missing".to_owned(),
+                        status: 2,
+                    },
+                ],
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        );
+        assert!(refused.refused_write().is_some());
+        assert_eq!(
+            ending_with_evidence("The work is complete.", &refused),
+            RunEnding::Refused
+        );
+    }
+
+    #[test]
+    fn every_http_error_status_on_a_write_is_evidence() {
+        for status in [400, 401, 403, 404, 409, 429, 500, 502, 503] {
+            let mut evidence = RunEvidence::default();
+            evidence.note_shell(
+                "curl -s -X DELETE http://127.0.0.1:1/team/workspace",
+                &shell_outcome(&format!("HTTP/1.1 {status} server answer")),
+            );
+            assert!(
+                evidence.refused_write().is_some(),
+                "HTTP {status} was not evidence"
+            );
+        }
+        // A bare whole-line code, as `curl -w '%{http_code}'` writes it, and the
+        // provider's own reason phrase without a code.
+        for text in ["401", "Unauthorized", "Forbidden", "Error code: 501"] {
+            let mut evidence = RunEvidence::default();
+            evidence.note_shell(
+                "curl -s -XDELETE http://127.0.0.1:1/team/workspace",
+                &shell_outcome(text),
+            );
+            assert!(
+                evidence.refused_write().is_some(),
+                "{text:?} was not evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_that_exits_non_zero_is_refusal_evidence() {
+        // Correction 3's rule: whatever the output says, a write that fails is a
+        // refusal. This is the pre-receive rejection and the global-option git push.
+        for command in [
+            "git -C . push origin main",
+            "git push origin main",
+            "rm -f workspace/file",
+        ] {
+            let mut evidence = RunEvidence::default();
+            evidence.note_shell(command, &failed_shell("everything looks fine"));
+            assert!(evidence.refused_write().is_some(), "{command}");
+            assert_eq!(
+                ending_with_evidence("The work is pushed and complete.", &evidence),
+                RunEnding::Refused
+            );
+        }
+        // A signal is a failure too.
+        let mut killed = RunEvidence::default();
+        killed.note_shell(
+            "rm -f workspace/file",
+            &ToolOutcome {
+                exit_code: None,
+                signal: Some(9),
+                excerpt: String::new(),
+                segments: Vec::new(),
+                raw_failures: Vec::new(),
+                shell_prefixes: Vec::new(),
+            },
+        );
+        assert!(killed.refused_write().is_some());
+    }
+
+    #[test]
+    fn a_zero_exit_phrase_is_evidence_only_for_curl() {
+        // Correction 3: word lists stay only for the tool whose exit code hides the
+        // status. A successful `git push` or `mv` whose text mentions a refusal
+        // phrase is not a refusal.
+        for command in ["git push origin main", "mv README.md old.md"] {
+            let mut evidence = RunEvidence::default();
+            evidence.note_shell(command, &shell_outcome("Forbidden"));
+            assert!(evidence.refused_write().is_none(), "{command}");
+        }
+        let mut curl = RunEvidence::default();
+        curl.note_shell(
+            "curl -s -XDELETE http://127.0.0.1:1/team/workspace",
+            &shell_outcome("Forbidden"),
+        );
+        assert!(curl.refused_write().is_some());
+        // `-f` makes curl exit non-zero on a 4xx, so a zero exit is a real success;
+        // a phrase in the body is then not evidence.
+        let mut fail_flag = RunEvidence::default();
+        fail_flag.note_shell(
+            "curl -sf -XDELETE http://127.0.0.1:1/team/workspace",
+            &shell_outcome("Forbidden"),
+        );
+        assert!(fail_flag.refused_write().is_none());
+    }
+
+    #[test]
+    fn a_success_body_with_a_status_number_is_not_evidence() {
+        // Correction 3, non-blocking 5: a 200 body can mention 404 without being one.
+        let mut evidence = RunEvidence::default();
+        evidence.note_shell(
+            "curl -s -XDELETE http://127.0.0.1:1/team/workspace",
+            &shell_outcome("error: purged 404 stale records"),
+        );
+        assert!(evidence.refused_write().is_none());
+        assert_eq!(
+            ending_with_evidence("The stale records are purged.", &evidence),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn a_bare_refused_word_in_a_successful_write_is_not_evidence() {
+        // Correction 2's non-blocking 4: a file named `refused` in a successful
+        // listing must not turn the run into a refusal. Under correction 3 a
+        // successful write's output is not scanned at all.
+        let mut listing = RunEvidence::default();
+        listing.note_shell(
+            "mv workspace/README.md workspace/refused && ls workspace",
+            &shell_outcome("refused"),
+        );
+        assert!(listing.refused_write().is_none());
+        assert_eq!(
+            ending_with_evidence("The README is renamed and the work is complete.", &listing),
+            RunEnding::Succeeded
+        );
+        // A failed write is a refusal even when its only word is ambiguous.
+        let mut refused = RunEvidence::default();
+        refused.note_shell(
+            "rm -f workspace/refused",
+            &failed_shell("rm: error: refused by policy"),
+        );
+        assert!(refused.refused_write().is_some());
+        // A read that fails without refusal evidence is a warning, not a refusal.
+        let mut read = RunEvidence::default();
+        read.note_shell(
+            "git show push",
+            &failed_shell("fatal: ambiguous argument 'push': unknown revision"),
+        );
+        assert!(read.refused_write().is_none());
+        assert!(read.failed_call().is_some());
+        // A failed read answered with a refusal status is refusal evidence.
+        let mut denied = RunEvidence::default();
+        denied.note_shell(
+            "curl -s http://127.0.0.1:1/team/issues",
+            &failed_shell("Forbidden"),
+        );
+        assert!(denied.refused_write().is_some());
+    }
+
+    #[test]
+    fn redirections_and_get_flags_do_not_make_a_read_a_write() {
+        // Correction 3, non-blocking 3: stderr redirection and a GET with --data are
+        // reads; a redirection into a file and a non-GET body are writes.
+        for read in [
+            "curl -s -X GET http://127.0.0.1:1/team/workspace 2>/dev/null",
+            "curl -s http://127.0.0.1:1/team/workspace 2>&1",
+            "curl -s -G --data 'q=1' http://127.0.0.1:1/team/search",
+            "curl -s --get --data 'q=1' http://127.0.0.1:1/team/search",
+        ] {
+            assert!(!shell_writes(read), "{read} was called a write");
+        }
+        for write in [
+            "curl -s --data 'q=1' http://127.0.0.1:1/team/search",
+            "echo 'x' > workspace/README.md",
+            "echo 'x' >> workspace/README.md",
+        ] {
+            assert!(shell_writes(write), "{write} was not called a write");
+        }
+        assert!(!shell_writes("echo 'x' >/dev/null"));
+    }
+
+    #[test]
+    fn a_prose_only_destructive_refusal_is_not_success() {
+        // Correction 2's non-blocking 2: no tool call, so the model's own sentence is
+        // the only witness. It is read only for a destructive instruction.
+        assert_eq!(
+            ending_for_instruction(
+                "Delete the repository team/workspace.",
+                "I left team/workspace in place; deleting it is not safe for your data.",
+                &RunEvidence::default(),
+            ),
+            RunEnding::Refused
+        );
+        assert_eq!(
+            ending_for_instruction(
+                "Delete the repository team/workspace.",
+                "I deleted team/workspace successfully.",
+                &RunEvidence::default(),
+            ),
+            RunEnding::Succeeded
+        );
+        // A destructive instruction that also says what to keep is not a refusal
+        // when the model reports doing both (review correction 3, non-blocking 4).
+        assert_eq!(
+            ending_for_instruction(
+                "Delete the stale branch and keep the docs as is.",
+                "I deleted the stale branch and kept the docs as is; the work is complete.",
+                &RunEvidence::default(),
+            ),
+            RunEnding::Succeeded
+        );
+        // A harmless report that kept a file is not a refusal.
+        assert_eq!(
+            ending_for_instruction(
+                "Review the repository.",
+                "I kept the README as is and the review is complete.",
+                &RunEvidence::default(),
+            ),
+            RunEnding::Succeeded
+        );
+        // "Do not delete" is an instruction not to destroy, not a destructive one.
+        assert_eq!(
+            ending_for_instruction(
+                "Do not delete anything; just report.",
+                "I left the repository in place as asked.",
+                &RunEvidence::default(),
+            ),
+            RunEnding::Succeeded
+        );
+        // "form" ends in "rm" but is not the `rm` command.
+        assert_eq!(
+            ending_for_instruction(
+                "Improve the form and report.",
+                "I left the current form in place and finished the report.",
+                &RunEvidence::default(),
+            ),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn a_refused_forgejo_write_is_evidence() {
+        let mut evidence = RunEvidence::default();
+        evidence.note_forgejo(
+            crate::forgejo_tools::COMMENT,
+            "the comment was refused: permission denied",
+        );
+        assert_eq!(
+            ending_with_evidence("I left the issue open as asked.", &evidence),
+            RunEnding::Refused
+        );
+        let mut read = RunEvidence::default();
+        read.note_forgejo(
+            crate::forgejo_tools::READ_ISSUE_OR_PULL,
+            "the issue could not be read",
+        );
+        assert!(read.refused_write().is_none());
+        assert!(
+            read.failed_call().is_some(),
+            "a failed read is a failed call, not a success"
+        );
+        assert_eq!(
+            ending_with_evidence("The review is complete.", &read),
+            RunEnding::Warned
+        );
+    }
+
+    #[test]
+    fn the_runs_own_summary_decides_a_clean_exits_mark() {
+        let (root, config, skills, credentials) = agent_source("agent-run-refusal");
+        let dir = run_dir(&root);
+        fs::write(config.join("instruction.md"), "Delete the repository.\n").expect("instruction");
+        let stub = Stub::start(vec![StubReply::json(completion(
+            "I could not delete team/library: Forgejo refused the request and my account has no delete permission. The repository is still there.",
+        ))]);
+        plan_with(
+            &dir,
+            &config,
+            &skills,
+            &credentials,
+            &stub.url(),
+            4,
+            Vec::new(),
+        );
+        let end = execute(&dir);
+        assert_eq!(end.ending, RunEnding::Refused);
+        assert!(end.is_success(), "the process exited 0");
+        let (outcome, reason) = transcript::terminal_record(&dir)
+            .and_then(|record| match record {
+                Record::RunFinished {
+                    outcome, reason, ..
+                } => Some((outcome, reason.unwrap_or_default())),
+                _ => None,
+            })
+            .expect("the terminal record");
+        assert_eq!(outcome, "refused", "a refusal wore the success word");
+        assert_eq!(
+            RunOutcome::parse(&outcome),
+            Some(RunOutcome::Refused),
+            "the transcript word does not read back"
+        );
+        assert!(reason.contains("could not delete"), "{reason}");
     }
 }

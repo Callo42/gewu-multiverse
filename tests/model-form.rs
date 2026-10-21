@@ -5,7 +5,7 @@
 //! never left the machine, and the same Tab moves in view mode and in edit mode.
 
 use gewu_multiverse::board::{Board, FakeEngine, Screen};
-use gewu_multiverse::engine_api::{Command, EngineApi};
+use gewu_multiverse::engine_api::{BoardView, Command, EngineApi};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -151,4 +151,85 @@ fn the_same_verb_opens_and_saves_the_model() {
     let frame = frame_text(&mut board, 80, 24);
     assert!(frame.contains("⏎ next"), "{frame}");
     assert!(!frame.contains("⏎ save"), "{frame}");
+}
+
+/// A model screen whose provider answered a realistic 404 on a completions path
+/// without `/v1`, with the sentence the string builder really produces.
+struct NotFoundEngine(FakeEngine);
+
+impl EngineApi for NotFoundEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        view.endpoint.test = gewu_multiverse::engine_api::EndpointTest::Failed {
+            reason: gewu_multiverse::model::failure_words(
+                &gewu_multiverse::model::ModelError::RouteNotFound {
+                    endpoint: "http://127.0.0.1:18192/chat/completions".to_owned(),
+                    status: 404,
+                    message: "Invalid URL (POST /chat/completions).".to_owned(),
+                },
+                "demo-model",
+            ),
+        };
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick()
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<std::path::PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: std::time::Duration) {
+        self.0.shutdown(grace)
+    }
+}
+
+#[test]
+fn the_v1_repair_is_visible_at_eighty_by_twenty_four() {
+    // Review B1: the persona's own 80x24 screen showed `— add…` or no `/v1` at all
+    // because the repair trailed the provider's clause in one ellipsized row.
+    let mut engine = FakeEngine::new();
+    engine.send(Command::AcknowledgeTerms).expect("terms");
+    engine
+        .send(Command::SetEndpoint {
+            url: "http://127.0.0.1:18192/chat/completions".to_owned(),
+            model: "demo-model".to_owned(),
+            key: Some("sk-test-key".to_owned()),
+        })
+        .expect("endpoint");
+    engine
+        .send(Command::CreateAgents { count: 1 })
+        .expect("agent");
+    engine.send(Command::StartForgejo).expect("Forgejo");
+    for _ in 0..130 {
+        engine.tick();
+    }
+    let _ = engine.board();
+
+    let mut board = Board::new(NotFoundEngine(engine));
+    assert_eq!(board.screen(), Screen::Home);
+    press(&mut board, KeyCode::Char('m'));
+    assert_eq!(board.screen(), Screen::Model);
+    let frame = frame_text(&mut board, 80, 24);
+    let repair = frame
+        .find("add /v1")
+        .unwrap_or_else(|| panic!("no /v1 repair at 80x24:\n{frame}"));
+    let status = frame
+        .find("HTTP 404")
+        .unwrap_or_else(|| panic!("no provider status at 80x24:\n{frame}"));
+    assert!(repair < status, "the repair is not first:\n{frame}");
+    assert!(
+        frame.contains("Invalid URL"),
+        "the provider's own clause is hidden:\n{frame}"
+    );
 }

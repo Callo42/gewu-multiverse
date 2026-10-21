@@ -50,6 +50,10 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 const TICK: Duration = Duration::from_millis(250);
 
 fn main() -> ExitCode {
+    // The shell record's diagnostic floor is the C library's own error vocabulary;
+    // build it once at startup, not on the first failed tool call.
+    agent_run::init_system_errors();
+
     let arguments: Vec<String> = std::env::args().skip(1).collect();
 
     // `git` runs `GIT_ASKPASS` as `<program> <prompt>`: the prompt is the program's

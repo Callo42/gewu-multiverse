@@ -225,6 +225,7 @@ fn draw_forgejo_box(
     agent_count: usize,
     selected: bool,
     wire: bool,
+    preview: bool,
 ) {
     if rect.width < 8 || rect.height < 3 {
         return;
@@ -248,7 +249,14 @@ fn draw_forgejo_box(
         theme::bold(theme::ACCENT),
         rect.width.saturating_sub(10) as usize,
     );
-    let state_text = format!("{} {}", face.symbol, face.status);
+    // The picker draws a preview, not a running server: label it so the person cannot
+    // mistake the planned state for the real one before `⏎ create` (F14).
+    let (face_symbol, face_status, face_colour) = if preview {
+        ('◐', "preview".to_owned(), theme::AMBER)
+    } else {
+        (face.symbol, face.status.clone(), face.colour)
+    };
+    let state_text = format!("{face_symbol} {face_status}");
     let state_width = text_util::width(&state_text) as u16 + 2;
     if state_width + 6 < rect.width {
         let state_x = right.saturating_sub(state_width + 3);
@@ -258,7 +266,7 @@ fn draw_forgejo_box(
             state_x,
             rect.y,
             &state_text,
-            theme::bold(face.colour),
+            theme::bold(face_colour),
             rect.width.saturating_sub(4) as usize,
         );
     }
@@ -419,6 +427,11 @@ fn draw_card(
 
     let junction_x = card_junction(rect);
     let max_top = (junction_x.saturating_sub(rect.x + 3)) as usize;
+    let title = if selected {
+        format!("▸ {}", agent.name)
+    } else {
+        agent.name.clone()
+    };
     border_label_parts(
         buf,
         rect,
@@ -426,7 +439,7 @@ fn draw_card(
         rect.y,
         &face.symbol.to_string(),
         theme::card_bold(face.colour, selected),
-        &agent.name,
+        &title,
         theme::card_bold(theme::FG, selected),
         max_top,
     );
@@ -504,7 +517,24 @@ fn draw_card(
             &count,
             theme::card(theme::MUTED, selected),
         );
-        if let Some(activity) = status::activity(agent) {
+        if let Some(result) = status::run_result(agent) {
+            let colour = if status::run_result_is_refusal(agent) {
+                theme::RED
+            } else {
+                theme::MUTED
+            };
+            text_util::put(
+                buf,
+                interior,
+                interior.x + 1,
+                rect.y + 3,
+                &text_util::ellipsize_words(
+                    &format!("result: {result}"),
+                    interior.width.saturating_sub(1) as usize,
+                ),
+                theme::card(colour, selected),
+            );
+        } else if let Some(activity) = status::activity(agent) {
             let lines = text_util::wrap(&activity, interior.width.saturating_sub(1) as usize);
             let take = if rect.height >= 6 { 2 } else { 1 };
             for (index, line) in lines.iter().take(take).enumerate() {
@@ -568,7 +598,11 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         .clamp(1, max_columns)
         .min(agent_count.max(3))
         .max(1);
-    let max_card_w = if roomy { 40 } else { 30 };
+    let max_card_w = if roomy {
+        if area.width >= 140 { 60 } else { 40 }
+    } else {
+        30
+    };
     let mut card_w =
         ((usable.saturating_sub((columns as u16 - 1) * gap)) / columns as u16).min(max_card_w);
     if card_w < 14 {
@@ -843,7 +877,8 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     let geometry = home_geometry(board, area, roomy, build);
     let agent_count = board.view.agents.len();
     let forgejo_width = if roomy {
-        (inner.width / 2 + 8).clamp(44, 72) & !1
+        let ceiling = if area.width >= 140 { 100 } else { 72 };
+        (inner.width / 2 + 8).clamp(44, ceiling) & !1
     } else {
         (inner.width.saturating_sub(16)).clamp(36, 50) & !1
     };
@@ -865,6 +900,7 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
         agent_count,
         !build && board.forgejo_selected,
         true,
+        false,
     );
 
     let wire_style = theme::fg(theme::WIRE);
@@ -983,6 +1019,14 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     }
 }
 
+/// The two footer lines of a removal confirmation: what it does, and the keys.
+fn remove_confirmation(name: &str) -> (String, String) {
+    (
+        format!("remove {name}? login revoked, account deactivated, history kept"),
+        "y remove   n keep".to_owned(),
+    )
+}
+
 fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     let footer_top = inner.bottom().saturating_sub(3);
     if board.confirm_quit {
@@ -1013,14 +1057,14 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
         return;
     }
 
-    let confirm = board.confirm_remove.as_ref().map(|name| {
-        format!("remove {name}? token revoked, account deactivated, history and folder kept — y/n")
-    });
-    if let Some(line) = confirm {
+    if let Some(name) = &board.confirm_remove {
+        // The consequences and the keys are both in the footer: a confirmation
+        // without its verb is a screen the person has to guess at (F6).
+        let (consequence, keys) = remove_confirmation(name);
         let width = inner.width.saturating_sub(2) as usize;
-        for (offset, part) in text_util::wrap(&line, width)
+        for (offset, part) in text_util::wrap(&consequence, width)
             .into_iter()
-            .take(2)
+            .take(1)
             .enumerate()
         {
             text_util::put(
@@ -1032,16 +1076,24 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
                 theme::bold(theme::AMBER),
             );
         }
-    } else {
         text_util::put(
             buf,
             inner,
             inner.x + 1,
-            footer_top,
-            "←→ pick   ⏎ open   s start/stop   + add   − remove",
-            theme::fg(theme::MUTED),
+            footer_top + 1,
+            &keys,
+            theme::bold(theme::AMBER),
         );
+        return;
     }
+    text_util::put(
+        buf,
+        inner,
+        inner.x + 1,
+        footer_top,
+        "←→ pick   ⏎ open   s start/stop   + add   − remove",
+        theme::fg(theme::MUTED),
+    );
     let second = "f Forgejo   m model   ? help   q quit";
     text_util::put(
         buf,
@@ -1255,7 +1307,7 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
             theme::bold(theme::AMBER),
         );
     }
@@ -1339,15 +1391,17 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::bold(theme::RED),
         ),
     };
-    if y < form.bottom().saturating_sub(1) {
-        text_util::put(
-            buf,
-            form,
-            form.x + 2,
-            y,
-            &text_util::ellipsize(&line, form.width.saturating_sub(4) as usize),
-            style,
-        );
+    // A failed test is the one sentence that has to repair the address, so it
+    // wraps rather than losing its end. At 80x24 the form has two rows below the
+    // fields; the `/v1` repair is already first, and the provider's clause follows
+    // on the second row (review B1).
+    let room = form.bottom().saturating_sub(1).saturating_sub(y) as usize;
+    for (row, part) in text_util::wrap(&line, form.width.saturating_sub(4) as usize)
+        .iter()
+        .take(room)
+        .enumerate()
+    {
+        text_util::put(buf, form, form.x + 2, y + row as u16, part, style);
     }
     let actions = if board.model_editing {
         "⏎ keep    esc cancel"
@@ -1368,7 +1422,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
             theme::bold(theme::AMBER),
         );
     }
@@ -1449,7 +1503,7 @@ fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
         .saturating_sub(forgejo_w / 2)
         .clamp(inner.x, inner.right().saturating_sub(forgejo_w));
     let forgejo = Rect::new(forgejo_x, block_top, forgejo_w, forgejo_h);
-    draw_forgejo_box(buf, forgejo, &board.view.forgejo, count, false, true);
+    draw_forgejo_box(buf, forgejo, &board.view.forgejo, count, false, true, true);
     let count_y = forgejo.bottom();
     text_util::put(
         buf,
@@ -1525,7 +1579,7 @@ fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
             theme::bold(theme::AMBER),
         );
     }
@@ -1630,71 +1684,136 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         theme::card(theme::MUTED, true),
     );
 
-    // The second row is the one line worth reading beside the status: what it is
-    // doing now, else the last failure, else the last error. Never a stale sentence
-    // pretending to be current: `status::activity` adds `last:` and an age when the
-    // run is over.
+    // The second row is the one line worth reading beside the status: a failed tool
+    // run's cause, else the newest run's own refusal/no-work summary, else the last
+    // error, else what it is doing now. Never a stale sentence pretending to be
+    // current: `status::activity` adds `last:` and an age when the run is over.
     let activity = status::activity(&agent);
+    let failure_mark = status::failure_mark(&agent);
     let failure = agent
         .last_failure
         .as_ref()
-        .map(|failure| format!("✗ {}", status::plain(failure)))
+        .map(|failure| format!("{failure_mark} {}", status::tool_failure(failure)))
         .or_else(|| {
             agent
                 .last_error
                 .as_ref()
                 .map(|error| format!("✗ {}", status::first_clause(error)))
         });
-    let second = activity
-        .clone()
-        .map(|activity| (activity, theme::card(theme::MUTED, true)))
-        .or_else(|| {
-            failure
-                .clone()
-                .map(|failure| (failure, theme::card(theme::RED, true)))
-        });
+    let result = status::run_result(&agent).map(|reason| format!("result: {reason}"));
+    let result_colour = if status::run_result_is_refusal(&agent) {
+        theme::RED
+    } else if status::run_result_is_warning(&agent) {
+        theme::AMBER
+    } else {
+        theme::MUTED
+    };
+    // The failure and the run's own result answer different questions, and both are
+    // drawn: a transient failed tool must not hide the summary beside `✓` (review
+    // B2). The activity keeps the row under the status, then the failure, then the
+    // result.
+    let mut extras: Vec<(String, ratatui::style::Style)> = Vec::new();
+    if let Some(failure) = failure {
+        extras.push((failure, theme::card(theme::RED, true)));
+    }
+    if let Some(result) = result {
+        extras.push((result, theme::card(result_colour, true)));
+    }
+    let (second, extras) = match (&activity, extras.is_empty()) {
+        (Some(activity), _) => (
+            Some((activity.clone(), theme::card(theme::MUTED, true))),
+            extras,
+        ),
+        (None, false) => {
+            let first = extras.remove(0);
+            (Some(first), extras)
+        }
+        (None, true) => (None, extras),
+    };
     if let Some((line, style)) = second {
         text_util::put(
             buf,
             card,
             interior_x,
             card.y + 2,
-            &text_util::ellipsize(&line, width),
+            &text_util::ellipsize_words(&line, width),
             style,
         );
     }
-    // A failure is shown even when there is an activity line to show too: the two
-    // answer different questions (`what did it manage` and `what went wrong`).
-    let failure_extra = u16::from(activity.is_some() && failure.is_some());
-    if failure_extra == 1 {
-        if let Some(failure) = failure.as_deref() {
-            text_util::put(
-                buf,
-                card,
-                interior_x,
-                card.y + 3,
-                &text_util::ellipsize(failure, width),
-                theme::card(theme::RED, true),
-            );
-        }
-    }
-
-    // The work block: the last issue / pull request / branch / comment the newest run
-    // named, in at most two lines (F5).
-    let work_start = card.y + 3 + failure_extra;
-    let work_rows = if has_rule && rule_y >= work_start + 4 && !agent.last_work.is_empty() {
-        2.min(agent.last_work.len()) as u16
-    } else {
-        0
-    };
-    for (index, line) in agent.last_work.iter().take(work_rows as usize).enumerate() {
+    let extra_rows = extras.len() as u16;
+    for (index, (notice, style)) in extras.iter().enumerate() {
         text_util::put(
             buf,
             card,
             interior_x,
-            work_start + index as u16,
-            &text_util::ellipsize(line, width),
+            card.y + 3 + index as u16,
+            &text_util::ellipsize_words(notice, width),
+            *style,
+        );
+    }
+
+    // The work block: the last issue / pull request / branch / comment a work run
+    // named, correctly typed and labelled `work`, in at most three lines (F5). It is
+    // kept until a later run does new work, so a read-only check run does not erase it
+    // (W31-3). With no work at all, the Agent screen names the assignment rule.
+    let work_start = card.y + 3 + extra_rows;
+    let available = if has_rule {
+        rule_y.saturating_sub(work_start) as usize
+    } else {
+        0
+    };
+    // A roomy card gets the `work` heading and up to three typed rows. A tight card
+    // keeps the typed rows but drops the heading, because showing the work matters
+    // more than the word and the row still carries its own type (`pull request #5 …`).
+    let labelled = available >= 5 && !agent.last_work.is_empty();
+    let work_lines = if !agent.last_work.is_empty() {
+        3.min(agent.last_work.len())
+            .min(available.saturating_sub(if labelled { 3 } else { 2 }))
+    } else {
+        0
+    };
+    let no_work = available >= 2 && agent.last_work.is_empty() && agent.no_assigned_work;
+    let work_rows = if labelled {
+        (work_lines + 1) as u16
+    } else if work_lines > 0 {
+        work_lines as u16
+    } else if no_work {
+        if available >= 3 { 2 } else { 1 }
+    } else {
+        0
+    };
+    if labelled {
+        text_util::put(
+            buf,
+            card,
+            interior_x,
+            work_start,
+            "work",
+            theme::card(theme::MUTED, true),
+        );
+    }
+    let first_work_row = work_start + u16::from(labelled);
+    for (index, line) in agent.last_work.iter().take(work_lines).enumerate() {
+        text_util::put(
+            buf,
+            card,
+            interior_x,
+            first_work_row + index as u16,
+            &text_util::ellipsize_words(line, width),
             theme::card(theme::FG, true),
+        );
+    }
+    if no_work {
+        text_util::put(
+            buf,
+            card,
+            interior_x,
+            work_start,
+            &text_util::ellipsize_words(
+                &format!("no issues assigned to {} yet", agent.login),
+                width,
+            ),
+            theme::card(theme::AMBER, true),
         );
     }
 
@@ -1729,7 +1848,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
                         card,
                         interior_x,
                         text_top + row as u16,
-                        &text_util::ellipsize(part, width),
+                        &text_util::ellipsize_words(part, width),
                         theme::card(theme::FG, true),
                     );
                 }
@@ -1744,7 +1863,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
                         card,
                         interior_x,
                         text_top + row as u16,
-                        &text_util::ellipsize(part, width),
+                        &text_util::ellipsize_words(part, width),
                         theme::card(theme::FG, true),
                     );
                 }
@@ -1824,25 +1943,32 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         theme::card(theme::MUTED, true),
     );
     if card.bottom().saturating_sub(1) > strip_y + 1 {
+        // One space between the words keeps the whole legend inside the 72-column
+        // card's 58-cell row. `■ stop` is the floor spelling; from 80 columns the
+        // card has 66 cells and the whole `■ stopped` fits. The `⚠ cmd` entry is the
+        // new mark's: a finished run with a failed command (correction 4).
+        let legend = if width >= 61 {
+            "✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out"
+        } else {
+            "✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stop ◷ timed out"
+        };
         text_util::put(
             buf,
             card,
             interior_x,
             strip_y + 1,
-            &text_util::ellipsize("✓ ok   ✗ failed   ■ stopped   ◷ timed out", width),
+            &text_util::ellipsize(legend, width),
             theme::card(theme::MUTED, true),
         );
     }
 
     let actions_y = inner.bottom().saturating_sub(2);
     if let Some(name) = &board.confirm_remove {
-        let line = format!(
-            "remove {name}? token revoked, account deactivated, history and folder kept — y/n"
-        );
+        let (consequence, keys) = remove_confirmation(name);
         let width = inner.width.saturating_sub(2) as usize;
-        for (offset, part) in text_util::wrap(&line, width)
+        for (offset, part) in text_util::wrap(&consequence, width)
             .into_iter()
-            .take(2)
+            .take(1)
             .enumerate()
         {
             text_util::put(
@@ -1854,6 +1980,14 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
                 theme::bold(theme::AMBER),
             );
         }
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            actions_y,
+            &keys,
+            theme::bold(theme::AMBER),
+        );
     } else if text_util::width(
         "s start/stop   e instruction   l log   t transcript   d remove   esc back",
     ) <= inner.width.saturating_sub(2) as usize
@@ -1893,7 +2027,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
             theme::bold(theme::AMBER),
         );
     }
@@ -1909,14 +2043,13 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let label_x = inner.x + 2;
     let value_x = inner.x + 18;
     let room = inner.width.saturating_sub(20) as usize;
-    let small = area.height <= 18 || area.width < 80;
     let repositories = if view.repository_names.is_empty() {
         "—".to_owned()
     } else {
         view.repository_names.join(" · ")
     };
     let team_page = format!(
-        "{}/orgs/{}/teams/{}",
+        "{}/org/{}/teams/{}",
         view.url,
         view.organisation,
         bundled_team()
@@ -1931,7 +2064,7 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let (password, revealed) = match board.revealed_password() {
         Some(password) => (password.to_owned(), true),
         None => (
-            "••••••••   p resets it — the old one stops working".to_owned(),
+            "••••••••   p resets it — shown for 10 s, old stops".to_owned(),
             false,
         ),
     };
@@ -1970,22 +2103,22 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
             "agents can",
             vec!["write to team repositories only".to_owned()],
         ),
+        (
+            "agents work",
+            text_util::wrap(
+                "only on issues assigned to them — assign an issue in Forgejo",
+                room,
+            ),
+        ),
         ("team page", text_util::wrap(&team_page, room)),
         ("agents", text_util::wrap(&agents, room)),
     ];
     if !events.is_empty() {
         rows.push(("events", text_util::wrap(&events, room)));
     }
-    if small {
-        // At the floor the page keeps the facts a person needs to sign in and see
-        // where the work is; the team address and events return with more room.
-        rows.retain(|(label, _)| {
-            matches!(
-                *label,
-                "address" | "repositories" | "your login:" | "password" | "agents can" | "agents"
-            )
-        });
-    }
+    // The floor keeps every row, including the version, organisation, the assignment
+    // rule and the team page: one compact line each, with no blank row between when
+    // the height is tight (F12). Only events are dropped before a fact is.
     // Drop the optional rows when the height is tight, never the password or login.
     let optional = ["events", "team page", "organisation", "version", "agents"];
     loop {
@@ -2058,7 +2191,7 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
             theme::bold(theme::AMBER),
         );
     }
@@ -2157,7 +2290,7 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
             theme::bold(theme::AMBER),
         );
     }
@@ -2232,7 +2365,7 @@ fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
             theme::bold(theme::AMBER),
         );
     }
@@ -2255,10 +2388,11 @@ pub fn draw(board: &mut Board, frame: &mut Frame) {
         );
         return;
     }
-    // A wide window gets a capped, centred picture: past about a hundred columns the
-    // same drawing only stretches, so the eye travels without learning more.
-    let area = if area.width > 140 {
-        Rect::new(area.x + (area.width - 100) / 2, area.y, 100, area.height)
+    // A wide window gets a capped, centred picture. The cap is 160 columns, not the
+    // old 100: past 140 the extra width is used for the repository line and the card
+    // detail instead of being left as margin (F8), and only the remainder is centred.
+    let area = if area.width > 160 {
+        Rect::new(area.x + (area.width - 160) / 2, area.y, 160, area.height)
     } else {
         area
     };

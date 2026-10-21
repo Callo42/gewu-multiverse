@@ -1340,6 +1340,13 @@ fn quitting_at_every_point_of_a_forgejo_start_leaves_nothing() {
             }
             if matches!(state, ForgejoState::Running) && running_hit.is_none() {
                 running_hit = Some(elapsed);
+                // A fast start can move from `Starting` to `Running` between two
+                // ticks; the `Running` frame is then the first start the test saw,
+                // and the plan's `starting` suffix is measured from it (test harness
+                // only; review correction 9, NB-B).
+                if starting_hit.is_none() {
+                    starting_hit = Some(elapsed);
+                }
             }
             let reached = match *kind {
                 "starting" => starting_hit.is_some_and(|hit| elapsed >= hit + *target as u128),

@@ -113,6 +113,39 @@ pub fn ellipsize(text: &str, max: usize) -> String {
     out
 }
 
+/// A string cut at a whole word, with an ellipsis when something was cut.
+///
+/// A card line is a sentence to a reader: `… push th…` reads as a typo, so the cut
+/// falls back to the last space. A single word longer than the line still has to be
+/// split; that is the one case `ellipsize` handles.
+pub fn ellipsize_words(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if width(text) <= max {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = char_width(ch);
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    match out.rfind(' ') {
+        Some(at) if !out[..at].trim().is_empty() => {
+            format!("{}…", out[..at].trim_end())
+        }
+        _ => {
+            out.push('…');
+            out
+        }
+    }
+}
+
 /// Wrap a string into lines of at most `max` cells.
 ///
 /// Explicit newlines are honoured. A word longer than the line is split rather than
@@ -190,6 +223,14 @@ mod tests {
         assert_eq!(ellipsize("abcdef", 5), "abcd…");
         assert_eq!(width(&ellipsize("abcdef", 5)), 5);
         assert_eq!(ellipsize("abcdef", 0), "");
+    }
+
+    #[test]
+    fn a_word_cut_does_not_split_the_word() {
+        assert_eq!(ellipsize_words("push the branch", 11), "push the…");
+        assert_eq!(ellipsize_words("push the branch", 80), "push the branch");
+        // One word longer than the line still has to be split; there is no space.
+        assert_eq!(ellipsize_words("abcdefghij", 4), "abc…");
     }
 
     #[test]

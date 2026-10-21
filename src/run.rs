@@ -236,6 +236,16 @@ pub fn parse_steps(text: &str) -> Vec<String> {
 pub enum RunOutcome {
     /// The agent process exited cleanly and every declared step succeeded.
     Succeeded,
+    /// The process exited cleanly, but its own final summary says it could not do the
+    /// instruction. Exit 0 is not proof of success (F4).
+    Refused,
+    /// The process exited cleanly, did nothing, and its own summary says there was
+    /// nothing assigned to do.
+    NoWork,
+    /// The process exited cleanly but at least one tool call failed (a non-zero exit
+    /// or a signal) and was not itself a refused write. It is never a plain `✓`
+    /// (correction 4, the mark rule).
+    Warned,
     /// The agent process failed, or a declared step did.
     Failed,
     /// The run was stopped on request before it ended on its own.
@@ -249,8 +259,11 @@ impl RunOutcome {
     ///
     /// The vocabulary guard drives the screens over this list, so a new outcome cannot
     /// be added without a word on every screen (W39-2).
-    pub const ALL: [RunOutcome; 4] = [
+    pub const ALL: [RunOutcome; 7] = [
         RunOutcome::Succeeded,
+        RunOutcome::Refused,
+        RunOutcome::NoWork,
+        RunOutcome::Warned,
         RunOutcome::Failed,
         RunOutcome::Stopped,
         RunOutcome::TimedOut,
@@ -264,6 +277,9 @@ impl RunOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             RunOutcome::Succeeded => "succeeded",
+            RunOutcome::Refused => "refused",
+            RunOutcome::NoWork => "no_work",
+            RunOutcome::Warned => "warned",
             RunOutcome::Failed => "failed",
             RunOutcome::Stopped => "stopped",
             RunOutcome::TimedOut => "timed_out",
@@ -274,6 +290,9 @@ impl RunOutcome {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "succeeded" => Some(RunOutcome::Succeeded),
+            "refused" => Some(RunOutcome::Refused),
+            "no_work" => Some(RunOutcome::NoWork),
+            "warned" => Some(RunOutcome::Warned),
             "failed" => Some(RunOutcome::Failed),
             "stopped" => Some(RunOutcome::Stopped),
             "timed_out" => Some(RunOutcome::TimedOut),
@@ -283,10 +302,9 @@ impl RunOutcome {
 
     /// Whether the run went the way it was meant to.
     ///
-    /// C-3: `succeeded` is the only outcome that is not something to explain. The
-    /// hub's note area names the reason for **every** other outcome, not only
-    /// `failed`, so `timed_out` and `stopped` are not left without their reason on
-    /// the landing screen.
+    /// C-3: `succeeded` is the only outcome that is not something to explain. A clean
+    /// exit whose own summary refuses the instruction, or reports no work, is not one
+    /// of them (F4).
     pub fn is_success(self) -> bool {
         matches!(self, RunOutcome::Succeeded)
     }
@@ -431,9 +449,14 @@ pub fn read_failure(run_dir: &Path) -> Option<String> {
     }
 }
 
-/// The last issue, branch, pull request and comment the newest run named, at most two
-/// short lines. It reads the run's own transcript; a run with no Forgejo context
-/// yields nothing rather than a guess.
+/// The work one run did, correctly typed, at most three short lines.
+///
+/// A call that only *reads* is not work: a later check run must not relabel the pull
+/// request it read as an issue (W31-3). The rows are `issue #N` for the issue the run
+/// read and did not open a pull request for, `pull request #N from <branch>` for a
+/// request it opened or updated (with the branch its own push witness recorded), and
+/// `comment on #N` for a comment it wrote. A run with no Forgejo write yields no
+/// lines, so the previous work block can stay until a later run does new work.
 pub fn work_summary(run_dir: &Path) -> Vec<String> {
     let Ok(file) = transcript::read_checked(run_dir) else {
         return Vec::new();
@@ -441,58 +464,88 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     let Some(file) = file else {
         return Vec::new();
     };
-    let mut issue: Option<String> = None;
-    let mut pull: Option<String> = None;
-    let mut commented = false;
+    let mut read: Option<(String, u64)> = None;
+    let mut pulls: Vec<u64> = Vec::new();
+    let mut comments: Vec<u64> = Vec::new();
     for record in &file.records {
         match record {
             Record::ForgejoCall {
+                tool,
                 repository: Some(repository),
                 number: Some(number),
                 ..
-            } => {
-                issue = Some(format!("{repository}#{number}"));
+            } if tool == crate::forgejo_tools::READ_ISSUE_OR_PULL => {
+                read = Some((repository.clone(), *number));
             }
             Record::ForgejoResult {
                 action: Some(action),
                 number: Some(number),
                 ..
             } => match action.as_str() {
-                "opened" | "updated" => pull = Some(format!("#{number}")),
-                "commented" => commented = true,
+                "opened" | "updated" => {
+                    pulls.retain(|seen| seen != number);
+                    pulls.push(*number);
+                }
+                "commented" => {
+                    comments.retain(|seen| seen != number);
+                    comments.push(*number);
+                }
                 _ => {}
             },
             _ => {}
         }
     }
-    let branch = read_push_witness(run_dir).map(|witness| witness.branch);
-    let mut first = String::new();
-    if let Some(issue) = issue {
-        first.push_str("issue ");
-        first.push_str(&issue);
+    // A push with no comment or pull request is still work (review N5): the branch
+    // is read before the early return, so the witness is never unreachable.
+    let branch = read_push_witness(run_dir)
+        .map(|witness| witness.branch)
+        .filter(|branch| !branch.trim().is_empty());
+    if pulls.is_empty() && comments.is_empty() && branch.is_none() {
+        return Vec::new();
     }
-    if let Some(pull) = pull {
-        if !first.is_empty() {
-            first.push_str(" · ");
+    let mut lines = Vec::new();
+    if let Some((_repository, number)) = read
+        && !pulls.contains(&number)
+    {
+        lines.push(format!("issue #{number}"));
+    }
+    if let Some(number) = pulls.last() {
+        match branch.as_deref().filter(|branch| !branch.trim().is_empty()) {
+            Some(branch) => lines.push(format!("pull request #{number} from {branch}")),
+            None => lines.push(format!("pull request #{number}")),
         }
-        first.push_str("PR ");
-        first.push_str(&pull);
+    } else if let Some(branch) = branch.as_deref() {
+        lines.push(format!("branch {branch}"));
     }
-    let mut second = String::new();
-    if let Some(branch) = branch {
-        second.push_str("branch ");
-        second.push_str(&branch);
+    if let Some(number) = comments.last() {
+        lines.push(format!("comment on #{number}"));
     }
-    if commented {
-        if !second.is_empty() {
-            second.push_str(" · ");
-        }
-        second.push_str("commented");
-    }
-    [first, second]
-        .into_iter()
-        .filter(|line| !line.is_empty())
-        .collect()
+    lines.truncate(3);
+    lines
+}
+
+/// The newest work block across an agent's runs, newest run first. The block stays
+/// until a later run does new work; a read-only run leaves it unchanged.
+pub fn latest_work(runs: &[RunSummary]) -> Vec<String> {
+    runs.iter()
+        .rev()
+        .map(|summary| work_summary(&summary.dir))
+        .find(|lines| !lines.is_empty())
+        .unwrap_or_default()
+}
+
+/// Whether the run's own log says no open issue was assigned to this agent.
+///
+/// The list tool's successful empty answer is the one fact the model is given; the
+/// Agent screen turns it into the sentence that names the fix instead of leaving an
+/// empty work block (F2).
+pub fn says_no_assigned_work(run_dir: &Path, login: &str) -> bool {
+    fs::read_to_string(run_dir.join(LOG_FILE))
+        .map(|text| {
+            text.contains("no open issue is assigned to")
+                || text.contains(&format!("no open issue is assigned to `{login}`"))
+        })
+        .unwrap_or(false)
 }
 
 /// Read a run's push witness, when one was written.
@@ -640,14 +693,151 @@ mod tests {
 
     #[test]
     fn an_outcome_round_trips_through_its_word() {
-        for outcome in [
-            RunOutcome::Succeeded,
-            RunOutcome::Failed,
-            RunOutcome::Stopped,
-            RunOutcome::TimedOut,
-        ] {
+        for outcome in RunOutcome::ALL {
             assert_eq!(RunOutcome::parse(outcome.as_str()), Some(outcome));
         }
         assert_eq!(RunOutcome::parse("half-done"), None);
+        assert!(!RunOutcome::Refused.is_success());
+        assert!(!RunOutcome::NoWork.is_success());
+        assert!(!RunOutcome::Warned.is_success());
+    }
+
+    #[test]
+    fn the_work_block_types_a_pull_request_and_keeps_the_last_work() {
+        let root = scratch_root("work-summary");
+        let idle = root.join("run-1700000000001-0001");
+        let work = root.join("run-1700000000002-0002");
+        fs::create_dir_all(&idle).expect("idle run");
+        fs::create_dir_all(&work).expect("work run");
+
+        // A later check run reads a pull request and does nothing else. That read is
+        // not work and must not relabel the request as an issue (W31-3).
+        let mut transcript = transcript::Transcript::open(&idle).expect("transcript");
+        transcript
+            .append(&Record::forgejo_call(
+                1,
+                1,
+                crate::forgejo_tools::READ_ISSUE_OR_PULL,
+                Some("team/website"),
+                Some(5),
+                "no body",
+            ))
+            .expect("call");
+        transcript
+            .append(&Record::forgejo_result(
+                1,
+                1,
+                crate::forgejo_tools::READ_ISSUE_OR_PULL,
+                Some("team/website"),
+                Some(5),
+                "ok",
+                None,
+                None,
+            ))
+            .expect("result");
+        assert!(work_summary(&idle).is_empty(), "a read is not work");
+
+        // A work run: it read issue #1, opened pull request #5 from fix/api-link and
+        // commented on #1. The branch comes from the run's own push witness.
+        let mut transcript = transcript::Transcript::open(&work).expect("transcript");
+        transcript
+            .append(&Record::forgejo_call(
+                1,
+                1,
+                crate::forgejo_tools::READ_ISSUE_OR_PULL,
+                Some("team/website"),
+                Some(1),
+                "no body",
+            ))
+            .expect("read issue");
+        transcript
+            .append(&Record::forgejo_result(
+                1,
+                2,
+                crate::forgejo_tools::OPEN_PULL_REQUEST,
+                Some("team/website"),
+                Some(5),
+                "ok",
+                Some("http://127.0.0.1:3000/team/website/pulls/5"),
+                Some("opened"),
+            ))
+            .expect("open");
+        transcript
+            .append(&Record::forgejo_result(
+                1,
+                3,
+                crate::forgejo_tools::COMMENT,
+                Some("team/website"),
+                Some(1),
+                "ok",
+                Some("http://127.0.0.1:3000/team/website/issues/1#comment"),
+                Some("commented"),
+            ))
+            .expect("comment");
+        write_push_witness_at(
+            &work,
+            "fix/api-link",
+            "refs/remotes/origin/fix/api-link",
+            None,
+            None,
+        )
+        .expect("witness");
+        let lines = work_summary(&work);
+        assert_eq!(
+            lines,
+            vec![
+                "issue #1".to_owned(),
+                "pull request #5 from fix/api-link".to_owned(),
+                "comment on #1".to_owned()
+            ]
+        );
+        assert!(
+            !lines.iter().any(|line| line == "issue #5"),
+            "the pull request was labelled an issue: {lines:?}"
+        );
+
+        let runs = vec![
+            RunSummary {
+                run_id: "run-1700000000001-0001".to_owned(),
+                outcome: Some(RunOutcome::Succeeded),
+                reason: None,
+                dir: idle.clone(),
+            },
+            RunSummary {
+                run_id: "run-1700000000002-0002".to_owned(),
+                outcome: Some(RunOutcome::Succeeded),
+                reason: None,
+                dir: work.clone(),
+            },
+        ];
+        assert_eq!(latest_work(&runs), lines, "the latest work block was lost");
+    }
+
+    #[test]
+    fn a_push_with_no_comment_or_pull_request_is_work() {
+        // Review N5: the early return used to sit before the push witness, so a run
+        // that only pushed a branch left no work row at all.
+        let root = scratch_root("work-branch-only");
+        let run = root.join("run-1700000000003-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        // A real run always has a transcript; an empty one is enough for the work
+        // reader to get as far as the push witness.
+        transcript::Transcript::open(&run).expect("the transcript");
+        write_push_witness_at(
+            &run,
+            "fix/only-push",
+            "refs/remotes/origin/fix/only-push",
+            Some("team/website"),
+            Some("main"),
+        )
+        .expect("the witness");
+        assert_eq!(work_summary(&run), vec!["branch fix/only-push".to_owned()]);
+
+        let empty = root.join("run-1700000000003-0002");
+        fs::create_dir_all(&empty).expect("an empty run");
+        assert!(
+            work_summary(&empty).is_empty(),
+            "no write and no push is not work"
+        );
     }
 }

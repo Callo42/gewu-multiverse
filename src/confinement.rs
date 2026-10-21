@@ -82,6 +82,23 @@ pub const ENV_STAGE: &str = "GEWU_CONFINE_STAGE";
 /// The person's opt-in to a namespace mechanism, `bwrap` or `unshare`. Landlock is
 /// the automatic mechanism; a namespace is never selected without this word.
 pub const ENV_REQUESTED: &str = "GEWU_CONFINEMENT";
+/// The private file the shell writes its per-command status record to (correction 5).
+pub const ENV_SEGMENTS_FILE: &str = "GEWU_SEGMENTS_FILE";
+
+/// The `bash` the recorder runs under, when the host has one.
+///
+/// `bash` is what offers the `DEBUG` trap with `BASH_COMMAND` and `set -T`; a host
+/// without it keeps `/bin/sh` and the output heuristics (correction 5).
+pub(crate) fn bash_program() -> Option<&'static str> {
+    ["/bin/bash", "/usr/bin/bash"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+}
+
+/// The shell a command runs under: `bash` when present, else the POSIX shell.
+pub(crate) fn shell_program() -> &'static str {
+    bash_program().unwrap_or("/bin/sh")
+}
 
 /// The bytes the enforcement probe must *not* be able to read. The parent writes
 /// them into the probe root; the confined child reads the allowed control file and
@@ -812,7 +829,7 @@ pub(crate) struct NamespacePlan<'a> {
 }
 
 /// The `--confined-shell` entry: apply the method named in the environment, then
-/// become `/bin/sh -c <command>`. Returns only on failure, as a process exit code.
+/// become `shell -c <command>`. Returns only on failure, as a process exit code.
 pub fn run_confined_shell() -> i32 {
     let method = Method::parse(&std::env::var(ENV_METHOD).unwrap_or_default());
     let command = std::env::var(ENV_COMMAND).unwrap_or_default();
@@ -926,9 +943,9 @@ fn exec_plain(command: &str) -> io::Result<std::convert::Infallible> {
     Err(exec_sh(command))
 }
 
-/// Replace this process with `/bin/sh -c command`.
+/// Replace this process with `shell -c command` (`bash` when the host has it).
 fn exec_sh(command: &str) -> io::Error {
-    Command::new("/bin/sh").arg("-c").arg(command).exec()
+    Command::new(shell_program()).arg("-c").arg(command).exec()
 }
 
 /// Landlock: allow the workspace, the system tools and `/dev`, deny everything else.
@@ -1072,7 +1089,7 @@ fn bwrap_args(plan: &NamespacePlan<'_>, command: &str) -> Vec<String> {
         "--chdir".to_owned(),
         plan.workspace.display().to_string(),
         "--".to_owned(),
-        "/bin/sh".to_owned(),
+        shell_program().to_owned(),
         "-c".to_owned(),
         command.to_owned(),
     ]);
@@ -1195,8 +1212,9 @@ fn unshare_script(plan: &NamespacePlan<'_>) -> String {
         }
     }
     script.push_str(&format!(
-        "cd {}\nexec /bin/sh -c \"$GEWU_CONFINE_COMMAND\"\n",
-        quote(&plan.workspace.display().to_string())
+        "cd {}\nexec {} -c \"$GEWU_CONFINE_COMMAND\"\n",
+        quote(&plan.workspace.display().to_string()),
+        shell_program()
     ));
     script
 }

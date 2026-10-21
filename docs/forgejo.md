@@ -52,8 +52,9 @@ The administrator password is not written down at all and never appears in a pro
 argument. The account is created with Forgejo's CLI `--random-password`; the value is
 read only to be discarded. `p` on the Forgejo page resets it through the administration
 API — the value is in the request body, never in a process argument — and shows the new
-value, wrapped whole, for about ten seconds. The consequence is a static line on the page: the password shown before
-the reset no longer works.
+value, wrapped whole, for ten seconds (deliberately two lines at 80 columns). The
+consequence is a static line on the page: the password shown before the reset no
+longer works.
 
 The database runs in WAL mode with `SQLITE_TIMEOUT = 5000` (five seconds), and the
 API client gives each call ten seconds — well under a run's own lifetime — so two
@@ -136,6 +137,14 @@ commit made there is authored by the agent because the account really exists and
 key really pushes the commit.
 
 An agent uses the user's own `git`; no `glab` and no other Git host client is needed.
+The work rule is the assignment: the list tool shows only the open issues assigned to
+the agent's own account in its cloned repositories, and a write outside that scope is
+refused by Forgejo. `forgejo_read_issue_or_pull` can open any issue or pull request by
+number in a cloned repository (a read is not a claim on it); the page therefore says
+`agents work only on issues assigned to them`, not that reads are invisible. The page
+and the README say so, and the Agent screen's empty work area says `no issues assigned
+to gewu-agent-1 yet`. Assign an issue to the agent's Forgejo
+account first; an unassigned issue is not silently picked up.
 The run declares six Forgejo tools beside `shell` only when all three hold: a Forgejo
 context was written for the run, the agent's identity is settled with its own key in
 the credentials file, and at least one repository is cloned into its workspace.
@@ -167,7 +176,9 @@ naming the class and status, never a raw reply body and never a key.
 Each call is recorded in the run's transcript with its tool, repository, number and
 outcome; each successful write is also a run action with its web URL. The board reads
 the newest action for the agent's card. A failed call leaves one visible line on the
-card and in the run log, `✗ <tool>: <first clause of the error>`, and while a call is in
+card and in the run log; the card prefixes it with the newest run's mark (`⚠` for a
+warned run, `✗` for a failed one), the log keeps `✗ <tool>: <first clause of the error>`,
+and while a call is in
 flight the card says which tool it is and how many seconds it has waited.
 
 ## The bundled pages' language

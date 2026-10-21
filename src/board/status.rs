@@ -22,8 +22,8 @@ pub struct Face {
 /// Remove the engine's technical words from anything that may reach the screen.
 ///
 /// The engine contract is allowed to say `endpoint`, `token`, `session` and the rest;
-/// the person is not. This is the one translation point for a free-text reason or an
-/// activity string, so no such word can leak through a notice, a reason or an error.
+/// the person is not. This is the translation point for an engine free-text reason or
+/// an activity string, so no such word can leak through a notice or a reason.
 pub fn plain(text: &str) -> String {
     text.replace("endpoint", "model")
         .replace("provisioning", "setting up")
@@ -32,6 +32,16 @@ pub fn plain(text: &str) -> String {
         .replace("missing", "not set up")
         .replace("blocked", "stopped")
         .replace('`', "")
+}
+
+/// A tool's own failure line, kept as the tool printed it.
+///
+/// The run record already redacts the run's key. The engine's word list is not
+/// applied here: a tool that says `cat: missing.txt: …` names the file it tried to
+/// read, and `cat: not set up.txt: …` would name a different file (correction 8,
+/// NB1). The row is a tool's evidence, not engine prose.
+pub fn tool_failure(text: &str) -> String {
+    text.to_owned()
 }
 
 /// The blocked reason in the words the card uses.
@@ -258,30 +268,83 @@ pub fn first_clause(text: &str) -> String {
         }
     }
     let clause = plain[..cut].trim().trim_end_matches('.');
-    let mut text = if clause.chars().count() > 90 {
-        clause.chars().take(89).collect::<String>()
-    } else {
-        clause.to_owned()
-    };
-    if text.chars().count() > 89 {
-        text.push('…');
+    if clause.chars().count() <= 90 {
+        return clause.to_owned();
     }
-    text
+    let whole: String = clause.chars().take(89).collect();
+    let cut = whole.rfind(' ').unwrap_or(whole.len());
+    format!("{}…", whole[..cut].trim_end())
 }
 
 /// The run count shown on the agent panel: `run 4`.
+///
+/// This is the total from the run records, not the session counter: it does not reset
+/// when the agent starts again or the program reopens (W31-5, F5).
 pub fn run_count(agent: &AgentView) -> String {
-    format!("run {}", agent.sessions_since_start)
+    format!("run {}", agent.runs_total)
 }
 
 /// The symbol and colour of one finished run.
 pub fn session_symbol(end: &SessionEnd) -> (char, Color) {
     match end {
         SessionEnd::Succeeded => ('✓', theme::RUNNING),
+        SessionEnd::Refused { .. } => ('⊘', theme::RED),
+        SessionEnd::NoWork { .. } => ('∅', theme::AMBER),
+        // A clean run whose tool results include a failed command: never a green
+        // tick, and not a refusal either (correction 4).
+        SessionEnd::Warned { .. } => ('⚠', theme::AMBER),
         SessionEnd::Failed { .. } => ('✗', theme::RED),
         SessionEnd::TimedOut => ('◷', theme::AMBER),
         SessionEnd::Stopped => ('■', theme::GREY),
     }
+}
+
+/// The mark beside the newest failed tool call.
+///
+/// `✗` belongs to a run that itself failed; a failed command inside a clean (or
+/// refused) run is a `⚠`. The strip still shows the history, so a previous run's `✓`
+/// may stand beside the newest run's `✗ shell: …`; the newest mark and its row are
+/// what the failed call gets (correction 5, N2).
+pub fn failure_mark(agent: &AgentView) -> char {
+    if matches!(agent.recent.last(), Some(SessionEnd::Failed { .. })) {
+        '✗'
+    } else {
+        '⚠'
+    }
+}
+
+/// The newest run's own final summary when it finished cleanly.
+///
+/// It is drawn beside every finished mark — `✓` included — so the symbol is never
+/// the whole claim: the run says what it did, or that it refused or found no work
+/// (review B2).
+pub fn run_result(agent: &AgentView) -> Option<String> {
+    if matches!(agent.session, SessionState::Running { .. }) {
+        return None;
+    }
+    let newest = agent.recent.last()?;
+    match newest {
+        SessionEnd::Succeeded
+        | SessionEnd::Refused { .. }
+        | SessionEnd::NoWork { .. }
+        | SessionEnd::Warned { .. } => agent.last_result.as_deref().map(first_clause),
+        _ => None,
+    }
+}
+
+/// Whether the result row belongs to the warned mark, so it is drawn as a caution
+/// (amber) rather than ordinary detail beside a `✓`.
+pub fn run_result_is_warning(agent: &AgentView) -> bool {
+    matches!(agent.recent.last(), Some(SessionEnd::Warned { .. }))
+}
+
+/// Whether the result row is a refusal/no-work, so it is drawn as a caution and not
+/// as ordinary detail beside a `✓`.
+pub fn run_result_is_refusal(agent: &AgentView) -> bool {
+    matches!(
+        agent.recent.last(),
+        Some(SessionEnd::Refused { .. } | SessionEnd::NoWork { .. })
+    )
 }
 
 /// Whether a word is one the product must not show. Used by the render tests.
@@ -310,6 +373,7 @@ mod tests {
             desired,
             session,
             sessions_since_start: 4,
+            runs_total: 4,
             recent: vec![
                 SessionEnd::Succeeded,
                 SessionEnd::Failed {
@@ -322,10 +386,12 @@ mod tests {
             activity: Some("commented #12".to_owned()),
             activity_at: Some(SystemTime::now() - Duration::from_secs(120)),
             last_error: None,
+            last_result: None,
             last_failure: None,
             current_tool: None,
             current_tool_seconds: 0,
             last_work: Vec::new(),
+            no_assigned_work: false,
         }
     }
 
@@ -443,6 +509,40 @@ mod tests {
         assert_eq!(
             plain("`agent-4` is connected as `gewu-agent-4`"),
             "agent-4 is connected as gewu-agent-4"
+        );
+    }
+
+    #[test]
+    fn a_tool_failure_keeps_the_tool_words() {
+        // Correction 8, NB1: the failure row is the tool's own diagnostic. The
+        // engine-word translation turned `cat: missing.txt` into a different file
+        // name on the card; a tool's file name is not engine prose.
+        assert_eq!(
+            tool_failure("shell: cat: missing.txt: No such file or directory"),
+            "shell: cat: missing.txt: No such file or directory"
+        );
+        assert_eq!(
+            tool_failure("shell: token.txt: Permission denied"),
+            "shell: token.txt: Permission denied"
+        );
+    }
+
+    #[test]
+    fn the_card_reads_the_total_run_count_not_the_session_counter() {
+        let mut agent = agent(SessionState::Idle, Desired::Stopped);
+        agent.sessions_since_start = 1;
+        agent.runs_total = 7;
+        assert_eq!(run_count(&agent), "run 7");
+        let refused = SessionEnd::Refused {
+            reason: "I could not do it".to_owned(),
+        };
+        assert_eq!(session_symbol(&refused).0, '⊘');
+        assert_eq!(
+            session_symbol(&SessionEnd::NoWork {
+                reason: "nothing assigned".to_owned(),
+            })
+            .0,
+            '∅'
         );
     }
 }
