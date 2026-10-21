@@ -26,7 +26,7 @@ const MAX_AGENTS: usize = 20;
 /// supply exactly these five sentences.
 const TERMS: [&str; 5] = [
     "Agents use this computer with your permissions.",
-    "They can read your files, including saved keys.",
+    "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
     "Each has its own login on your Forgejo.",
     "Started agents keep going until you stop them.",
     "Their work is sent to your model provider.",
@@ -50,6 +50,9 @@ pub struct FakeEngine {
     instruction_root: PathBuf,
     reveal_sent: bool,
     shutdown_called: bool,
+    /// Whether the host can confine a run. The fake is confined by default; the
+    /// `unconfined` constructor adds the sixth warning and takes the claim away.
+    confined: bool,
 }
 
 struct FakeAgent {
@@ -63,7 +66,14 @@ struct FakeAgent {
     instruction_path: PathBuf,
     instruction_chars: usize,
     instruction_first_line: Option<String>,
+    instruction_lines: usize,
     activity: Option<String>,
+    activity_at: Option<SystemTime>,
+    last_error: Option<String>,
+    last_failure: Option<String>,
+    current_tool: Option<String>,
+    current_tool_seconds: u64,
+    last_work: Vec<String>,
     session_ticks: u32,
     restart_ticks: u32,
 }
@@ -95,7 +105,16 @@ impl FakeEngine {
             instruction_root: root,
             reveal_sent: false,
             shutdown_called: false,
+            confined: true,
         }
+    }
+
+    /// The same fake on a host where runs are not confined: five warnings plus the
+    /// sixth sentence, and `confined = false` on the board.
+    pub fn unconfined() -> Self {
+        let mut fake = Self::new();
+        fake.confined = false;
+        fake
     }
 
     /// Whether [`EngineApi::shutdown`] has been called.
@@ -171,6 +190,7 @@ impl FakeEngine {
             .map(str::trim)
             .find(|line| !line.is_empty())
             .map(str::to_owned);
+        agent.instruction_lines = text.lines().filter(|line| !line.trim().is_empty()).count();
     }
 
     fn begin_session(agent: &mut FakeAgent) {
@@ -189,6 +209,17 @@ impl FakeEngine {
             )),
             _ => None,
         };
+        agent.activity_at = Some(SystemTime::now());
+        agent.last_work = if agent.activity.is_some() {
+            vec![
+                format!("issue team/workspace#{}", agent.sessions_since_start),
+                "branch demo · PR #3".to_owned(),
+            ]
+        } else {
+            Vec::new()
+        };
+        agent.current_tool = Some("shell".to_owned());
+        agent.current_tool_seconds = 3;
     }
 
     fn end_session(agent: &mut FakeAgent) {
@@ -203,12 +234,16 @@ impl FakeEngine {
         if agent.recent.len() > 10 {
             agent.recent.remove(0);
         }
+        agent.last_error = match &end {
+            SessionEnd::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
         agent.session = SessionState::Restarting {
             next_at: SystemTime::now() + Duration::from_secs(1),
             last: end,
         };
         agent.restart_ticks = RESTART_TICKS;
-        agent.activity = None;
+        agent.current_tool = None;
     }
 
     fn stop_agent(agent: &mut FakeAgent) {
@@ -220,7 +255,8 @@ impl FakeEngine {
         }
         agent.desired = Desired::Stopped;
         agent.session = SessionState::Idle;
-        agent.activity = None;
+        agent.current_tool = None;
+        agent.current_tool_seconds = 0;
         agent.session_ticks = 0;
         agent.restart_ticks = 0;
     }
@@ -336,7 +372,14 @@ impl FakeEngine {
             instruction_path,
             instruction_chars: 0,
             instruction_first_line: None,
+            instruction_lines: 0,
             activity: None,
+            activity_at: None,
+            last_error: None,
+            last_failure: None,
+            current_tool: None,
+            current_tool_seconds: 0,
+            last_work: Vec::new(),
             session_ticks: 0,
             restart_ticks: 0,
         }
@@ -420,12 +463,25 @@ impl EngineApi for FakeEngine {
                 recent: agent.recent.clone(),
                 instruction_chars: agent.instruction_chars,
                 instruction_first_line: agent.instruction_first_line.clone(),
+                instruction_lines: agent.instruction_lines,
                 activity: agent.activity.clone(),
+                activity_at: agent.activity_at,
+                last_error: agent.last_error.clone(),
+                last_failure: agent.last_failure.clone(),
+                current_tool: agent.current_tool.clone(),
+                current_tool_seconds: agent.current_tool_seconds,
+                last_work: agent.last_work.clone(),
             })
             .collect();
         BoardView {
             terms_acknowledged: self.terms_acknowledged,
-            terms: TERMS.iter().map(|item| (*item).to_owned()).collect(),
+            terms: {
+                let mut terms: Vec<String> = TERMS.iter().map(|item| (*item).to_owned()).collect();
+                if !self.confined {
+                    terms.push("Runs are not confined on this computer.".to_owned());
+                }
+                terms
+            },
             setup_complete: self.terms_acknowledged
                 && !self.endpoint_url.trim().is_empty()
                 && !self.endpoint_model.trim().is_empty()
@@ -434,9 +490,18 @@ impl EngineApi for FakeEngine {
                 state: self.forgejo.clone(),
                 url: "http://127.0.0.1:3000".to_owned(),
                 version: "17.0.0".to_owned(),
-                admin_login: "admin".to_owned(),
+                admin_login: "owner".to_owned(),
                 organisation: "team".to_owned(),
                 repositories: self.repositories,
+                repository_names: (0..self.repositories)
+                    .map(|index| match index {
+                        0 => "team/workspace".to_owned(),
+                        1 => "team/website".to_owned(),
+                        other => format!("team/repo-{other}"),
+                    })
+                    .collect(),
+                events: Vec::new(),
+                admin_login_kept: false,
             },
             agents,
             endpoint: EndpointView {
@@ -449,6 +514,8 @@ impl EngineApi for FakeEngine {
             },
             notice: self.notice.take(),
             admin_password,
+            confined: self.confined,
+            upgrade: None,
         }
     }
 
@@ -598,7 +665,7 @@ mod tests {
             view.terms,
             [
                 "Agents use this computer with your permissions.",
-                "They can read your files, including saved keys.",
+                "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
                 "Each has its own login on your Forgejo.",
                 "Started agents keep going until you stop them.",
                 "Their work is sent to your model provider.",

@@ -27,6 +27,16 @@ pub enum Invocation {
         /// The prompt git asked with. It is not a secret and is not printed.
         prompt: String,
     },
+    /// Become the confined shell of one agent run. Started by a run, never by a
+    /// person; the mechanism, command, workspace and hidden paths come from the
+    /// environment so no path is ever a command-line word a tool could read back.
+    ConfinedShell,
+    /// Prove in this child that a Landlock ruleset is fully enforced. Started by the
+    /// product's own probe, never by a person.
+    LandlockProbe {
+        /// The probe root holding the readable control file and the denied secret.
+        root: PathBuf,
+    },
     /// Fetch the pinned Forgejo into the data directory and exit.
     InstallForgejo,
     /// Print the help text.
@@ -95,6 +105,21 @@ where
             "--git-askpass" => {
                 let prompt = args.collect::<Vec<String>>().join(" ");
                 return Ok(Invocation::GitAskpass { prompt });
+            }
+            // A run starts this mode with no other argument. It is not a person's
+            // mode and is not in the help.
+            "--confined-shell" => {
+                if args.next().is_some() {
+                    return Err("--confined-shell takes no argument".to_owned());
+                }
+                return Ok(Invocation::ConfinedShell);
+            }
+            // The product's own enforcement probe; it is not a person's mode and is
+            // not in the help. The root holds two files and no secret.
+            "--landlock-probe" => {
+                return Ok(Invocation::LandlockProbe {
+                    root: value_after(&mut args, "--landlock-probe")?,
+                });
             }
             "--config-dir" => {
                 if root.is_some() {

@@ -11,12 +11,12 @@ use crate::board::text as text_util;
 use crate::board::theme;
 use crate::board::{Board, Screen};
 use crate::engine_api::{
-    AgentView, Desired, EndpointTest, ForgejoState, ForgejoView, Provisioning,
+    AgentView, Desired, EndpointTest, ForgejoState, ForgejoView, Provisioning, SessionState,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 
 /// One card on the home screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,12 +299,22 @@ fn draw_forgejo_box(
             theme::fg(theme::FG),
         );
         y += 1;
-        let team = format!(
-            "{} · {} {}",
-            view.organisation,
-            view.repositories,
-            repositories_plural(view.repositories)
-        );
+        let team = if view.repository_names.is_empty() {
+            format!(
+                "{} · {} {}",
+                view.organisation,
+                view.repositories,
+                repositories_plural(view.repositories)
+            )
+        } else {
+            format!(
+                "{} · {} {} · {}",
+                view.organisation,
+                view.repositories,
+                repositories_plural(view.repositories),
+                view.repository_names.join(" · ")
+            )
+        };
         text_util::put(
             buf,
             rect,
@@ -325,19 +335,25 @@ fn draw_forgejo_box(
         );
         if rect.height >= 7 {
             y += 1;
-            let version = format!("version {}", view.version);
+            let event = view
+                .events
+                .last()
+                .cloned()
+                .map(|event| status::plain(&event))
+                .unwrap_or_else(|| format!("version {}", view.version));
             text_util::put(
                 buf,
                 rect,
                 info_x,
                 y,
-                &text_util::ellipsize(&version, room),
+                &text_util::ellipsize(&event, room),
                 theme::fg(theme::MUTED),
             );
         }
         if rect.height >= 8 {
             y += 1;
-            let login = format!("your login: {}", view.admin_login);
+            let kept = if view.admin_login_kept { " (kept)" } else { "" };
+            let login = format!("your login: {}{kept}", view.admin_login);
             text_util::put(
                 buf,
                 rect,
@@ -440,14 +456,35 @@ fn draw_card(
         rect.width.saturating_sub(2),
         rect.height.saturating_sub(2),
     );
+    // The run count is on every card, not only the roomy one (N5). On the
+    // three-row card it shares the login row, so the login gives way when the two
+    // would meet.
+    let count = status::run_count(agent);
+    let count_width = text_util::width(&count) as u16;
+    let login_room = if roomy {
+        interior.width.saturating_sub(2) as usize
+    } else {
+        interior.width.saturating_sub(2 + count_width + 1) as usize
+    };
     text_util::put(
         buf,
         interior,
         interior.x + 1,
         rect.y + 1,
-        &text_util::ellipsize(&login, interior.width.saturating_sub(2) as usize),
+        &text_util::ellipsize(&login, login_room.max(1)),
         theme::card(theme::MUTED, selected),
     );
+    if !roomy {
+        let count_x = rect.right().saturating_sub(count_width + 2);
+        text_util::put(
+            buf,
+            interior,
+            count_x,
+            rect.y + 1,
+            &count,
+            theme::card(theme::MUTED, selected),
+        );
+    }
 
     if roomy && rect.height >= 5 {
         text_util::put(
@@ -457,6 +494,15 @@ fn draw_card(
             rect.y + 2,
             &text_util::ellipsize(&face.status, interior.width.saturating_sub(1) as usize),
             theme::card(face.colour, selected),
+        );
+        let count_x = rect.right().saturating_sub(count_width + 2);
+        text_util::put(
+            buf,
+            interior,
+            count_x,
+            rect.y + 2,
+            &count,
+            theme::card(theme::MUTED, selected),
         );
         if let Some(activity) = status::activity(agent) {
             let lines = text_util::wrap(&activity, interior.width.saturating_sub(1) as usize);
@@ -528,6 +574,12 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
     if card_w < 14 {
         columns = 1;
         card_w = inner.width.saturating_sub(2).min(max_card_w);
+    }
+    // At the 72-column floor the picture is one vertical list with one spine, not a
+    // row with a detached card below it (F7).
+    if area.width < 80 {
+        columns = 1;
+        card_w = inner.width.saturating_sub(6).clamp(20, 56);
     }
 
     let capacity = if content_h > forgejo_h + trunk_gap {
@@ -816,12 +868,17 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     );
 
     let wire_style = theme::fg(theme::WIRE);
-    if let Some(first_bus) = geometry.bus_ys.first() {
-        for y in forgejo_rect.bottom()..*first_bus {
-            put_arms(buf, buf.area, geometry.trunk_x, y, U | D, wire_style);
+    if geometry.columns > 1 {
+        if let Some(first_bus) = geometry.bus_ys.first() {
+            for y in forgejo_rect.bottom()..*first_bus {
+                put_arms(buf, buf.area, geometry.trunk_x, y, U | D, wire_style);
+            }
         }
     }
     for (row, bus_y) in geometry.bus_ys.iter().enumerate() {
+        if geometry.columns == 1 {
+            break;
+        }
         let index = geometry.first_visible + row * geometry.columns;
         let in_row = (agent_count.saturating_sub(index)).min(geometry.columns);
         if in_row == 0 {
@@ -885,6 +942,29 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
             );
             let selected = !board.forgejo_selected && agent_index == board.selection;
             draw_card(buf, rect, agent, selected, roomy, true);
+            if geometry.columns == 1 {
+                // One vertical list, one spine: the wire above this card leaves the
+                // Forgejo box (first card) or the previous card's bottom centre.
+                let junction_x = card_junction(rect);
+                if let Some(previous) = layout.cards.last() {
+                    put_arms(
+                        buf,
+                        buf.area,
+                        card_junction(previous.rect),
+                        previous.rect.bottom() - 1,
+                        L | R | D,
+                        wire_style,
+                    );
+                }
+                let from = layout
+                    .cards
+                    .last()
+                    .map(|previous| previous.rect.bottom())
+                    .unwrap_or(forgejo_rect.bottom());
+                for wire_y in from..rect.y {
+                    put_arms(buf, buf.area, junction_x, wire_y, U | D, wire_style);
+                }
+            }
             layout.cards.push(CardSlot {
                 agent: agent_index,
                 rect,
@@ -913,7 +993,8 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
             .filter(|agent| agent.desired == Desired::Started)
             .count();
         let line = format!(
-            "quit stops {started} agents and Forgejo; they start again when you reopen — q again quits"
+            "quit stops {started} {} and Forgejo; they start again when you reopen — q again quits",
+            plural(started)
         );
         let width = inner.width.saturating_sub(2) as usize;
         for (y, part) in (footer_top..).zip(text_util::wrap(&line, width).into_iter().take(2)) {
@@ -932,19 +1013,25 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
         return;
     }
 
-    let confirm = board
-        .confirm_remove
-        .as_ref()
-        .map(|name| format!("remove {name}? y/n"));
+    let confirm = board.confirm_remove.as_ref().map(|name| {
+        format!("remove {name}? token revoked, account deactivated, history and folder kept — y/n")
+    });
     if let Some(line) = confirm {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            footer_top,
-            &line,
-            theme::bold(theme::AMBER),
-        );
+        let width = inner.width.saturating_sub(2) as usize;
+        for (offset, part) in text_util::wrap(&line, width)
+            .into_iter()
+            .take(2)
+            .enumerate()
+        {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                footer_top + offset as u16,
+                &part,
+                theme::bold(theme::AMBER),
+            );
+        }
     } else {
         text_util::put(
             buf,
@@ -992,16 +1079,48 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
             theme::fg(theme::MUTED),
         );
     }
+    let bottom = inner.bottom().saturating_sub(1);
     if let Some(notice) = board.notice() {
         text_util::put(
             buf,
             inner,
             inner.x + 1,
-            inner.bottom().saturating_sub(1),
+            bottom,
             &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
             theme::fg(theme::FG),
         );
+    } else if let Some(line) = waiting_sentence(board) {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            bottom,
+            &text_util::ellipsize(&line, inner.width.saturating_sub(2) as usize),
+            theme::fg(theme::AMBER),
+        );
+    } else if !board.view.confined {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            bottom,
+            "runs are not confined on this computer",
+            theme::fg(theme::AMBER),
+        );
     }
+}
+
+/// A started agent that cannot run says why in the footer, in the same words as the
+/// card, instead of a bare `started`.
+fn waiting_sentence(board: &Board) -> Option<String> {
+    let agent = board.selected_agent()?;
+    let SessionState::Blocked { reason } = &agent.session else {
+        return None;
+    };
+    Some(match status::blocked_words(reason) {
+        "needs an instruction" => "not started — write an instruction first".to_owned(),
+        other => format!("not started — {other}"),
+    })
 }
 
 fn draw_build_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
@@ -1050,8 +1169,11 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
         })
         .collect();
     let total_lines: usize = blocks.iter().map(|(count, _)| *count).sum();
+    // When the warnings just fit at the 72x18 floor there is no row left for a blank
+    // separator; the numbered items still read as separate items. Never trade an
+    // unseen warning for spacing.
     let spacing = if blocks.len() > 1 {
-        ((content_h as usize).saturating_sub(total_lines) / (blocks.len() - 1)).clamp(1, 4)
+        ((content_h as usize).saturating_sub(total_lines) / (blocks.len() - 1)).clamp(0, 4)
     } else {
         1
     };
@@ -1160,12 +1282,13 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let mut y = form.y + 1;
     for (index, label) in labels.iter().enumerate() {
         let selected = index == board.model_focus;
+        let marker = if selected { "▸ " } else { "  " };
         text_util::put(
             buf,
             form,
             form.x + 2,
             y,
-            label,
+            &format!("{marker}{label}"),
             if selected {
                 theme::bold(theme::ACCENT)
             } else {
@@ -1175,7 +1298,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
         y += 1;
         let field = Rect::new(form.x + 2, y, form.width.saturating_sub(4), 1);
         let style = if selected {
-            theme::field(theme::FG)
+            theme::focus_field()
         } else {
             theme::field(theme::MUTED)
         };
@@ -1228,10 +1351,8 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     }
     let actions = if board.model_editing {
         "⏎ keep    esc cancel"
-    } else if board.model_origin == crate::board::ModelOrigin::FirstRun {
-        "e edit   t test   ⏎ next   esc back"
     } else {
-        "e edit   t test   ⏎ save   esc back"
+        "e edit   t test   ⏎ next   esc back"
     };
     text_util::put(
         buf,
@@ -1468,7 +1589,12 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         border,
     );
 
-    let face = status::agent_face(&agent);
+    // The rule above the run strip is a row of its own: content stops before it and
+    // never paints over it (F1). It is only drawn when it cannot cut into the status
+    // rows at the top of the smallest card.
+    let strip_y = card.bottom().saturating_sub(3);
+    let rule_y = strip_y.saturating_sub(1);
+    let has_rule = rule_y > card.y + 4;
     let divider = |buf: &mut Buffer, y: u16| {
         for x in card.x + 1..card.right() - 1 {
             put_arms(buf, card, x, y, L | R, border);
@@ -1476,13 +1602,12 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         put_arms(buf, card, card.x, y, U | D | R, border);
         put_arms(buf, card, card.right() - 1, y, U | D | L, border);
     };
-    if card.height > 8 {
-        divider(buf, card.y + 3);
+    if has_rule {
+        divider(buf, rule_y);
     }
-    let strip_y = card.bottom().saturating_sub(3);
-    if strip_y > card.y + 4 {
-        divider(buf, strip_y - 1);
-    }
+
+    let face = status::agent_face(&agent);
+    let width = card.width.saturating_sub(4) as usize;
     let interior_x = card.x + 2;
     text_util::put(
         buf,
@@ -1504,49 +1629,152 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         &login,
         theme::card(theme::MUTED, true),
     );
-    if let Some(detail) = status::activity(&agent) {
+
+    // The second row is the one line worth reading beside the status: what it is
+    // doing now, else the last failure, else the last error. Never a stale sentence
+    // pretending to be current: `status::activity` adds `last:` and an age when the
+    // run is over.
+    let activity = status::activity(&agent);
+    let failure = agent
+        .last_failure
+        .as_ref()
+        .map(|failure| format!("✗ {}", status::plain(failure)))
+        .or_else(|| {
+            agent
+                .last_error
+                .as_ref()
+                .map(|error| format!("✗ {}", status::first_clause(error)))
+        });
+    let second = activity
+        .clone()
+        .map(|activity| (activity, theme::card(theme::MUTED, true)))
+        .or_else(|| {
+            failure
+                .clone()
+                .map(|failure| (failure, theme::card(theme::RED, true)))
+        });
+    if let Some((line, style)) = second {
         text_util::put(
             buf,
             card,
             interior_x,
             card.y + 2,
-            &text_util::ellipsize(&detail, card.width.saturating_sub(4) as usize),
-            theme::card(theme::MUTED, true),
+            &text_util::ellipsize(&line, width),
+            style,
         );
     }
+    // A failure is shown even when there is an activity line to show too: the two
+    // answer different questions (`what did it manage` and `what went wrong`).
+    let failure_extra = u16::from(activity.is_some() && failure.is_some());
+    if failure_extra == 1 {
+        if let Some(failure) = failure.as_deref() {
+            text_util::put(
+                buf,
+                card,
+                interior_x,
+                card.y + 3,
+                &text_util::ellipsize(failure, width),
+                theme::card(theme::RED, true),
+            );
+        }
+    }
+
+    // The work block: the last issue / pull request / branch / comment the newest run
+    // named, in at most two lines (F5).
+    let work_start = card.y + 3 + failure_extra;
+    let work_rows = if has_rule && rule_y >= work_start + 4 && !agent.last_work.is_empty() {
+        2.min(agent.last_work.len()) as u16
+    } else {
+        0
+    };
+    for (index, line) in agent.last_work.iter().take(work_rows as usize).enumerate() {
+        text_util::put(
+            buf,
+            card,
+            interior_x,
+            work_start + index as u16,
+            &text_util::ellipsize(line, width),
+            theme::card(theme::FG, true),
+        );
+    }
+
+    let label_y = work_start + work_rows;
+    let text_top = label_y + 1;
+    let text_bottom = if has_rule { rule_y } else { strip_y };
+    let rows = text_bottom.saturating_sub(text_top) as usize;
     text_util::put(
         buf,
         card,
         interior_x,
-        card.y + 4,
+        label_y,
         "instruction",
         theme::card(theme::MUTED, true),
     );
     match &agent.instruction_first_line {
         Some(line) => {
-            let width = card.width.saturating_sub(4) as usize;
-            for (row, part) in text_util::wrap(line, width).into_iter().take(3).enumerate() {
+            let wrapped = text_util::wrap(line, width);
+            // Count wrapped display rows, not physical lines: a long one-line
+            // instruction can fill or overrun the area on its own (B6). The count
+            // the marker carries is what the person cannot see: the wrapped rows
+            // that did not fit plus every physical line after the first.
+            let more_physical = agent.instruction_lines.saturating_sub(1);
+            // The whole first line fits and there is no physical line after it: draw
+            // it. Otherwise the marker is owed: it counts the wrapped rows of the
+            // first line that did not fit plus every later physical line, which the
+            // view does not carry at all.
+            if more_physical == 0 && wrapped.len() <= rows {
+                for (row, part) in wrapped.iter().enumerate() {
+                    text_util::put(
+                        buf,
+                        card,
+                        interior_x,
+                        text_top + row as u16,
+                        &text_util::ellipsize(part, width),
+                        theme::card(theme::FG, true),
+                    );
+                }
+            } else if rows > 0 {
+                // One row is the marker's; when only one row exists it is the marker
+                // itself, so dropped text is never silent.
+                let take = rows - 1;
+                let drawn = take.min(wrapped.len());
+                for (row, part) in wrapped.iter().take(drawn).enumerate() {
+                    text_util::put(
+                        buf,
+                        card,
+                        interior_x,
+                        text_top + row as u16,
+                        &text_util::ellipsize(part, width),
+                        theme::card(theme::FG, true),
+                    );
+                }
+                let hidden = (wrapped.len() - drawn) + more_physical;
                 text_util::put(
                     buf,
                     card,
                     interior_x,
-                    card.y + 5 + row as u16,
-                    &part,
-                    theme::card(theme::FG, true),
+                    text_top + drawn as u16,
+                    &text_util::ellipsize(&format!("… ({hidden} more lines)"), width),
+                    theme::card(theme::MUTED, true),
                 );
             }
         }
         None => {
-            text_util::put(
-                buf,
-                card,
-                interior_x,
-                card.y + 5,
-                "no instruction — e writes one",
-                theme::card_bold(theme::RED, true),
-            );
+            if rows > 0 {
+                text_util::put(
+                    buf,
+                    card,
+                    interior_x,
+                    text_top,
+                    &text_util::ellipsize("no instruction — e writes one", width),
+                    theme::card_bold(theme::RED, true),
+                );
+            }
         }
     }
+
+    // The run marks are bounded: five, then `+N`, and a legend. A row of unlabeled
+    // marks was a tally nobody could read (F8).
     text_util::put(
         buf,
         card,
@@ -1556,10 +1784,9 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         theme::card(theme::MUTED, true),
     );
     let mut x = interior_x + 10;
-    if agent.recent.is_empty() {
-        text_util::put(buf, card, x, strip_y, "—", theme::card(theme::MUTED, true));
-    }
-    for end in agent.recent.iter().rev().take(10).rev() {
+    let total = agent.recent.len();
+    let shown = total.min(5);
+    for end in agent.recent.iter().skip(total - shown) {
         let (symbol, colour) = status::session_symbol(end);
         text_util::put(
             buf,
@@ -1570,9 +1797,19 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::card(colour, true),
         );
         x += 2;
-        if x > card.right().saturating_sub(3) {
-            break;
-        }
+    }
+    if total > shown {
+        let rest = total - shown;
+        text_util::put(
+            buf,
+            card,
+            x,
+            strip_y,
+            &format!("+{rest}"),
+            theme::card(theme::MUTED, true),
+        );
+    } else if total == 0 {
+        text_util::put(buf, card, x, strip_y, "—", theme::card(theme::MUTED, true));
     }
     let count = status::run_count(&agent);
     let count_x = card
@@ -1586,41 +1823,59 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         &count,
         theme::card(theme::MUTED, true),
     );
+    if card.bottom().saturating_sub(1) > strip_y + 1 {
+        text_util::put(
+            buf,
+            card,
+            interior_x,
+            strip_y + 1,
+            &text_util::ellipsize("✓ ok   ✗ failed   ■ stopped   ◷ timed out", width),
+            theme::card(theme::MUTED, true),
+        );
+    }
 
-    let start_stop = "s start/stop";
     let actions_y = inner.bottom().saturating_sub(2);
     if let Some(name) = &board.confirm_remove {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            actions_y,
-            &format!("remove {name}? y/n"),
-            theme::bold(theme::AMBER),
+        let line = format!(
+            "remove {name}? token revoked, account deactivated, history and folder kept — y/n"
         );
-    } else if text_util::width(&format!(
-        "{start_stop}   e instruction   l log   t transcript   d remove   esc back"
-    )) <= inner.width.saturating_sub(2) as usize
+        let width = inner.width.saturating_sub(2) as usize;
+        for (offset, part) in text_util::wrap(&line, width)
+            .into_iter()
+            .take(2)
+            .enumerate()
+        {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                actions_y.saturating_sub(1) + offset as u16,
+                &part,
+                theme::bold(theme::AMBER),
+            );
+        }
+    } else if text_util::width(
+        "s start/stop   e instruction   l log   t transcript   d remove   esc back",
+    ) <= inner.width.saturating_sub(2) as usize
     {
-        let line =
-            format!("{start_stop}   e instruction   l log   t transcript   d remove   esc back");
+        let line = "s start/stop   e instruction   l log   t transcript   d remove   esc back";
         text_util::put(
             buf,
             inner,
             inner.x + 1,
             actions_y,
-            &line,
+            line,
             theme::fg(theme::MUTED),
         );
     } else {
-        let line1 = format!("{start_stop}   e instruction   l log");
+        let line1 = "s start/stop   e instruction   l log";
         let line2 = "t transcript   d remove   esc back";
         text_util::put(
             buf,
             inner,
             inner.x + 1,
             actions_y.saturating_sub(1),
-            &line1,
+            line1,
             theme::fg(theme::MUTED),
         );
         text_util::put(
@@ -1651,29 +1906,35 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let content_bottom = inner.bottom().saturating_sub(2);
     let content_h = content_bottom.saturating_sub(content_top);
     let view = &board.view.forgejo;
-    let label_x = inner.x + 4;
-    let value_x = inner.x + 20;
-    let room = inner.width.saturating_sub(22) as usize;
-    let mut rows: Vec<(&str, String, Color)> = vec![
-        (
-            "address",
-            if forgejo_address(view) == "—" {
-                "not set up yet".to_owned()
-            } else {
-                view.url.clone()
-            },
-            theme::FG,
-        ),
-        ("version", view.version.clone(), theme::FG),
-        ("organisation", view.organisation.clone(), theme::FG),
-        ("repositories", format!("{}", view.repositories), theme::FG),
-        ("your login:", view.admin_login.clone(), theme::FG),
-    ];
-    let password = match board.revealed_password() {
-        Some(password) => password.to_owned(),
-        None => "••••••••   p shows".to_owned(),
+    let label_x = inner.x + 2;
+    let value_x = inner.x + 18;
+    let room = inner.width.saturating_sub(20) as usize;
+    let small = area.height <= 18 || area.width < 80;
+    let repositories = if view.repository_names.is_empty() {
+        "—".to_owned()
+    } else {
+        view.repository_names.join(" · ")
     };
-    rows.push(("password", password, theme::FG));
+    let team_page = format!(
+        "{}/orgs/{}/teams/{}",
+        view.url,
+        view.organisation,
+        bundled_team()
+    );
+    let login = if view.admin_login_kept {
+        format!("{}  (kept from an earlier setup)", view.admin_login)
+    } else {
+        view.admin_login.clone()
+    };
+    // The password is never truncated: when it is shown, it wraps whole. An
+    // ellipsis on a secret makes a value that cannot be typed (P3).
+    let (password, revealed) = match board.revealed_password() {
+        Some(password) => (password.to_owned(), true),
+        None => (
+            "••••••••   p resets it — the old one stops working".to_owned(),
+            false,
+        ),
+    };
     let agents = if board.view.agents.is_empty() {
         "—".to_owned()
     } else {
@@ -1685,55 +1946,209 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
             .collect::<Vec<_>>()
             .join(" · ")
     };
-    rows.push(("agents", agents, theme::FG));
-    let agent_lines = text_util::wrap(
-        &rows.last().map(|row| row.1.clone()).unwrap_or_default(),
-        room,
-    );
-    let agent_extra = agent_lines.len().saturating_sub(1) as u16;
-    let line_count = rows.len() as u16 + agent_extra + 2;
-    let spacing = if line_count > 1 {
-        (content_h.saturating_sub(line_count) / (line_count - 1)).clamp(0, 3)
-    } else {
-        1
-    };
-    let block = line_count + spacing * line_count.saturating_sub(1);
-    let mut y = content_top + content_h.saturating_sub(block) / 2;
-    for (label, value, colour) in rows {
-        text_util::put(buf, inner, label_x, y, label, theme::fg(theme::MUTED));
-        let lines = if label == "agents" {
-            text_util::wrap(&value, room)
+    let events = view
+        .events
+        .iter()
+        .map(|event| status::plain(event))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let mut rows: Vec<(&str, Vec<String>)> = vec![
+        (
+            "address",
+            vec![if forgejo_address(view) == "—" {
+                "not set up yet".to_owned()
+            } else {
+                view.url.clone()
+            }],
+        ),
+        ("version", vec![view.version.clone()]),
+        ("organisation", vec![view.organisation.clone()]),
+        ("repositories", text_util::wrap(&repositories, room)),
+        ("your login:", text_util::wrap(&login, room)),
+        ("password", text_util::wrap(&password, room)),
+        (
+            "agents can",
+            vec!["write to team repositories only".to_owned()],
+        ),
+        ("team page", text_util::wrap(&team_page, room)),
+        ("agents", text_util::wrap(&agents, room)),
+    ];
+    if !events.is_empty() {
+        rows.push(("events", text_util::wrap(&events, room)));
+    }
+    if small {
+        // At the floor the page keeps the facts a person needs to sign in and see
+        // where the work is; the team address and events return with more room.
+        rows.retain(|(label, _)| {
+            matches!(
+                *label,
+                "address" | "repositories" | "your login:" | "password" | "agents can" | "agents"
+            )
+        });
+    }
+    // Drop the optional rows when the height is tight, never the password or login.
+    let optional = ["events", "team page", "organisation", "version", "agents"];
+    loop {
+        let lines: usize = rows.iter().map(|(_, lines)| lines.len().max(1)).sum();
+        let spacing = if rows.len() > 1 && lines < content_h as usize {
+            ((content_h as usize - lines) / (rows.len() - 1)).min(1)
         } else {
-            vec![value]
+            0
         };
-        for (index, line) in lines.into_iter().enumerate() {
+        if lines + spacing * rows.len().saturating_sub(1) <= content_h as usize {
+            break;
+        }
+        let Some(index) = rows.iter().position(|(label, _)| optional.contains(label)) else {
+            break;
+        };
+        rows.remove(index);
+    }
+    let line_count: usize = rows.iter().map(|(_, lines)| lines.len().max(1)).sum();
+    let spacing = if rows.len() > 1 && line_count < content_h as usize {
+        ((content_h as usize - line_count) / (rows.len() - 1)).min(1)
+    } else {
+        0
+    };
+    let block = line_count + spacing * rows.len().saturating_sub(1);
+    let mut y = content_top + content_h.saturating_sub(block as u16) / 2;
+    for (label, lines) in rows {
+        text_util::put(buf, inner, label_x, y, label, theme::fg(theme::MUTED));
+        for (index, line) in lines.iter().enumerate() {
             text_util::put(
                 buf,
                 inner,
                 value_x,
                 y + index as u16,
-                &text_util::ellipsize(&line, room),
-                theme::fg(colour),
+                &text_util::ellipsize(line, room),
+                if label == "password" && revealed {
+                    theme::bold(theme::FG)
+                } else {
+                    theme::fg(theme::FG)
+                },
             );
         }
-        y += 1 + if label == "agents" { agent_extra } else { 0 };
-        y += spacing;
+        y += lines.len().max(1) as u16 + spacing as u16;
     }
-    let note = "open the address in a browser to see their work.";
-    text_util::put(
-        buf,
-        inner,
-        label_x,
-        y.min(content_bottom.saturating_sub(1)),
-        &text_util::ellipsize(note, inner.width.saturating_sub(6) as usize),
-        theme::fg(theme::MUTED),
-    );
+    let note = if revealed {
+        "the password was reset — the one shown before no longer works"
+    } else {
+        "open the address in a browser to see their work."
+    };
+    if y < content_bottom {
+        text_util::put(
+            buf,
+            inner,
+            label_x,
+            y,
+            &text_util::ellipsize(note, inner.width.saturating_sub(4) as usize),
+            theme::fg(theme::MUTED),
+        );
+    }
     text_util::put(
         buf,
         inner,
         inner.x + 1,
         inner.bottom().saturating_sub(2),
-        "p password   esc back",
+        "p reset password   esc back",
+        theme::fg(theme::MUTED),
+    );
+    if let Some(notice) = board.notice() {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            inner.bottom().saturating_sub(1),
+            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+            theme::bold(theme::AMBER),
+        );
+    }
+}
+
+/// The team's short name, from the one place that names it.
+fn bundled_team() -> &'static str {
+    crate::bundled_forgejo::TEAM
+}
+
+/// The one screen shown the first time this build opens an older installation.
+fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
+    draw_outer(buf, area, "gewu-multiverse");
+    let Some(upgrade) = board.view.upgrade.clone() else {
+        return;
+    };
+    let inner = inner(area);
+    let content_top = inner.y;
+    let content_bottom = inner.bottom().saturating_sub(2);
+    let content_h = content_bottom.saturating_sub(content_top);
+    let width = inner.width.saturating_sub(6) as usize;
+    let mut lines: Vec<(String, Style, bool)> = vec![
+        (
+            format!(
+                "this installation was {} · this build is {}",
+                upgrade.from_version, upgrade.to_version
+            ),
+            theme::bold(theme::ACCENT),
+            true,
+        ),
+        (
+            format!(
+                "found: settings · {} · {} · {}",
+                crate::words::counted(upgrade.agents, "agent", "agents"),
+                crate::words::counted(upgrade.instructions, "instruction", "instructions"),
+                crate::words::counted(upgrade.runs, "run", "runs")
+            ),
+            theme::fg(theme::FG),
+            true,
+        ),
+        (
+            "reused: your model, your agents and their names".to_owned(),
+            theme::fg(theme::MUTED),
+            false,
+        ),
+        (
+            "kept: every instruction and every run".to_owned(),
+            theme::fg(theme::MUTED),
+            false,
+        ),
+    ];
+    if upgrade.ignored_config {
+        lines.push((
+            "ignored: the old config.toml (left as it was)".to_owned(),
+            theme::fg(theme::MUTED),
+            false,
+        ));
+    }
+    lines.push((
+        format!("release notes: {}", upgrade.release_url),
+        theme::fg(theme::MUTED),
+        false,
+    ));
+    let wrapped: Vec<(Vec<String>, Style)> = lines
+        .into_iter()
+        .map(|(text, style, _)| (text_util::wrap(&text, width), style))
+        .collect();
+    let total: usize = wrapped.iter().map(|(lines, _)| lines.len()).sum();
+    let rule = content_h as usize;
+    let mut y = content_top + rule.saturating_sub(total) as u16 / 2;
+    let mut shown = 0_usize;
+    for (lines, style) in wrapped {
+        for line in lines {
+            if shown >= rule.saturating_sub(1) {
+                break;
+            }
+            text_util::put(buf, inner, inner.x + 3, y, &line, style);
+            y += 1;
+            shown += 1;
+        }
+        if shown >= rule.saturating_sub(1) {
+            break;
+        }
+    }
+    text_util::put(
+        buf,
+        inner,
+        inner.x + 1,
+        inner.bottom().saturating_sub(2),
+        "⏎ continue",
         theme::fg(theme::MUTED),
     );
     if let Some(notice) = board.notice() {
@@ -1840,6 +2255,13 @@ pub fn draw(board: &mut Board, frame: &mut Frame) {
         );
         return;
     }
+    // A wide window gets a capped, centred picture: past about a hundred columns the
+    // same drawing only stretches, so the eye travels without learning more.
+    let area = if area.width > 140 {
+        Rect::new(area.x + (area.width - 100) / 2, area.y, 100, area.height)
+    } else {
+        area
+    };
     board.last = BoardLayout::default();
     match board.screen {
         Screen::Terms => draw_terms(board, buf, area),
@@ -1850,6 +2272,7 @@ pub fn draw(board: &mut Board, frame: &mut Frame) {
         Screen::Agent => draw_agent(board, buf, area),
         Screen::Forgejo => draw_forgejo(board, buf, area),
         Screen::Help => draw_help(board, buf, area),
+        Screen::Upgrade => draw_upgrade(board, buf, area),
     }
 }
 

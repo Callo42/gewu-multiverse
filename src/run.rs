@@ -70,6 +70,15 @@ pub struct RunPlan {
     pub steps: Vec<String>,
     /// How long the run may last before it is stopped. A bound, not a promise.
     pub timeout_secs: u64,
+    /// How the run's shell is confined: `bwrap`, `unshare`, `landlock` or `none`.
+    /// An older plan without the field is `none`: a run recorded before confinement
+    /// existed is not retroactively promised it.
+    #[serde(default)]
+    pub confinement: String,
+    /// The directories the confined shell must not see: the product's configuration
+    /// root, state root and the bundled Forgejo's data root.
+    #[serde(default)]
+    pub hide: Vec<PathBuf>,
 }
 
 /// The non-secret context that lets a run declare the Forgejo tools.
@@ -163,8 +172,33 @@ impl RunPlan {
 /// The plan file's name.
 pub const PLAN_FILE: &str = "plan.json";
 
+/// The marker a run leaves when its plan promised a boundary the run-time layout
+/// cannot keep. The engine reads it and stops claiming confinement for the board
+/// (B9-R-R); it holds one reason sentence, never a secret.
+pub const CONFINEMENT_REFUSED_FILE: &str = "confinement-refused.txt";
+
 /// The non-secret Forgejo context file, written before a run starts.
 pub const FORGEJO_CONTEXT_FILE: &str = "forgejo.json";
+
+/// Record a run-time confinement refusal, `0600` like every record.
+pub fn write_confinement_refusal(run_dir: &Path, reason: &str) -> io::Result<()> {
+    crate::mode::write_private(
+        run_dir.join(CONFINEMENT_REFUSED_FILE),
+        reason.trim().as_bytes(),
+    )
+}
+
+/// Why a run's promised boundary was refused, when it was. A missing file is the
+/// normal case: the plan's method was used.
+pub fn read_confinement_refusal(run_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(run_dir.join(CONFINEMENT_REFUSED_FILE)).ok()?;
+    let reason = text.trim();
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason.to_owned())
+    }
+}
 
 /// The log file's name.
 pub const LOG_FILE: &str = "run.log";
@@ -363,6 +397,110 @@ pub fn forgejo_actions(run_dir: &Path) -> Vec<ForgejoAction> {
         .collect()
 }
 
+/// The file the run writes while a tool call is in flight: the tool's name and the
+/// unix time it started, two lines. The engine reads it so a card can say
+/// `shell · 12s` instead of a stale line.
+pub const CURRENT_TOOL_FILE: &str = "current-tool";
+
+/// The file the run writes when a tool call fails: `tool: first clause`. The engine
+/// reads it for the card's `✗` line; the run log has the same line.
+pub const FAILURE_FILE: &str = "last-failure";
+
+/// The tool call in flight, and when it started (from the file's own mtime).
+pub fn read_current_tool(run_dir: &Path) -> Option<(String, std::time::SystemTime)> {
+    let path = run_dir.join(CURRENT_TOOL_FILE);
+    let started = fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())?;
+    let text = fs::read_to_string(&path).ok()?;
+    let tool = text.lines().next()?.trim();
+    if tool.is_empty() {
+        return None;
+    }
+    Some((tool.to_owned(), started))
+}
+
+/// The last failed tool call, as the card shows it: one line, no raw output.
+pub fn read_failure(run_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(run_dir.join(FAILURE_FILE)).ok()?;
+    let line = text.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_owned())
+    }
+}
+
+/// The last issue, branch, pull request and comment the newest run named, at most two
+/// short lines. It reads the run's own transcript; a run with no Forgejo context
+/// yields nothing rather than a guess.
+pub fn work_summary(run_dir: &Path) -> Vec<String> {
+    let Ok(file) = transcript::read_checked(run_dir) else {
+        return Vec::new();
+    };
+    let Some(file) = file else {
+        return Vec::new();
+    };
+    let mut issue: Option<String> = None;
+    let mut pull: Option<String> = None;
+    let mut commented = false;
+    for record in &file.records {
+        match record {
+            Record::ForgejoCall {
+                repository: Some(repository),
+                number: Some(number),
+                ..
+            } => {
+                issue = Some(format!("{repository}#{number}"));
+            }
+            Record::ForgejoResult {
+                action: Some(action),
+                number: Some(number),
+                ..
+            } => match action.as_str() {
+                "opened" | "updated" => pull = Some(format!("#{number}")),
+                "commented" => commented = true,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let branch = read_push_witness(run_dir).map(|witness| witness.branch);
+    let mut first = String::new();
+    if let Some(issue) = issue {
+        first.push_str("issue ");
+        first.push_str(&issue);
+    }
+    if let Some(pull) = pull {
+        if !first.is_empty() {
+            first.push_str(" · ");
+        }
+        first.push_str("PR ");
+        first.push_str(&pull);
+    }
+    let mut second = String::new();
+    if let Some(branch) = branch {
+        second.push_str("branch ");
+        second.push_str(&branch);
+    }
+    if commented {
+        if !second.is_empty() {
+            second.push_str(" · ");
+        }
+        second.push_str("commented");
+    }
+    [first, second]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Read a run's push witness, when one was written.
+pub fn read_push_witness(run_dir: &Path) -> Option<PushWitness> {
+    let text = fs::read_to_string(run_dir.join(PUSH_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// The file that records a branch the run actually pushed.
 ///
 /// Written by the agent process from the repository's own state after the run, not
@@ -444,6 +582,8 @@ mod tests {
             max_turns: 4,
             steps: vec!["echo one".to_owned(), "echo two".to_owned()],
             timeout_secs: 30,
+            confinement: "none".to_owned(),
+            hide: Vec::new(),
         }
     }
 

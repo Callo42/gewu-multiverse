@@ -246,7 +246,11 @@ fn plus_adds_and_minus_asks_once_before_removing() {
     press(&mut board, KeyCode::Char('-'));
     assert!(board.sent_commands().is_empty(), "the remove waits for y");
     let frame = frame_text(&draw(&mut board));
-    assert!(frame.contains("remove agent-1? y/n"), "{frame}");
+    assert!(
+        frame.contains("remove agent-1? token revoked")
+            && frame.contains("history and folder kept"),
+        "{frame}"
+    );
     press(&mut board, KeyCode::Char('y'));
     assert_eq!(
         board.sent_commands(),
@@ -330,7 +334,7 @@ fn forgejo_reveals_the_password_once_and_never_keeps_it() {
     assert_eq!(board.sent_commands(), [Command::RevealAdminPassword]);
     let frame = frame_text(&draw(&mut board));
     assert!(frame.contains("demo-admin-pw"), "{frame}");
-    for _ in 0..9 {
+    for _ in 0..45 {
         board.tick();
     }
     let frame = frame_text(&draw(&mut board));
@@ -387,7 +391,7 @@ fn q_asks_once_when_an_agent_is_started_and_the_second_q_stops_everything() {
         .join(" ");
     assert!(
         flat.contains(
-            "quit stops 1 agents and Forgejo; they start again when you reopen — q again quits"
+            "quit stops 1 agent and Forgejo; they start again when you reopen — q again quits"
         ),
         "{flat}"
     );

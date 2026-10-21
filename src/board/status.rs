@@ -173,7 +173,9 @@ pub fn agent_face(agent: &AgentView) -> Face {
         SessionState::Blocked { reason } => {
             let status = blocked_words(reason).to_owned();
             Face {
-                symbol: '●',
+                // An unfilled ring: a blocked agent is not working, and must not wear
+                // the filled circle a working run wears (F6).
+                symbol: '○',
                 word: status.clone(),
                 colour: theme::RED,
                 status,
@@ -200,11 +202,71 @@ pub fn agent_face(agent: &AgentView) -> Face {
 }
 
 /// The newest activity of a running agent, in the card's words, if it has one.
+///
+/// While a tool call is in flight that is what the card says, with the seconds it has
+/// been waiting (P2). After the run ends the line is marked `last:` with its age, so
+/// it cannot read as the current thing (P10).
 pub fn activity(agent: &AgentView) -> Option<String> {
-    if !matches!(agent.session, SessionState::Running { .. }) {
-        return None;
+    if matches!(agent.session, SessionState::Running { .. }) {
+        if let Some(tool) = agent
+            .current_tool
+            .as_deref()
+            .filter(|tool| !tool.trim().is_empty())
+        {
+            return Some(format!(
+                "{} · {}s",
+                tool.trim(),
+                agent.current_tool_seconds.max(1)
+            ));
+        }
+        return agent.activity.as_deref().map(activity_words);
     }
-    agent.activity.as_deref().map(activity_words)
+    let activity = agent.activity.as_deref().map(activity_words)?;
+    match agent.activity_at {
+        Some(at) => {
+            let age = SystemTime::now()
+                .duration_since(at)
+                .map(age_words)
+                .unwrap_or_else(|_| "just now".to_owned());
+            Some(format!("last: {activity} · {age}"))
+        }
+        None => Some(format!("last: {activity}")),
+    }
+}
+
+/// An age in the card's few words.
+fn age_words(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 10 {
+        "just now".to_owned()
+    } else if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else {
+        format!("{}h ago", seconds / 3600)
+    }
+}
+
+/// The first clause of an error, as a card line: no raw body, no second sentence.
+pub fn first_clause(text: &str) -> String {
+    let plain = plain(text);
+    let mut cut = plain.len();
+    for needle in [" — ", ". ", "; ", "\n"] {
+        if let Some(at) = plain.find(needle) {
+            cut = cut.min(at);
+        }
+    }
+    let clause = plain[..cut].trim().trim_end_matches('.');
+    let mut text = if clause.chars().count() > 90 {
+        clause.chars().take(89).collect::<String>()
+    } else {
+        clause.to_owned()
+    };
+    if text.chars().count() > 89 {
+        text.push('…');
+    }
+    text
 }
 
 /// The run count shown on the agent panel: `run 4`.
@@ -256,7 +318,14 @@ mod tests {
             ],
             instruction_chars: 4,
             instruction_first_line: Some("work".to_owned()),
+            instruction_lines: 1,
             activity: Some("commented #12".to_owned()),
+            activity_at: Some(SystemTime::now() - Duration::from_secs(120)),
+            last_error: None,
+            last_failure: None,
+            current_tool: None,
+            current_tool_seconds: 0,
+            last_work: Vec::new(),
         }
     }
 
@@ -329,6 +398,26 @@ mod tests {
                 assert!(!written.contains(word), "{written} contains {word}");
             }
         }
+    }
+
+    #[test]
+    fn a_blocked_agent_wears_an_unfilled_ring_not_the_working_circle() {
+        let face = agent_face(&agent(
+            SessionState::Blocked {
+                reason: "needs an instruction".to_owned(),
+            },
+            Desired::Started,
+        ));
+        assert_eq!(face.symbol, '○');
+        assert_eq!(face.word, "needs an instruction");
+        let working = agent_face(&agent(
+            SessionState::Running {
+                number: 1,
+                since: SystemTime::now(),
+            },
+            Desired::Started,
+        ));
+        assert_eq!(working.symbol, '●');
     }
 
     #[test]

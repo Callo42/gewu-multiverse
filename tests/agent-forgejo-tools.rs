@@ -306,6 +306,8 @@ fn write_plan(
         max_turns,
         steps: Vec::new(),
         timeout_secs: 30,
+        confinement: "none".to_owned(),
+        hide: Vec::new(),
     }
     .write(&run_dir)
     .expect("the plan is written");

@@ -546,7 +546,7 @@ fn the_last_agent_scrolls_into_view_with_its_wire() {
 fn the_terms_are_exact_and_all_shown_before_y_records_them() {
     let expected = [
         "Agents use this computer with your permissions.",
-        "They can read your files, including saved keys.",
+        "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
         "Each has its own login on your Forgejo.",
         "Started agents keep going until you stop them.",
         "Their work is sent to your model provider.",
@@ -563,12 +563,47 @@ fn the_terms_are_exact_and_all_shown_before_y_records_them() {
             "y was accepted before the items were drawn"
         );
         let buffer = draw(&mut board, width, height);
+        // A warning may wrap at a narrow size; compare the screen with its line
+        // breaks removed, not a row against the whole sentence.
+        let drawn = flat(&buffer);
         for item in expected {
             assert!(
-                text(&buffer).contains(item),
-                "the term {item:?} was not on screen at {width}x{height}"
+                drawn.contains(item),
+                "the term {item:?} was not on screen at {width}x{height}:\n{drawn}"
             );
         }
+        press(&mut board, KeyCode::Char('y'));
+        assert_eq!(board.sent_commands(), [Command::AcknowledgeTerms]);
+        assert_eq!(board.screen(), Screen::Model);
+    }
+}
+
+#[test]
+fn the_sixth_warning_is_drawn_at_every_size_too() {
+    // On a host without confinement the terms list has one more item; the 72x18
+    // floor must still show every warning before `y` records them.
+    for (width, height) in SIZES {
+        let mut board = Board::new(FakeEngine::unconfined());
+        assert!(!board.view().confined);
+        assert_eq!(board.view().terms.len(), 6);
+        let expected = board.view().terms.clone();
+        press(&mut board, KeyCode::Char('y'));
+        assert!(
+            !board
+                .sent_commands()
+                .iter()
+                .any(|command| matches!(command, Command::AcknowledgeTerms)),
+            "y was accepted before the six items were drawn"
+        );
+        let buffer = draw(&mut board, width, height);
+        let drawn = flat(&buffer);
+        for item in &expected {
+            assert!(
+                drawn.contains(item),
+                "the term {item:?} was not on screen at {width}x{height}:\n{drawn}"
+            );
+        }
+        assert!(drawn.contains("Runs are not confined on this computer."));
         press(&mut board, KeyCode::Char('y'));
         assert_eq!(board.sent_commands(), [Command::AcknowledgeTerms]);
         assert_eq!(board.screen(), Screen::Model);
@@ -804,6 +839,616 @@ fn the_corrections_main_asked_for_are_on_the_board() {
                     "{label}: the login line has no colon: {flat}"
                 );
             }
+        }
+    }
+}
+
+/// One row with a card's section rule on it must carry no text: the rule is a row of
+/// its own, and the instruction is truncated inside its content area (F1).
+fn assert_no_text_on_a_rule_row(buffer: &Buffer, label: &str) {
+    let area = buffer.area;
+    for y in area.y..area.bottom() {
+        let row: Vec<&str> = (area.x..area.right())
+            .map(|x| buffer.cell((x, y)).expect("a cell").symbol())
+            .collect();
+        let Some(left) = row.iter().position(|symbol| *symbol == "├") else {
+            continue;
+        };
+        let Some(right) = row.iter().rposition(|symbol| *symbol == "┤") else {
+            continue;
+        };
+        if right <= left + 1 {
+            continue;
+        }
+        for symbol in &row[left + 1..right] {
+            let acceptable = symbol.chars().all(|ch| {
+                ch.is_whitespace() || matches!(ch, '─' | '┬' | '┴' | '┼' | '├' | '┤' | '╴' | '╶')
+            });
+            assert!(
+                acceptable,
+                "{label}: text {symbol:?} shares row {y} with a section rule:\n{}",
+                text(buffer)
+            );
+        }
+    }
+}
+
+fn four_line_engine(count: usize) -> FakeEngine {
+    let mut engine = endpoint_engine(count);
+    let path = engine
+        .instruction_path("agent-1")
+        .expect("an instruction path");
+    fs::write(
+        path,
+        "Take issue #1 in team/website: the README install command is out of date.\n\
+         Change the README to use the published one-line installer,\n\
+         commit the change on a new branch, open a pull request explaining the fix,\n\
+         and comment on issue #1 with the pull request link.\n",
+    )
+    .expect("the instruction is written");
+    engine
+        .send(Command::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect("the agent starts");
+    engine.tick();
+    let _ = engine.board();
+    engine
+}
+
+#[test]
+fn no_card_text_shares_a_row_with_a_section_rule_at_any_size() {
+    for (width, height) in SIZES {
+        for (name, engine, second) in [
+            ("stopped", endpoint_engine(3), false),
+            ("running", four_line_engine(3), false),
+            ("blocked", blocked_engine(), false),
+            ("restarting", restarting_engine(), false),
+            (
+                "failed",
+                {
+                    let mut engine = four_line_engine(1);
+                    for _ in 0..40 {
+                        engine.tick();
+                    }
+                    let _ = engine.board();
+                    engine
+                },
+                true,
+            ),
+        ] {
+            let mut board = Board::new(engine);
+            press(&mut board, KeyCode::Enter);
+            if second {
+                // Open agent-1; its newest run failed in the fake's cycle.
+                assert_eq!(board.screen(), Screen::Agent);
+            }
+            let buffer = draw(&mut board, width, height);
+            assert_no_text_on_a_rule_row(&buffer, &format!("{name} {width}x{height}"));
+            // The instruction is still named, whole or with its remaining-line count.
+            let flat = flat(&buffer);
+            assert!(
+                flat.contains("instruction"),
+                "{name} {width}x{height}: no instruction section: {flat}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_72_column_board_is_one_vertical_list_with_one_spine() {
+    for count in [1, 3, 4, 7] {
+        let mut board = Board::new(endpoint_engine(count));
+        let buffer = draw(&mut board, 72, 18);
+        let layout = board.layout();
+        assert_eq!(
+            layout.columns, 1,
+            "72x18 with {count} agents is not a single column"
+        );
+        let mut x: Option<u16> = None;
+        let mut last_bottom = 0;
+        for card in &layout.cards {
+            if let Some(expected) = x {
+                assert_eq!(card.rect.x, expected, "the vertical list moves sideways");
+            } else {
+                x = Some(card.rect.x);
+            }
+            assert!(
+                card.rect.y >= last_bottom,
+                "cards overlap in the vertical list"
+            );
+            last_bottom = card.rect.bottom();
+            let below = buffer
+                .cell((card.rect.x + card.rect.width / 2 + 2, card.rect.y - 1))
+                .expect("the wire above a card")
+                .symbol();
+            assert!(
+                matches!(below, "│" | "┴" | "╵"),
+                "the vertical list has no spine above card {}: {below:?}",
+                card.agent
+            );
+        }
+        assert!(!layout.cards.is_empty());
+    }
+}
+
+#[test]
+fn a_wide_window_caps_the_picture_at_about_one_hundred_columns() {
+    let mut board = Board::new(endpoint_engine(3));
+    let buffer = draw(&mut board, 200, 60);
+    let area = buffer.area;
+    let mut left = area.right();
+    let mut right = area.x;
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if buffer.cell((x, y)).expect("a cell").symbol() != " " {
+                left = left.min(x);
+                right = right.max(x);
+            }
+        }
+    }
+    // The frame is 100 wide, centred: the drawn cells sit inside 50..150 of 200.
+    assert!(
+        left >= 45 && right <= 155,
+        "the 200x60 picture spans {left}..{right}"
+    );
+    assert!(
+        right - left <= 104,
+        "the picture is {} columns wide",
+        right - left
+    );
+    // A 120-column window still uses its room.
+    let mut board = Board::new(endpoint_engine(3));
+    let buffer = draw(&mut board, 120, 40);
+    let area = buffer.area;
+    let mut left = area.right();
+    let mut right = area.x;
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if buffer.cell((x, y)).expect("a cell").symbol() != " " {
+                left = left.min(x);
+                right = right.max(x);
+            }
+        }
+    }
+    assert!(right - left > 100, "the 120x40 picture is capped too");
+}
+
+/// An engine that shows a long password when `p` asks, so the 80-column reveal can be
+/// checked for the whole value and never an ellipsis.
+struct LongPasswordEngine {
+    inner: FakeEngine,
+    revealed: bool,
+}
+
+impl EngineApi for LongPasswordEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.inner.board();
+        if self.revealed {
+            view.admin_password = Some(
+                "Gw-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef!9".to_owned(),
+            );
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        if matches!(command, Command::RevealAdminPassword) {
+            self.revealed = true;
+        }
+        self.inner.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.inner.tick();
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.inner.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.inner.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.inner.shutdown(grace);
+    }
+}
+
+#[test]
+fn the_revealed_password_is_whole_at_eighty_columns() {
+    let password = "Gw-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef!9";
+    for (width, height) in [(72, 18), (80, 24), (100, 30), (120, 40)] {
+        let mut board = Board::new(LongPasswordEngine {
+            inner: endpoint_engine(3),
+            revealed: false,
+        });
+        press(&mut board, KeyCode::Char('f'));
+        press(&mut board, KeyCode::Char('p'));
+        let frame = text(&draw(&mut board, width, height));
+        // The page wraps the value; the whole secret is on screen, never cut short.
+        let flat: String = frame
+            .replace(['│', '╭', '╮', '╰', '╯', '─'], "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            flat.contains(password),
+            "{width}x{height}: the revealed password is not whole:\n{frame}"
+        );
+        assert!(
+            !frame.contains("••••••••   p"),
+            "{width}x{height}: the password was not revealed:\n{frame}"
+        );
+    }
+}
+
+/// An engine whose view carries the facts the walk found missing: repository names,
+/// the permission summary, the team address, a kept login, repository events, and a
+/// card's work block, remaining instruction lines and last failure.
+struct RichEngine(FakeEngine);
+
+impl EngineApi for RichEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        view.forgejo.repository_names =
+            vec!["team/workspace".to_owned(), "team/website".to_owned()];
+        view.forgejo.events = vec!["team/scratch was deleted".to_owned()];
+        view.forgejo.admin_login = "mei".to_owned();
+        view.forgejo.admin_login_kept = true;
+        if let Some(agent) = view.agents.first_mut() {
+            agent.instruction_lines = 5;
+            agent.instruction_first_line = Some(
+                "Take issue #1 in team/website: the README install command is out of date."
+                    .to_owned(),
+            );
+            agent.last_work = vec![
+                "issue team/website#2 · PR #5".to_owned(),
+                "branch fix/contributing-link · commented".to_owned(),
+            ];
+            agent.last_failure = Some("shell: exit 128: fatal: could not read".to_owned());
+            agent.activity = Some("opened pull request #5".to_owned());
+            agent.activity_at = Some(std::time::SystemTime::now() - Duration::from_secs(120));
+            agent.session = gewu_multiverse::engine_api::SessionState::Idle;
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick();
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace);
+    }
+}
+
+#[test]
+fn the_forgejo_page_names_repositories_permissions_and_the_team() {
+    let mut board = Board::new(RichEngine(endpoint_engine(3)));
+    press(&mut board, KeyCode::Char('f'));
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(frame.contains("team/workspace"), "{frame}");
+    assert!(frame.contains("team/website"), "{frame}");
+    assert!(frame.contains("write to team repositories only"), "{frame}");
+    assert!(frame.contains("/orgs/team/teams/agents"), "{frame}");
+    assert!(frame.contains("kept from an earlier setup"), "{frame}");
+    assert!(frame.contains("team/scratch was deleted"), "{frame}");
+    // The board's own box names the repositories at a roomy size.
+    press(&mut board, KeyCode::Esc);
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(frame.contains("team/website"), "{frame}");
+}
+
+#[test]
+fn a_card_names_its_last_work_and_its_remaining_instruction() {
+    let mut board = Board::new(RichEngine(endpoint_engine(3)));
+    press(&mut board, KeyCode::Enter);
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(frame.contains("issue team/website#2"), "{frame}");
+    assert!(frame.contains("PR #5"), "{frame}");
+    assert!(frame.contains("branch fix/contributing-link"), "{frame}");
+    assert!(frame.contains("more lines"), "{frame}");
+    // The last failure is on the card; the stale activity is marked `last:`.
+    assert!(frame.contains("✗ shell:"), "{frame}");
+    let flat = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("last: opened pull request #5"), "{flat}");
+    assert!(flat.contains("2m ago"), "{flat}");
+}
+
+/// An engine whose newest run failed at the model call: the card carries the first
+/// clause of that error, not only a `✗` mark (P6).
+struct ErrorEngine(FakeEngine);
+
+impl EngineApi for ErrorEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        if let Some(agent) = view.agents.first_mut() {
+            agent.session = gewu_multiverse::engine_api::SessionState::Idle;
+            agent.activity = None;
+            agent.last_failure = None;
+            agent.last_error = Some(
+                "the model call failed (transport) at model http://127.0.0.1:1 — could not be reached"
+                    .to_owned(),
+            );
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick();
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace);
+    }
+}
+
+#[test]
+fn the_last_errors_first_clause_is_on_the_card() {
+    let mut board = Board::new(ErrorEngine(endpoint_engine(1)));
+    press(&mut board, KeyCode::Enter);
+    let frame = text(&draw(&mut board, 100, 30));
+    let flat = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("✗ the model call failed (transport) at model http://127.0.0.1:1"),
+        "{flat}"
+    );
+    assert!(
+        !flat.contains("could not be reached"),
+        "the second clause is on the card: {flat}"
+    );
+}
+
+/// An engine on a host that offers no confinement: the board must say so in words.
+struct UnconfinedEngine(FakeEngine);
+
+impl EngineApi for UnconfinedEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        view.confined = false;
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick();
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace);
+    }
+}
+
+#[test]
+fn an_unconfined_host_says_so_on_the_board() {
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let mut board = Board::new(UnconfinedEngine(endpoint_engine(3)));
+        let buffer = draw(&mut board, width, height);
+        let frame = text(&buffer);
+        assert!(
+            frame.contains("runs are not confined on this computer"),
+            "{width}x{height}: the board does not say so:\n{frame}"
+        );
+    }
+}
+
+/// One physical instruction line long enough to need signposting at the floor.
+fn long_line_engine(count: usize) -> FakeEngine {
+    let mut engine = endpoint_engine(count);
+    let path = engine
+        .instruction_path("agent-1")
+        .expect("an instruction path");
+    fs::write(
+        path,
+        "Take issue #1 in team/website: the README install command is out of date and the published one-line installer is the one to use; change the README, commit the change on a branch, open a pull request explaining the fix, and comment on issue #1 with the link.\n",
+    )
+    .expect("the instruction is written");
+    engine
+        .send(Command::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect("the agent starts");
+    engine.tick();
+    let _ = engine.board();
+    engine
+}
+
+#[test]
+fn a_long_one_line_instruction_is_signposted_at_the_floor() {
+    for (width, height) in [(72, 18), (80, 24)] {
+        let mut board = Board::new(long_line_engine(1));
+        press(&mut board, KeyCode::Enter);
+        let buffer = draw(&mut board, width, height);
+        let frame = text(&buffer);
+        let flat = flat(&buffer);
+        // The rule is whole instruction or a signposted cut: at 80x24 the one line
+        // fits in the content area, at 72x18 it cannot.
+        if !flat.contains("with the link.") {
+            assert!(
+                frame.contains("… ("),
+                "{width}x{height}: no ellipsis marker:\n{frame}"
+            );
+            assert!(
+                frame.contains("more lines"),
+                "{width}x{height}: the dropped text is not counted:\n{frame}"
+            );
+        }
+        assert_no_text_on_a_rule_row(&buffer, &format!("long-line {width}x{height}"));
+    }
+}
+
+#[test]
+fn a_long_one_line_instruction_keeps_its_first_line_when_a_second_row_exists() {
+    // At 80x24 there are four content rows: the first three carry the instruction's
+    // first display rows and the fourth carries the marker. At the 72x18 floor only
+    // one row exists and it is the marker (N9's documented marker-only form).
+    let mut engine = long_line_engine(1);
+    let path = engine
+        .instruction_path("agent-1")
+        .expect("an instruction path");
+    let one = fs::read_to_string(&path).expect("the instruction");
+    fs::write(&path, format!("{one}{one}")).expect("the long instruction is written");
+    engine.tick();
+    let _ = engine.board();
+
+    let mut board = Board::new(engine);
+    press(&mut board, KeyCode::Enter);
+    let buffer = draw(&mut board, 80, 24);
+    let frame = text(&buffer);
+    let first = frame
+        .lines()
+        .position(|line| line.contains("Take issue #1"))
+        .unwrap_or_else(|| panic!("the first line is missing at 80x24:\n{frame}"));
+    let marker = frame
+        .lines()
+        .position(|line| line.contains("more lines"))
+        .unwrap_or_else(|| panic!("the marker is missing at 80x24:\n{frame}"));
+    assert!(
+        first < marker,
+        "the marker is not after the first line:\n{frame}"
+    );
+    assert_no_text_on_a_rule_row(&buffer, "long-line first-row 80x24");
+
+    let mut board = Board::new(long_line_engine(1));
+    press(&mut board, KeyCode::Enter);
+    let frame = text(&draw(&mut board, 72, 18));
+    assert!(
+        frame.contains("… (") && frame.contains("more lines"),
+        "the one-row floor must signpost the whole line:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Take issue #1"),
+        "the documented one-row form is the marker, not a clipped first line:\n{frame}"
+    );
+}
+
+/// An engine with more than five run endings, so the bounded strip and its `+N` are
+/// on the Agent screen.
+struct StripEngine(FakeEngine);
+
+impl EngineApi for StripEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        if let Some(agent) = view.agents.first_mut() {
+            agent.recent = vec![
+                gewu_multiverse::engine_api::SessionEnd::Succeeded,
+                gewu_multiverse::engine_api::SessionEnd::Succeeded,
+                gewu_multiverse::engine_api::SessionEnd::Failed {
+                    reason: "the model call failed".to_owned(),
+                },
+                gewu_multiverse::engine_api::SessionEnd::TimedOut,
+                gewu_multiverse::engine_api::SessionEnd::Stopped,
+                gewu_multiverse::engine_api::SessionEnd::Succeeded,
+                gewu_multiverse::engine_api::SessionEnd::Succeeded,
+                gewu_multiverse::engine_api::SessionEnd::Succeeded,
+                gewu_multiverse::engine_api::SessionEnd::Succeeded,
+            ];
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick();
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace);
+    }
+}
+
+#[test]
+fn the_run_strip_is_bounded_with_a_legend_and_a_count() {
+    let mut board = Board::new(StripEngine(running_engine(1)));
+    press(&mut board, KeyCode::Enter);
+    let frame = text(&draw(&mut board, 120, 40));
+    let flat = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("last runs"), "{flat}");
+    assert!(flat.contains("+4"), "no +N for four hidden marks: {flat}");
+    assert!(
+        flat.contains("✓ ok") && flat.contains("✗ failed"),
+        "no legend: {flat}"
+    );
+    assert!(flat.contains("run "), "no run count: {flat}");
+}
+
+#[test]
+fn the_home_card_keeps_its_few_words_at_72_and_80() {
+    for (width, height) in [(72, 18), (80, 24)] {
+        for count in [1, 4, 12] {
+            let mut board = Board::new(endpoint_engine(count));
+            let buffer = draw(&mut board, width, height);
+            let frame = text(&buffer);
+            assert!(
+                frame.contains("agent-1") && frame.contains("gewu-agent-1"),
+                "{width}x{height} with {count}: the name or login is missing:\n{frame}"
+            );
+            assert!(
+                frame.contains("run "),
+                "{width}x{height} with {count}: the run count is missing:\n{frame}"
+            );
+            assert!(
+                !frame.contains("instruction"),
+                "{width}x{height} with {count}: the rich detail is on the board card:\n{frame}"
+            );
+        }
+    }
+}
+
+#[test]
+fn one_four_and_twelve_agents_are_whole_at_72_and_80() {
+    for (width, height) in [(72, 18), (80, 24)] {
+        for count in [1, 4, 12] {
+            let mut board = Board::new(endpoint_engine(count));
+            check_frame(&mut board, width, height, &format!("count {count}"));
         }
     }
 }

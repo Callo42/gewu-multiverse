@@ -54,7 +54,7 @@ The person's started/stopped choice is stored in `multiverse.toml`. `Start` reco
 and the engine tries a run; `Stop` clears it and ends the run in flight. When a run
 ends, for any reason, and the agent is still started, the next one is scheduled:
 
-- a run that succeeded, or ran at least 60 seconds, waits **3 seconds**;
+- a run that succeeded, or ran at least 60 seconds, waits **5 seconds**;
 - a quick failure waits **10 seconds**, doubling with each consecutive quick failure,
   capped at **5 minutes** (10, 20, 40, 80, 160, 300, 300 …).
 
@@ -227,24 +227,78 @@ On an agent's screen, `e` edits `agents/<name>/instruction.md` (the editor creat
 if it is absent), `l` opens the newest run's `run.log`, and `t` opens
 `transcript.jsonl`. A hand-off steps out of the terminal and restores it exactly.
 
-## The workspace is a layout, not a sandbox
+## What an agent run can see
 
-This matters enough to say twice.
+An agent runs **as you**: the same user, the same machine, your rights. Its tools are
+started with the workspace as their working directory. The workspace is a layout you
+can reason about; it is not, by itself, a boundary. On this computer the product also
+asks the operating system for one, and the mechanisms it knows differ:
 
-An agent runs **as you**: the same user, the same machine, your rights. Its workspace
-is a directory and its tools are started with that directory as their working
-directory — that is the whole intent, and it is **not confinement**. A tool can read
-anything you can read, including the credentials file, and it can write anywhere you
-can write. The product deliberately asks the operating system for no isolation: no
-container runtime, no service, no privilege change. The honest statement is that the
-workspace is a layout you can reason about, not a boundary that holds.
+- **Landlock** is the automatic mechanism. It applies a kernel ruleset to the shell.
+  It may read its workspace, its private `TMPDIR` (where its per-run askpass file
+  lives), the system's tools (`/usr`, `/bin`, `/sbin`, `/lib`, `/opt`), `/etc`,
+  `/proc`, `/sys`, `/run`, `/dev` and the product binary's directory; the
+  configuration root, the state root, the Forgejo data root and your real home are
+  denied. The names still exist and an attempt answers `Permission denied`. The
+  product claims Landlock only after a child process built the ruleset at
+  `HardRequirement`, required `FullyEnforced`, and proved it: the child reads an
+  allowed control file and is denied a file outside the grant. A kernel where Landlock
+  is missing or disabled therefore gives **none**, not a dummy ruleset. Landlock
+  grants a whole tree and cannot subtract a rule, so it is **not** chosen when one of
+  the hidden roots lies inside a tree it would grant (for example a `--config-dir`
+  under `/run`, `/etc`, `/opt`, `/usr`, `/dev`): the method is **none**. A hidden
+  root that resolves *inside* the workspace is beyond every mechanism here, because
+  Landlock grants the workspace and the namespaces bind it back; that layout is
+  **none**. Both sides are resolved with `realpath` first, and the engine enumerates
+  every real `<agents>/<agent>/workspace` when it opens and when an agent is added,
+  so a state root or workspace that is a link into the other cannot slip past it.
+- **bwrap** and **unshare** build a user and mount namespace. They are **opt-in**:
+  the product selects one only when you start it with `GEWU_CONFINEMENT=bwrap` or
+  `GEWU_CONFINEMENT=unshare`. Their complete argument lists are tested against
+  bubblewrap's and mount(8)'s contracts, but they have not yet been proven on a real
+  user-namespace host, so they are never chosen for you. In the namespace the
+  configuration root, the state root, the Forgejo data root, your real home directory,
+  `/tmp` and the engine's own temporary directory are replaced by empty mounts; only
+  this run's own directory and its workspace are bound back. The run gets an empty
+  `HOME` and its own `TMPDIR`; a sibling run's `tmp/askpass.toml` is behind the
+  private `/tmp` and is not visible. The namespace's mounts are made private before
+  anything is mounted, so an empty mount can never leak back to the host. Every path a
+  mount is placed on is resolved with `realpath` first: bubblewrap refuses a symlink
+  destination, and a symlink under `/tmp` whose target is elsewhere would otherwise
+  survive the private `/tmp` with its target visible. The mounts stage this run's own
+  files in `/dev/shm` (or `$XDG_RUNTIME_DIR`, or `/var/tmp`), mode 0700, removed when
+  the run ends.
+- **none**: this computer cannot run Landlock, the layout above cannot be confined, or
+  the opted-in namespace does not work. An opted-in namespace that cannot be honoured
+  gives **none**; the product never substitutes Landlock for the mechanism you asked
+  for. The run is not confined, and the first-run
+  screen and the board say `runs are not confined on this computer` in one sentence.
+  Nothing is pretended. If a run's plan had promised a boundary and its run-time
+  layout cannot keep it, the run records `none` in its plan, leaves a marker the
+  engine puts on the board, and refuses to execute a command rather than run it
+  unconfined behind the promise. A run whose Landlock probe fails at start takes the
+  same path.
 
-Because an agent can read the credentials file, the run does not rely on the boundary
-for secrecy: the key and every other secret in that file are redacted from every string
-the run writes down — a tool's output, a model reply, an error message — before it
-reaches the transcript or the log. The Forgejo tools do not make the credentials file
-unreachable to a shell command: `shell` still runs as you, with your rights, and can
-read the file as before.
+The run's environment is not inherited: it is cleared and replaced with a short
+allow-list — `PATH`, `LANG` and `LC_*`, `TERM`, `TZ`, `HOME` and `TMPDIR` (the run's
+own), and the `GEWU_*` and git variables the run needs. An exported `OPENAI_API_KEY`
+or `AWS_SECRET_ACCESS_KEY` is therefore not readable inside the run.
+
+What a confined run can still see on every mechanism: the system's files under `/etc`,
+`/proc`, `/sys` and `/run`, the network, and the tools you installed. Its environment
+is the short allow-list above, so a socket or an API key exported in any other variable
+is not inherited; its stdin is empty. Under an opted-in bwrap or unshare it also sees
+the rest of `/` except the replaced directories. It cannot read the product's
+`credentials.toml` — the model key, the administrator token and the other agents'
+logins — or `multiverse.toml`, the state root, the Forgejo data directory, another
+agent's instruction, or another run's login file. A confined run's per-run askpass
+file holds only **that run's own** Forgejo login and token, lives under the run's
+private `TMPDIR`, and is removed when the run ends.
+
+The key and every other secret in the credentials file are still redacted from every
+string the run writes down — a tool's output, a model reply, an error message — before
+it reaches the transcript or the log. That is a second line, not the boundary: a
+command can still do anything the confinement above leaves open.
 
 ## What is not here
 

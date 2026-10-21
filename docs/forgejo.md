@@ -33,24 +33,40 @@ forgejo/
   forgejo-17.0.0-linux-amd64   0755, hash-checked
   engine.lock                 0600, one program per data directory
   instance/
-    app.ini                   0600, generated secrets and SQLite
-    secrets/admin-password    0600, generated once
-    secrets/admin-login       0600
+    app.ini                   0600, generated secrets, SQLite in WAL mode
+    secrets/admin-login       0600, the login the instance was made with
+    custom/templates/base/head_script.tmpl   the locale guard before the pinned page script
     log/forgejo.log
     data/forgejo.db
     data/repositories/
 ```
 
 The address is chosen once from 3000–3099, written into `app.ini`, and read back on
-every later start. It is reachable only from this computer. The person's administrator
-login comes from `$USER` when that is a valid Forgejo login, else `owner`; the board
-shows it next to `your login:`. The generated password is never printed by the engine;
-the Forgejo page shows it for a moment when the person presses `p`, and the file above
-holds it with mode 0600.
+every later start. It is reachable only from this computer. A new installation's
+administrator login is the fixed `owner`, not the operating system account name; the
+board shows it next to `your login:`. Forgejo reserves `admin` for its own route, so
+`owner` is the fixed choice. An installation made by an earlier version keeps its
+recorded login and the page says `(kept from an earlier setup)`.
+
+The administrator password is not written down at all and never appears in a process
+argument. The account is created with Forgejo's CLI `--random-password`; the value is
+read only to be discarded. `p` on the Forgejo page resets it through the administration
+API — the value is in the request body, never in a process argument — and shows the new
+value, wrapped whole, for about ten seconds. The consequence is a static line on the page: the password shown before
+the reset no longer works.
+
+The database runs in WAL mode with `SQLITE_TIMEOUT = 5000` (five seconds), and the
+API client gives each call ten seconds — well under a run's own lifetime — so two
+agents writing at once wait for the lock rather than hanging the card on a 500.
+
+Those pinned keys are checked on **every** start, not only when `app.ini` is created:
+an instance made by an earlier version keeps `SQLITE_TIMEOUT = 500`, no journal mode,
+and no `[i18n]`/`[time]` section, so the keys are replaced or added before Forgejo is
+started. Every other setting the person wrote stays exactly as it is.
 
 `migrate` runs before the first administrative change, and the administrator account is
-made through Forgejo's own `admin user` CLI. The server runs as `web` in its own process
-group. It is ready when `/api/v1/version` answers.
+made through Forgejo's own `admin user create --random-password` CLI. The server runs
+as `web` in its own process group. It is ready when `/api/v1/version` answers.
 
 ## What is set up
 
@@ -93,15 +109,22 @@ The engine's `identity::manage`:
 
 The agent's token lives under `[forgejo_agent_tokens]` in the 0600 credentials file.
 Git is handed the token through `GIT_ASKPASS`: git runs this same program with the
-prompt as its one argument, and the program answers from that file over a pipe. The key
-is never a URL, a command-line argument, a log line or a screen. `credential.helper` is
+prompt as its one argument. In a confined run the program reads a per-run file that
+holds only that run's login and token, under the run's private `TMPDIR` (private from other runs on every mechanism); outside a
+run it reads the shared credentials file over the same pipe. The shared file — the
+model key, the administrator token and every other agent's login — is not readable
+inside a confined run. The key is never a URL, a command-line argument, a log line or
+a screen. `credential.helper` is
 disabled for every git command the product runs, so the key is not copied into a git
 credential store.
 
 The account, its commits and its run records stay when the agent is removed. Removal
 deletes the token on the server by its recorded name, removes the account from team
-`agents`, deletes the key from the credentials file, and forgets the agent in the
-settings. It is not a history rewrite.
+`agents`, deactivates the account (`active = false` and `prohibit_login = true`, so a
+web sign-in is refused as well as every token), deletes the key from the credentials
+file, and forgets the agent in the settings. It is not a history rewrite; the confirmation sentence says all four
+things before it acts. Adding an agent with the same name again reactivates the same
+account, keeping its history.
 
 ## Working in the repositories
 
@@ -143,7 +166,27 @@ naming the class and status, never a raw reply body and never a key.
 
 Each call is recorded in the run's transcript with its tool, repository, number and
 outcome; each successful write is also a run action with its web URL. The board reads
-the newest action for the agent's card.
+the newest action for the agent's card. A failed call leaves one visible line on the
+card and in the run log, `✗ <tool>: <first clause of the error>`, and while a call is in
+flight the card says which tool it is and how many seconds it has waited.
+
+## The bundled pages' language
+
+Forgejo's `webcomponents.js` builds an `Intl.DateTimeFormat` from
+`navigator.language` at load time. A browser whose language tag is not usable (`C`, an
+empty string, a tag older ICU rejects) makes that throw before the page's own script
+runs, and Forgejo paints its red `JavaScript error` banner on every page. A browser is
+not the product's to configure, so the pinned instance serves one custom template,
+extracted from the pinned binary and prefixed with a small guard: an unusable language
+is replaced with `en-US`; a valid one is left alone. `app.ini` also pins a valid
+default (`[i18n] LANGS = en-US`, `[time] DEFAULT_UI_LOCATION = UTC`), so the page's own
+language and date formats stay valid even when the browser's `Accept-Language` is odd.
+
+Registration is off (`DISABLE_REGISTRATION = true`), so `/user/sign_up` renders
+`Registration is disabled. Please contact your site administrator.` for a signed-out
+visitor. Forgejo itself redirects a visitor who is already signed in from that route to
+the dashboard; there is no setting that keeps that page for a signed-in account, and
+this build does not pretend otherwise.
 
 ## Trying it against a local instance
 

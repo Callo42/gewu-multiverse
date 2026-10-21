@@ -511,6 +511,8 @@ fn the_agent_tools_round_trip_against_a_live_instance() {
         max_turns: 12,
         steps: Vec::new(),
         timeout_secs: 90,
+        confinement: "none".to_owned(),
+        hide: Vec::new(),
     }
     .write(&run_dir)
     .expect("the plan");

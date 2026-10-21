@@ -14,10 +14,9 @@ requests are its own. The board shows the whole thing at a glance:
 │                       ╭╴ FORGEJO ╶─────────────────────────────╴ ● running ╶─╮                   │
 │                       │                                                      │                   │
 │                       │ http://127.0.0.1:3000                                │                   │
-│                       │ team · 1 repository                                  │                   │
+│                       │ team · 1 repository · team/workspace                 │                   │
 │                       │ 3 agents                                             │                   │
-│                       │ version 17.0.0                                       │                   │
-│                       │ your login: admin                                    │                   │
+│                       │ your login: owner                                    │                   │
 │                       ╰───────────────────────────┬──────────────────────────╯                   │
 │                                                   │                                              │
 │                  ╭────────────────────────────────┼────────────────────────────────╮             │
@@ -43,11 +42,40 @@ requests are its own. The board shows the whole thing at a glance:
 - **One model for all of them.** You give one model address and one key. Every agent
   uses them, with its own instruction.
 - **A card for each agent.** A filled circle means working, a half circle means waiting
-  for its next run, an empty circle means stopped. The card also shows its Forgejo
-  login and its latest run.
+  for its next run, an empty ring means stopped or not started. The board card keeps
+  the few words: the agent's name, its Forgejo login, its state, one last line and its
+  run count. Open it with `⏎` for the Agent screen: the last work block (issue, branch,
+  pull request, comment), the instruction's first line or `… (N more lines)`, the
+  bounded run marks with their legend, the last tool failure and the newest failed
+  run's first reason. Started agents keep a visible idle between runs
+  (`next run in 5s`).
 
 The program keeps the Forgejo running while it is open. When an agent is started, it
-runs its instruction, and when that run ends it starts another one, until you stop it.
+runs its instruction, and when that run ends it starts another one after a short
+visible idle, until you stop it. An agent's shell is confined where the computer allows
+it. **Landlock is the automatic mechanism**: it denies the product's roots, and is not
+chosen when one of them lies inside a tree it must allow. The product claims Landlock
+only after a child process proved that a ruleset is fully enforced — it reads a file it
+allows and is denied one it does not — so a kernel without Landlock gets the `none`
+sentence below, not a promise. **bwrap or unshare are
+opt-in** (`GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare`); they replace this
+product's configuration, state and Forgejo data roots, your home, and the engine's
+temporary directory (with `/tmp`) with empty mounts, bind back only this run's own
+directory and workspace, and clear the run's environment to a short allow-list. Their
+complete argument lists are tested against the real contracts but they are not yet
+proven on a real user-namespace host, so they are never chosen for you; an opt-in that
+cannot be honoured gives `none`, never a substitute mechanism. Every hidden
+path and the engine's temporary root are resolved with `realpath` first, and the engine
+enumerates every real workspace, so a symlinked root cannot slip past. The workspace,
+the run's private `TMPDIR`, the network and the tools you installed stay visible, as do
+the system's `/etc`, `/proc`, `/sys` and `/run`. When the computer offers no mechanism
+or the layout cannot be confined, the first-run screen and the board say `runs are not
+confined on this computer`.
+
+After an upgrade, the first open shows one screen: the version this installation was,
+the version this is, what was found (settings, agents, instructions and runs) and what
+is reused or ignored, with the release page address. The next open goes straight to
+the board.
 
 ## Install
 
@@ -79,9 +107,14 @@ gewu-multiverse
 On the first start the board walks you through these; after that it opens on the board
 and you can change any of them later.
 
-1. **Read the five warnings.** They say that agents use this computer with your
-   permissions and can read your files, including saved keys. Press `y` after you have
-   read every one.
+1. **Read the warnings.** They say that agents use this computer with your
+   permissions. When this computer can confine an agent's shell, a run cannot read your
+   configuration, saved keys, Forgejo data, home or another run's login file; when it
+   cannot, the same screen says, in
+   one sentence, `runs are not confined on this computer`. Landlock is the automatic
+   mechanism; `bwrap` and `unshare` are opt-in with
+   `GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare` and are tested but not yet
+   proven on a real user-namespace host. Press `y` after you have read every one.
 2. **Set the model.** Give the full model address (it ends in `/chat/completions`), the
    model name, and the key. Press `t` to test it; `✓ the model answered` means it
    works. Press `⏎` to go on.
@@ -106,13 +139,21 @@ and `q` quits.
 | Each agent's instruction, skills and workspace | `~/.config/gewu-multiverse/agents/<agent>/` |
 | Every run's log and record | `~/.local/state/gewu-multiverse/<agent>/<run>/` |
 | Forgejo and its database | `~/.local/share/gewu-multiverse/forgejo/` |
-| The Forgejo administrator password | `~/.local/share/gewu-multiverse/forgejo/instance/secrets/admin-password` (mode 0600) |
+| The Forgejo administrator password | not on disk: `p` on the Forgejo page resets it through Forgejo's administration API and shows the new one |
 
 The Forgejo address is on the board and on the Forgejo page, for example
 `http://127.0.0.1:3000`. On the Forgejo page (`f`) your login is shown next to
-`your login:`, and the board shows it too when the window has room. The password is
-not printed: open the Forgejo page and press `p` to show it for a moment, or read the
-file above.
+`your login:`, the repositories are listed by name, and the agents' one-line
+permission summary is there with the team page address. A new installation uses the
+fixed login `owner`, not your computer account name; an installation made by an
+earlier version keeps its recorded login, and the page says `(kept from an earlier
+setup)`.
+
+The password is never written down. Open the Forgejo page and press `p`: the product
+resets it through Forgejo's administration API, with the new value in the request body,
+and the new value is shown, wrapped in full, for a few seconds. The one-line
+consequence is a static row on the page: the password shown before that moment stops
+working.
 
 `--config-dir <dir>` moves the settings, keys and agent folders; `--state-dir <dir>` moves the run records.
 A relative folder is taken from the folder you started the program in.
@@ -173,9 +214,27 @@ Nothing else is installed: no service, no system-wide file, no other account.
 
 ## What it does not do
 
-- It is **not a sandbox**. Agents run as you, with your permissions. They can read your
-  files, including `credentials.toml`. The program removes saved keys from the logs and
-  records it writes, but a command an agent runs can still do anything you can do.
+- It is **not a container and not a privilege boundary**. Agents run as you, with your
+  permissions, and their shell is confined only by the mechanism this computer offers.
+  **Landlock is chosen automatically.** `bwrap` and `unshare` are chosen only when you
+  ask for one (`GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare`); their complete
+  argument lists are tested against the real contracts, but they are not yet proven on
+  a real user-namespace host. A confined run cannot read the product's configuration,
+  saved keys, state or Forgejo data root, your home, another run's login file, or a
+  secret you exported in an ordinary variable such as `OPENAI_API_KEY` (the run starts
+  with a cleared environment: only `PATH`, `LANG`/`LC_*`, `TERM` and `TZ` survive).
+  Landlock denies the product's roots and is skipped when one lies inside a tree it
+  must allow; it is claimed only after a child probe proved a fully enforced ruleset
+  (a denied read outside the grant). An opted-in namespace makes `/tmp` and the
+  engine's temporary directory private; an opt-in that cannot be honoured gives
+  `none` rather than Landlock. Every hidden path and the engine's temporary root are
+  resolved with `realpath` first, and the engine enumerates every real agent
+  workspace, so a symlinked root cannot slip past the check. A confined run can still
+  read `/etc`, `/proc`, `/sys` and `/run`, reach the network and use the tools you
+  installed. When no mechanism works, the run is not confined at all and the board
+  says so; a run whose plan promised a boundary it cannot keep records `none` and
+  does not execute the command. The program also removes saved keys from the logs and
+  records it writes, but redaction is not the confinement.
 - It does not connect to another Forgejo, and it does not host more than one.
 - It does not let you open or update pull requests from the terminal. The agents do
   that in Forgejo; you review there in a browser.
