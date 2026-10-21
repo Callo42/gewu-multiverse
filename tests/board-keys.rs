@@ -247,8 +247,9 @@ fn plus_adds_and_minus_asks_once_before_removing() {
     assert!(board.sent_commands().is_empty(), "the remove waits for y");
     let frame = frame_text(&draw(&mut board));
     assert!(
-        frame.contains("remove agent-1? token revoked")
-            && frame.contains("history and folder kept"),
+        frame.contains("remove agent-1?")
+            && frame.contains("history kept")
+            && frame.contains("y remove   n keep"),
         "{frame}"
     );
     press(&mut board, KeyCode::Char('y'));

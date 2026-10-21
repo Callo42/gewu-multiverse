@@ -42,6 +42,21 @@ base="https://github.com/$repo/releases/download/$tag"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# A build before 0.1.31 left no record of the version it was. Record the version the
+# installed binary reports before it is replaced, so the first open of the new build
+# can show the one upgrade screen with the real old version instead of guessing (W31-1).
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/gewu-multiverse
+if [ -x "$dir/gewu-multiverse" ] && [ -f "$config_dir/multiverse.toml" ]; then
+    old_version=$("$dir/gewu-multiverse" --version 2>/dev/null | sed -n 's/^gewu-multiverse[[:space:]]*//p' | head -1)
+    if [ -n "$old_version" ]; then
+        old_umask=$(umask)
+        umask 077
+        printf '# The newest version that has opened this configuration.\nversion = "%s"\n' "$old_version" \
+            > "$config_dir/last-seen.toml" 2>/dev/null || true
+        umask "$old_umask"
+    fi
+fi
+
 say "downloading $tarball ($tag)"
 curl -fsSL -o "$tmp/$tarball" "$base/$tarball" || die "download failed"
 curl -fsSL -o "$tmp/$tarball.sha256" "$base/$tarball.sha256" || die "checksum download failed"
@@ -69,8 +84,11 @@ fi
 # The product's own Forgejo is fetched now, once, so the first run does not have to
 # wait for it. A failure is not fatal: the product is installed, and its first start
 # tries again.
-say "fetching Forgejo 17.0.0 for gewu-multiverse (about 122 MB)"
-if "$dir/gewu-multiverse" --install-forgejo >/dev/null 2>&1; then
+say "fetching Forgejo 17.0.0 for gewu-multiverse (about 122 MB; progress is shown below)"
+# Keep the product's own progress on stderr: the 122 MB fetch is the longest step,
+# and a silent line makes a slow connection look stuck (F7). Standard output is the
+# product's ready line, which the installer replaces with its own.
+if "$dir/gewu-multiverse" --install-forgejo >/dev/null; then
     say "Forgejo 17.0.0 is ready"
 else
     say "the Forgejo download did not finish — the product is installed; its first start will try again"

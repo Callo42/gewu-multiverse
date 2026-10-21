@@ -62,6 +62,7 @@ struct FakeAgent {
     desired: Desired,
     session: SessionState,
     sessions_since_start: u64,
+    runs_total: u64,
     recent: Vec<SessionEnd>,
     instruction_path: PathBuf,
     instruction_chars: usize,
@@ -70,10 +71,12 @@ struct FakeAgent {
     activity: Option<String>,
     activity_at: Option<SystemTime>,
     last_error: Option<String>,
+    last_result: Option<String>,
     last_failure: Option<String>,
     current_tool: Option<String>,
     current_tool_seconds: u64,
     last_work: Vec<String>,
+    no_assigned_work: bool,
     session_ticks: u32,
     restart_ticks: u32,
 }
@@ -195,6 +198,7 @@ impl FakeEngine {
 
     fn begin_session(agent: &mut FakeAgent) {
         agent.sessions_since_start += 1;
+        agent.runs_total += 1;
         agent.session = SessionState::Running {
             number: agent.sessions_since_start,
             since: SystemTime::now(),
@@ -212,8 +216,9 @@ impl FakeEngine {
         agent.activity_at = Some(SystemTime::now());
         agent.last_work = if agent.activity.is_some() {
             vec![
-                format!("issue team/workspace#{}", agent.sessions_since_start),
-                "branch demo · PR #3".to_owned(),
+                format!("issue #{}", agent.sessions_since_start),
+                "pull request #3 from demo".to_owned(),
+                "comment on #1".to_owned(),
             ]
         } else {
             Vec::new()
@@ -368,6 +373,7 @@ impl FakeEngine {
             desired: Desired::Stopped,
             session: SessionState::Idle,
             sessions_since_start: 0,
+            runs_total: 0,
             recent: Vec::new(),
             instruction_path,
             instruction_chars: 0,
@@ -376,10 +382,12 @@ impl FakeEngine {
             activity: None,
             activity_at: None,
             last_error: None,
+            last_result: None,
             last_failure: None,
             current_tool: None,
             current_tool_seconds: 0,
             last_work: Vec::new(),
+            no_assigned_work: false,
             session_ticks: 0,
             restart_ticks: 0,
         }
@@ -460,6 +468,7 @@ impl EngineApi for FakeEngine {
                 desired: agent.desired,
                 session: agent.session.clone(),
                 sessions_since_start: agent.sessions_since_start,
+                runs_total: agent.runs_total,
                 recent: agent.recent.clone(),
                 instruction_chars: agent.instruction_chars,
                 instruction_first_line: agent.instruction_first_line.clone(),
@@ -467,10 +476,12 @@ impl EngineApi for FakeEngine {
                 activity: agent.activity.clone(),
                 activity_at: agent.activity_at,
                 last_error: agent.last_error.clone(),
+                last_result: agent.last_result.clone(),
                 last_failure: agent.last_failure.clone(),
                 current_tool: agent.current_tool.clone(),
                 current_tool_seconds: agent.current_tool_seconds,
                 last_work: agent.last_work.clone(),
+                no_assigned_work: agent.no_assigned_work,
             })
             .collect();
         BoardView {

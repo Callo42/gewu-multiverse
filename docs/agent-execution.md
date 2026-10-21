@@ -175,14 +175,67 @@ the run has left.
 
 ## Finishing
 
-The outcome is decided by the process, never by what it wrote:
+The process decides whether the run finished; the run's own tools and final summary
+decide what a clean finish means:
 
 | How it ended | Outcome |
 |---|---|
-| the process exited 0: the model finished | `succeeded` |
+| exited 0, and a write tool refused a write, or the summary says it could not do the instruction | `refused` |
+| exited 0, and a tool call failed (non-zero exit or a signal) without being a refused write | `warned` |
+| exited 0, and the summary says there was nothing assigned to do | `no_work` |
+| exited 0, and neither: the model finished | `succeeded` |
 | the process exited non-zero, or a model call failed | `failed` |
 | the person stopped it | `stopped` |
 | the engine stopped it for its timeout | `timed_out` |
+
+The final summary is kept as the terminal record's reason for every clean finish, so
+the card can draw it beside `✓` as well as `⊘`/`∅`/`⚠`. A refused Forgejo write, or a
+failed shell write (`DELETE`/`PUT`/`POST`/`PATCH` in any standard curl spelling, a
+git write read by subcommand position — `push`, `rm`, `mv`, `add`, `commit`, `stash`,
+`pull`, `fetch`, `branch`/`tag` changes — `rm`, `rmdir`, `unlink`, `mv`, `cp`, `tee`,
+`truncate`, `sed -i`, or a redirection into a file), is evidence from the run rather
+than from its prose (review B2). The rule as built (correction 7): the command runs
+under `bash` with a `DEBUG` trap installed under `set -T`; the shell reports every
+simple command it completes to the product on a private file, and the tool result
+carries `segments: [{command, status}]`. The mark reads every raw status the shell
+reported — each record's `$?` and every `PIPESTATUS` element — so a run with any
+non-zero status is never `✓`: it is `warned` (`⚠`) with the failed command's cause,
+or `refused` (`⊘`) when the failed command is a recognised write. Pairing only names
+the command; a raw failure the pairing cannot place is `⚠`, never `✓`. A write inside
+a compound whose status the shell hides (`if rm …; fi | cat`) is `⊘` when the
+operating system's own diagnostic is in the output, and any program's POSIX
+diagnostic (`<program-or-shell>: [line N: ][<path>: ]<strerror>`, ending in any error
+message the C library itself prints — `Permission denied`, `Read-only file system`,
+`File name too long`, `Too many levels of symbolic links` and the rest) is a
+witness; an unlisted program's failure there is `⚠`. The shell's own voice is the
+third witness: every shell that reads the prelude reports its `$0` (the outer shell
+and every nested `bash` that reads `BASH_ENV`), the trap reports `BASH_SOURCE[0]`
+(the name bash uses for a sourced command or a function defined there), and bash
+prefixes its own errors and warnings with that exact
+`<name>: ` — `<name>: line N: <message>` and `<name>: <message>`; a function defined
+on the `-c` line is named `environment`. Any line in that form is shell-reported
+trouble whatever its text (`ambiguous redirect`, `cannot overwrite existing file` and
+every other wording); with an all-zero raw record it makes the run `⚠`, or `⊘` when
+the command names a recognised write, or when the shell's record names a write whose
+plain target the diagnostic carries. A nested interpreter that does not load the
+product's recorder — any non-bash interpreter, or `bash` in POSIX or privileged mode
+(`--posix`, `-p`, `POSIXLY_CORRECT=1`) — is limit (e) in `docs/board.md`: its failed
+write is seen only through the outer command's exit status and the output
+heuristics. A failure with neither a status nor a
+diagnostic the system or the shell prints is limit (f) or (g) in `docs/board.md`. A
+write that exits non-zero
+is a refusal whatever its output says; a failed Forgejo read is a failed call and
+also marks the run `warned`.
+On a host without `bash`, or when the private record cannot be opened, the product
+falls back to reading the output: a failed write behind `; echo done`, `|| true` or
+`| tail -5` is still a refusal when its output carries a failure-context line, and a
+`curl` without `-f` (which exits 0 on a 4xx/5xx) is read for a status line or an HTTP
+error phrase; a write that succeeded is not re-read for words (review corrections 3
+and 4). Any other failed tool call marks the run `warned` (`⚠`), never `✓`. A destructive instruction answered only in prose (`I left it in place`,
+`I did not delete it`, `deleting it is not safe`) is also a refusal, because the run's
+own sentence says the work was not done; a keep phrase beside a success verb for the
+destructive act (`I deleted the stale branch and kept the docs as is`) stays a
+success.
 
 The agent process writes the terminal record when it ends on its own. When the engine
 stops a run, the process cannot write anything, so the engine writes the terminal

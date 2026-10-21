@@ -74,7 +74,25 @@ pub enum Desired {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEnd {
     Succeeded,
-    Failed { reason: String },
+    /// The run exited cleanly, but its own final summary says it could not do the
+    /// instruction. It is not a success on the card.
+    Refused {
+        reason: String,
+    },
+    /// The run exited cleanly and did nothing, and its own summary says there was
+    /// nothing assigned to do. It is not a success on the card.
+    NoWork {
+        reason: String,
+    },
+    /// The run exited cleanly but a tool call failed (a non-zero exit or a signal)
+    /// and was not a refused write. It is not a success on the card; the reason is
+    /// the failed command's cause (correction 4).
+    Warned {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
     TimedOut,
     Stopped,
 }
@@ -106,8 +124,13 @@ pub struct AgentView {
     pub provisioning: Provisioning,
     pub desired: Desired,
     pub session: SessionState,
-    /// Sessions since the agent was last started.
+    /// Sessions since the agent was last started (the session counter; the card's
+    /// `run N` is the total below, which does not reset).
     pub sessions_since_start: u64,
+    /// Every run recorded for this agent, reconstructed from the records on open and
+    /// updated as runs end. It does not reset when the agent starts or the program
+    /// reopens (W31-5, F5).
+    pub runs_total: u64,
     /// How the newest finished sessions ended, newest last, at most ten.
     pub recent: Vec<SessionEnd>,
     /// The instruction's length in characters; 0 means none is written yet.
@@ -123,16 +146,23 @@ pub struct AgentView {
     pub activity_at: Option<SystemTime>,
     /// The last finished run's error, first clause only, for the card.
     pub last_error: Option<String>,
+    /// The newest clean run's own final summary; the card shows it beside the run
+    /// mark, so `✓` carries what the run says it did as well as `⊘`/`∅` do.
+    pub last_result: Option<String>,
     /// The last failure of a tool call inside the current or newest run: one line,
-    /// `✗ shell: exit 128 — …`'s first clause.
+    /// `shell: exit 128 — …`'s first clause; the card adds `⚠` or `✗`.
     pub last_failure: Option<String>,
     /// The tool call in flight right now, if a run is inside one.
     pub current_tool: Option<String>,
     /// How many seconds that call has been in flight.
     pub current_tool_seconds: u64,
-    /// The last issue, branch, pull request and comment named by the newest run, at
-    /// most two short lines, for the card's work block.
+    /// The last issue, branch, pull request and comment named by the newest run that
+    /// did work, at most three short typed lines, for the card's work block. It stays
+    /// until a later run does new work.
     pub last_work: Vec<String>,
+    /// The newest run's own log says no open issue was assigned to this agent. The
+    /// Agent screen names the fix instead of leaving an empty work block.
+    pub no_assigned_work: bool,
 }
 
 /// What an older installation looked like when this version first opened it.
