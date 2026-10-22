@@ -1766,7 +1766,10 @@ fn an_inaccessible_unrelated_process_does_not_hide_a_readable_holder() {
     if !stopped {
         stop_unrelated(holder);
     }
-    let reader_survived = reader.try_wait().expect("unrelated process status").is_none();
+    let reader_survived = reader
+        .try_wait()
+        .expect("unrelated process status")
+        .is_none();
     if reader_survived {
         stop_unrelated(reader);
     }
