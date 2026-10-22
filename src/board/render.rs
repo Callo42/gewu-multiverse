@@ -58,8 +58,9 @@ pub struct BoardLayout {
     pub wire_cells: Vec<(u16, u16)>,
     /// Whether cards are above or below the window.
     pub scrolls: bool,
-    /// Rows the footer occupies: three normally, four when a footer event and
-    /// the status line both need a row of their own (B3).
+    /// Rows the footer occupies, exactly matching the lines the footer draws:
+    /// the two key lines plus one each for the status sentence and the event
+    /// (B3), or the quit warning's wrapped lines plus its notice (review-2).
     pub footer_rows: u16,
 }
 
@@ -881,13 +882,83 @@ fn status_row_needed(board: &Board) -> bool {
     board.notice().is_some() || waiting_sentence(board).is_some() || !board.view.confined
 }
 
-/// How many rows the footer really needs: the two key lines, one for the event,
-/// and one for the status. A row that has nothing to say is not reserved.
-fn footer_rows_for(board: &Board, build: bool) -> u16 {
+/// The agents the quit warning names: started, and running or restarting.
+fn started_agent_names(board: &Board) -> Vec<&str> {
+    board
+        .view
+        .agents
+        .iter()
+        .filter(|agent| {
+            agent.desired == Desired::Started
+                && matches!(
+                    agent.session,
+                    SessionState::Running { .. } | SessionState::Restarting { .. }
+                )
+        })
+        .map(|agent| agent.name.as_str())
+        .collect()
+}
+
+/// The quit warning, chosen so its wrapped form fits the `budget` rows the
+/// geometry can give it. Naming every running agent is preferred; when the
+/// names alone would need more rows than the frame can spare, the count keeps
+/// what stops and the reopen sentence instead of losing them (F-13).
+fn quit_warning_text(board: &Board, width: u16, budget: u16) -> String {
+    let started = started_agent_names(board);
+    if started.is_empty() {
+        return "quit stops Forgejo; it starts again on reopen — q again quits".to_owned();
+    }
+    let names = join_names(&started);
+    let line = if started.len() == 1 {
+        format!("quit stops {names} and Forgejo; they start again on reopen — q again quits")
+    } else {
+        format!("quit stops {names}, and Forgejo; they start again on reopen — q again quits")
+    };
+    if text_util::wrap(&line, width.saturating_sub(2) as usize).len() as u16 <= budget {
+        return line;
+    }
+    let noun = if started.len() == 1 {
+        "agent"
+    } else {
+        "agents"
+    };
+    format!(
+        "quit stops {} {noun} and Forgejo; they start again on reopen — q again quits",
+        started.len()
+    )
+}
+
+/// How many rows the footer really needs. It is the single count both the
+/// geometry and the drawing use: the quit warning owns exactly the rows its
+/// wrapped text needs (plus the one notice it would show), the remove
+/// confirmation owns its consequence and key lines, and otherwise the two key
+/// lines, the status line and the event row are each reserved only when they
+/// have something to say. The board above gives up these rows; the footer is
+/// never asked to fit into fewer (review-2 blocker).
+fn footer_rows_for(
+    board: &Board,
+    inner: Rect,
+    forgejo_h: u16,
+    board_floor: u16,
+    build: bool,
+) -> u16 {
     if build {
         return 2;
     }
-    2 + u16::from(status_row_needed(board)) + u16::from(!board.view.forgejo.events.is_empty())
+    if board.confirm_remove.is_some() {
+        return 2;
+    }
+    if board.confirm_quit {
+        let notice = u16::from(board.notice().is_some());
+        let budget = inner.height.saturating_sub(notice + board_floor).max(1);
+        let line = quit_warning_text(board, inner.width, budget);
+        let warning = text_util::wrap(&line, inner.width.saturating_sub(2) as usize)
+            .len()
+            .max(1) as u16;
+        return warning + notice;
+    }
+    let event = !board.view.forgejo.events.is_empty() && forgejo_h < 8;
+    2 + u16::from(status_row_needed(board)) + u16::from(event)
 }
 
 /// How many agent rows fit inside the list box: the content rows minus the
@@ -913,8 +984,6 @@ fn balanced_columns(count: usize, limit: usize) -> usize {
 fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeometry {
     let inner = inner(area);
     let compact = area.width < 80;
-    let footer_rows = footer_rows_for(board, build);
-    let content_h = inner.height.saturating_sub(footer_rows);
     let agent_count = board.view.agents.len().max(1);
     let gap = if compact { 0 } else { 2 };
     let usable = inner.width.saturating_sub(2);
@@ -931,6 +1000,11 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         4
     };
     let trunk_gap = if compact { 0 } else { 1 };
+    // The smallest board the footer must leave room for: the Forgejo box, the
+    // trunk gap, and the compact list's bottom border plus one agent row.
+    let board_floor = forgejo_h + trunk_gap + 3;
+    let footer_rows = footer_rows_for(board, inner, forgejo_h, board_floor, build);
+    let content_h = inner.height.saturating_sub(footer_rows);
 
     let mut use_list = false;
     let mut columns = 1;
@@ -1699,62 +1773,34 @@ fn join_names(names: &[&str]) -> String {
 }
 
 fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
-    let footer_rows = board.last.footer_rows.max(2);
+    // Exactly the rows `footer_rows_for` reserved; drawing never writes below
+    // this, and every line the footer draws has a reserved row (review-2).
+    let footer_rows = board.last.footer_rows;
     let footer_top = inner.bottom().saturating_sub(footer_rows);
     if board.confirm_quit {
-        let started: Vec<&str> = board
-            .view
-            .agents
-            .iter()
-            .filter(|agent| {
-                agent.desired == Desired::Started
-                    && matches!(
-                        agent.session,
-                        SessionState::Running { .. } | SessionState::Restarting { .. }
-                    )
-            })
-            .map(|agent| agent.name.as_str())
-            .collect();
-        let names = join_names(&started);
-        let line = if started.len() == 1 {
-            format!("quit stops {names} and Forgejo; they start again on reopen — q again quits")
-        } else {
-            format!("quit stops {names}, and Forgejo; they start again on reopen — q again quits")
-        };
+        let notice = board.notice();
         let width = inner.width.saturating_sub(2) as usize;
-        // The geometry gives the footer three rows (or four when a notice needs
-        // one). The warning uses every row it is given: the consequence, the
-        // reopen sentence and the confirmation are never cut for want of a row
-        // (F-13). If more running agents than the frame can name would overflow,
-        // the count keeps what stops instead of dropping the consequence.
-        let rows = footer_rows.max(3) as usize;
-        let mut parts = text_util::wrap(&line, width);
-        if parts.len() > rows {
-            let noun = if started.len() == 1 {
-                "agent"
-            } else {
-                "agents"
-            };
-            parts = text_util::wrap(
-                &format!(
-                    "quit stops {} {noun} and Forgejo; they start again on reopen — q again quits",
-                    started.len()
-                ),
-                width,
-            );
-        }
-        let used = parts.len();
-        for (y, part) in (footer_top..).zip(parts.into_iter().take(rows)) {
-            text_util::put(buf, inner, inner.x + 1, y, &part, theme::bold(theme::AMBER));
-        }
-        if let Some(notice) = board.notice()
-            && used < rows
-        {
+        // The warning owns everything the geometry gave it except the notice's
+        // one row: consequence, reopen sentence and confirmation are whole.
+        let budget = footer_rows.saturating_sub(u16::from(notice.is_some()));
+        let line = quit_warning_text(board, inner.width, budget);
+        let parts = text_util::wrap(&line, width);
+        for (offset, part) in (0..budget).zip(parts) {
             text_util::put(
                 buf,
                 inner,
                 inner.x + 1,
-                inner.bottom().saturating_sub(1),
+                footer_top + offset,
+                &part,
+                theme::bold(theme::AMBER),
+            );
+        }
+        if let Some(notice) = notice {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                footer_top + footer_rows.saturating_sub(1),
                 &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
                 theme::fg(theme::FG),
             );
@@ -1815,15 +1861,14 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     } else {
         board.view.forgejo.events.last()
     };
-    let bottom = inner.bottom().saturating_sub(1);
     // B3: the event owns a row. It is never right-aligned onto the key line, so a
     // long repository name or the scroll indicator cannot draw over a key hint.
-    let event_y = if event.is_some() && footer_rows >= 4 {
-        footer_top + 2
-    } else {
-        bottom
-    };
-    let status_y = bottom;
+    // The event row sits directly under the two key lines; the status sentence
+    // (when one is drawn) takes the row after it. `footer_rows_for` reserved
+    // exactly these rows, so the event is never placed on the status row and the
+    // status is never written past the reserved block (review-2).
+    let event_y = footer_top + 2;
+    let status_y = footer_top + 2 + u16::from(event.is_some());
     let shown = if layout.form == BoardForm::List {
         layout.listed.len()
     } else {
@@ -1879,10 +1924,10 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
             theme::fg(theme::MUTED),
         );
     }
-    // The status line has the bottom row unless the event took it (which the
-    // geometry only allows when there is no notice, no waiting sentence and a
-    // confined host).
-    if event.is_none() || event_y != status_y {
+    // The status line owns the row the geometry reserved after the event, if
+    // any was reserved; it is never written into an unreserved row.
+    let status_reserved = footer_rows > 2 + u16::from(event.is_some());
+    if status_reserved {
         if let Some(notice) = board.notice() {
             text_util::put(
                 buf,

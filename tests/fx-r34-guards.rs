@@ -526,6 +526,142 @@ fn the_quit_warning_uses_its_rows_and_keeps_the_consequences() {
     }
 }
 
+/// One cell of the review-2 quit-warning matrix: render the confirming-quit
+/// footer and check that the warning is whole and the board above it is intact.
+fn assert_quit_warning_cell(width: u16, height: u16, count: usize, event: bool, status: bool) {
+    let label = format!("{width}x{height}, {count} running agents, event={event}, status={status}");
+    let mut board_view = view(count);
+    for agent in &mut board_view.agents {
+        agent.desired = Desired::Started;
+        agent.session = SessionState::Running {
+            number: 1,
+            since: SystemTime::now(),
+        };
+    }
+    if !event {
+        board_view.forgejo.events.clear();
+    }
+    if status {
+        board_view.notice = Some("copied repository URL".to_owned());
+    }
+    let mut board = Board::new(Fixed(board_view));
+    board.on_key(KeyEvent::from(KeyCode::Char('q')));
+    let frame = frame_text(&draw(&mut board, width, height));
+    // Drop the frame's borders before flattening, so a wrapped sentence can be
+    // checked as words rather than as pixels.
+    let flat = frame
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '│' | '╭' | '╮' | '╰' | '╯' | '─') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // What stops: every running agent, and the Forgejo.
+    assert!(flat.contains("quit stops"), "{label}:\n{frame}");
+    for number in 1..=count {
+        let name = format!("agent-{number}");
+        assert!(
+            has_whole_word(&flat, &name),
+            "{label}: {name} is not named whole:\n{frame}"
+        );
+    }
+    assert!(
+        flat.contains("Forgejo; they start again on reopen — q again quits"),
+        "{label}: the consequence, reopen sentence or confirmation is cut:\n{frame}"
+    );
+    assert!(
+        flat.contains("q again quits"),
+        "{label}: the confirmation is cut:\n{frame}"
+    );
+
+    // The picture above gives up rows, never the warning: every drawn card or
+    // list row stays above the reserved footer, and no two share a cell.
+    let footer = board.layout().footer_rows;
+    assert!(footer >= 1, "{label}: no footer rows");
+    let content_bottom = height - 1 - footer;
+    let lines: Vec<&str> = frame.lines().collect();
+    let warning_top = lines
+        .iter()
+        .position(|line| line.contains("quit stops"))
+        .unwrap_or_else(|| panic!("{label}: no warning line:\n{frame}"));
+    let warning_bottom = lines
+        .iter()
+        .rposition(|line| line.contains("quits"))
+        .unwrap_or_else(|| panic!("{label}: no confirmation line:\n{frame}"));
+    assert!(
+        warning_top >= content_bottom as usize,
+        "{label}: the warning starts inside the board at row {warning_top} \
+         (content ends at {content_bottom}):\n{frame}"
+    );
+    assert!(
+        warning_bottom < height as usize - 1,
+        "{label}: the warning is drawn past the footer frame:\n{frame}"
+    );
+    let slots: Vec<ratatui::layout::Rect> = board
+        .layout()
+        .cards
+        .iter()
+        .chain(board.layout().listed.iter())
+        .map(|slot| slot.rect)
+        .collect();
+    assert!(!slots.is_empty(), "{label}: no agent is drawn");
+    for rect in &slots {
+        assert!(
+            rect.y >= 1 && rect.bottom() <= content_bottom,
+            "{label}: a card at {rect:?} reaches into the footer \
+             (content bottom {content_bottom}):\n{frame}"
+        );
+    }
+    for (index, one) in slots.iter().enumerate() {
+        for two in &slots[index + 1..] {
+            assert!(
+                one.x >= two.right()
+                    || two.x >= one.right()
+                    || one.y >= two.bottom()
+                    || two.y >= one.bottom(),
+                "{label}: cards {one:?} and {two:?} share a cell:\n{frame}"
+            );
+        }
+    }
+}
+
+/// The review-2 blocker: the quit warning's lines are part of the footer
+/// geometry, so a 12-agent warning is never clipped for want of rows. The full
+/// matrix is 1, 4, 7 and 12 running agents at every supported size, with and
+/// without a repository-event row and with and without a status sentence.
+#[test]
+fn the_quit_warning_is_whole_in_every_footer_state() {
+    for (width, height) in SIZES {
+        for count in [1_usize, 4, 7, 12] {
+            for event in [false, true] {
+                for status in [false, true] {
+                    assert_quit_warning_cell(width, height, count, event, status);
+                }
+            }
+        }
+    }
+}
+
+/// The two cells the reviewer saw cut: twelve running agents, no repository
+/// event row, no status sentence, at 72x18 and 80x24. Each is its own guard so
+/// that both fail at 5294397 rather than the first masking the second.
+#[test]
+fn the_12_agent_quit_warning_at_72x18_needs_no_event_row() {
+    assert_quit_warning_cell(72, 18, 12, false, false);
+}
+
+#[test]
+fn the_12_agent_quit_warning_at_80x24_needs_no_event_row() {
+    assert_quit_warning_cell(80, 24, 12, false, false);
+}
+
 #[test]
 fn the_reaper_reads_no_process_environment() {
     // The review's blocker 5: the reap path must not scan other processes'

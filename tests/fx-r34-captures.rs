@@ -311,6 +311,50 @@ fn capture_the_model_form_warnings_upgrade_and_quit_warning() {
     }
 }
 
+/// The review-2 matrix: 1, 4, 7 and 12 running agents at every supported size,
+/// with and without a repository-event row and with and without a status
+/// sentence. The frames are the evidence for the footer-geometry guard.
+#[test]
+fn capture_the_quit_warning_matrix() {
+    if std::env::var_os("GEWU_CAPTURE_DIR").is_none() {
+        return;
+    }
+    for (width, height) in [(72, 18), (80, 24), (100, 30), (120, 40), (200, 60)] {
+        for count in [1, 4, 7, 12] {
+            for event in [false, true] {
+                for status in [false, true] {
+                    let mut many = view(count);
+                    for agent in &mut many.agents {
+                        agent.desired = Desired::Started;
+                        agent.session = SessionState::Running {
+                            number: 1,
+                            since: SystemTime::now(),
+                        };
+                    }
+                    if !event {
+                        many.forgejo.events.clear();
+                    }
+                    if status {
+                        many.notice = Some("copied repository URL".to_owned());
+                    }
+                    let mut quit = Board::new(Fixed(many));
+                    quit.on_key(KeyEvent::from(KeyCode::Char('q')));
+                    save(
+                        &format!(
+                            "quit-{width}x{height}-{count}-{}-{}",
+                            if event { "event" } else { "no-event" },
+                            if status { "status" } else { "no-status" },
+                        ),
+                        &mut quit,
+                        width,
+                        height,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn capture_the_real_upgrade_with_changed_warnings() {
     if std::env::var_os("GEWU_CAPTURE_DIR").is_none() {

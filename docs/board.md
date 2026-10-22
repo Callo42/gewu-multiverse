@@ -517,12 +517,14 @@ run (running or waiting for the next run):
 `quit stops agent-2 and agent-3, and Forgejo; they start again on reopen — q again
 quits`. An agent that is started but has no instruction is not named.
 
-The warning uses every footer row the geometry gives (three at 72 and 80 columns, four
-when a notice or the status line needs one): it wraps on whole words, is never
-abbreviated, and the consequence, the reopen sentence and `q again quits` are always
-kept. If a home past twelve has more running agents than the rows can name, the count
-keeps what stops rather than dropping the consequence. A second `q` sends `shutdown`.
-With every agent stopped, `q` quits at once and draws no warning.
+The footer geometry reserves exactly the rows the warning will draw: the wrapped
+warning itself plus one row for a notice, and the board above gives up those rows. The
+warning wraps on whole words, is never abbreviated, and the consequence, the reopen
+sentence and `q again quits` are always kept (at 72 and 80 columns with twelve agents
+it takes three rows). If a home past twelve had names so long that the warning would
+need more rows than the board can spare, the count keeps what stops rather than
+dropping the consequence. Drawing writes only the reserved rows. A second `q` sends
+`shutdown`. With every agent stopped, `q` quits at once and draws no warning.
 
 ## Key map
 
