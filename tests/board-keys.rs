@@ -93,12 +93,8 @@ fn fill_model(board: &mut Board, url: &str, model: &str, key: &str) {
     press(board, KeyCode::Char('e'));
     type_text(board, url);
     press(board, KeyCode::Enter);
-    press(board, KeyCode::Down);
-    press(board, KeyCode::Char('e'));
     type_text(board, model);
     press(board, KeyCode::Enter);
-    press(board, KeyCode::Down);
-    press(board, KeyCode::Char('e'));
     type_text(board, key);
     press(board, KeyCode::Enter);
 }
@@ -392,7 +388,7 @@ fn q_asks_once_when_an_agent_is_started_and_the_second_q_stops_everything() {
         .join(" ");
     assert!(
         flat.contains(
-            "quit stops 1 agent and Forgejo; they start again when you reopen — q again quits"
+            "quit stops agent-1 and Forgejo; they start again when you reopen — q again quits"
         ),
         "{flat}"
     );
@@ -419,7 +415,12 @@ fn the_last_agent_is_not_removed() {
     let mut board = Board::new(endpoint_engine(1));
     press(&mut board, KeyCode::Char('-'));
     assert!(board.sent_commands().is_empty());
-    assert!(board.notice().unwrap().contains("one agent is the least"));
+    assert!(
+        board
+            .notice()
+            .unwrap()
+            .contains("the last agent cannot be removed")
+    );
     let _ = draw(&mut board);
     press(&mut board, KeyCode::Enter);
     press(&mut board, KeyCode::Char('d'));
@@ -499,7 +500,12 @@ fn the_last_agent_cannot_be_removed_from_the_board_or_its_panel() {
     let mut board = Board::new(endpoint_engine(1));
     press(&mut board, KeyCode::Char('-'));
     assert!(board.sent_commands().is_empty());
-    assert!(board.notice().unwrap().contains("one agent is the least"));
+    assert!(
+        board
+            .notice()
+            .unwrap()
+            .contains("the last agent cannot be removed")
+    );
     let _ = draw(&mut board);
     press(&mut board, KeyCode::Enter);
     press(&mut board, KeyCode::Char('d'));

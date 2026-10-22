@@ -28,8 +28,11 @@ pub const SELECT: Color = Color::Rgb(34, 211, 238);
 pub const CARD: Color = Color::Rgb(15, 23, 42);
 /// The selected card's background.
 pub const CARD_SELECTED: Color = Color::Rgb(8, 51, 68);
-/// A wire between the Forgejo box and a card.
-pub const WIRE: Color = Color::Rgb(71, 85, 105);
+/// A wire between the Forgejo box and a card, and every box edge.
+///
+/// This is the lightest grey that keeps a box edge at 3.86:1 against the product's
+/// black background; the old `#475569` was 2.77:1 (F-12).
+pub const WIRE: Color = Color::Rgb(91, 107, 129);
 /// A field the person is writing into.
 pub const FIELD: Color = Color::Rgb(30, 41, 59);
 

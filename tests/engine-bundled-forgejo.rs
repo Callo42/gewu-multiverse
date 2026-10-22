@@ -2245,7 +2245,9 @@ fn two_agents_load_a_v0130_shaped_data_directory_for_two_minutes() {
             if agent
                 .last_failure
                 .as_deref()
-                .is_some_and(|failure| failure.contains("forgejo_comment"))
+                // U6: a refused Forgejo write's card row says `write refused:` and
+                // no longer repeats the tool's internal name.
+                .is_some_and(|failure| failure.contains("write refused"))
             {
                 saw_failure = true;
             }
@@ -2348,4 +2350,46 @@ fn two_agents_load_a_v0130_shaped_data_directory_for_two_minutes() {
     for pid in &seen_pids {
         assert!(!process_alive(*pid), "pid {pid} is still alive");
     }
+}
+
+/// U10: a real bundled page carries the product footer but no developer timings.
+#[test]
+#[ignore = "live Forgejo: run with GEWU_FORGEJO_BINARY=/path/to/forgejo cargo test --test engine-bundled-forgejo the_page_footer_is_not_a_debug_build -- --ignored --nocapture"]
+fn the_page_footer_is_not_a_debug_build() {
+    let binary = PathBuf::from(std::env::var("GEWU_FORGEJO_BINARY").unwrap_or_else(|_| {
+        panic!("GEWU_FORGEJO_BINARY is not set; this live test verifies nothing without it")
+    }));
+    assert!(binary.is_file(), "{} is not a file", binary.display());
+    let root = Scratch::new("footer");
+    let layout =
+        Layout::rooted_at(root.path().join("config")).expect("the test layout is absolute");
+    let data_root = root.path().join("data");
+    let product = PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse"));
+    let mut options = EngineOptions::new(layout, &data_root).expect("options");
+    options.product_binary = product;
+    options.auto_start_forgejo = false;
+    options.ready_timeout = Duration::from_secs(180);
+    options.stop_grace = Duration::from_secs(5);
+    let mut engine = engine::open_with(options).expect("the engine opens");
+    engine.send(Command::AcknowledgeTerms).expect("terms");
+    engine.send(Command::StartForgejo).expect("start Forgejo");
+    wait_engine(
+        &mut engine,
+        "the bundled Forgejo to run",
+        Duration::from_secs(240),
+        |engine| matches!(engine.board().forgejo.state, ForgejoState::Running),
+    );
+    let url = engine.board().forgejo.url.clone();
+    let body = ureq::get(format!("{url}/user/login"))
+        .call()
+        .expect("the sign-in page answers")
+        .into_body()
+        .read_to_string()
+        .expect("the page body reads");
+    assert!(body.contains("Powered by Forgejo"), "no Forgejo footer");
+    assert!(
+        !body.contains("Template:") && !body.contains("Page: "),
+        "the page footer still carries developer timings"
+    );
+    engine.shutdown(Duration::from_secs(5));
 }

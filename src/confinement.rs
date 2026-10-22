@@ -143,6 +143,17 @@ impl Method {
         }
     }
 
+    /// The name a person reads on the warnings screen: `Landlock`, `bwrap`,
+    /// `unshare`. Only a mechanism this computer really enforces is named.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bwrap => "bwrap",
+            Self::Unshare => "unshare",
+            Self::Landlock => "Landlock",
+            Self::None => "none",
+        }
+    }
+
     /// Read a plan's word back. An unknown word is no confinement, never a pretend.
     pub fn parse(text: &str) -> Self {
         match text.trim() {
@@ -232,6 +243,33 @@ pub(crate) fn run_hide_roots(plan_hide: &[PathBuf], real_home: Option<&Path>) ->
 /// must not stay lexical (B5-R-R-R).
 pub(crate) fn resolved_temp() -> Option<PathBuf> {
     resolved_layout(&std::env::temp_dir())
+}
+
+/// The prefix of one run's private temporary directory.
+pub const RUN_TEMP_PREFIX: &str = "gewu-run-";
+
+/// The private temporary root of the run whose process has `pid`.
+///
+/// The pid and the run id make the name exact, so the engine can remove the tree of
+/// a run it had to kill even though the run process never ran its own cleanup (F-01).
+pub fn run_temp_path(temp: &Path, pid: u32, run_id: &str) -> PathBuf {
+    temp.join(format!("{RUN_TEMP_PREFIX}{pid}-{run_id}"))
+}
+
+/// Remove one run's whole private temporary tree, if this engine made one.
+///
+/// The run process removes it on a normal exit; this is the path for a stop, a kill
+/// or a crash, where no destructor in the run process gets to run. It never touches
+/// another run: the pid is part of the name.
+pub fn remove_run_temp_at(temp: &Path, pid: u32, run_id: &str) {
+    let _ = fs::remove_dir_all(run_temp_path(temp, pid, run_id));
+}
+
+/// [`remove_run_temp_at`] under the engine's own temporary root.
+pub fn remove_run_temp(pid: u32, run_id: &str) {
+    if let Some(temp) = resolved_temp() {
+        remove_run_temp_at(&temp, pid, run_id);
+    }
 }
 
 /// The method a run may actually use for this run-time layout.

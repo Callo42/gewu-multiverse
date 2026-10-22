@@ -700,9 +700,11 @@ fn a_failed_destructive_write_behind_a_later_success_is_not_a_green_tick() {
             frame.contains("result:"),
             "{command} lost its result row:\n{frame}"
         );
+        // U6/F-02: a refused write's cause row names the refusal and wears the
+        // strip's `⊘`, not the read warning's `⚠ shell:`.
         assert!(
-            frame.contains("⚠ shell:"),
-            "{command} lost the failed command's cause row:\n{frame}"
+            frame.contains("⊘ write refused:"),
+            "{command} lost the write-refused cause row:\n{frame}"
         );
     }
 }

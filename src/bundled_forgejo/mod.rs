@@ -513,6 +513,10 @@ pub const PINNED_APP_INI: &[(&str, &str, &str)] = &[
     ("i18n", "LANGS", "en-US"),
     ("i18n", "NAMES", "English"),
     ("time", "DEFAULT_UI_LOCATION", "UTC"),
+    // The footer's page/template timings are a developer's numbers, not the
+    // person's page. They are pinned off on every start, including on an instance
+    // an earlier version made (U10).
+    ("other", "SHOW_FOOTER_TEMPLATE_LOAD_TIME", "false"),
 ];
 
 /// The lower-case section name of an INI header line.
@@ -721,6 +725,9 @@ pub fn app_ini_text(
          \n\
          [time]\n\
          DEFAULT_UI_LOCATION = UTC\n\
+         \n\
+         [other]\n\
+         SHOW_FOOTER_TEMPLATE_LOAD_TIME = false\n\
          \n\
          [repository]\n\
          ROOT = {root}/data/repositories\n\
