@@ -534,6 +534,22 @@ pub fn latest_work(runs: &[RunSummary]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The final summary of the newest run that did work, newest run first.
+///
+/// The card prefers it over a later check run's reason: a no-op must not erase the
+/// one-line account of the work the person can still see in the work block (F-10).
+pub fn latest_work_result(runs: &[RunSummary]) -> Option<String> {
+    runs.iter()
+        .rev()
+        .find(|summary| !work_summary(&summary.dir).is_empty())
+        .and_then(|summary| summary.reason.clone())
+}
+
+/// Whether one run did work, as its own transcript and push witness show.
+pub fn run_did_work(run_dir: &Path) -> bool {
+    !work_summary(run_dir).is_empty()
+}
+
 /// Whether the run's own log says no open issue was assigned to this agent.
 ///
 /// The list tool's successful empty answer is the one fact the model is given; the

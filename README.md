@@ -47,8 +47,10 @@ requests are its own. The board shows the whole thing at a glance:
   run count. `run N` is the total from the run records, so it does not reset when an
   agent starts again or the program reopens. Open it with `⏎` for the Agent screen:
   the last work block (typed, and kept until a later run does new work), the
-  instruction's first line or `… (N more lines)`, the bounded run marks with their
-  legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`), the last
+  instruction's first line, always, and `… (N more lines)` where N counts the
+  document's **file** lines (not wrapped display rows), the bounded run marks with
+  their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`; at
+  72 columns the same entries are whole as `∅ none`), the newest mark's word, the last
   tool failure and the newest run's reason. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
   every element of `PIPESTATUS`, so a failed command in a pipeline, a condition or a
   nested `bash -c`/`#!/bin/bash` script that reads the prelude can never hide behind
@@ -71,10 +73,13 @@ requests are its own. The board shows the whole thing at a glance:
   diagnostic text, and a failure inside a piped or negated condition reported only by
   a program's own free-form message.) A run that exited 0 but whose own
   summary says it could not do the instruction, or whose tool results show a refused
-  write, is `⊘ refused`; one that found nothing assigned is `∅ no work`; one whose tool
-  results include a failed command is `⚠` with the command's cause as its row. None of
-  those is `✓`. The
-  summary is drawn on a `result:` line. Started agents keep
+  write, is `⊘ refused`; a refused **read** is `⚠`, never `⊘`. One whose assigned-issues
+  list came back empty and that wrote nothing is `∅ no work`, even when its own
+  sentence says everything is done; one whose tool results include a failed command is
+  `⚠` with the command's cause as its row. None of those is `✓`. A refused write's
+  cause row says `⊘ write refused: …`, matching the strip. The
+  summary line prefers the newest run that did work (`last work: …`); a later no-op's
+  reason is labelled `no work: …`. Started agents keep
   a visible idle between runs (`next run in 5s`). The selected card is marked `▸`, and
   a window from 140 to 160 columns uses its width for the repository names and card
   detail; a wider one centres the same picture in 160.
@@ -97,9 +102,15 @@ cannot be honoured gives `none`, never a substitute mechanism. Every hidden
 path and the engine's temporary root are resolved with `realpath` first, and the engine
 enumerates every real workspace, so a symlinked root cannot slip past. The workspace,
 the run's private `TMPDIR`, the network and the tools you installed stay visible, as do
-the system's `/etc`, `/proc`, `/sys` and `/run`. When the computer offers no mechanism
-or the layout cannot be confined, the first-run screen and the board say `runs are not
-confined on this computer`.
+the system's `/etc`, `/proc`, `/sys` and `/run`. The warnings screen states what is true on **this** computer: `runs on this computer
+are confined (Landlock)` (or `bwrap`/`unshare`) after the second warning, or the same
+negative line when the computer offers no mechanism or the layout cannot be confined.
+The board repeats the negative sentence. The 72×18 board draws compact cards while they
+fit; once they would need a scroll it is a one-line-per-agent list, so every agent the
+picker offers is on screen. The 80×24 board keeps the organisation, the repository
+count, the login, the version and the newest repository event; a crowded home takes
+the same one-line form rather than dropping them. The newest event, when the Forgejo
+box is too short for it, has a footer row of its own and never overwrites the keys.
 
 After an upgrade, the first open shows one screen: the version this installation was,
 the version this is, what was found (settings, agents, instructions and runs) and what
@@ -145,17 +156,19 @@ and you can change any of them later.
 1. **Read the warnings.** They say that agents use this computer with your
    permissions. When this computer can confine an agent's shell, a run cannot read your
    configuration, saved keys, Forgejo data, home or another run's login file; when it
-   cannot, the same screen says, in
-   one sentence, `runs are not confined on this computer`. Landlock is the automatic
+   cannot, the same screen says, in one sentence,
+   `runs are not confined on this computer`; on a host that can confine, it says
+   `runs on this computer are confined (Landlock)` after the second warning. Landlock is the automatic
    mechanism; `bwrap` and `unshare` are opt-in with
    `GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare` and are tested but not yet
    proven on a real user-namespace host. Press `y` after you have read every one.
 2. **Set the model.** Give the full model address (it ends in `/chat/completions`), the
    model name, and the key. Press `t` to test it; `✓ the model answered` means it
    works. The address suffix and an empty key are checked before anything is sent;
-   every other failure names the provider's status and the first clause of its own
-   message (a 404 on a `/chat/completions` address without `/v1` says so). Press `⏎`
-   to go on.
+   every other failure names the provider's status and its own message, kept whole and
+   wrapped to the form's rows at 80 columns (a 404 on a `/chat/completions` address
+   without `/v1` says so first). `↑`/`↓` moves between fields and `⏎` keeps a field and
+   moves to the next; on the key it finishes editing. Press `⏎` again to go on.
 3. **Choose how many agents.** `←` / `→` changes the number from 1 to 12. Press `⏎` to
    create them. The board shows `downloading n%`, `setting up`, `starting`, then
    `● running` while your Forgejo is prepared.
@@ -165,9 +178,12 @@ and you can change any of them later.
    Forgejo first:** an agent works only on the issues assigned to its own Forgejo
    account, so an unassigned issue produces a run with nothing to do.
 
-After the first setup, `+` adds an agent and `−` removes the selected one (it asks
-once). `m` opens the model settings, `f` opens the Forgejo page, `?` lists every key,
-and `q` quits.
+After the first setup, `+` adds a new agent and `−` removes the selected one (it asks
+once). A removed agent's number and Forgejo account are never reused: `+` after
+removing `agent-2` makes `agent-3`, with its own new account, while the removed account
+stays deactivated with its history. The last agent cannot be removed and the screen says
+why. `m` opens the model settings, `f` opens the Forgejo page, `?` lists every key, and
+`q` quits.
 
 ## Where things live
 
@@ -186,7 +202,9 @@ The Forgejo address is on the board and on the Forgejo page, for example
 — assign an issue in Forgejo`, and its team link is
 `/org/<organisation>/teams/<team>`. On the Forgejo page (`f`) your login is shown next to
 `your login:`, the repositories are listed by name, and the agents' one-line
-permission summary is there with the team page address. A new installation uses the
+permission summary is there with the team page address. The newest repository event is
+on the page and on the board at every supported size; the 80-column board also keeps
+the organisation, the repository count and your login. A new installation uses the
 fixed login `owner`, not your computer account name; an installation made by an
 earlier version keeps its recorded login, and the page says `(kept from an earlier
 setup)`.
@@ -195,8 +213,11 @@ The password is never written down. Open the Forgejo page and press `p`: the pro
 resets it through Forgejo's administration API, with the new value in the request body,
 and the new value is shown, wrapped in full, for ten seconds — deliberately two lines
 at 80 columns, never cut. The one-line consequence is a static row on the page:
-`p resets it — shown for 10 s, old stops`, so the password shown before that moment no
-longer works.
+`p resets it, c copies — shown for 10 s, old stops`, so the password shown before that
+moment no longer works. While the value is on show, `c` puts it on the terminal's
+clipboard with one OSC 52 sequence (base64) — never into a file, a log or a second
+plaintext line. A terminal without OSC 52 ignores the sequence, and the screen still
+shows the value for its ten seconds.
 
 `--config-dir <dir>` moves the settings, keys and agent folders; `--state-dir <dir>` moves the run records.
 A relative folder is taken from the folder you started the program in.
@@ -206,14 +227,18 @@ A relative folder is taken from the folder you started the program in.
 
 - `s` stops the selected agent. Its current run is asked to stop, and then made to stop
   if it does not; nothing new starts.
-- `q` quits. If an agent is started, the board first says how many will stop; press `q`
-  again. It stops every started agent and the Forgejo, and prints one line. Closing the
-  terminal window does the same.
+- `q` quits. If an agent is started, the board first names the agents that will stop —
+  `quit stops agent-2 and agent-3, and Forgejo`; press `q` again. It stops every started
+  agent and the Forgejo, and prints one line (`stopped 1 agent`, not `1 agents`).
+  Closing the terminal window does the same.
 - Opening the program again starts the Forgejo, and starts the agents you had left
   started, with the same instructions.
 - If the program was killed outright, the next start finds the Forgejo and any runs it
   left behind, stops them, and only then opens. It believes a saved process number only
-  when the command line still matches what it started.
+  when the command line still matches what it started. A stopped, killed or crashed run's
+  private temporary directory — including the per-run `askpass.toml` that held its own
+  login — is removed by the run on every exit it sees and by the engine or the next open
+  otherwise; a live run's directory is never touched.
 
 ## Removing it
 

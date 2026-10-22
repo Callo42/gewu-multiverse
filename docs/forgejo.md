@@ -62,8 +62,11 @@ agents writing at once wait for the lock rather than hanging the card on a 500.
 
 Those pinned keys are checked on **every** start, not only when `app.ini` is created:
 an instance made by an earlier version keeps `SQLITE_TIMEOUT = 500`, no journal mode,
-and no `[i18n]`/`[time]` section, so the keys are replaced or added before Forgejo is
-started. Every other setting the person wrote stays exactly as it is.
+and no `[i18n]`/`[time]`/`[other]` section, so the keys are replaced or added before
+Forgejo is started. The pinned `[other] SHOW_FOOTER_TEMPLATE_LOAD_TIME = false` hides
+the page-footer timing that made a stranger's first page look like a debug build, on a
+new instance and on one an earlier version made. Every other setting the person wrote
+stays exactly as it is.
 
 `migrate` runs before the first administrative change, and the administrator account is
 made through Forgejo's own `admin user create --random-password` CLI. The server runs
@@ -111,8 +114,11 @@ The engine's `identity::manage`:
 The agent's token lives under `[forgejo_agent_tokens]` in the 0600 credentials file.
 Git is handed the token through `GIT_ASKPASS`: git runs this same program with the
 prompt as its one argument. In a confined run the program reads a per-run file that
-holds only that run's login and token, under the run's private `TMPDIR` (private from other runs on every mechanism); outside a
-run it reads the shared credentials file over the same pipe. The shared file — the
+holds only that run's login and token, under the run's private `TMPDIR` (private from
+other runs on every mechanism); outside a run it reads the shared credentials file over
+the same pipe. The per-run file and its whole temporary tree are removed on every exit
+the run sees, by the engine when it had to stop, kill or reap a crashed run, and by the
+next open when the owner is gone. The shared file — the
 model key, the administrator token and every other agent's login — is not readable
 inside a confined run. The key is never a URL, a command-line argument, a log line or
 a screen. `credential.helper` is
@@ -129,9 +135,10 @@ The account, its commits and its run records stay when the agent is removed. Rem
 deletes the token on the server by its recorded name, removes the account from team
 `agents`, deactivates the account (`active = false` and `prohibit_login = true`, so a
 web sign-in is refused as well as every token), deletes the key from the credentials
-file, and forgets the agent in the settings. It is not a history rewrite; the confirmation sentence says all four
-things before it acts. Adding an agent with the same name again reactivates the same
-account, keeping its history.
+file, and forgets the agent in the settings. It is not a history rewrite; the
+confirmation sentence says all four things before it acts. `+ add` never reuses a
+removed name: the number high-water mark is kept, so the next agent gets a new number,
+a new login and a new account; the removed account stays deactivated with its history.
 
 ## Working in the repositories
 

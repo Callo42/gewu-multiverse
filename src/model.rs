@@ -814,12 +814,61 @@ pub fn first_clause(text: &str, limit: usize) -> String {
     format!("{}…", clause[..cut].trim_end())
 }
 
+/// The provider's whole message, collapsed to one line and bounded only at its end.
+///
+/// The model screen wraps this to the rows the form has. Unlike [`first_clause`], it
+/// does not stop at the provider's first sentence, so a refusal that explains the
+/// repair in its second sentence is shown whole at 80 columns (F-07).
+pub fn whole_message(text: &str, limit: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= limit {
+        return one_line;
+    }
+    let cut = one_line
+        .char_indices()
+        .nth(limit)
+        .map(|(at, _)| at)
+        .unwrap_or(one_line.len());
+    let cut = one_line[..cut].rfind(' ').unwrap_or(cut);
+    format!("{}…", one_line[..cut].trim_end())
+}
+
+/// The transport's own errno in words a person can read.
+///
+/// `io:` is the transport library's prefix and `(os error 111)` its errno. The card
+/// has one line; naming the errno without the library's parenthesis is shorter and
+/// ends on a word: `Connection refused (errno 111)` (U9).
+pub fn transport_detail(text: &str) -> String {
+    let text = text.strip_prefix("io: ").unwrap_or(text);
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("(os error ") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "(os error ".len()..];
+        let Some(end) = after.find(')') else {
+            out.push_str(&rest[at..]);
+            return out;
+        };
+        let number = &after[..end];
+        if number.chars().all(|c| c.is_ascii_digit()) {
+            out.push_str(&format!("(errno {number})"));
+        } else {
+            out.push_str(&rest[at..at + "(os error ".len() + end + 1]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The one line the model screen shows for a failed test.
 ///
 /// The suffix check and the empty-key check happen before a request is sent; every
-/// other arm is the provider's refusal and names the provider's status and first
-/// clause. A 404 on a `/chat/completions` path names the `/v1` correction, because
-/// that is the mistake a full completions address without `/v1` produces.
+/// other arm is the provider's refusal and names the provider's status and its own
+/// message. A 404 on a `/chat/completions` path names the `/v1` correction, because
+/// that is the mistake a full completions address without `/v1` produces. The
+/// provider's message is kept whole (bounded at 400 characters) and the form wraps
+/// it to the rows it has (F-07).
 pub fn failure_words(error: &ModelError, model: &str) -> String {
     match error {
         ModelError::BadUrl { .. } | ModelError::BadAddress { .. } => {
@@ -856,7 +905,7 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
             line.push_str(&format!("the provider answered HTTP {status}"));
             if !message.is_empty() {
                 line.push_str(": ");
-                line.push_str(&first_clause(message, 72));
+                line.push_str(&whole_message(message, 400));
             }
             line
         }
@@ -867,7 +916,7 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
             let detail = if message.is_empty() {
                 String::new()
             } else {
-                format!(": {}", first_clause(message, 72))
+                format!(": {}", whole_message(message, 400))
             };
             format!("the provider answered HTTP {status}{detail}")
         }
@@ -1072,7 +1121,7 @@ fn provider_message(body: &str) -> Option<String> {
     if one_line.is_empty() {
         None
     } else {
-        Some(excerpt(&one_line, 200))
+        Some(excerpt(&one_line, 400))
     }
 }
 

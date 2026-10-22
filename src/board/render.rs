@@ -27,21 +27,40 @@ pub struct CardSlot {
     pub rect: Rect,
 }
 
+/// How the home screen draws the agents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BoardForm {
+    /// A boxed card for each agent: two rows at the floor, three or more above it.
+    #[default]
+    Cards,
+    /// One text line per agent inside one wired box, used when the cards cannot
+    /// all fit (B1/B2). The line carries the mark, the name, the login and the run
+    /// count; the state word follows when the column has room for it whole.
+    List,
+}
+
 /// The rectangles and junctions drawn by the last home frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BoardLayout {
-    /// Cards per row.
+    /// Cards (or list lines) per row.
     pub columns: usize,
     /// The first agent index on screen.
     pub first_visible: usize,
-    /// Every card drawn.
+    /// Every bordered card drawn (empty in the list form).
     pub cards: Vec<CardSlot>,
+    /// Every one-line agent row drawn in the list form (empty in the card form).
+    pub listed: Vec<CardSlot>,
+    /// Which complete form the agents took.
+    pub form: BoardForm,
     /// The Forgejo box.
     pub forgejo: Option<Rect>,
     /// The cell above each card's top centre where its wire arrives.
     pub wire_cells: Vec<(u16, u16)>,
     /// Whether cards are above or below the window.
     pub scrolls: bool,
+    /// Rows the footer occupies: three normally, four when a footer event and
+    /// the status line both need a row of their own (B3).
+    pub footer_rows: u16,
 }
 
 /// The four arms of a box-drawing cell.
@@ -210,6 +229,67 @@ fn repositories_plural(count: usize) -> &'static str {
     }
 }
 
+/// The repository line: the count always, whole names while they fit, and `(+N)`
+/// for the rest. A name is never cut to `tea…`: a person must be able to tell how
+/// many repositories there are and which ones are hidden (F-09).
+fn repository_line(view: &ForgejoView, room: usize) -> String {
+    let names = if view.repositories == 0 {
+        view.repository_names.as_slice()
+    } else {
+        &view.repository_names[..view.repository_names.len().min(view.repositories)]
+    };
+    let count = view.repositories.max(names.len());
+    let base = format!(
+        "{} · {} {}",
+        view.organisation,
+        count,
+        repositories_plural(count)
+    );
+    if names.is_empty() {
+        return base;
+    }
+    let mut shown: Vec<&str> = Vec::new();
+    for name in names {
+        let mut candidate = base.clone();
+        for kept in &shown {
+            candidate.push_str(" · ");
+            candidate.push_str(kept);
+        }
+        candidate.push_str(" · ");
+        candidate.push_str(name);
+        if text_util::width(&candidate) <= room {
+            shown.push(name);
+        } else {
+            break;
+        }
+    }
+    let mut hidden = names.len().saturating_sub(shown.len());
+    let mut line = base.clone();
+    for kept in &shown {
+        line.push_str(" · ");
+        line.push_str(kept);
+    }
+    // Reserve room for `(+N)` by dropping the last shown name: a count with no
+    // hint that names are hidden is not the whole truth (NB1).
+    while hidden > 0 {
+        let tag = format!(" (+{hidden})");
+        if text_util::width(&line) + text_util::width(&tag) <= room {
+            line.push_str(&tag);
+            break;
+        }
+        if shown.pop().is_none() {
+            break;
+        }
+        hidden += 1;
+        line = base.clone();
+        for kept in &shown {
+            line.push_str(" · ");
+            line.push_str(kept);
+        }
+    }
+    line
+}
+
 /// Where Forgejo is, in the box's line, without an address before it is installed.
 fn forgejo_address(view: &ForgejoView) -> &str {
     match view.state {
@@ -271,7 +351,11 @@ fn draw_forgejo_box(
         );
     }
 
+    let room = rect.width.saturating_sub(4) as usize;
     if rect.height == 3 {
+        // The 72-column floor keeps the address and the live count on its one
+        // interior row; the latest event has the footer line when the box cannot
+        // hold it (F-05).
         let info = format!(
             "{} · {} {}",
             forgejo_address(view),
@@ -287,88 +371,39 @@ fn draw_forgejo_box(
             theme::fg(theme::MUTED),
         );
     } else {
-        // A server front: a solid accent header bar, then the facts.
+        // A server front: a solid accent header bar, then the facts in the order a
+        // person needs them. Facts that do not fit are dropped whole; no row is left
+        // empty. At 80x24 the box is tall enough for the organisation, the
+        // repositories, the count, the version, the latest event and the login
+        // (F-03/U1, F-05, F-09).
         let bar = Rect::new(rect.x + 1, rect.y + 1, rect.width.saturating_sub(2), 1);
         text_util::fill(buf, bar, Style::new().fg(theme::ACCENT).bg(theme::ACCENT));
         let info_x = rect.x + 2;
-        let room = rect.width.saturating_sub(4) as usize;
-        let mut y = rect.y + 2;
         let address = if forgejo_address(view) == "—" {
             "—".to_owned()
         } else {
             view.url.clone()
         };
-        text_util::put(
-            buf,
-            rect,
-            info_x,
-            y,
-            &text_util::ellipsize(&address, room),
-            theme::fg(theme::FG),
-        );
-        y += 1;
-        let team = if view.repository_names.is_empty() {
-            format!(
-                "{} · {} {}",
-                view.organisation,
-                view.repositories,
-                repositories_plural(view.repositories)
-            )
-        } else {
-            format!(
-                "{} · {} {} · {}",
-                view.organisation,
-                view.repositories,
-                repositories_plural(view.repositories),
-                view.repository_names.join(" · ")
-            )
-        };
-        text_util::put(
-            buf,
-            rect,
-            info_x,
-            y,
-            &text_util::ellipsize(&team, room),
-            theme::fg(theme::MUTED),
-        );
-        y += 1;
-        let agents = format!("{} {}", agent_count, plural(agent_count));
-        text_util::put(
-            buf,
-            rect,
-            info_x,
-            y,
-            &text_util::ellipsize(&agents, room),
-            theme::fg(theme::MUTED),
-        );
-        if rect.height >= 7 {
-            y += 1;
-            let event = view
-                .events
-                .last()
-                .cloned()
-                .map(|event| status::plain(&event))
-                .unwrap_or_else(|| format!("version {}", view.version));
-            text_util::put(
-                buf,
-                rect,
-                info_x,
-                y,
-                &text_util::ellipsize(&event, room),
-                theme::fg(theme::MUTED),
-            );
+        let mut facts: Vec<String> = vec![
+            address,
+            repository_line(view, room),
+            format!("{} {}", agent_count, plural(agent_count)),
+            format!("version {}", view.version),
+        ];
+        if let Some(event) = view.events.last() {
+            facts.push(status::plain(event));
         }
-        if rect.height >= 8 {
-            y += 1;
-            let kept = if view.admin_login_kept { " (kept)" } else { "" };
-            let login = format!("your login: {}{kept}", view.admin_login);
+        let kept = if view.admin_login_kept { " (kept)" } else { "" };
+        facts.push(format!("your login: {}{kept}", view.admin_login));
+        let rows = rect.height.saturating_sub(3) as usize;
+        for (index, fact) in facts.iter().take(rows).enumerate() {
             text_util::put(
                 buf,
                 rect,
                 info_x,
-                y,
-                &text_util::ellipsize(&login, room),
-                theme::fg(theme::MUTED),
+                rect.y + 2 + index as u16,
+                &text_util::ellipsize(fact, room),
+                theme::fg(if index == 0 { theme::FG } else { theme::MUTED }),
             );
         }
     }
@@ -387,6 +422,102 @@ fn draw_forgejo_box(
             },
         );
     }
+}
+
+/// A two-row card: one text line per agent, for the 72-column floor.
+///
+/// The top border carries the state symbol, the name and the state; the bottom
+/// border carries the login and the run total. The card is still a complete box
+/// with a wire junction, so the picture stays whole (F-03/U1).
+/// The state phrase a narrow board card can hold whole. The Agent panel and the
+/// selected-card footer keep the full sentence.
+fn board_state(face: &status::Face) -> &str {
+    match face.status.as_str() {
+        "needs an instruction" => "needs instruction",
+        "waiting for Forgejo" => "waiting Forgejo",
+        other => other,
+    }
+}
+
+fn draw_compact_card(
+    buf: &mut Buffer,
+    rect: Rect,
+    agent: &AgentView,
+    selected: bool,
+    junction: bool,
+) {
+    let face = status::agent_face(agent);
+    let bg = if selected {
+        theme::CARD_SELECTED
+    } else {
+        theme::CARD
+    };
+    let base = Style::new().fg(theme::FG).bg(bg);
+    let border = if selected {
+        theme::card_bold(theme::SELECT, selected)
+    } else {
+        Style::new().fg(theme::WIRE).bg(bg)
+    };
+    text_util::fill(buf, rect, base);
+    let right = rect.right() - 1;
+    let bottom = rect.bottom() - 1;
+    for x in rect.x + 1..right {
+        put_arms(buf, rect, x, rect.y, L | R, border);
+        put_arms(buf, rect, x, bottom, L | R, border);
+    }
+    put_arms(buf, rect, rect.x, rect.y, R | D, border);
+    put_arms(buf, rect, right, rect.y, L | D, border);
+    put_arms(buf, rect, rect.x, bottom, R | U, border);
+    put_arms(buf, rect, right, bottom, L | U, border);
+
+    let junction_x = card_junction(rect);
+    let max_top = (junction_x.saturating_sub(rect.x + 3)) as usize;
+    let title = if selected {
+        format!("▸ {}", agent.name)
+    } else {
+        agent.name.clone()
+    };
+    // The compact border has room for one whole state phrase; the full phrase is
+    // on the Agent panel and in the footer sentence.
+    let tail = format!("{title} · {}", board_state(&face));
+    border_label_parts(
+        buf,
+        rect,
+        rect.x + 1,
+        rect.y,
+        &face.symbol.to_string(),
+        theme::card_bold(face.colour, selected),
+        &tail,
+        theme::card_bold(theme::FG, selected),
+        max_top,
+    );
+    if junction {
+        put_arms(
+            buf,
+            rect,
+            junction_x,
+            rect.y,
+            L | R | U,
+            if selected {
+                border
+            } else {
+                Style::new().fg(theme::WIRE).bg(bg)
+            },
+        );
+    }
+    // The second line rides its border: identity and run total, between caps so
+    // every arm of the border still meets a neighbour.
+    let count = status::run_count(agent);
+    let line = format!("{} · {count}", agent.login);
+    border_label(
+        buf,
+        rect,
+        rect.x + 1,
+        bottom,
+        &line,
+        theme::card(theme::MUTED, selected),
+        rect.width.saturating_sub(4) as usize,
+    );
 }
 
 fn draw_card(
@@ -500,12 +631,17 @@ fn draw_card(
     }
 
     if roomy && rect.height >= 5 {
+        let status = if roomy {
+            face.status.as_str()
+        } else {
+            board_state(&face)
+        };
         text_util::put(
             buf,
             interior,
             interior.x + 1,
             rect.y + 2,
-            &text_util::ellipsize(&face.status, interior.width.saturating_sub(1) as usize),
+            &text_util::ellipsize(status, interior.width.saturating_sub(1) as usize),
             theme::card(face.colour, selected),
         );
         let count_x = rect.right().saturating_sub(count_width + 2);
@@ -517,7 +653,7 @@ fn draw_card(
             &count,
             theme::card(theme::MUTED, selected),
         );
-        if let Some(result) = status::run_result(agent) {
+        if let Some(result) = status::run_result_line(agent) {
             let colour = if status::run_result_is_refusal(agent) {
                 theme::RED
             } else {
@@ -528,10 +664,7 @@ fn draw_card(
                 interior,
                 interior.x + 1,
                 rect.y + 3,
-                &text_util::ellipsize_words(
-                    &format!("result: {result}"),
-                    interior.width.saturating_sub(1) as usize,
-                ),
+                &text_util::ellipsize_words(&result, interior.width.saturating_sub(1) as usize),
                 theme::card(colour, selected),
             );
         } else if let Some(activity) = status::activity(agent) {
@@ -554,15 +687,20 @@ fn draw_card(
             rect,
             rect.x + 1,
             bottom,
-            &face.status,
+            board_state(&face),
             theme::card_bold(face.colour, selected),
-            rect.width.saturating_sub(4) as usize,
+            rect.width.saturating_sub(2) as usize,
         );
     }
 }
 
 /// A grid of cards under a Forgejo box, with the trunk, bus and wrapped-row spine.
+///
+/// When the cards cannot all fit, the same layout becomes [`BoardForm::List`]: one
+/// wired box with a text line per agent, laid out in as many columns as the width
+/// allows, so every agent stays on the frame (B1/B2).
 struct GridGeometry {
+    form: BoardForm,
     columns: usize,
     first_visible: usize,
     visible_rows: usize,
@@ -570,23 +708,69 @@ struct GridGeometry {
     card_w: u16,
     gap: u16,
     forgejo_h: u16,
+    footer_rows: u16,
     row_tops: Vec<u16>,
     bus_ys: Vec<u16>,
     spine_x: u16,
     trunk_x: u16,
     block_top: u16,
+    /// The agent box's outer rectangle in the list form.
+    list: Option<Rect>,
+    /// Width of one list column's text.
+    list_col_w: u16,
+    /// Left edge of the first list column's text.
+    list_x: u16,
+}
+
+/// Whether the bottom footer row has something to say: a notice, a waiting
+/// sentence, or the negative confinement line.
+fn status_row_needed(board: &Board) -> bool {
+    board.notice().is_some() || waiting_sentence(board).is_some() || !board.view.confined
+}
+
+/// How many agent lines fit inside the list box: the content rows minus the
+/// Forgejo box, the trunk gap and the list box's own two borders.
+fn list_available_rows(content_h: u16, trunk_gap: u16) -> usize {
+    content_h.saturating_sub(3 + trunk_gap + 2).max(1) as usize
 }
 
 fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeometry {
     let inner = inner(area);
-    let footer_rows = if build { 2 } else { 3 };
+    let compact = area.width < 80;
+    // The newest event has its own footer row at the floor (B3). Keep the status
+    // line too, so the event never shares a row with the keys or the notice.
+    let event_in_footer = !build && compact && !board.view.forgejo.events.is_empty();
+    let footer_rows = if build {
+        2
+    } else if event_in_footer && status_row_needed(board) {
+        4
+    } else {
+        3
+    };
     let footer_top = inner.bottom().saturating_sub(footer_rows);
     let content_h = footer_top.saturating_sub(inner.y);
     let agent_count = board.view.agents.len();
 
+    // The 72-column floor keeps the picture complete: two-row compact cards for a
+    // small team, and one line per agent when the cards would need a scroll (B1).
+    // From 80 the three-row card returns and the Forgejo box can grow tall enough
+    // for its facts; a crowded board that would cost the box a fact uses the same
+    // one-line form (B2).
     let forgejo_h = if roomy { 6 } else { 3 };
-    let trunk_gap = if roomy { 2 } else { 1 };
-    let card_h = if roomy { 5 } else { 3 };
+    let trunk_gap = if roomy {
+        2
+    } else if compact {
+        0
+    } else {
+        1
+    };
+    let card_h = if roomy {
+        5
+    } else if compact {
+        2
+    } else {
+        3
+    };
     let gap = if roomy { 3 } else { 2 };
     let min_card_w = if roomy { 22 } else { 24 };
     let max_columns = if roomy { 6 } else { 4 };
@@ -609,18 +793,113 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         columns = 1;
         card_w = inner.width.saturating_sub(2).min(max_card_w);
     }
-    // At the 72-column floor the picture is one vertical list with one spine, not a
-    // row with a detached card below it (F7).
-    if area.width < 80 {
+    if compact {
+        // The floor card keeps the width for the whole `name · state` label; the
+        // old 56-cell cap cut `needs an instruction` and `next run in 8s`.
         columns = 1;
-        card_w = inner.width.saturating_sub(6).clamp(20, 56);
+        card_w = inner.width.saturating_sub(6).clamp(20, 64);
     }
 
+    // Would every card fit, and would the Forgejo box still reach its facts? The
+    // list form is chosen only when a complete card picture is not possible.
+    let card_rows_total = agent_count.div_ceil(columns.max(1));
     let capacity = if content_h > forgejo_h + trunk_gap {
         ((content_h - forgejo_h - trunk_gap) / (1 + card_h)).max(1) as usize
     } else {
         1
     };
+    let visible_card_rows = card_rows_total.min(capacity).max(1);
+    let fact_rows: u16 = 5 + u16::from(!board.view.forgejo.events.is_empty());
+    let max_forgejo: u16 = if compact { 3 } else { 3 + fact_rows };
+    let card_base = forgejo_h + trunk_gap + visible_card_rows as u16 * (1 + card_h);
+    let card_box_h = forgejo_h
+        + content_h
+            .saturating_sub(card_base)
+            .min(max_forgejo.saturating_sub(forgejo_h));
+    let cards_fit = card_rows_total <= capacity;
+    let facts_fit = card_box_h >= 3 + fact_rows;
+    let use_list = if compact {
+        !cards_fit
+    } else {
+        !cards_fit || (!roomy && !facts_fit)
+    };
+
+    if use_list {
+        // Use the fewest columns that keep two promises: every agent is on the
+        // frame, and the Forgejo box still reaches its facts. One column gives each
+        // line the full width (mark, name, login, run count and state); two or
+        // three are the crowded fallback.
+        // At the floor two columns are the most the 72 cells keep readable; a home
+        // past the picker's twelve still scrolls there, as it always did. Wider
+        // boards may use a third column to keep every name and the box facts.
+        let max_list_columns = if compact { 2 } else { 3 };
+        let mut list_columns = 1;
+        loop {
+            let rows = agent_count.div_ceil(list_columns);
+            let visible = rows.min(list_available_rows(content_h, trunk_gap));
+            let list_h = visible as u16 + 2;
+            let spare = content_h.saturating_sub(3 + trunk_gap + list_h);
+            let facts_kept = compact || spare >= fact_rows;
+            if (rows <= list_available_rows(content_h, trunk_gap) && facts_kept)
+                || list_columns >= max_list_columns
+            {
+                break;
+            }
+            list_columns += 1;
+        }
+        let rows_total = agent_count.div_ceil(list_columns);
+        let available = list_available_rows(content_h, trunk_gap);
+        let visible_rows = rows_total.min(available).max(1);
+        let list_w = inner.width.saturating_sub(2).clamp(8, 100);
+        let list_x = inner.x + inner.width.saturating_sub(list_w) / 2;
+        let col_w = ((list_w.saturating_sub(2)).saturating_sub(list_columns as u16 - 1))
+            / list_columns as u16;
+        let list_h = visible_rows as u16 + 2;
+        let mut forgejo_h = 3;
+        let mut spare = content_h.saturating_sub(3 + trunk_gap + list_h);
+        let add = spare.min(max_forgejo.saturating_sub(forgejo_h));
+        forgejo_h += add;
+        spare -= add;
+        let block_top = inner.y + spare / 2;
+        let list_y = block_top + forgejo_h + trunk_gap;
+        let list = Rect::new(list_x, list_y, list_w, list_h);
+        let mut row_tops = Vec::new();
+        for row in 0..visible_rows {
+            row_tops.push(list_y + 1 + row as u16);
+        }
+        let selected_row = board.selection / list_columns.max(1);
+        let mut scroll_row = board.scroll_row;
+        if selected_row < scroll_row {
+            scroll_row = selected_row;
+        }
+        let last_row = rows_total.saturating_sub(visible_rows);
+        scroll_row = scroll_row.min(last_row);
+        if selected_row >= scroll_row + visible_rows {
+            scroll_row = selected_row + 1 - visible_rows;
+        }
+        let first_visible = scroll_row.saturating_mul(list_columns);
+        let trunk_x = list_x + list_w / 2;
+        return GridGeometry {
+            form: BoardForm::List,
+            columns: list_columns,
+            first_visible,
+            visible_rows,
+            card_h: 1,
+            card_w: col_w,
+            gap: 1,
+            forgejo_h,
+            footer_rows,
+            row_tops,
+            bus_ys: Vec::new(),
+            spine_x: trunk_x,
+            trunk_x,
+            block_top,
+            list: Some(list),
+            list_col_w: col_w,
+            list_x: list_x + 1,
+        };
+    }
+
     let rows_total = agent_count.div_ceil(columns.max(1));
     let mut scroll_row = board.scroll_row;
     let selected_row = board.selection / columns.max(1);
@@ -645,17 +924,20 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
     let mut row_gap = 0_u16;
     let mut base = forgejo_h + trunk_gap + (visible_rows as u16) * (1 + card_h);
     let mut spare = content_h.saturating_sub(base);
-    // The box has four facts at the smallest roomy height and six at the largest:
-    // address, team, agents, version and login. Eight rows hold all six plus the
-    // top and bottom borders, so a taller box would only draw empty rows.
-    let max_forgejo: u16 = if roomy { 8 } else { 3 };
+    // The box is only as tall as its facts: address, team/repositories, agents,
+    // version, the newest event when there is one, and the login. A taller box would
+    // draw empty rows, which the layout tests refuse.
     let max_card: u16 = if roomy {
         if content_h >= 40 { 8 } else { 6 }
+    } else if compact {
+        2
     } else {
         3
     };
     let max_trunk = if roomy {
         (content_h / 12).clamp(2, 4)
+    } else if compact {
+        0
     } else {
         1
     };
@@ -697,6 +979,7 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
     let spine_x = choose_spine_x(inner, columns, card_w, gap, trunk_x);
 
     GridGeometry {
+        form: BoardForm::Cards,
         columns,
         first_visible,
         visible_rows,
@@ -704,11 +987,15 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         card_w,
         gap,
         forgejo_h,
+        footer_rows,
         row_tops,
         bus_ys,
         spine_x,
         trunk_x,
         block_top,
+        list: None,
+        list_col_w: 0,
+        list_x: 0,
     }
 }
 
@@ -865,6 +1152,170 @@ fn draw_wrapped_row_spine(
     }
 }
 
+/// One agent on a list line: the mark, its name, its Forgejo login and its state.
+///
+/// The name is never cut; the login is kept when it fits whole, and the state takes
+/// the rest of the column. The selected line keeps the `▸` and the tint (B1/B2).
+fn draw_list_line(buf: &mut Buffer, rect: Rect, agent: &AgentView, selected: bool) {
+    let face = status::agent_face(agent);
+    let bg = if selected {
+        theme::CARD_SELECTED
+    } else {
+        theme::CARD
+    };
+    text_util::fill(buf, rect, Style::new().fg(theme::FG).bg(bg));
+    let max = rect.width as usize;
+    let mut x = rect.x;
+    let mut used = 0usize;
+    let name_style = if selected {
+        theme::card_bold(theme::SELECT, true)
+    } else {
+        theme::card_bold(theme::FG, true)
+    };
+    if selected && used < max {
+        text_util::put(buf, rect, x, rect.y, "▸", name_style);
+        x += 1;
+        used += 1;
+    }
+    if used < max {
+        text_util::put(
+            buf,
+            rect,
+            x,
+            rect.y,
+            &face.symbol.to_string(),
+            theme::card_bold(face.colour, selected),
+        );
+        x += 1;
+        used += 1;
+    }
+    if used < max {
+        text_util::put(buf, rect, x, rect.y, " ", name_style);
+        x += 1;
+        used += 1;
+    }
+    let name = text_util::ellipsize(&agent.name, max.saturating_sub(used));
+    let name_width = text_util::width(&name);
+    text_util::put(buf, rect, x, rect.y, &name, name_style);
+    x += name_width as u16;
+    used += name_width;
+    let login = if agent.provisioning == Provisioning::Pending {
+        "connecting…".to_owned()
+    } else {
+        agent.login.clone()
+    };
+    if used + 1 + text_util::width(&login) <= max {
+        text_util::put(buf, rect, x, rect.y, " ", name_style);
+        x += 1;
+        used += 1;
+        text_util::put(
+            buf,
+            rect,
+            x,
+            rect.y,
+            &login,
+            theme::card(theme::MUTED, selected),
+        );
+        x += text_util::width(&login) as u16;
+        used += text_util::width(&login);
+    }
+    // The run total keeps its place here too: it is the number an earlier round
+    // promised on every card (N5), and it never resets with the session.
+    let count = status::run_count(agent);
+    if used + 1 + text_util::width(&count) <= max {
+        text_util::put(buf, rect, x, rect.y, " ", name_style);
+        x += 1;
+        used += 1;
+        text_util::put(
+            buf,
+            rect,
+            x,
+            rect.y,
+            &count,
+            theme::card(theme::MUTED, selected),
+        );
+        x += text_util::width(&count) as u16;
+        used += text_util::width(&count);
+    }
+    if used < max {
+        text_util::put(buf, rect, x, rect.y, " ", name_style);
+        x += 1;
+        used += 1;
+        let room = max.saturating_sub(used);
+        // A state word is a word: draw it whole or leave it to the Agent panel.
+        if text_util::width(&face.status) <= room {
+            text_util::put(
+                buf,
+                rect,
+                x,
+                rect.y,
+                &face.status,
+                theme::card_bold(face.colour, selected),
+            );
+        }
+    }
+}
+
+/// The one-line agent form: one wired box whose interior is a line per agent.
+fn draw_agent_list(
+    board: &Board,
+    buf: &mut Buffer,
+    geometry: &GridGeometry,
+    forgejo_rect: Rect,
+    wire_style: Style,
+) -> BoardLayout {
+    let list = geometry.list.expect("the list form has a box");
+    for y in forgejo_rect.bottom()..list.y {
+        put_arms(buf, buf.area, geometry.trunk_x, y, U | D, wire_style);
+    }
+    text_util::fill(buf, list, Style::new().fg(theme::FG).bg(theme::CARD));
+    draw_plain_box(buf, list, Style::new().fg(theme::WIRE).bg(theme::CARD));
+    // The trunk arrives at the middle of the box's top border as one `┴`.
+    put_arms(
+        buf,
+        buf.area,
+        geometry.trunk_x,
+        list.y,
+        L | R | U,
+        wire_style,
+    );
+
+    let agent_count = board.view.agents.len();
+    let mut layout = BoardLayout {
+        columns: geometry.columns,
+        first_visible: geometry.first_visible,
+        cards: Vec::new(),
+        listed: Vec::new(),
+        form: BoardForm::List,
+        forgejo: Some(forgejo_rect),
+        wire_cells: vec![(geometry.trunk_x, list.y.saturating_sub(1))],
+        scrolls: agent_count > geometry.visible_rows * geometry.columns,
+        footer_rows: geometry.footer_rows,
+    };
+    for row in 0..geometry.visible_rows {
+        let y = geometry.row_tops[row];
+        for column in 0..geometry.columns {
+            let agent_index = geometry.first_visible + row * geometry.columns + column;
+            let Some(agent) = board.view.agents.get(agent_index) else {
+                continue;
+            };
+            let rect = Rect::new(
+                geometry.list_x + column as u16 * (geometry.list_col_w + geometry.gap),
+                y,
+                geometry.list_col_w,
+                1,
+            );
+            let selected = !board.forgejo_selected && agent_index == board.selection;
+            draw_list_line(buf, rect, agent, selected);
+            layout.listed.push(CardSlot {
+                agent: agent_index,
+                rect,
+            });
+        }
+    }
+    layout
+}
+
 fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     let title = if build {
         "Setting up…"
@@ -879,6 +1330,10 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     let forgejo_width = if roomy {
         let ceiling = if area.width >= 140 { 100 } else { 72 };
         (inner.width / 2 + 8).clamp(44, ceiling) & !1
+    } else if area.width >= 80 {
+        // 80 columns leaves room for two whole repository names beside the count;
+        // the count and a `(+N)` still say what is hidden, never a cut name (F-09).
+        (inner.width.saturating_sub(10)).clamp(50, 64) & !1
     } else {
         (inner.width.saturating_sub(16)).clamp(36, 50) & !1
     };
@@ -904,110 +1359,123 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     );
 
     let wire_style = theme::fg(theme::WIRE);
-    if geometry.columns > 1 {
-        if let Some(first_bus) = geometry.bus_ys.first() {
+    let layout = if geometry.form == BoardForm::List {
+        draw_agent_list(board, buf, &geometry, forgejo_rect, wire_style)
+    } else {
+        if geometry.columns > 1
+            && let Some(first_bus) = geometry.bus_ys.first()
+        {
             for y in forgejo_rect.bottom()..*first_bus {
                 put_arms(buf, buf.area, geometry.trunk_x, y, U | D, wire_style);
             }
         }
-    }
-    for (row, bus_y) in geometry.bus_ys.iter().enumerate() {
-        if geometry.columns == 1 {
-            break;
-        }
-        let index = geometry.first_visible + row * geometry.columns;
-        let in_row = (agent_count.saturating_sub(index)).min(geometry.columns);
-        if in_row == 0 {
-            break;
-        }
-        let centres = row_junctions(inner, in_row, geometry.card_w, geometry.gap);
-        draw_bus(
-            buf,
-            buf.area,
-            *bus_y,
-            &centres,
-            geometry.spine_x,
-            if row == 0 {
-                Some(geometry.trunk_x)
-            } else {
-                None
-            },
-            row > 0,
-            row + 1 < geometry.visible_rows,
-            wire_style,
-        );
-        if row + 1 < geometry.visible_rows {
-            draw_wrapped_row_spine(
+        for (row, bus_y) in geometry.bus_ys.iter().enumerate() {
+            if geometry.columns == 1 {
+                break;
+            }
+            let index = geometry.first_visible + row * geometry.columns;
+            let in_row = (agent_count.saturating_sub(index)).min(geometry.columns);
+            if in_row == 0 {
+                break;
+            }
+            let centres = row_junctions(inner, in_row, geometry.card_w, geometry.gap);
+            draw_bus(
                 buf,
                 buf.area,
-                geometry.spine_x,
                 *bus_y,
-                geometry.bus_ys[row + 1],
+                &centres,
+                geometry.spine_x,
+                if row == 0 {
+                    Some(geometry.trunk_x)
+                } else {
+                    None
+                },
+                row > 0,
+                row + 1 < geometry.visible_rows,
                 wire_style,
             );
-        }
-    }
-
-    let mut layout = BoardLayout {
-        columns: geometry.columns,
-        first_visible: geometry.first_visible,
-        cards: Vec::new(),
-        forgejo: Some(forgejo_rect),
-        wire_cells: Vec::new(),
-        scrolls: board.view.agents.len() > geometry.visible_rows * geometry.columns,
-    };
-    for row in 0..geometry.visible_rows {
-        let index = geometry.first_visible + row * geometry.columns;
-        let in_row = (agent_count.saturating_sub(index)).min(geometry.columns);
-        if in_row == 0 {
-            break;
-        }
-        let centres = row_junctions(inner, in_row, geometry.card_w, geometry.gap);
-        let start = card_group_start(inner, in_row, geometry.card_w, geometry.gap);
-        let y = geometry.row_tops[row];
-        for (column, centre) in centres.iter().enumerate() {
-            let agent_index = index + column;
-            let Some(agent) = board.view.agents.get(agent_index) else {
-                continue;
-            };
-            let rect = Rect::new(
-                start + column as u16 * (geometry.card_w + geometry.gap),
-                y,
-                geometry.card_w,
-                geometry.card_h,
-            );
-            let selected = !board.forgejo_selected && agent_index == board.selection;
-            draw_card(buf, rect, agent, selected, roomy, true);
-            if geometry.columns == 1 {
-                // One vertical list, one spine: the wire above this card leaves the
-                // Forgejo box (first card) or the previous card's bottom centre.
-                let junction_x = card_junction(rect);
-                if let Some(previous) = layout.cards.last() {
-                    put_arms(
-                        buf,
-                        buf.area,
-                        card_junction(previous.rect),
-                        previous.rect.bottom() - 1,
-                        L | R | D,
-                        wire_style,
-                    );
-                }
-                let from = layout
-                    .cards
-                    .last()
-                    .map(|previous| previous.rect.bottom())
-                    .unwrap_or(forgejo_rect.bottom());
-                for wire_y in from..rect.y {
-                    put_arms(buf, buf.area, junction_x, wire_y, U | D, wire_style);
-                }
+            if row + 1 < geometry.visible_rows {
+                draw_wrapped_row_spine(
+                    buf,
+                    buf.area,
+                    geometry.spine_x,
+                    *bus_y,
+                    geometry.bus_ys[row + 1],
+                    wire_style,
+                );
             }
-            layout.cards.push(CardSlot {
-                agent: agent_index,
-                rect,
-            });
-            layout.wire_cells.push((*centre, y.saturating_sub(1)));
         }
-    }
+
+        let mut layout = BoardLayout {
+            columns: geometry.columns,
+            first_visible: geometry.first_visible,
+            cards: Vec::new(),
+            listed: Vec::new(),
+            form: BoardForm::Cards,
+            forgejo: Some(forgejo_rect),
+            wire_cells: Vec::new(),
+            scrolls: agent_count > geometry.visible_rows * geometry.columns,
+            footer_rows: geometry.footer_rows,
+        };
+        for row in 0..geometry.visible_rows {
+            let index = geometry.first_visible + row * geometry.columns;
+            let in_row = (agent_count.saturating_sub(index)).min(geometry.columns);
+            if in_row == 0 {
+                break;
+            }
+            let centres = row_junctions(inner, in_row, geometry.card_w, geometry.gap);
+            let start = card_group_start(inner, in_row, geometry.card_w, geometry.gap);
+            let y = geometry.row_tops[row];
+            for (column, centre) in centres.iter().enumerate() {
+                let agent_index = index + column;
+                let Some(agent) = board.view.agents.get(agent_index) else {
+                    continue;
+                };
+                let rect = Rect::new(
+                    start + column as u16 * (geometry.card_w + geometry.gap),
+                    y,
+                    geometry.card_w,
+                    geometry.card_h,
+                );
+                let selected = !board.forgejo_selected && agent_index == board.selection;
+                if rect.height <= 2 {
+                    draw_compact_card(buf, rect, agent, selected, true);
+                } else {
+                    draw_card(buf, rect, agent, selected, roomy, true);
+                }
+                if geometry.columns == 1 {
+                    // One vertical list, one spine: the wire above this card leaves
+                    // the Forgejo box (first card) or the previous card's bottom
+                    // centre.
+                    let junction_x = card_junction(rect);
+                    if let Some(previous) = layout.cards.last() {
+                        put_arms(
+                            buf,
+                            buf.area,
+                            card_junction(previous.rect),
+                            previous.rect.bottom() - 1,
+                            L | R | D,
+                            wire_style,
+                        );
+                    }
+                    let from = layout
+                        .cards
+                        .last()
+                        .map(|previous| previous.rect.bottom())
+                        .unwrap_or(forgejo_rect.bottom());
+                    for wire_y in from..rect.y {
+                        put_arms(buf, buf.area, junction_x, wire_y, U | D, wire_style);
+                    }
+                }
+                layout.cards.push(CardSlot {
+                    agent: agent_index,
+                    rect,
+                });
+                layout.wire_cells.push((*centre, y.saturating_sub(1)));
+            }
+        }
+        layout
+    };
     board.last = layout;
     board.columns = geometry.columns;
     board.scroll_row = geometry.first_visible / geometry.columns.max(1);
@@ -1027,19 +1495,41 @@ fn remove_confirmation(name: &str) -> (String, String) {
     )
 }
 
+/// Join agent names the way the quit warning names them: `a`, `a and b`,
+/// `a, b and c`.
+fn join_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let (last, rest) = names.split_last().expect("a non-empty list");
+            format!("{} and {last}", rest.join(", "))
+        }
+    }
+}
+
 fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
-    let footer_top = inner.bottom().saturating_sub(3);
+    let footer_rows = board.last.footer_rows.max(3);
+    let footer_top = inner.bottom().saturating_sub(footer_rows);
     if board.confirm_quit {
-        let started = board
+        let started: Vec<&str> = board
             .view
             .agents
             .iter()
             .filter(|agent| agent.desired == Desired::Started)
-            .count();
-        let line = format!(
-            "quit stops {started} {} and Forgejo; they start again when you reopen — q again quits",
-            plural(started)
-        );
+            .map(|agent| agent.name.as_str())
+            .collect();
+        let names = join_names(&started);
+        let line = if started.len() == 1 {
+            format!(
+                "quit stops {names} and Forgejo; they start again when you reopen — q again quits"
+            )
+        } else {
+            format!(
+                "quit stops {names}, and Forgejo; they start again when you reopen — q again quits"
+            )
+        };
         let width = inner.width.saturating_sub(2) as usize;
         for (y, part) in (footer_top..).zip(text_util::wrap(&line, width).into_iter().take(2)) {
             text_util::put(buf, inner, inner.x + 1, y, &part, theme::bold(theme::AMBER));
@@ -1104,10 +1594,31 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
         theme::fg(theme::MUTED),
     );
     let layout = &board.last;
+    let box_shows_event = layout.forgejo.map(|rect| rect.height >= 8).unwrap_or(false);
+    let event = if box_shows_event {
+        None
+    } else {
+        board.view.forgejo.events.last()
+    };
+    let bottom = inner.bottom().saturating_sub(1);
+    // B3: the event owns a row. It is never right-aligned onto the key line, so a
+    // long repository name or the scroll indicator cannot draw over a key hint.
+    let event_y = if event.is_some() && footer_rows >= 4 {
+        footer_top + 2
+    } else {
+        bottom
+    };
+    let status_y = bottom;
+    let shown = if layout.form == BoardForm::List {
+        layout.listed.len()
+    } else {
+        layout.cards.len()
+    };
+    let mut right = String::new();
     if layout.scrolls {
         let first = layout.first_visible + 1;
-        let last = (layout.first_visible + layout.cards.len()).min(board.view.agents.len());
-        let indicator = format!(
+        let last = (layout.first_visible + shown).min(board.view.agents.len());
+        right.push_str(&format!(
             "{}{}–{} / {} {}",
             if first > 1 { "↑" } else { "" },
             first,
@@ -1118,47 +1629,73 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
             } else {
                 ""
             }
-        );
-        let x = inner
-            .right()
-            .saturating_sub(text_util::width(indicator.trim_end()) as u16 + 2);
+        ));
+    }
+    if !right.is_empty() {
+        // The indicator stays right of the second key line and gives way rather
+        // than overwrite it.
+        let keys_width = text_util::width(second) as u16;
+        let room = inner.width.saturating_sub(2).saturating_sub(keys_width + 2) as usize;
+        if room >= 6 {
+            let line = text_util::ellipsize(&right, room);
+            let x = inner
+                .right()
+                .saturating_sub(text_util::width(&line) as u16 + 2);
+            text_util::put(
+                buf,
+                inner,
+                x,
+                footer_top + 1,
+                &line,
+                theme::fg(theme::MUTED),
+            );
+        }
+    }
+    if let Some(event) = event {
         text_util::put(
             buf,
             inner,
-            x,
-            footer_top + 1,
-            indicator.trim_end(),
+            inner.x + 1,
+            event_y,
+            &text_util::ellipsize(
+                &status::plain(event),
+                inner.width.saturating_sub(2) as usize,
+            ),
             theme::fg(theme::MUTED),
         );
     }
-    let bottom = inner.bottom().saturating_sub(1);
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            bottom,
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
-            theme::fg(theme::FG),
-        );
-    } else if let Some(line) = waiting_sentence(board) {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            bottom,
-            &text_util::ellipsize(&line, inner.width.saturating_sub(2) as usize),
-            theme::fg(theme::AMBER),
-        );
-    } else if !board.view.confined {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            bottom,
-            "runs are not confined on this computer",
-            theme::fg(theme::AMBER),
-        );
+    // The status line has the bottom row unless the event took it (which the
+    // geometry only allows when there is no notice, no waiting sentence and a
+    // confined host).
+    if event.is_none() || event_y != status_y {
+        if let Some(notice) = board.notice() {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                status_y,
+                &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
+                theme::fg(theme::FG),
+            );
+        } else if let Some(line) = waiting_sentence(board) {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                status_y,
+                &text_util::ellipsize(&line, inner.width.saturating_sub(2) as usize),
+                theme::fg(theme::AMBER),
+            );
+        } else if !board.view.confined {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                status_y,
+                "runs are not confined on this computer",
+                theme::fg(theme::AMBER),
+            );
+        }
     }
 }
 
@@ -1211,7 +1748,7 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let content_h = content_bottom.saturating_sub(content_top);
 
     let width = inner.width.saturating_sub(10) as usize;
-    let blocks: Vec<(usize, Vec<String>)> = board
+    let mut blocks: Vec<(usize, Vec<String>)> = board
         .view
         .terms
         .iter()
@@ -1220,6 +1757,19 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
             (lines.len().max(1), lines)
         })
         .collect();
+    // F-06: the second item is conditional; this status line says what is true on
+    // *this* computer. It is not numbered, and it scrolls with item 2. The negative
+    // sentence is the engine's sixth term on a host with no mechanism.
+    if let Some(method) = &board.view.confinement {
+        let line = format!("runs on this computer are confined ({method})");
+        let lines = text_util::wrap(&line, width);
+        if let Some((count, block)) = blocks.get_mut(1) {
+            block.extend(lines);
+            *count = block.len();
+        } else {
+            blocks.push((lines.len().max(1), lines));
+        }
+    }
     let total_lines: usize = blocks.iter().map(|(count, _)| *count).sum();
     // When the warnings just fit at the 72x18 floor there is no row left for a blank
     // separator; the numbered items still read as separate items. Never trade an
@@ -1321,8 +1871,9 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let content_h = content_bottom.saturating_sub(content_top);
     let form_width = inner.width.saturating_sub(8).clamp(40, 76).min(inner.width);
     let field_gap = if content_h >= 22 { 3 } else { 1 };
-    let form_height = 9 + 2 * field_gap + 2;
-    let form_height = form_height.min(content_h);
+    // The test line gets real rows, not one: the provider's whole answer wraps to
+    // what the form can hold, and at 80x24 that is the whole refusal (F-07).
+    let form_height = (9 + 2 * field_gap + 2 + 6).min(content_h);
     let form = Rect::new(
         inner.x + inner.width.saturating_sub(form_width) / 2,
         content_top + content_h.saturating_sub(form_height) / 2,
@@ -1396,17 +1947,19 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     // fields; the `/v1` repair is already first, and the provider's clause follows
     // on the second row (review B1).
     let room = form.bottom().saturating_sub(1).saturating_sub(y) as usize;
-    for (row, part) in text_util::wrap(&line, form.width.saturating_sub(4) as usize)
-        .iter()
-        .take(room)
-        .enumerate()
-    {
-        text_util::put(buf, form, form.x + 2, y + row as u16, part, style);
+    let parts = text_util::wrap(&line, form.width.saturating_sub(4) as usize);
+    for (row, part) in parts.iter().take(room).enumerate() {
+        let shown = if row + 1 == room && parts.len() > room {
+            format!("{}…", part.trim_end())
+        } else {
+            part.clone()
+        };
+        text_util::put(buf, form, form.x + 2, y + row as u16, &shown, style);
     }
     let actions = if board.model_editing {
-        "⏎ keep    esc cancel"
+        "⏎ next field   ↑↓ field   esc cancel"
     } else {
-        "e edit   t test   ⏎ next   esc back"
+        "e edit   ↑↓ field   t test   ⏎ next   esc back"
     };
     text_util::put(
         buf,
@@ -1613,7 +2166,9 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let content_bottom = inner.bottom().saturating_sub(3);
     let content_h = content_bottom.saturating_sub(content_top);
     let card_width = inner.width.saturating_sub(8).clamp(40, 90).min(inner.width);
-    let card_height = content_h.saturating_sub(2).clamp(10, 14);
+    // A tall terminal gives the instruction the spare rows instead of a fixed
+    // 14-row card with the rest of the screen empty (U4/F-11).
+    let card_height = content_h.saturating_sub(2).clamp(10, 44);
     let card = Rect::new(
         inner.x + inner.width.saturating_sub(card_width) / 2,
         content_top + content_h.saturating_sub(card_height) / 2,
@@ -1700,7 +2255,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
                 .as_ref()
                 .map(|error| format!("✗ {}", status::first_clause(error)))
         });
-    let result = status::run_result(&agent).map(|reason| format!("result: {reason}"));
+    let result = status::run_result_line(&agent);
     let result_colour = if status::run_result_is_refusal(&agent) {
         theme::RED
     } else if status::run_result_is_warning(&agent) {
@@ -1829,56 +2384,33 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         "instruction",
         theme::card(theme::MUTED, true),
     );
-    match &agent.instruction_first_line {
-        Some(line) => {
-            let wrapped = text_util::wrap(line, width);
-            // Count wrapped display rows, not physical lines: a long one-line
-            // instruction can fill or overrun the area on its own (B6). The count
-            // the marker carries is what the person cannot see: the wrapped rows
-            // that did not fit plus every physical line after the first.
-            let more_physical = agent.instruction_lines.saturating_sub(1);
-            // The whole first line fits and there is no physical line after it: draw
-            // it. Otherwise the marker is owed: it counts the wrapped rows of the
-            // first line that did not fit plus every later physical line, which the
-            // view does not carry at all.
-            if more_physical == 0 && wrapped.len() <= rows {
-                for (row, part) in wrapped.iter().enumerate() {
-                    text_util::put(
-                        buf,
-                        card,
-                        interior_x,
-                        text_top + row as u16,
-                        &text_util::ellipsize_words(part, width),
-                        theme::card(theme::FG, true),
-                    );
-                }
-            } else if rows > 0 {
-                // One row is the marker's; when only one row exists it is the marker
-                // itself, so dropped text is never silent.
-                let take = rows - 1;
-                let drawn = take.min(wrapped.len());
-                for (row, part) in wrapped.iter().take(drawn).enumerate() {
-                    text_util::put(
-                        buf,
-                        card,
-                        interior_x,
-                        text_top + row as u16,
-                        &text_util::ellipsize_words(part, width),
-                        theme::card(theme::FG, true),
-                    );
-                }
-                let hidden = (wrapped.len() - drawn) + more_physical;
-                text_util::put(
-                    buf,
-                    card,
-                    interior_x,
-                    text_top + drawn as u16,
-                    &text_util::ellipsize(&format!("… ({hidden} more lines)"), width),
-                    theme::card(theme::MUTED, true),
-                );
-            }
+    match (&agent.instruction, &agent.instruction_first_line) {
+        (Some(text), _) => draw_instruction(
+            buf,
+            card,
+            interior_x,
+            text_top,
+            rows,
+            width,
+            text,
+            agent.instruction_lines,
+        ),
+        (None, Some(line)) => {
+            // An older view carries only the first line; the count still says how
+            // many file lines the document has.
+            let physical = vec![text_util::wrap(line, width)];
+            draw_instruction_rows(
+                buf,
+                card,
+                interior_x,
+                text_top,
+                rows,
+                width,
+                &physical,
+                agent.instruction_lines.max(1),
+            );
         }
-        None => {
+        (None, None) => {
             if rows > 0 {
                 text_util::put(
                     buf,
@@ -1917,6 +2449,21 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         );
         x += 2;
     }
+    let count = status::run_count(&agent);
+    let count_x = card
+        .right()
+        .saturating_sub(text_util::width(&count) as u16 + 2);
+    // F-04: the newest mark carries its one word beside it, so `⊘` and `∅` never
+    // have to be told apart by shape alone.
+    if let Some(newest) = agent.recent.last() {
+        let label = status::session_label(newest);
+        let (_, colour) = status::session_symbol(newest);
+        let room = (count_x.saturating_sub(x + 1)) as usize;
+        if text_util::width(label) < room {
+            text_util::put(buf, card, x + 1, strip_y, label, theme::card(colour, true));
+            x += 1 + text_util::width(label) as u16;
+        }
+    }
     if total > shown {
         let rest = total - shown;
         text_util::put(
@@ -1924,16 +2471,12 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             card,
             x,
             strip_y,
-            &format!("+{rest}"),
+            &format!(" +{rest}"),
             theme::card(theme::MUTED, true),
         );
     } else if total == 0 {
         text_util::put(buf, card, x, strip_y, "—", theme::card(theme::MUTED, true));
     }
-    let count = status::run_count(&agent);
-    let count_x = card
-        .right()
-        .saturating_sub(text_util::width(&count) as u16 + 2);
     text_util::put(
         buf,
         card,
@@ -1947,10 +2490,13 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         // card's 58-cell row. `■ stop` is the floor spelling; from 80 columns the
         // card has 66 cells and the whole `■ stopped` fits. The `⚠ cmd` entry is the
         // new mark's: a finished run with a failed command (correction 4).
+        // The 72-column card has 58 cells: this spelling fits whole, with every
+        // entry's word complete. `∅ none` is the no-work mark; the longer `no work`
+        // is used where the card has room (F-04).
         let legend = if width >= 61 {
             "✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out"
         } else {
-            "✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stop ◷ timed out"
+            "✓ ok ⊘ refused ∅ none ✗ failed ⚠ cmd ■ stopped ◷ timed out"
         };
         text_util::put(
             buf,
@@ -2033,6 +2579,131 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     }
 }
 
+/// Draw the instruction's first rows and a marker counted in **file** lines.
+///
+/// The first display row is always drawn, even when only one row is available: the
+/// instruction must not disappear behind a bare count (U4/F-11). The marker counts
+/// the physical lines of the document, not the wrapped rows, and it only appears
+/// when a row can be spared for it. At a tall size the spare rows show more lines.
+#[allow(clippy::too_many_arguments)]
+fn draw_instruction(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    top: u16,
+    rows: usize,
+    width: usize,
+    text: &str,
+    file_lines: usize,
+) {
+    let physical: Vec<Vec<String>> = text
+        .lines()
+        .map(|line| text_util::wrap(line, width))
+        .collect();
+    draw_instruction_rows(
+        buf,
+        clip,
+        x,
+        top,
+        rows,
+        width,
+        &physical,
+        file_lines.max(physical.len()).max(1),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_instruction_rows(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    top: u16,
+    rows: usize,
+    width: usize,
+    physical: &[Vec<String>],
+    file_lines: usize,
+) {
+    if rows == 0 {
+        return;
+    }
+    let total_rows: usize = physical.iter().map(Vec::len).sum();
+    if total_rows <= rows {
+        let mut row = 0;
+        for line in physical {
+            for part in line {
+                text_util::put(
+                    buf,
+                    clip,
+                    x,
+                    top + row as u16,
+                    &text_util::ellipsize_words(part, width),
+                    theme::card(theme::FG, true),
+                );
+                row += 1;
+            }
+        }
+        // A view that carries only the first line still knows how many file lines
+        // the document has; name the rest when a row can be spared.
+        let hidden = file_lines.saturating_sub(physical.len());
+        if hidden > 0 && row < rows {
+            let noun = if hidden == 1 { "line" } else { "lines" };
+            text_util::put(
+                buf,
+                clip,
+                x,
+                top + row as u16,
+                &text_util::ellipsize(&format!("… ({hidden} more {noun})"), width),
+                theme::card(theme::MUTED, true),
+            );
+        }
+        return;
+    }
+    let mut take = rows.saturating_sub(1);
+    let marker = take > 0;
+    if take == 0 {
+        // One row and no room for both: the first line wins, never the count.
+        take = 1;
+    }
+    let mut drawn = 0;
+    let mut fully_shown = 0;
+    for line in physical {
+        if drawn >= take {
+            break;
+        }
+        let mut complete = true;
+        for part in line {
+            if drawn >= take {
+                complete = false;
+                break;
+            }
+            text_util::put(
+                buf,
+                clip,
+                x,
+                top + drawn as u16,
+                &text_util::ellipsize_words(part, width),
+                theme::card(theme::FG, true),
+            );
+            drawn += 1;
+        }
+        if complete {
+            fully_shown += 1;
+        }
+    }
+    let hidden = file_lines.saturating_sub(fully_shown);
+    if marker && hidden > 0 {
+        let noun = if hidden == 1 { "line" } else { "lines" };
+        text_util::put(
+            buf,
+            clip,
+            x,
+            top + drawn as u16,
+            &text_util::ellipsize(&format!("… ({hidden} more {noun})"), width),
+            theme::card(theme::MUTED, true),
+        );
+    }
+}
+
 fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Forgejo");
     let inner = inner(area);
@@ -2064,7 +2735,7 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let (password, revealed) = match board.revealed_password() {
         Some(password) => (password.to_owned(), true),
         None => (
-            "••••••••   p resets it — shown for 10 s, old stops".to_owned(),
+            "••••••••   p resets it, c copies — shown for 10 s, old stops".to_owned(),
             false,
         ),
     };
@@ -2079,12 +2750,13 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
             .collect::<Vec<_>>()
             .join(" · ")
     };
+    // The newest event is the fact a person needs; older ones are history. Keeping
+    // one line whole is what lets the floor page carry it at 72x18 (F-05).
     let events = view
         .events
-        .iter()
+        .last()
         .map(|event| status::plain(event))
-        .collect::<Vec<_>>()
-        .join(" · ");
+        .unwrap_or_default();
     let mut rows: Vec<(&str, Vec<String>)> = vec![
         (
             "address",
@@ -2117,10 +2789,11 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
         rows.push(("events", text_util::wrap(&events, room)));
     }
     // The floor keeps every row, including the version, organisation, the assignment
-    // rule and the team page: one compact line each, with no blank row between when
-    // the height is tight (F12). Only events are dropped before a fact is.
-    // Drop the optional rows when the height is tight, never the password or login.
-    let optional = ["events", "team page", "organisation", "version", "agents"];
+    // rule, the team page and the latest repository event: one compact line each,
+    // with no blank row between when the height is tight (F12). The password and
+    // login are never dropped either; a row that cannot fit any other way gives up
+    // its spacing first.
+    let optional = ["team page", "organisation", "version", "agents"];
     loop {
         let lines: usize = rows.iter().map(|(_, lines)| lines.len().max(1)).sum();
         let spacing = if rows.len() > 1 && lines < content_h as usize {
@@ -2182,7 +2855,7 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         inner.x + 1,
         inner.bottom().saturating_sub(2),
-        "p reset password   esc back",
+        "p reset password   c copy   esc back",
         theme::fg(theme::MUTED),
     );
     if let Some(notice) = board.notice() {
@@ -2437,6 +3110,22 @@ mod tests {
             );
             assert_eq!(arms_char(arms).is_some(), expected, "arms {arms:04b}");
         }
+    }
+
+    #[test]
+    fn a_narrow_card_state_phrase_is_whole() {
+        let face = |status: &str| status::Face {
+            symbol: '○',
+            word: status.to_owned(),
+            colour: theme::GREY,
+            status: status.to_owned(),
+        };
+        assert_eq!(
+            board_state(&face("needs an instruction")),
+            "needs instruction"
+        );
+        assert_eq!(board_state(&face("waiting for Forgejo")), "waiting Forgejo");
+        assert_eq!(board_state(&face("working")), "working");
     }
 
     #[test]

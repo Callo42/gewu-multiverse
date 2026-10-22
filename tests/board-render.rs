@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gewu_multiverse::board::status::BANNED;
-use gewu_multiverse::board::{Board, FakeEngine, Screen};
+use gewu_multiverse::board::{Board, BoardForm, FakeEngine, Screen};
 use gewu_multiverse::engine_api::{BoardView, Command, EngineApi};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -136,12 +136,8 @@ fn fill_model(board: &mut Board, url: &str, model: &str, key: &str) {
     press(board, KeyCode::Char('e'));
     type_text(board, url);
     press(board, KeyCode::Enter);
-    press(board, KeyCode::Down);
-    press(board, KeyCode::Char('e'));
     type_text(board, model);
     press(board, KeyCode::Enter);
-    press(board, KeyCode::Down);
-    press(board, KeyCode::Char('e'));
     type_text(board, key);
     press(board, KeyCode::Enter);
 }
@@ -332,6 +328,31 @@ fn assert_cards_whole(board: &Board, buffer: &Buffer, label: &str) {
             card.agent
         );
     }
+    // The one-line form is one wired box whose interior holds every agent line.
+    // Each line is one row and stays inside the frame; the box is checked by the
+    // connectivity guard, and the list's own guard checks the names.
+    for line in &layout.listed {
+        let rect = line.rect;
+        assert_eq!(rect.height, 1, "{label}: a list line is not one row");
+        assert!(
+            rect.x >= area.x && rect.right() <= area.right(),
+            "{label}: list line {} starts outside the window",
+            line.agent
+        );
+        assert!(
+            rect.y >= area.y && rect.bottom() <= area.bottom(),
+            "{label}: list line {} ends outside the window",
+            line.agent
+        );
+        let row: String = (rect.x..rect.right())
+            .map(|x| buffer.cell((x, rect.y)).expect("a cell").symbol())
+            .collect();
+        assert!(
+            !row.trim().is_empty(),
+            "{label}: list line {} is blank",
+            line.agent
+        );
+    }
 }
 
 fn check_frame(board: &mut Board, width: u16, height: u16, label: &str) -> Buffer {
@@ -340,7 +361,11 @@ fn check_frame(board: &mut Board, width: u16, height: u16, label: &str) -> Buffe
     assert_connected(&buffer, label);
     assert_no_engine_words(&buffer, label);
     if board.screen() == Screen::Home || board.screen() == Screen::Build {
-        assert!(!board.layout().cards.is_empty(), "{label}: no card drawn");
+        let layout = board.layout();
+        assert!(
+            !layout.cards.is_empty() || !layout.listed.is_empty(),
+            "{label}: no card or list line drawn"
+        );
         assert_cards_whole(board, &buffer, label);
     }
     buffer
@@ -529,8 +554,10 @@ fn the_last_agent_scrolls_into_view_with_its_wire() {
         }
         let buffer = check_frame(&mut board, width, height, "home 20 last");
         assert_eq!(board.selection(), Some(19));
+        let layout = board.layout();
         assert!(
-            board.layout().cards.iter().any(|card| card.agent == 19),
+            layout.cards.iter().any(|card| card.agent == 19)
+                || layout.listed.iter().any(|line| line.agent == 19),
             "the selected card is not drawn at {width}x{height}"
         );
         if board.layout().scrolls {
@@ -810,13 +837,14 @@ fn the_corrections_main_asked_for_are_on_the_board() {
             assert!(!flat.contains('`'), "{label}: a backtick was drawn");
 
             // The first card keeps the three-card row's one-cell margin.
-            let first = board
-                .layout()
+            let layout = board.layout();
+            let first = layout
                 .cards
                 .iter()
+                .chain(layout.listed.iter())
                 .map(|card| card.rect.x)
                 .min()
-                .expect("a card is drawn");
+                .expect("a card or list line is drawn");
             assert!(first >= 2, "{label}: the first card touches the frame");
 
             // No empty row inside the Forgejo box: every row below the accent bar
@@ -936,11 +964,18 @@ fn no_card_text_shares_a_row_with_a_section_rule_at_any_size() {
 }
 
 #[test]
-fn the_72_column_board_is_one_vertical_list_with_one_spine() {
-    for count in [1, 3, 4, 7] {
+fn the_72_column_board_keeps_every_agent_on_the_frame() {
+    // One vertical list of compact cards while the cards fit (F7): the wire above
+    // each card leaves the box or the previous card's bottom centre.
+    for count in [1, 3] {
         let mut board = Board::new(endpoint_engine(count));
         let buffer = draw(&mut board, 72, 18);
         let layout = board.layout();
+        assert_eq!(
+            layout.form,
+            BoardForm::Cards,
+            "72x18 with {count} agents is not the card form"
+        );
         assert_eq!(
             layout.columns, 1,
             "72x18 with {count} agents is not a single column"
@@ -969,6 +1004,35 @@ fn the_72_column_board_is_one_vertical_list_with_one_spine() {
             );
         }
         assert!(!layout.cards.is_empty());
+    }
+    // When the cards cannot all fit, the same place becomes the one-line form and
+    // no agent is left off the frame (B1). Each line is one row.
+    for count in [4, 7, 12] {
+        let mut board = Board::new(endpoint_engine(count));
+        let buffer = draw(&mut board, 72, 18);
+        let frame = text(&buffer);
+        let layout = board.layout();
+        assert_eq!(
+            layout.form,
+            BoardForm::List,
+            "72x18 with {count} agents did not take the one-line form"
+        );
+        assert_eq!(layout.listed.len(), count, "a list line is missing");
+        assert!(
+            !layout.scrolls,
+            "the 72x18 list scrolls with {count} agents"
+        );
+        let words: Vec<&str> = frame.split_whitespace().collect();
+        for number in 1..=count {
+            assert!(
+                words.contains(&format!("agent-{number}").as_str()),
+                "agent-{number} is off the 72x18 frame with {count} agents:\n{frame}"
+            );
+            assert!(
+                words.contains(&format!("gewu-agent-{number}").as_str()),
+                "gewu-agent-{number}'s login is off the frame with {count} agents:\n{frame}"
+            );
+        }
     }
 }
 
@@ -1316,15 +1380,16 @@ fn a_long_one_line_instruction_is_signposted_at_the_floor() {
         let buffer = draw(&mut board, width, height);
         let frame = text(&buffer);
         let flat = flat(&buffer);
-        // The rule is whole instruction or a signposted cut: at 80x24 the one line
-        // fits in the content area, at 72x18 it cannot.
-        if !flat.contains("with the link.") {
+        // U4/F-11: the first display row is always drawn. When the whole line
+        // fits, it is whole; when it does not, the first row stays and a marker
+        // (where a row can be spared) counts the *file* lines not shown.
+        assert!(
+            flat.contains("Take issue #1"),
+            "{width}x{height}: the first line disappeared behind the count:\n{frame}"
+        );
+        if !flat.contains("with the link.") && width >= 80 {
             assert!(
-                frame.contains("… ("),
-                "{width}x{height}: no ellipsis marker:\n{frame}"
-            );
-            assert!(
-                frame.contains("more lines"),
+                frame.contains("… (") && frame.contains("more line"),
                 "{width}x{height}: the dropped text is not counted:\n{frame}"
             );
         }
@@ -1356,7 +1421,7 @@ fn a_long_one_line_instruction_keeps_its_first_line_when_a_second_row_exists() {
         .unwrap_or_else(|| panic!("the first line is missing at 80x24:\n{frame}"));
     let marker = frame
         .lines()
-        .position(|line| line.contains("more lines"))
+        .position(|line| line.contains("more line"))
         .unwrap_or_else(|| panic!("the marker is missing at 80x24:\n{frame}"));
     assert!(
         first < marker,
@@ -1368,12 +1433,8 @@ fn a_long_one_line_instruction_keeps_its_first_line_when_a_second_row_exists() {
     press(&mut board, KeyCode::Enter);
     let frame = text(&draw(&mut board, 72, 18));
     assert!(
-        frame.contains("… (") && frame.contains("more lines"),
-        "the one-row floor must signpost the whole line:\n{frame}"
-    );
-    assert!(
-        !frame.contains("Take issue #1"),
-        "the documented one-row form is the marker, not a clipped first line:\n{frame}"
+        frame.contains("Take issue #1"),
+        "the one-row floor must keep the first line (U4):\n{frame}"
     );
 }
 
@@ -1517,6 +1578,20 @@ fn the_warning_mark_is_in_the_legend_at_every_size() {
         assert!(
             frame.contains("⊘ refused") && frame.contains("◷ timed out"),
             "{width}x{height}: the legend lost an earlier word:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn the_floor_card_states_are_whole() {
+    // F-03: the compact card's one border line must not cut a state word.
+    for (width, height) in [(72, 18), (80, 24)] {
+        let mut board = Board::new(blocked_engine());
+        let buffer = draw(&mut board, width, height);
+        let frame = text(&buffer);
+        assert!(
+            frame.contains("needs instruction") || frame.contains("needs an instruction"),
+            "{width}x{height}: the state word is cut:\n{frame}"
         );
     }
 }

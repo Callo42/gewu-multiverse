@@ -172,6 +172,10 @@ pub struct RunEvidence {
     failed_call: Option<String>,
     /// The cause row for the newest hidden failure, when one was recorded.
     cause: Option<String>,
+    /// The assigned-issues list was read successfully and was empty.
+    checked_empty: bool,
+    /// At least one write tool or write shell command succeeded.
+    wrote: bool,
 }
 
 impl RunEvidence {
@@ -183,6 +187,22 @@ impl RunEvidence {
     /// The first failed call that was not a refusal, when there was one.
     pub fn failed_call(&self) -> Option<&str> {
         self.failed_call.as_deref()
+    }
+
+    /// The refused write's cause without the engine's explanatory prefix, for the
+    /// card's `write refused:` row.
+    pub fn refused_cause(&self) -> Option<&str> {
+        let refused = self.refused_write.as_deref()?;
+        for prefix in [
+            "a shell write was refused: ",
+            "a shell write failed: ",
+            "a shell command was refused: ",
+        ] {
+            if let Some(cause) = refused.strip_prefix(prefix) {
+                return Some(cause);
+            }
+        }
+        Some(refused)
     }
 
     /// The card's cause row for a failure hidden behind a zero-exit wrapper.
@@ -201,6 +221,21 @@ impl RunEvidence {
         }
     }
 
+    /// A Forgejo tool succeeded. The assigned-issues list is the one read whose
+    /// empty answer is a fact about the work, not an empty shell result: a run that
+    /// checked and found nothing assigned is `∅`, not `✓` (U3). A successful write
+    /// means the run did not merely check.
+    pub fn note_forgejo_success(&mut self, tool: &str, text: &str) {
+        if tool == crate::forgejo_tools::LIST_ASSIGNED_ISSUES
+            && text.trim_start().starts_with("no open issue is assigned")
+        {
+            self.checked_empty = true;
+        }
+        if crate::forgejo_tools::is_write_tool(tool) {
+            self.wrote = true;
+        }
+    }
+
     /// A shell command ended. The mark reads the shell's raw record: a run is never
     /// `✓` when any status the shell reported — each record's `$?` or any element of
     /// `PIPESTATUS` — is non-zero, even if the pairing could not name the command
@@ -209,6 +244,7 @@ impl RunEvidence {
     /// the `⚠` row. A `curl` without `-f` is the one tool whose zero exit hides a
     /// 4xx/5xx, so its output is read for a status.
     fn note_shell(&mut self, command: &str, outcome: &ToolOutcome) -> bool {
+        let writes = shell_writes(command);
         let raw_failure = outcome
             .raw_failures
             .iter()
@@ -231,7 +267,7 @@ impl RunEvidence {
         // The write's own diagnostic, when the output carries one: a mixed failure can
         // print a read's diagnostic after the write's, and the write is the cause a
         // person needs (review correction 9, NB-A).
-        let write_line = if shell_writes(command) {
+        let write_line = if writes {
             write_diagnostic(command, &outcome.excerpt)
         } else {
             None
@@ -254,8 +290,6 @@ impl RunEvidence {
             if !failing.is_empty() {
                 if failed_write {
                     self.refused_write = Some(format!("a shell write was refused: {cause}"));
-                } else if refusal_evidence(&outcome.excerpt) {
-                    self.refused_write = Some(format!("a shell command was refused: {cause}"));
                 } else if self.failed_call.is_none() {
                     self.failed_call = Some(reason);
                 }
@@ -267,17 +301,15 @@ impl RunEvidence {
                 let raw_cause = write_line
                     .clone()
                     .unwrap_or_else(|| failing_cause(status, &outcome.excerpt));
-                if shell_writes(command) && write_failure_context(&outcome.excerpt) {
+                if writes && write_failure_context(&outcome.excerpt) {
                     self.refused_write = Some(format!("a shell write was refused: {raw_cause}"));
                 } else if self.failed_call.is_none() {
                     self.failed_call = Some(raw_cause);
                 }
                 return false;
             }
-            if shell_writes(command) {
+            if writes {
                 self.refused_write = Some(format!("a shell write was refused: {cause}"));
-            } else if refusal_evidence(&outcome.excerpt) {
-                self.refused_write = Some(format!("a shell command was refused: {cause}"));
             } else if self.failed_call.is_none() {
                 self.failed_call = Some(reason);
             }
@@ -322,8 +354,10 @@ impl RunEvidence {
             if failed_write {
                 self.refused_write = Some(format!("a shell write was refused: {segment_cause}"));
                 self.cause = Some(segment_cause);
-            } else if refusal_evidence(&outcome.excerpt) {
-                self.refused_write = Some(format!("a shell command was refused: {segment_cause}"));
+            } else if writes && write_line.is_some() {
+                // A read failed beside a write whose own diagnostic is in the
+                // output: the write is the refused act and its line is the cause.
+                self.refused_write = Some(format!("a shell write was refused: {segment_cause}"));
                 self.cause = Some(segment_cause);
             } else {
                 if self.failed_call.is_none() {
@@ -343,7 +377,7 @@ impl RunEvidence {
             .clone()
             .or_else(|| system_diagnostic(&outcome.excerpt))
         {
-            if shell_writes(command) {
+            if writes {
                 self.refused_write = Some(format!("a shell write was refused: {cause}"));
             } else if self.failed_call.is_none() {
                 self.failed_call = Some(cause.clone());
@@ -362,7 +396,7 @@ impl RunEvidence {
         // makes it `⊘`, anything else `⚠`; it can only lower the mark.
         if let Some(line) = shell_voice_line(outcome) {
             let cause = shell_diagnostic_clause(line);
-            if shell_writes(command) || recorded_write_named(outcome, line) {
+            if writes || recorded_write_named(outcome, line) {
                 self.refused_write = Some(format!("a shell write was refused: {cause}"));
             } else if self.failed_call.is_none() {
                 self.failed_call = Some(cause.clone());
@@ -384,7 +418,7 @@ impl RunEvidence {
         // The wrapper exited 0. A curl without `-f` may still have been answered with
         // a 4xx/5xx; its output is the only witness. A GET is a read even when it is
         // refused (review correction 3, non-blocking 3).
-        if shell_writes(command) && curl_without_fail(command) && output_refused(&outcome.excerpt) {
+        if writes && curl_without_fail(command) && output_refused(&outcome.excerpt) {
             self.refused_write = Some(format!("a shell write was refused: {cause}"));
             self.cause = Some(cause);
             return true;
@@ -394,12 +428,15 @@ impl RunEvidence {
         // when the shell could not report itself (correction 5).
         if outcome.segments.is_empty()
             && shell_segments(command).len() > 1
-            && shell_writes(command)
+            && writes
             && write_failure_context(&outcome.excerpt)
         {
             self.refused_write = Some(format!("a shell write failed: {cause}"));
             self.cause = Some(cause);
             return true;
+        }
+        if writes && !wrapper_failed && failing.is_empty() {
+            self.wrote = true;
         }
         false
     }
@@ -939,43 +976,6 @@ fn has_redirection(text: &str) -> bool {
     false
 }
 
-/// Whether a failed call's output carries refusal evidence (correction 4, rule 1).
-///
-/// The call already failed, so a bare `denied`/`refused` is in a failure context and
-/// counts, unlike in a successful write's body.
-fn refusal_evidence(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    // HTTP refusal words and curl's own `-f` error. These are narrow on purpose: a
-    // compiler's `conflicting implementations` is a failed command, not a refusal.
-    const PHRASES: [&str; 8] = [
-        "unauthorized",
-        "forbidden",
-        "permission denied",
-        "not permitted",
-        "access denied",
-        "not allowed",
-        "authentication failed",
-        "curl: (22)",
-    ];
-    if PHRASES.iter().any(|needle| lower.contains(needle)) || http_error_status(&lower) {
-        return true;
-    }
-    let status_in_error = output.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        (lower.contains("error") || lower.contains("status") || lower.contains("http"))
-            && lower.split(|c: char| !c.is_ascii_digit()).any(|token| {
-                token.len() == 3
-                    && token
-                        .parse::<u16>()
-                        .is_ok_and(|code| (400..=599).contains(&code))
-            })
-    });
-    status_in_error
-        || ["denied", "refused"]
-            .iter()
-            .any(|needle| lower.contains(needle))
-}
-
 /// The failure-context lines that make a failed write inside a compound command
 /// evidence even when the wrapper exited 0 (correction 4, rule 2).
 fn write_failure_context(output: &str) -> bool {
@@ -1088,6 +1088,20 @@ pub fn ending_for_instruction(
         return RunEnding::Refused;
     }
     let lower = summary.to_ascii_lowercase();
+    // A checked, empty assignment with nothing written is `∅`, whatever sentence the
+    // model puts on it: the tool result is the fact (U3). It is never a `✓`.
+    if evidence.checked_empty && !evidence.wrote && evidence.failed_call.is_none() {
+        return RunEnding::NoWork;
+    }
+    // A failed read is `⚠`, even when the model's own sentence says it could not do
+    // the work: only a refused write wears `⊘` (F-02). A destructive instruction
+    // still keeps its prose refusal as a write refusal.
+    if evidence.failed_call.is_some() {
+        if destructive_instruction(instruction) && refused_in_prose(&lower) {
+            return RunEnding::Refused;
+        }
+        return RunEnding::Warned;
+    }
     let finds_nothing = [
         "could not find any",
         "couldn't find any",
@@ -1157,7 +1171,13 @@ pub fn ending_for_instruction(
         "does not have permission",
     ];
     if refused.iter().any(|needle| lower.contains(needle)) {
-        return RunEnding::Refused;
+        // `⊘` is the write mark: a refusal that names no write is a warned run, not
+        // a refused write. A destructive instruction is a write in intent and keeps
+        // its prose refusal as `⊘`.
+        if destructive_instruction(instruction) || summary_names_write(&lower) {
+            return RunEnding::Refused;
+        }
+        return RunEnding::Warned;
     }
     if destructive_instruction(instruction) && refused_in_prose(&lower) {
         return RunEnding::Refused;
@@ -1168,6 +1188,35 @@ pub fn ending_for_instruction(
         return RunEnding::Warned;
     }
     RunEnding::Succeeded
+}
+
+/// Whether a refusal sentence names a write: `⊘` is only the write mark (F-02).
+fn summary_names_write(lower: &str) -> bool {
+    [
+        "delet",
+        "remov",
+        "push",
+        "commit",
+        "comment",
+        "pull request",
+        "open a",
+        "creat",
+        "writ",
+        "updat",
+        "edit",
+        "save",
+        "upload",
+        "post",
+        "renam",
+        "move ",
+        "copy",
+        "truncat",
+        "destro",
+        "wipe",
+        "eras",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Whether the instruction asked for something to be removed or replaced.
@@ -1312,10 +1361,18 @@ impl RunLog {
         eprintln!("gewu-multiverse: {redacted}");
     }
 
-    /// A block of a tool's own output, redacted, written as it came.
+    /// A block of a tool's own output, redacted, always ending on a line boundary.
+    ///
+    /// A tool's URL or last line may arrive without a newline. Writing the next
+    /// stamped line straight after it glued the two together (`…/pulls/32026-…`,
+    /// U8), so a missing final newline is added here and every log line ends on its
+    /// own line.
     fn block(&mut self, text: &str) {
         let redacted = self.secret.redact(text);
         let _ = self.file.write_all(redacted.as_bytes());
+        if !redacted.ends_with('\n') {
+            let _ = self.file.write_all(b"\n");
+        }
         let _ = self.file.flush();
     }
 
@@ -1341,10 +1398,16 @@ impl RunLog {
         // The file holds the card's text without the symbol; the log holds the line
         // with it. The card adds the one `✗`.
         let line = format!("{tool}: {clause}");
-        let redacted = self.secret.redact(&line);
+        // A refused write says so on the card, with the same `⊘` as the strip; a
+        // failed read keeps its tool's own line and wears `⚠` (F-02, U6).
+        let card = if crate::forgejo_tools::is_write_tool(tool) {
+            format!("write refused: {clause}")
+        } else {
+            line.clone()
+        };
         let _ = crate::mode::write_private(
             self.dir.join(crate::run::FAILURE_FILE),
-            redacted.as_bytes(),
+            self.secret.redact(&card).as_bytes(),
         );
         self.line(&format!("✗ {line}"));
     }
@@ -1355,10 +1418,10 @@ impl RunLog {
     fn tool_warning(&mut self, tool: &str, detail: &str) {
         let clause = first_clause(detail, 120);
         let line = format!("{tool}: {clause}");
-        let redacted = self.secret.redact(&line);
+        let card = format!("write refused: {clause}");
         let _ = crate::mode::write_private(
             self.dir.join(crate::run::FAILURE_FILE),
-            redacted.as_bytes(),
+            self.secret.redact(&card).as_bytes(),
         );
         self.line(&format!("⚠ {line}"));
     }
@@ -2219,7 +2282,13 @@ fn model_loop(
                             .split_once(": ")
                             .map(|(_, rest)| rest)
                             .unwrap_or(message.as_str());
-                        format!("the model could not be reached: {detail}")
+                        // NB2: the 72-column card has one row. A shorter lead-in
+                        // keeps `(errno 111)` on it instead of ending at
+                        // `Connection refused…`.
+                        format!(
+                            "cannot reach the model: {}",
+                            crate::model::transport_detail(detail)
+                        )
                     }
                     other => other.to_string(),
                 };
@@ -2462,13 +2531,18 @@ fn run_model_tool(
     // A failed write whose own output names the refusal is evidence for the run's
     // outcome, before the model's final sentence is read (review B2). A refusal
     // hidden in a zero-exit compound or behind `curl` without `-f` also gets the
-    // card's cause row (correction 4).
-    if evidence.note_shell(&command, &outcome) {
+    // card's cause row (correction 4). A failed write whose wrapper exited non-zero
+    // already wrote the tool's line; replace it with `write refused:` so the row
+    // speaks the same `⊘` as the strip (U6/F-02).
+    let hidden_refusal = evidence.note_shell(&command, &outcome);
+    let failed = outcome.signal.is_some() || outcome.exit_code != Some(0);
+    if hidden_refusal || (failed && shell_writes(&command) && evidence.refused_write().is_some()) {
         // The evidence carries the failed segment's own cause: its error line, or
         // its exit status when it printed none (correction 5).
         let cause = evidence
             .cause()
             .map(str::to_owned)
+            .or_else(|| evidence.refused_cause().map(str::to_owned))
             .unwrap_or_else(|| summarise_output(&outcome.excerpt));
         log.tool_warning(model::SHELL_TOOL, &cause);
     }
@@ -2631,6 +2705,7 @@ fn run_forgejo_tool(
                 )));
             }
             let text = log.secret().redact(&reply.text);
+            evidence.note_forgejo_success(&call.function.name, &text);
             log.block(&text);
             Ok(text)
         }
@@ -2848,7 +2923,8 @@ impl Shell {
             });
         }
         let engine_temp = engine_temp.take().expect("a confined run has a temp root");
-        let root = engine_temp.join(format!("gewu-run-{}-{}", std::process::id(), plan.run_id));
+        let root =
+            crate::confinement::run_temp_path(&engine_temp, std::process::id(), &plan.run_id);
         let home = root.join("home");
         let temp = root.join("tmp");
         let stage = if method.namespace() {
@@ -5054,14 +5130,19 @@ mod tests {
             ending_with_evidence("The work is complete.", &read),
             RunEnding::Warned
         );
-        // A failed read that carries a refusal status is refusal evidence: the call
-        // was refused, whatever its method (correction 4, rule 1).
+        // A failed **read** that carries a refusal status is `⚠`: only a refused
+        // write wears `⊘` (F-02).
         let mut denied_read = RunEvidence::default();
         denied_read.note_shell(
             "curl -sf http://127.0.0.1:1/team/issues",
             &failed_shell("curl: (22) The requested URL returned error: 403"),
         );
-        assert!(denied_read.refused_write().is_some());
+        assert!(denied_read.refused_write().is_none());
+        assert!(denied_read.failed_call().is_some());
+        assert_eq!(
+            ending_with_evidence("I could not read the issues.", &denied_read),
+            RunEnding::Warned
+        );
     }
 
     #[test]
@@ -5687,9 +5768,11 @@ mod tests {
             ending_with_evidence("The work is complete.", &evidence),
             RunEnding::Warned
         );
+        // A failed read never becomes the write mark, even when the model says it
+        // could not do the work (F-02).
         assert_eq!(
             ending_with_evidence("I could not do it.", &evidence),
-            RunEnding::Refused
+            RunEnding::Warned
         );
     }
 
@@ -6336,13 +6419,15 @@ mod tests {
         );
         assert!(read.refused_write().is_none());
         assert!(read.failed_call().is_some());
-        // A failed read answered with a refusal status is refusal evidence.
+        // A failed read answered with a refusal status is a warning, not a write
+        // refusal (F-02).
         let mut denied = RunEvidence::default();
         denied.note_shell(
             "curl -s http://127.0.0.1:1/team/issues",
             &failed_shell("Forbidden"),
         );
-        assert!(denied.refused_write().is_some());
+        assert!(denied.refused_write().is_none());
+        assert!(denied.failed_call().is_some());
     }
 
     #[test]

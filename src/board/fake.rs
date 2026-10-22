@@ -77,6 +77,8 @@ struct FakeAgent {
     current_tool_seconds: u64,
     last_work: Vec<String>,
     no_assigned_work: bool,
+    last_work_result: Option<String>,
+    last_result_is_work: bool,
     session_ticks: u32,
     restart_ticks: u32,
 }
@@ -193,7 +195,7 @@ impl FakeEngine {
             .map(str::trim)
             .find(|line| !line.is_empty())
             .map(str::to_owned);
-        agent.instruction_lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+        agent.instruction_lines = text.lines().count();
     }
 
     fn begin_session(agent: &mut FakeAgent) {
@@ -388,6 +390,8 @@ impl FakeEngine {
             current_tool_seconds: 0,
             last_work: Vec::new(),
             no_assigned_work: false,
+            last_work_result: None,
+            last_result_is_work: false,
             session_ticks: 0,
             restart_ticks: 0,
         }
@@ -472,6 +476,9 @@ impl EngineApi for FakeEngine {
                 recent: agent.recent.clone(),
                 instruction_chars: agent.instruction_chars,
                 instruction_first_line: agent.instruction_first_line.clone(),
+                instruction: fs::read_to_string(&agent.instruction_path)
+                    .ok()
+                    .filter(|text| !text.trim().is_empty()),
                 instruction_lines: agent.instruction_lines,
                 activity: agent.activity.clone(),
                 activity_at: agent.activity_at,
@@ -482,6 +489,8 @@ impl EngineApi for FakeEngine {
                 current_tool_seconds: agent.current_tool_seconds,
                 last_work: agent.last_work.clone(),
                 no_assigned_work: agent.no_assigned_work,
+                last_work_result: agent.last_work_result.clone(),
+                last_result_is_work: agent.last_result_is_work,
             })
             .collect();
         BoardView {
@@ -526,6 +535,7 @@ impl EngineApi for FakeEngine {
             notice: self.notice.take(),
             admin_password,
             confined: self.confined,
+            confinement: self.confined.then(|| "Landlock".to_owned()),
             upgrade: None,
         }
     }

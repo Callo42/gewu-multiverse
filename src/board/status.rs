@@ -301,33 +301,70 @@ pub fn session_symbol(end: &SessionEnd) -> (char, Color) {
 
 /// The mark beside the newest failed tool call.
 ///
-/// `✗` belongs to a run that itself failed; a failed command inside a clean (or
-/// refused) run is a `⚠`. The strip still shows the history, so a previous run's `✓`
+/// `✗` belongs to a run that itself failed. A refused **write** is the strip's `⊘`,
+/// so its cause row wears the same mark: `⊘ write refused: …`. Every other failed
+/// command inside a clean (or refused) run is a `⚠`; a refused read is never the
+/// write mark (F-02, U6). The strip still shows the history, so a previous run's `✓`
 /// may stand beside the newest run's `✗ shell: …`; the newest mark and its row are
 /// what the failed call gets (correction 5, N2).
 pub fn failure_mark(agent: &AgentView) -> char {
-    if matches!(agent.recent.last(), Some(SessionEnd::Failed { .. })) {
+    if agent
+        .last_failure
+        .as_deref()
+        .is_some_and(|failure| failure.trim_start().starts_with("write refused:"))
+    {
+        '⊘'
+    } else if matches!(agent.recent.last(), Some(SessionEnd::Failed { .. })) {
         '✗'
     } else {
         '⚠'
     }
 }
 
-/// The newest run's own final summary when it finished cleanly.
+/// The one-word label for a run mark, used beside the newest mark so the two circle
+/// glyphs never have to be told apart from the legend alone (F-04).
+pub fn session_label(end: &SessionEnd) -> &'static str {
+    match end {
+        SessionEnd::Succeeded => "ok",
+        SessionEnd::Refused { .. } => "refused",
+        SessionEnd::NoWork { .. } => "no work",
+        SessionEnd::Warned { .. } => "cmd failed",
+        SessionEnd::Failed { .. } => "failed",
+        SessionEnd::TimedOut => "timed out",
+        SessionEnd::Stopped => "stopped",
+    }
+}
+
+/// The newest finished run's line, labelled by what it is.
 ///
-/// It is drawn beside every finished mark — `✓` included — so the symbol is never
-/// the whole claim: the run says what it did, or that it refused or found no work
+/// The line prefers the newest run that did work: a later check run's no-op reason
+/// must not stand for the agent's whole work (F-10). A no-op's own reason is labelled
+/// `no work:` instead of being presented as the result. The line is drawn beside
+/// every finished mark — `✓` included — so the symbol is never the whole claim
 /// (review B2).
-pub fn run_result(agent: &AgentView) -> Option<String> {
+pub fn run_result_line(agent: &AgentView) -> Option<String> {
     if matches!(agent.session, SessionState::Running { .. }) {
         return None;
     }
     let newest = agent.recent.last()?;
+    if !agent.last_result_is_work
+        && let Some(work) = agent.last_work_result.as_deref()
+    {
+        return Some(format!("last work: {}", first_clause(work)));
+    }
+    let result = agent.last_result.as_deref().map(first_clause);
     match newest {
-        SessionEnd::Succeeded
-        | SessionEnd::Refused { .. }
-        | SessionEnd::NoWork { .. }
-        | SessionEnd::Warned { .. } => agent.last_result.as_deref().map(first_clause),
+        SessionEnd::Succeeded | SessionEnd::Warned { .. } => {
+            result.map(|result| format!("result: {result}"))
+        }
+        SessionEnd::Refused { reason } => Some(format!(
+            "result: {}",
+            result.unwrap_or_else(|| first_clause(reason))
+        )),
+        SessionEnd::NoWork { reason } => Some(format!(
+            "no work: {}",
+            result.unwrap_or_else(|| first_clause(reason))
+        )),
         _ => None,
     }
 }
@@ -382,6 +419,7 @@ mod tests {
             ],
             instruction_chars: 4,
             instruction_first_line: Some("work".to_owned()),
+            instruction: Some("work".to_owned()),
             instruction_lines: 1,
             activity: Some("commented #12".to_owned()),
             activity_at: Some(SystemTime::now() - Duration::from_secs(120)),
@@ -392,6 +430,8 @@ mod tests {
             current_tool_seconds: 0,
             last_work: Vec::new(),
             no_assigned_work: false,
+            last_work_result: None,
+            last_result_is_work: false,
         }
     }
 

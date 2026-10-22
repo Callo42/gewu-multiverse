@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use fake::FakeEngine;
-pub use render::BoardLayout;
+pub use render::{BoardForm, BoardLayout};
 pub use text::words;
 
 /// Which screen the person is looking at.
@@ -94,6 +94,7 @@ pub struct Board {
     notice: Option<String>,
     notice_ticks: u8,
     revealed_password: Option<(String, u8)>,
+    clipboard: Option<String>,
     sent: Vec<Command>,
     handoff: Option<Handoff>,
     quitting: bool,
@@ -144,6 +145,7 @@ impl Board {
             notice: None,
             notice_ticks: 0,
             revealed_password: None,
+            clipboard: None,
             sent: Vec::new(),
             handoff: None,
             quitting: false,
@@ -440,9 +442,25 @@ impl Board {
         self.model_cursor = self.model_fields[self.model_focus].chars().count();
     }
 
+    /// Move to the next model field and put the cursor at its end.
+    fn next_model_field(&mut self) {
+        self.model_focus = (self.model_focus + 1) % 3;
+        self.model_cursor = self.model_fields[self.model_focus].chars().count();
+    }
+
     fn edit_field(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter | KeyCode::Esc => self.model_editing = false,
+            KeyCode::Enter => {
+                // U2: `⏎` moves to the next field, so the person never has to guess
+                // that Tab or a Down arrow is the way on. On the last field it ends
+                // editing, so `t` and `⏎` can act on the finished form.
+                if self.model_focus + 1 >= 3 {
+                    self.model_editing = false;
+                } else {
+                    self.next_model_field();
+                }
+            }
+            KeyCode::Esc => self.model_editing = false,
             KeyCode::Left => self.model_cursor = self.model_cursor.saturating_sub(1),
             KeyCode::Right => {
                 let len = self.model_fields[self.model_focus].chars().count();
@@ -603,7 +621,7 @@ impl Board {
                 }
                 Some('-') => {
                     if count <= 1 {
-                        self.set_notice("one agent is the least");
+                        self.set_notice("the last agent cannot be removed");
                     } else if let Some(agent) = self.selected_agent() {
                         self.confirm_remove = Some(agent.name.clone());
                     } else {
@@ -661,7 +679,7 @@ impl Board {
                 Some('t') => self.offer_session_file(false),
                 Some('d') => {
                     if self.view.agents.len() <= 1 {
-                        self.set_notice("one agent is the least");
+                        self.set_notice("the last agent cannot be removed");
                     } else {
                         self.confirm_remove = Some(self.agent_name.clone());
                     }
@@ -689,6 +707,17 @@ impl Board {
                     self.revealed_password = None;
                     self.send(Command::RevealAdminPassword);
                 }
+                Some('c') => match self.revealed_password.as_ref() {
+                    // F-13: a copy route that never puts the value in a file, a log
+                    // or a second plaintext line. OSC 52 carries it to the terminal's
+                    // clipboard; a terminal that does not support it simply ignores
+                    // the sequence and the screen value is still there.
+                    Some((password, _)) => {
+                        self.clipboard = Some(osc52(password));
+                        self.set_notice("password copied — if your terminal supports it");
+                    }
+                    None => self.set_notice("press p to show the password, then c copies it"),
+                },
                 Some('?') => {
                     self.help_back = Screen::Forgejo;
                     self.screen = Screen::Help;
@@ -851,6 +880,11 @@ impl Board {
         }
     }
 
+    /// The OSC 52 sequence waiting for the terminal, once.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
+    }
+
     /// The password on show after `p`, if it is still in its few seconds.
     pub fn revealed_password(&self) -> Option<&str> {
         self.revealed_password
@@ -862,6 +896,38 @@ impl Board {
     pub fn model_editing(&self) -> bool {
         self.model_editing
     }
+}
+
+/// The OSC 52 clipboard sequence for a secret, base64 encoded.
+///
+/// The value never leaves in plaintext a second time and is never written to a file
+/// or a log: the terminal that owns the screen either supports OSC 52 or ignores it
+/// (F-13).
+fn osc52(text: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(8 + bytes.len().div_ceil(3) * 4);
+    out.push_str("\x1b]52;c;");
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as u32;
+        let b = chunk.get(1).copied().unwrap_or(0) as u32;
+        let c = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (a << 16) | (b << 8) | c;
+        out.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out.push('\x07');
+    out
 }
 
 /// A character key without control or alt, so `t` can type a `t` in a field and

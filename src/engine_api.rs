@@ -137,6 +137,9 @@ pub struct AgentView {
     pub instruction_chars: usize,
     /// The first line of the instruction, for the card and the panel.
     pub instruction_first_line: Option<String>,
+    /// The whole instruction, so a tall panel can show more than its first line
+    /// without the board reading a file (U4/F-11). None when there is none.
+    pub instruction: Option<String>,
     /// How many lines the whole instruction has, so a card can say how much it is
     /// not showing.
     pub instruction_lines: usize,
@@ -163,6 +166,13 @@ pub struct AgentView {
     /// The newest run's own log says no open issue was assigned to this agent. The
     /// Agent screen names the fix instead of leaving an empty work block.
     pub no_assigned_work: bool,
+    /// The newest finished run that did actual work, and its own final summary. The
+    /// card prefers it over a later no-op's reason, so the persistent work block is
+    /// reflected in the one-line summary (F-10).
+    pub last_work_result: Option<String>,
+    /// Whether the newest finished run itself did work. False means a later result
+    /// is a check run and must not be presented as the agent's whole work.
+    pub last_result_is_work: bool,
 }
 
 /// What an older installation looked like when this version first opened it.
@@ -227,6 +237,11 @@ pub struct BoardView {
     /// Whether this computer can confine an agent's shell. When it cannot, the
     /// board and the warnings say `runs are not confined on this computer`.
     pub confined: bool,
+    /// The mechanism this computer really enforces, for the warnings screen's
+    /// positive sentence: `Some("Landlock")` reads
+    /// `runs on this computer are confined (Landlock)` (F-06). `None` on a host
+    /// with no mechanism; the negative sentence then comes from `confined`.
+    pub confinement: Option<String>,
     /// The one screen shown the first time this build opens an older installation.
     pub upgrade: Option<UpgradeView>,
 }

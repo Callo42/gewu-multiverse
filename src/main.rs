@@ -256,11 +256,16 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
     }
     let left = if lost { Ok(()) } else { screen.leave() };
     drawn.and(left)?;
-    Ok((started > 0).then(|| {
-        format!(
-            "gewu-multiverse: stopped {started} agents and Forgejo — they start again when you reopen"
-        )
-    }))
+    Ok((started > 0).then(|| stopped_line(started)))
+}
+
+/// The line printed after stopping started agents, with the noun in agreement (U7).
+fn stopped_line(started: usize) -> String {
+    format!(
+        "gewu-multiverse: stopped {} {} and Forgejo — they start again when you reopen",
+        started,
+        if started == 1 { "agent" } else { "agents" }
+    )
 }
 
 /// Open the board with the scripted engine and run it until the person leaves.
@@ -333,6 +338,10 @@ fn terminal_is_gone(error: &io::Error) -> bool {
 /// What the loop does with the terminal around the board.
 trait BoardUi {
     fn draw(&mut self, board: &mut Board) -> io::Result<()>;
+    /// Send a control sequence to the terminal itself (the copy route, F-13).
+    fn copy(&mut self, _sequence: &str) -> io::Result<()> {
+        Ok(())
+    }
     fn handoff(
         &mut self,
         board: &mut Board,
@@ -349,6 +358,15 @@ impl BoardUi for ScreenUi<'_> {
     fn draw(&mut self, board: &mut Board) -> io::Result<()> {
         self.screen.terminal.draw(|frame| board.draw(frame))?;
         Ok(())
+    }
+
+    fn copy(&mut self, sequence: &str) -> io::Result<()> {
+        use std::io::Write;
+        self.screen
+            .terminal
+            .backend_mut()
+            .write_all(sequence.as_bytes())?;
+        self.screen.terminal.backend_mut().flush()
     }
 
     fn handoff(
@@ -394,6 +412,9 @@ fn run_board(
             match input.read(TICK) {
                 Ok(InputRead::Event(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                     board.on_key(key);
+                    if let Some(sequence) = board.take_clipboard() {
+                        ui.copy(&sequence)?;
+                    }
                 }
                 Ok(InputRead::Event(Event::Paste(text))) => {
                     // A paste into the model form is ordinary text. The board's
@@ -730,6 +751,19 @@ impl Drop for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_final_line_uses_the_right_noun() {
+        // U7: `stopped 1 agents` was the plural for one.
+        assert_eq!(
+            stopped_line(1),
+            "gewu-multiverse: stopped 1 agent and Forgejo — they start again when you reopen"
+        );
+        assert_eq!(
+            stopped_line(2),
+            "gewu-multiverse: stopped 2 agents and Forgejo — they start again when you reopen"
+        );
+    }
 
     /// The guard the hand-off safety rests on: a `^C` that arrives while the
     /// person's program owns the terminal is caught by the board, not left to kill

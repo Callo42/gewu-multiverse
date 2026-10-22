@@ -80,7 +80,10 @@ its own process group. It is ready when `/api/v1/version` answers.
 Provisioning through the administration API is idempotent: organisation `team`, team
 `agents` with write access to all its repositories (its units are code, issues, pull
 requests and projects, all write, so Forgejo's own summary says `write`), and the
-starter repository `team/workspace` initialised with a README.
+starter repository `team/workspace` initialised with a README. The pinned `app.ini`
+also carries `[other] SHOW_FOOTER_TEMPLATE_LOAD_TIME = false`, and the same key is
+added or replaced on an instance an earlier version made, so the page footer shows
+`Powered by Forgejo` without the developer's page/template timings.
 
 The lock is held for as long as the engine is open. A second program that points at the
 same data directory fails at `open` with one sentence; it never touches the first
@@ -168,7 +171,11 @@ mechanism hides the network, and neither is a container.
 
 A confined shell gets an empty `HOME`, a private `TMPDIR`, an environment cleared to a
 short allow-list, and a per-run askpass file under that `TMPDIR` holding only that run's own
-Forgejo login and token, because git inside the run must authenticate. A sibling run's
+Forgejo login and token, because git inside the run must authenticate. The run removes
+its whole private temporary tree on every exit it sees (success, failure, a handled
+stop); the engine removes the same tree by the exact pid + run id after a stopped,
+killed or crashed run is reaped, and the next open sweeps a tree whose owner is gone.
+An askpass file therefore cannot outlive its run. A sibling run's
 askpass file is not visible: an opted-in namespace replaces the shared temporary tree
 with a private `tmpfs`, and Landlock grants only this run's own subtree. The shared
 `credentials.toml` — the model key, the administrator token and every other agent's
@@ -259,24 +266,32 @@ is needed and is never printed.
 
 ## Agents and one model
 
-`CreateAgents { count }` makes `agent-1` … `agent-N`; `AddAgent` makes the next free
-`agent-N`. Each name derives its Forgejo login `gewu-<name>`: the account is created
-and marked, the token is made with repository, user and issue rights, and the account
-joins team `agents`. Membership is idempotent. Provisioning runs on a background
-thread and retries while Forgejo is up; the card shows `Pending`, `Ready` or
-`Failed { reason }`.
+`CreateAgents { count }` makes `agent-1` … `agent-N`; `AddAgent` makes a **new**
+`agent-N` whose number this installation has never used. The high-water mark is kept
+in `multiverse.toml` (`next_agent`) and raised by every name found in the settings,
+the configuration directories and the state root, so a removed `agent-2` is never
+handed out again even after an upgrade. Each name derives its Forgejo login
+`gewu-<name>`: the account is created and marked, the token is made with repository,
+user and issue rights, and the account joins team `agents`. Membership is idempotent.
+Provisioning runs on a background thread and retries while Forgejo is up; the card
+shows `Pending`, `Ready` or `Failed { reason }`.
 
 `RemoveAgent` stops the agent, deletes its token on the server by the name recorded
 when the token was made, removes it from team `agents`, deactivates the account
 (`active = false` and `prohibit_login = true`, so a web sign-in is refused too),
 deletes the dead token value from the credentials file, and forgets the agent in the
 settings. The account, its commits and its run records stay; removal is not a history
-rewrite, and adding the agent name again reactivates the same account.
+rewrite. `AddAgent` never reuses that name: a new number gets a new login and a new
+account, and the removed account stays deactivated with its history.
 
 The model is one set of three facts — address, model, key — used by every agent. The
 key is written to the shared top-level `model_key` in the credentials file.
 `TestEndpoint` runs the model probe in the background and leaves its result in the
-view.
+view. A failed test keeps the provider's whole message (bounded at 400 characters),
+and the form wraps it to the rows it has; at 80×24 that is the whole answer, not its
+first clause. A transport failure names the errno without the library's `os error`
+gutter: `cannot reach the model: Connection refused (errno 111)`. The shorter lead-in
+keeps the errno on the 72-column card, which has one row.
 
 ## One agent's run loop
 
@@ -416,14 +431,24 @@ record, cannot be seen. In (f) and (g) the transcript and `l` keep what there wa
 Any other failed tool call — a non-zero
 exit or a signal, not a recognised write, with no refusal evidence in its output —
 marks the run `warned` (`⚠`), with the failed command's cause as its row; it is never
-`✓`. Otherwise the last sentence decides between `refused`, `no work` (an empty
-assignment), `warned` (a tool call failed) and `succeeded`; a review that found no
-problem and says the work is complete stays a success. A destructive instruction answered only in prose (`I left it
+`✓`. A failed **read** is in this class even when its output carries a 403 or
+`Permission denied`: `⊘` is only a refused write (F-02). A successful
+`forgejo_list_assigned_issues` that returned no issues is the tool-result witness for
+`no work`: if nothing was written, the run is `∅` even when the model's own sentence
+says everything is done (U3). Otherwise the last sentence decides between `refused`
+(when it names a write or the instruction was destructive), `no work`, `warned` and
+`succeeded`; a review that found no problem and says the work is complete stays a
+success. A refused write's cause row says `write refused: …` and wears `⊘` on the
+card, matching the strip. A destructive instruction answered only in prose (`I left it
 in place`, `I did not delete it`, `deleting it is not safe`) is also a refusal,
 because there is no tool result to read and the run's own sentence says the work was
 not done; a keep phrase beside a success verb for the destructive act stays a success.
 The final sentence is kept as the terminal record's reason for every clean finish, so
-the card can draw it beside `✓` as well as `⊘`/`∅`/`⚠`.
+the card can draw it beside `✓` as well as `⊘`/`∅`/`⚠`. The card's summary line
+prefers the newest finished run that did work (`last work: …`); a later check run's
+reason is labelled `no work: …`, so a no-op never stands for the agent's whole work.
+The run log writes a newline after a tool's output even when the tool's last line had
+none, so the next stamped line never joins itself to a URL.
 An instruction's stored first line is cut at 120 characters **on a word boundary**, so
 the card never renders `extraord…` from a word the engine itself halved.
 
@@ -447,8 +472,9 @@ The terms the board shows are the five fixed plain sentences in `engine::TERMS`,
 the one-sentence confinement warning when the host offers no confinement; the
 mechanism names (Landlock, bwrap, unshare) are in this document and the shell tool's
 description, not on the consent screen. The model test distinguishes its own suffix
-and empty-key checks (nothing sent) from a provider refusal (status and first clause of
-the provider's message); a 404 on a `/chat/completions` path names the `/v1` form. The
+and empty-key checks (nothing sent) from a provider refusal (status and the provider's
+own message, kept whole and wrapped to the form's rows at 80 columns); a 404 on a
+`/chat/completions` path names the `/v1` form first. The
 engine's reasons, notices, activities and model-test lines are written in the same
 plain words the board uses, so no technical word reaches a screen from either side.
 `src/board/status.rs` is the one cleaner for free text and also removes the backticks

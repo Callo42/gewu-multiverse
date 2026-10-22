@@ -292,6 +292,7 @@ fn build(
     // product started, and stopped before a fresh one can start.
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
     recover_stale_sessions(&options.layout, options.stop_grace)?;
+    remove_stale_run_temps();
     let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
     let mut inner = Inner::new(options.clone(), settings_path, settings, credentials)?;
     inner.upgrade = upgrade;
@@ -439,6 +440,7 @@ struct AgentRuntime {
     recent: VecDeque<SessionEnd>,
     instruction_chars: usize,
     instruction_first_line: Option<String>,
+    instruction: Option<String>,
     instruction_lines: usize,
     instruction_mtime: Option<SystemTime>,
     activity: Option<String>,
@@ -450,6 +452,8 @@ struct AgentRuntime {
     current_tool_since: Option<SystemTime>,
     last_work: Vec<String>,
     no_assigned_work: bool,
+    last_work_result: Option<String>,
+    last_result_is_work: bool,
     activity_refresh_at: Option<Instant>,
     newest_run: Option<PathBuf>,
     running: Option<RunningState>,
@@ -606,6 +610,10 @@ impl Inner {
             stopping: false,
             generation: 0,
         };
+        // A number this installation has ever used is never reused, even when the
+        // agent is gone from the settings. The names on disk are the floor for an
+        // upgrade from a version that kept no high-water mark (U5).
+        inner.observe_used_agent_numbers();
         let names = inner.settings.names();
         for name in names {
             inner.agents.push(AgentRuntime::load(&inner, &name));
@@ -631,6 +639,28 @@ impl Inner {
 
     fn agent_index(&self, name: &str) -> Option<usize> {
         self.agents.iter().position(|agent| agent.name == name)
+    }
+
+    /// Raise the high-water mark to every agent name this installation has ever had
+    /// on disk. The configuration and state directories survive a removal because
+    /// the history is kept, so they still name a removed agent (U5).
+    fn observe_used_agent_numbers(&mut self) {
+        let mut names = self.settings.names();
+        for root in [
+            self.options.layout.agents_dir(),
+            self.options.layout.state_root().to_path_buf(),
+        ] {
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        names.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        for name in names {
+            self.settings.observe_agent_name(&name);
+        }
     }
 
     fn take_notice(&mut self) -> Option<String> {
@@ -714,13 +744,13 @@ impl AgentRuntime {
             Provisioning::Pending
         };
         let paths = inner.options.layout.agent(name).ok();
-        let instruction = paths
+        let instruction_path = paths
             .as_ref()
             .map(|paths| paths.instruction().to_path_buf());
-        let (chars, first_line, lines, mtime) = instruction
+        let (chars, first_line, instruction_text, lines, mtime) = instruction_path
             .as_deref()
             .map(instruction_facts)
-            .unwrap_or((0, None, 0, None));
+            .unwrap_or((0, None, None, 0, None));
         let mut runs = run::runs_of_agent(inner.options.layout.state_root(), name);
         runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         let mut recent = VecDeque::new();
@@ -774,6 +804,8 @@ impl AgentRuntime {
         let no_assigned_work = newest_run
             .as_deref()
             .is_some_and(|dir| run::says_no_assigned_work(dir, &format!("gewu-{name}")));
+        let last_work_result = run::latest_work_result(&runs);
+        let last_result_is_work = newest_run.as_deref().is_some_and(run::run_did_work);
         Self {
             name: name.to_owned(),
             desired,
@@ -787,6 +819,7 @@ impl AgentRuntime {
             recent,
             instruction_chars: chars,
             instruction_first_line: first_line,
+            instruction: instruction_text,
             instruction_lines: lines,
             instruction_mtime: mtime,
             activity,
@@ -798,6 +831,8 @@ impl AgentRuntime {
             current_tool_since: None,
             last_work,
             no_assigned_work,
+            last_work_result,
+            last_result_is_work,
             activity_refresh_at: None,
             newest_run,
             running: None,
@@ -824,9 +859,10 @@ impl AgentRuntime {
         if mtime == self.instruction_mtime && self.instruction_first_line.is_some() {
             return;
         }
-        let (chars, first_line, lines, mtime) = instruction_facts(paths.instruction());
+        let (chars, first_line, instruction, lines, mtime) = instruction_facts(paths.instruction());
         self.instruction_chars = chars;
         self.instruction_first_line = first_line;
+        self.instruction = instruction;
         self.instruction_lines = lines;
         self.instruction_mtime = mtime;
     }
@@ -872,25 +908,35 @@ fn end_from_outcome(summary: &run::RunSummary) -> Option<SessionEnd> {
     }
 }
 
-fn instruction_facts(path: &Path) -> (usize, Option<String>, usize, Option<SystemTime>) {
+fn instruction_facts(
+    path: &Path,
+) -> (
+    usize,
+    Option<String>,
+    Option<String>,
+    usize,
+    Option<SystemTime>,
+) {
     let mtime = fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok());
     let Ok(bytes) = fs::read(path) else {
-        return (0, None, 0, mtime);
+        return (0, None, None, 0, mtime);
     };
     if agent_run::instruction_is_blank(&bytes) {
-        return (0, None, 0, mtime);
+        return (0, None, None, 0, mtime);
     }
     let text = String::from_utf8_lossy(&bytes);
     let chars = text.chars().count();
-    let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+    // File lines, not wrapped display rows: the card's `(N more lines)` counts what
+    // is written in the document (U4/F-11).
+    let lines = text.lines().count().max(1);
     let first = text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(first_line_at_a_word);
-    (chars, first, lines, mtime)
+    (chars, first, Some(text.into_owned()), lines, mtime)
 }
 
 /// The first line of an instruction, cut at 120 characters on a word.
@@ -1061,7 +1107,7 @@ impl Inner {
 
     fn poll_agent(&mut self, index: usize, now: Instant) {
         let desired = self.agents[index].desired;
-        let mut ended: Option<(SessionEnd, Instant, PathBuf)> = None;
+        let mut ended: Option<(SessionEnd, Instant, PathBuf, u32)> = None;
         if let Some(run) = self.agents[index].running.as_mut() {
             if !run.stopping {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
@@ -1089,11 +1135,16 @@ impl Inner {
                         reason: session_failure_reason(&run.run_dir, status),
                     }
                 };
-                ended = Some((end, run.started, run.run_dir.clone()));
+                ended = Some((end, run.started, run.run_dir.clone(), run.handle.pid()));
             }
         }
-        if let Some((end, started, run_dir)) = ended {
+        if let Some((end, started, run_dir, pid)) = ended {
             self.observe_confinement_refusal(&run_dir);
+            // A stopped, killed or crashed run gets no chance to run its own
+            // destructor: the engine removes its private askpass tree here (F-01).
+            if let Some(run_id) = run_id_in(&run_dir) {
+                crate::confinement::remove_run_temp(pid, run_id);
+            }
             self.agents[index].running = None;
             self.agents[index].starting = false;
             self.agents[index].activity_refresh_at = None;
@@ -1544,6 +1595,8 @@ fn finish_session(
         let mut runs = run::runs_of_agent(state_root, &agent.name);
         runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         agent.last_work = run::latest_work(&runs);
+        agent.last_work_result = run::latest_work_result(&runs);
+        agent.last_result_is_work = run::run_did_work(&dir);
         agent.no_assigned_work = run::says_no_assigned_work(
             &dir,
             &agent
@@ -1642,6 +1695,7 @@ impl EngineApi for Engine {
                 recent: agent.recent.iter().cloned().collect(),
                 instruction_chars: agent.instruction_chars,
                 instruction_first_line: agent.instruction_first_line.clone(),
+                instruction: agent.instruction.clone(),
                 instruction_lines: agent.instruction_lines,
                 activity: agent.activity.clone(),
                 activity_at: agent.activity_at,
@@ -1656,6 +1710,8 @@ impl EngineApi for Engine {
                     .unwrap_or(0),
                 last_work: agent.last_work.clone(),
                 no_assigned_work: agent.no_assigned_work,
+                last_work_result: agent.last_work_result.clone(),
+                last_result_is_work: agent.last_result_is_work,
             })
             .collect();
         BoardView {
@@ -1676,6 +1732,11 @@ impl EngineApi for Engine {
             notice,
             admin_password,
             confined: inner.options.confinement.confined(),
+            confinement: inner
+                .options
+                .confinement
+                .confined()
+                .then(|| inner.options.confinement.label().to_owned()),
             upgrade: inner.upgrade.clone(),
         }
     }
@@ -1747,7 +1808,7 @@ impl EngineApi for Engine {
                 Ok(())
             }
             Command::AddAgent => {
-                let name = inner.settings.next_free_name();
+                let name = inner.settings.allocate_agent_name()?;
                 inner.settings.add_agent(&name, Desired::Stopped)?;
                 ensure_agent_paths(&inner.options.layout, &name)?;
                 let runtime = AgentRuntime::load(&inner, &name);
@@ -1932,6 +1993,9 @@ impl EngineApi for Engine {
                 for agent in &mut inner.agents {
                     if let Some(run) = agent.running.as_mut() {
                         if run.handle.try_status().is_some() {
+                            if let Some(run_id) = run_id_in(&run.run_dir) {
+                                crate::confinement::remove_run_temp(run.handle.pid(), run_id);
+                            }
                             agent.running = None;
                         } else {
                             alive = true;
@@ -2075,6 +2139,48 @@ impl Drop for Engine {
     }
 }
 
+/// Remove a run's private temporary tree when its process is gone.
+///
+/// A run removes its own tree on every exit it can see. A `SIGKILL`, a crash after
+/// the run's pid record was reaped, or the program itself being killed can leave
+/// the tree behind; the pid and the run id are in its name, so a dead owner is
+/// recognised exactly and nothing of a live run is touched (F-01).
+fn remove_stale_run_temps() {
+    let Some(temp) = crate::confinement::resolved_temp() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&temp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(crate::confinement::RUN_TEMP_PREFIX) else {
+            continue;
+        };
+        let Some((pid, run_id)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        let live_owner = bundled_forgejo::command_line(pid).is_some_and(|parts| {
+            parts.iter().any(|part| part == "--run-agent")
+                && parts.iter().any(|part| part.ends_with(run_id))
+        });
+        if !live_owner {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// The run id a run directory's name carries, for the private-temp name.
+fn run_id_in(run_dir: &Path) -> Option<&str> {
+    run_dir.file_name().and_then(std::ffi::OsStr::to_str)
+}
+
 /// Stop every `--run-agent` process an earlier program left behind.
 ///
 /// The state root is walked without following the agents' own settings: a run
@@ -2121,6 +2227,9 @@ fn recover_stale_sessions(layout: &Layout, grace: Duration) -> Result<Vec<u32>, 
                 ));
             }
             let _ = fs::remove_file(&record);
+            if let Some(run_id) = run_id_in(&run_dir) {
+                crate::confinement::remove_run_temp(pid, run_id);
+            }
             stopped.push(pid);
         }
     }
@@ -2886,6 +2995,7 @@ fn sentence(error: &impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::Board;
     use crate::engine::clock::FakeClock;
     use crate::test_support::scratch_root;
 
@@ -3503,6 +3613,193 @@ mod tests {
             third.is_ok(),
             "the lock was not released with the first engine"
         );
+    }
+
+    #[test]
+    fn a_stopped_killed_or_crashed_run_leaves_no_private_temp() {
+        let root = scratch_root("engine-run-temp");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+
+        let make_temp = |pid: u32, run_dir: &Path| {
+            let run_id = run_dir
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("a run id");
+            let temp = std::env::temp_dir().join(format!("gewu-run-{pid}-{run_id}"));
+            fs::create_dir_all(temp.join("tmp")).expect("the run temp");
+            fs::write(temp.join("tmp/askpass.toml"), b"synthetic").expect("the askpass file");
+            temp
+        };
+        let first_run = fake.last_run_dir().expect("a run directory");
+        let first_pid = fake.live()[0];
+        let stopped = make_temp(first_pid, &first_run);
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop");
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert!(!stopped.exists(), "a stopped run left its askpass temp");
+
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("start again");
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 2);
+        let crashed_run = fake.last_run_dir().expect("the crashed run directory");
+        let crashed_pid = fake.live()[0];
+        let crashed = make_temp(crashed_pid, &crashed_run);
+        fake.finish_current(1);
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert!(!crashed.exists(), "a crashed run left its askpass temp");
+
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("start again");
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 3);
+        let killed_run = fake.last_run_dir().expect("the killed run directory");
+        let killed_pid = fake.live()[0];
+        let killed = make_temp(killed_pid, &killed_run);
+        engine.shutdown(Duration::ZERO);
+        assert!(!killed.exists(), "a killed run left its askpass temp");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adding_after_a_removal_takes_a_new_number_and_account() {
+        let root = scratch_root("engine-add-after-remove");
+        let mut settings = write_ready(
+            &root,
+            &[("agent-1", Desired::Stopped), ("agent-2", Desired::Stopped)],
+        );
+        // The remove job leaves the account and history; the settings lose the name.
+        assert!(settings.remove_agent("agent-2"));
+        let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+        settings
+            .save(&settings::path_in(layout.root()))
+            .expect("settings");
+        let mut engine = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        engine.send(Command::AddAgent).expect("add");
+        let board = engine.board();
+        let names: Vec<&str> = board
+            .agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["agent-1", "agent-3"],
+            "U5: + add reused the removed agent-2 number and account"
+        );
+        assert_eq!(
+            board.agents[1].login.as_str(),
+            "gewu-agent-3",
+            "U5: the new agent did not get a new Forgejo account"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_cards_summary_prefers_the_newest_run_that_did_work() {
+        let root = scratch_root("engine-last-work-result");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+        let agent_paths = layout.agent("agent-1").expect("paths");
+        let state = agent_paths.state_dir();
+        // An older run that commented on an issue and finished with a summary.
+        let older = state.join("run-1700000000000-0001");
+        fs::create_dir_all(&older).expect("the older run");
+        let mut transcript = crate::transcript::Transcript::open(&older).expect("transcript");
+        transcript
+            .append(&crate::transcript::Record::forgejo_result(
+                1,
+                1,
+                crate::forgejo_tools::COMMENT,
+                Some("team/workspace"),
+                Some(1),
+                "ok",
+                None,
+                Some("commented"),
+            ))
+            .expect("the comment record");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-1700000000000-0001",
+                run::RunOutcome::Succeeded,
+                Some(0),
+                1_000,
+                Some("I fixed the flaky test".to_owned()),
+            ))
+            .expect("the older finish");
+        // A newer check run that found the review already addressed.
+        let newer = state.join("run-1700000000000-0002");
+        fs::create_dir_all(&newer).expect("the newer run");
+        let mut transcript = crate::transcript::Transcript::open(&newer).expect("transcript");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-1700000000000-0002",
+                run::RunOutcome::NoWork,
+                Some(0),
+                500,
+                Some("The review is already addressed".to_owned()),
+            ))
+            .expect("the newer finish");
+
+        let engine = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        let mut board = Board::new(engine);
+        // A fresh root gets the one upgrade screen; continue to the board.
+        board.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Enter,
+        ));
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a terminal");
+        terminal
+            .draw(|frame| board.draw(frame))
+            .expect("the frame draws");
+        let mut frame = String::new();
+        let area = terminal.backend().buffer().area;
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                frame.push_str(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((x, y))
+                        .expect("a cell")
+                        .symbol(),
+                );
+            }
+            frame.push('\n');
+        }
+        assert!(
+            frame.contains("last work: I fixed the flaky test"),
+            "the card did not keep the work run's summary:\n{frame}"
+        );
+        assert!(
+            !frame.contains("result: The review is already addressed"),
+            "the no-op's reason was presented as the work result:\n{frame}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4161,7 +4458,7 @@ mod tests {
         // then said `extraord…` at 80 columns (review B3).
         let prefix = "one two ".repeat(14);
         fs::write(&path, format!("{prefix}extraordinary result\n")).expect("the instruction");
-        let (_chars, first, _lines, _mtime) = instruction_facts(&path);
+        let (_chars, first, _text, _lines, _mtime) = instruction_facts(&path);
         let first = first.expect("a first line");
         assert!(first.ends_with('…'), "{first}");
         assert!(
@@ -4176,7 +4473,7 @@ mod tests {
 
         let short = "fix the flaky login test";
         fs::write(&path, format!("{short}\n")).expect("the short instruction");
-        let (_chars, first, _lines, _mtime) = instruction_facts(&path);
+        let (_chars, first, _text, _lines, _mtime) = instruction_facts(&path);
         assert_eq!(first.as_deref(), Some(short));
     }
 

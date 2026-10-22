@@ -43,6 +43,12 @@ pub struct Settings {
     /// The agents, in the order they were made.
     #[serde(default)]
     pub agents: Vec<AgentSettings>,
+    /// The next agent number this installation has never used. It only moves
+    /// forward, so `+ add` after a removal makes a new agent and a new Forgejo
+    /// account instead of reactivating the removed one (U5). An older file without
+    /// it starts at the highest number its names and directories show.
+    #[serde(default)]
+    pub next_agent: usize,
 }
 
 /// The shared endpoint. It holds no key.
@@ -134,12 +140,21 @@ impl AgentSettings {
 impl Settings {
     /// Read the file, or the defaults when it is not there.
     pub fn load(path: &Path) -> Result<Self, String> {
-        match fs::read_to_string(path) {
+        let mut settings: Self = match fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text)
-                .map_err(|error| format!("{} is not valid: {error}", path.display())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(format!("{} cannot be read: {error}", path.display())),
+                .map_err(|error| format!("{} is not valid: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(format!("{} cannot be read: {error}", path.display())),
+        };
+        // A file written before `next_agent` existed still must not reuse a name it
+        // has ever held: the names in it are the floor.
+        let names = settings.names();
+        for name in names {
+            settings.observe_agent_name(&name);
         }
+        Ok(settings)
     }
 
     /// Write the file at 0600, atomically, so a reader never sees half a choice.
@@ -184,6 +199,7 @@ impl Settings {
         };
         agent.set_desired(desired);
         self.agents.push(agent);
+        self.observe_agent_name(name);
         Ok(())
     }
 
@@ -194,21 +210,54 @@ impl Settings {
         before != self.agents.len()
     }
 
-    /// The next free `agent-N`, from 1 upwards.
-    pub fn next_free_name(&self) -> String {
-        for number in 1..=MAX_AGENTS {
-            let name = format!("agent-{number}");
-            if self.agent(&name).is_none() {
-                return name;
-            }
+    /// Note that this installation has held `agent-N`, so `N` is never given out
+    /// again even after the agent is removed (U5).
+    pub fn observe_agent_name(&mut self, name: &str) {
+        if let Some(number) = agent_number(name) {
+            self.next_agent = self.next_agent.max(number.saturating_add(1));
         }
-        format!("agent-{}", MAX_AGENTS + 1)
+    }
+
+    /// The highest number any saved name has ever used, plus one.
+    fn highest_number(&self) -> usize {
+        self.agents
+            .iter()
+            .filter_map(|agent| agent_number(&agent.name))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// The next name `+ add` will take, without changing anything.
+    pub fn next_free_name(&self) -> String {
+        format!(
+            "agent-{}",
+            self.next_agent.max(1).max(self.highest_number())
+        )
+    }
+
+    /// Take the next never-used `agent-N`. The number only moves forward, so a
+    /// removed agent's name, account and history are never silently reused.
+    pub fn allocate_agent_name(&mut self) -> Result<String, String> {
+        let number = self.next_agent.max(1).max(self.highest_number());
+        if number > MAX_AGENTS {
+            return Err(format!(
+                "this installation has used all {MAX_AGENTS} agent numbers; the last agent cannot be replaced with a new one"
+            ));
+        }
+        self.next_agent = number.saturating_add(1);
+        Ok(format!("agent-{number}"))
     }
 
     /// Every name, in order.
     pub fn names(&self) -> Vec<String> {
         self.agents.iter().map(|agent| agent.name.clone()).collect()
     }
+}
+
+/// The number in an `agent-N` name, when the name has that shape.
+fn agent_number(name: &str) -> Option<usize> {
+    name.strip_prefix("agent-")?.parse().ok()
 }
 
 /// The settings file below one configuration root.
@@ -285,6 +334,11 @@ mod tests {
             .expect("added");
         assert!(settings.remove_agent("agent-1"));
         assert_eq!(settings.names(), vec!["agent-2"]);
-        assert_eq!(settings.next_free_name(), "agent-1");
+        // U5: a removed number is never handed out again.
+        assert_eq!(settings.next_free_name(), "agent-3");
+        assert_eq!(
+            settings.allocate_agent_name().expect("a fresh number"),
+            "agent-3"
+        );
     }
 }
