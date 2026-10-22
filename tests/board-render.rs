@@ -136,8 +136,10 @@ fn fill_model(board: &mut Board, url: &str, model: &str, key: &str) {
     press(board, KeyCode::Char('e'));
     type_text(board, url);
     press(board, KeyCode::Enter);
+    press(board, KeyCode::Char('e'));
     type_text(board, model);
     press(board, KeyCode::Enter);
+    press(board, KeyCode::Char('e'));
     type_text(board, key);
     press(board, KeyCode::Enter);
 }

@@ -857,3 +857,436 @@ mod tests {
         );
     }
 }
+
+/// The file recording one run's process group, beside the pid record.
+///
+/// It is written as soon as the child exists. A reopened program reads it to stop
+/// a group whose supervisor died before it could remove the record: the group id
+/// outlives the leader as long as one command in the group is alive.
+pub const PGID_FILE: &str = "session.pgid";
+
+/// The shell's own pid, written by the run supervisor when its command's shell
+/// starts. The shell can outlive a supervisor killed with `SIGKILL`; this record
+/// is how a later start finds the group without `session.pid` (F-02/F-03).
+pub const SHELL_PID_FILE: &str = "shell.pid";
+
+/// The shell's process group, beside its pid.
+pub const SHELL_PGID_FILE: &str = "shell.pgid";
+
+/// The marker written when a run's left-over group was stopped by a later start.
+pub const STOPPED_FILE: &str = "run-stopped.json";
+
+/// One left-over process group's ending, written by the program that stopped it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunStopped {
+    /// When the group was stopped, in RFC 3339 UTC.
+    pub ts: String,
+    /// The run the group belonged to.
+    pub run_id: String,
+    /// The recorded process-group id.
+    pub pgid: u32,
+    /// One plain sentence naming why it was stopped.
+    pub reason: String,
+}
+
+/// Write the `run_stopped` record and the run's terminal record, before the
+/// program opens. A run that was killed before it could write its own ending gets
+/// one ending decided by the program that saw it (F-02/F-03).
+pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
+    let record = RunStopped {
+        ts: crate::time::rfc3339(now_unix_ms()),
+        run_id: run_id.to_owned(),
+        pgid,
+        reason: reason.to_owned(),
+    };
+    let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(STOPPED_FILE), text.as_bytes())?;
+    let _ = transcript::record_outcome_if_missing(
+        run_dir,
+        run_id,
+        RunOutcome::Stopped,
+        Some(reason.to_owned()),
+        0,
+    );
+    Ok(())
+}
+
+fn read_number(run_dir: &Path, name: &str) -> Option<u32> {
+    fs::read_to_string(run_dir.join(name))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+}
+
+/// Record a command's shell so its group is found even after the supervisor and
+/// its `session.*` records are gone. The supervisor writes this; the shell never
+/// reads or changes it.
+pub fn write_shell_record(run_dir: &Path, pid: u32, pgid: u32) -> io::Result<()> {
+    crate::mode::write_private(run_dir.join(SHELL_PID_FILE), pid.to_string().as_bytes())?;
+    crate::mode::write_private(run_dir.join(SHELL_PGID_FILE), pgid.to_string().as_bytes())
+}
+
+/// Remove every process record for a run whose group was reaped (or was found
+/// already gone), so a later reopen never acts on a stale group id.
+pub fn clear_process_records(run_dir: &Path) {
+    for name in [
+        crate::engine::session::PID_FILE,
+        PGID_FILE,
+        SHELL_PID_FILE,
+        SHELL_PGID_FILE,
+    ] {
+        let _ = fs::remove_file(run_dir.join(name));
+    }
+}
+
+/// The recorded pid and process group of a run, when a record is readable.
+///
+/// The supervisor's own records are preferred; when it exited and removed them,
+/// the shell record it wrote at spawn still names the group (F-02/F-03).
+pub fn recorded_group(run_dir: &Path) -> Option<(u32, u32)> {
+    if let Some(pid) = read_number(run_dir, crate::engine::session::PID_FILE) {
+        return Some((pid, read_number(run_dir, PGID_FILE).unwrap_or(pid)));
+    }
+    if let Some(pgid) = read_number(run_dir, PGID_FILE) {
+        return Some((pgid, pgid));
+    }
+    if let Some(pid) = read_number(run_dir, SHELL_PID_FILE) {
+        return Some((pid, read_number(run_dir, SHELL_PGID_FILE).unwrap_or(pid)));
+    }
+    read_number(run_dir, SHELL_PGID_FILE).map(|pgid| (pgid, pgid))
+}
+
+/// The pid the run directory itself names: the supervisor, or the shell it left.
+fn recorded_leader(run_dir: &Path) -> Option<u32> {
+    read_number(run_dir, crate::engine::session::PID_FILE)
+        .or_else(|| read_number(run_dir, SHELL_PID_FILE))
+}
+
+/// Every process in a recorded group, read from the kernel's `stat` only. No
+/// process environment is read (F-02 review).
+fn group_members(pgid: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|text| text.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let stat = fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        // A zombie has already ended; only its parent's reaping is left. Counting
+        // it as live would wait forever for a process that can no longer run.
+        if fields.next() == Some("Z") {
+            continue;
+        }
+        let group = fields.nth(1).and_then(|text| text.parse::<u32>().ok());
+        if group == Some(pgid) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// The live members of a run's recorded group, believed only through the run's own
+/// records: a member carrying the run directory on its command line, the recorded
+/// supervisor or shell still alive in the group, or the shell record naming this
+/// group. A bare recycled group id is never signalled.
+fn live_run_pids(pgid: u32, run_dir: &Path) -> Vec<u32> {
+    let members = group_members(pgid);
+    if members.is_empty() {
+        return members;
+    }
+    let expected_dir = run_dir.display().to_string();
+    let named = members.iter().any(|pid| {
+        crate::bundled_forgejo::command_line(*pid)
+            .is_some_and(|parts| parts.iter().any(|part| part == &expected_dir))
+    });
+    let leader_alive = recorded_leader(run_dir).is_some_and(|pid| members.contains(&pid));
+    let shell_group = read_number(run_dir, SHELL_PGID_FILE) == Some(pgid);
+    if named || leader_alive || shell_group {
+        members
+    } else {
+        Vec::new()
+    }
+}
+
+fn any_live(pgid: u32, run_dir: &Path) -> Vec<u32> {
+    live_run_pids(pgid, run_dir)
+}
+
+fn signal_pids(pids: &[u32], signal: nix::sys::signal::Signal) {
+    for pid in pids {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid as i32), signal);
+    }
+}
+
+/// Stop a run's left-over process group, then write its `run_stopped` record.
+///
+/// A supervisor can die by `SIGKILL` before it removes its pid record, leaving the
+/// shell and the command it started in its process group. A later start calls this
+/// for every recorded run before it opens; the run boundary calls it before the next
+/// run starts. The group is believed only when a member still carries the run's own
+/// id or command line, so a reused pid is never signalled.
+///
+/// `Ok(true)` means a group was found and stopped; `Ok(false)` means there was
+/// nothing left. `Err` is one plain sentence for the card when a process survives.
+pub fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
+    let Some((_pid, pgid)) = recorded_group(run_dir) else {
+        return Ok(false);
+    };
+    let reaped = reap_process_group(pgid, run_dir, grace)?;
+    if !reaped && transcript::terminal_record(run_dir).is_none() {
+        // The pid record survived but nothing is alive: the supervisor died before
+        // it could close the run. Give it the ending the reopen is owed (F-02).
+        if let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) {
+            write_run_stopped(
+                run_dir,
+                run_id,
+                pgid,
+                "the run from an earlier start ended without a closing record",
+            )
+            .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+        }
+    }
+    clear_process_records(run_dir);
+    Ok(reaped)
+}
+
+/// Stop one run's process group by the group id the engine recorded at spawn.
+///
+/// This is the boundary call: the supervisor may already have been reaped and its
+/// pid files removed, but the shell record it wrote still names the group it
+/// started. The group is believed only through the run's own records, so a
+/// recycled group id is never signalled.
+pub fn reap_process_group(
+    pgid: u32,
+    run_dir: &Path,
+    grace: std::time::Duration,
+) -> Result<bool, String> {
+    let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return Ok(false);
+    };
+    let mut live = any_live(pgid, run_dir);
+    if live.is_empty() {
+        return Ok(false);
+    }
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    signal_pids(&live, nix::sys::signal::Signal::SIGTERM);
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if any_live(pgid, run_dir).is_empty() {
+            write_run_stopped(
+                run_dir,
+                run_id,
+                pgid,
+                "an earlier start's run was still running and was stopped",
+            )
+            .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    signal_pids(&live, nix::sys::signal::Signal::SIGKILL);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        live = any_live(pgid, run_dir);
+        if live.is_empty() {
+            write_run_stopped(
+                run_dir,
+                run_id,
+                pgid,
+                "an earlier start's run was still running and was stopped",
+            )
+            .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(format!(
+        "a process from run {run_id} (pid {}) could not be stopped",
+        live.first().copied().unwrap_or(pgid)
+    ))
+}
+
+/// The readable transcript's file name, beside the append-only JSONL.
+pub const TRANSCRIPT_TEXT_FILE: &str = "transcript.txt";
+
+/// Render one run's JSONL record as a transcript a person can read.
+///
+/// The JSONL stays the record; this is a view of it. Each line names the turn, the
+/// role or tool, and the bounded text; the raw tool output and the model's own words
+/// are kept, not the request bodies and tool schemas (F-12).
+pub fn readable_transcript(run_dir: &Path) -> String {
+    let Ok(file) = transcript::read(run_dir) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for record in &file.records {
+        match record {
+            Record::RunStarted {
+                ts, run_id, agent, ..
+            } => out.push_str(&format!("{ts}  run {run_id} of {agent} started\n")),
+            Record::InstructionRead {
+                ts, path, bytes, ..
+            } => out.push_str(&format!("{ts}  instruction read: {path} ({bytes} bytes)\n")),
+            Record::SkillsDiscovered { ts, skills } => {
+                let names = skills
+                    .iter()
+                    .map(|skill| skill.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("{ts}  skills: {names}\n"));
+            }
+            Record::RunLimits {
+                ts,
+                max_turns,
+                timeout_secs,
+                model,
+                ..
+            } => out.push_str(&format!(
+                "{ts}  bounds: {max_turns} turns, {timeout_secs} s, model {model}\n"
+            )),
+            Record::ModelReply {
+                ts,
+                turn,
+                content,
+                tool_calls,
+                ..
+            } => {
+                if let Some(content) = content.as_deref().filter(|text| !text.trim().is_empty()) {
+                    out.push_str(&format!(
+                        "{ts}  turn {turn} model: {}\n",
+                        bounded(content, 4000)
+                    ));
+                }
+                for call in tool_calls {
+                    out.push_str(&format!(
+                        "{ts}  turn {turn} model asks {}({})\n",
+                        call.name,
+                        bounded(&call.arguments, 600)
+                    ));
+                }
+            }
+            Record::ModelCallFailed {
+                ts,
+                turn,
+                class,
+                message,
+                ..
+            } => out.push_str(&format!(
+                "{ts}  turn {turn} model failed ({class}): {}\n",
+                bounded(message, 800)
+            )),
+            Record::ToolCall {
+                ts,
+                turn,
+                tool,
+                command,
+                ..
+            } => out.push_str(&format!(
+                "{ts}  turn {} {tool}: {}\n",
+                turn.map(|turn| turn.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                bounded(command, 600)
+            )),
+            Record::ToolResult {
+                ts,
+                tool,
+                exit_code,
+                signal,
+                output,
+                ..
+            } => {
+                let end = match (exit_code, signal) {
+                    (Some(code), _) => format!("exit {code}"),
+                    (None, Some(signal)) => format!("signal {signal}"),
+                    _ => "ended".to_owned(),
+                };
+                out.push_str(&format!("{ts}  {tool} -> {end}\n"));
+                if let Some(output) = output.as_deref().filter(|text| !text.trim().is_empty()) {
+                    for line in bounded(output, 4000).lines() {
+                        out.push_str(&format!("          {line}\n"));
+                    }
+                }
+            }
+            Record::ForgejoCall {
+                ts,
+                tool,
+                repository,
+                number,
+                detail,
+                ..
+            } => {
+                let target = match (repository, number) {
+                    (Some(repository), Some(number)) => format!(" {repository}#{number}"),
+                    (Some(repository), None) => format!(" {repository}"),
+                    _ => String::new(),
+                };
+                out.push_str(&format!("{ts}  {tool}{target}: {}\n", bounded(detail, 600)));
+            }
+            Record::ForgejoResult {
+                ts,
+                tool,
+                outcome,
+                action,
+                url,
+                ..
+            } => {
+                let say = action.as_deref().unwrap_or(outcome);
+                let at = url
+                    .as_deref()
+                    .map(|url| format!(" {url}"))
+                    .unwrap_or_default();
+                out.push_str(&format!("{ts}  {tool} -> {say}{at}\n"));
+            }
+            Record::RunFinished {
+                ts,
+                outcome,
+                reason,
+                ..
+            } => {
+                let reason = reason
+                    .as_deref()
+                    .map(|reason| format!(" — {}", bounded(reason, 800)))
+                    .unwrap_or_default();
+                out.push_str(&format!("{ts}  run finished: {outcome}{reason}\n"));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Write the readable transcript beside the JSONL at 0600 and return its path.
+pub fn write_readable_transcript(run_dir: &Path) -> io::Result<PathBuf> {
+    let path = run_dir.join(TRANSCRIPT_TEXT_FILE);
+    let text = readable_transcript(run_dir);
+    crate::mode::write_private(&path, text.as_bytes())?;
+    Ok(path)
+}
+
+fn bounded(text: &str, limit: usize) -> String {
+    let mut out: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        out.push_str(" …");
+    }
+    out
+}

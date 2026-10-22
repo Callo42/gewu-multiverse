@@ -476,7 +476,7 @@ fn the_72_legend_is_whole_and_the_newest_mark_has_a_word() {
         "F-04: the 72 legend is not whole: {flat}"
     );
     assert!(
-        flat.contains("∅ none"),
+        flat.contains("∅ no work"),
         "F-04: the no-work mark has no whole 72-column word: {flat}"
     );
 }
@@ -529,6 +529,10 @@ fn the_provider_failure_words_keep_the_whole_message() {
 #[test]
 fn the_quit_warning_names_the_agents() {
     let mut engine = ready(3);
+    for name in ["agent-1", "agent-2"] {
+        let path = engine.instruction_path(name).expect("an instruction path");
+        std::fs::write(path, "work the issue\n").expect("the instruction");
+    }
     engine
         .send(Command::Start {
             name: "agent-1".to_owned(),
@@ -820,6 +824,7 @@ fn the_card_summary_prefers_the_newest_run_that_did_work() {
     layout.ensure_root().expect("the config root");
     let mut settings = Settings {
         terms_acknowledged: true,
+        terms_version: gewu_multiverse::engine::TERMS_VERSION,
         ..Settings::default()
     };
     settings.endpoint.url = "http://127.0.0.1:9/v1/chat/completions".to_owned();

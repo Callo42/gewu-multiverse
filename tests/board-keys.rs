@@ -93,8 +93,10 @@ fn fill_model(board: &mut Board, url: &str, model: &str, key: &str) {
     press(board, KeyCode::Char('e'));
     type_text(board, url);
     press(board, KeyCode::Enter);
+    press(board, KeyCode::Char('e'));
     type_text(board, model);
     press(board, KeyCode::Enter);
+    press(board, KeyCode::Char('e'));
     type_text(board, key);
     press(board, KeyCode::Enter);
 }
@@ -387,9 +389,7 @@ fn q_asks_once_when_an_agent_is_started_and_the_second_q_stops_everything() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        flat.contains(
-            "quit stops agent-1 and Forgejo; they start again when you reopen — q again quits"
-        ),
+        flat.contains("quit stops agent-1 and Forgejo; they start again on reopen — q again quits"),
         "{flat}"
     );
     assert!(board.sent_commands().is_empty());

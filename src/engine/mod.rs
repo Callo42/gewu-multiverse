@@ -90,6 +90,14 @@ pub const REPOSITORY_REFRESH: Duration = Duration::from_secs(2);
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.
+pub const TERMS_VERSION: u32 = 2;
+
+/// The one line from this release's notes that the upgrade screen shows.
+pub const WHATS_NEW: &str =
+    "run marks say exactly what happened, and a started agent's runs never outlive it";
+
+/// The terms the first-run screen shows, one short item each. They are the product's
+/// fixed words, in the first-time reader's language.
 pub const TERMS: &[&str] = &[
     "Agents use this computer with your permissions.",
     "When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.",
@@ -291,11 +299,12 @@ fn build(
     // their recorded pids, believed only when their command line is the one this
     // product started, and stopped before a fresh one can start.
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
-    recover_stale_sessions(&options.layout, options.stop_grace)?;
+    let (_, leftovers) = recover_stale_sessions(&options.layout, options.stop_grace)?;
     remove_stale_run_temps();
     let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
     let mut inner = Inner::new(options.clone(), settings_path, settings, credentials)?;
     inner.upgrade = upgrade;
+    inner.leftovers = leftovers;
     last_seen::write(options.layout.root(), env!("CARGO_PKG_VERSION"))?;
     // An installation from the old screens may still hold `config.toml`. The new
     // engine does not read it and does not convert it; it says once, on the first
@@ -366,6 +375,8 @@ fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> O
             "https://github.com/{}/releases",
             bundled_forgejo::REPOSITORY
         ),
+        whats_new: WHATS_NEW.to_owned(),
+        warnings_changed: settings.terms_version < TERMS_VERSION,
     })
 }
 
@@ -448,6 +459,8 @@ struct AgentRuntime {
     last_error: Option<String>,
     last_result: Option<String>,
     last_failure: Option<String>,
+    /// A left-over process group this engine could not reap, one plain sentence.
+    leftover: Option<String>,
     current_tool: Option<String>,
     current_tool_since: Option<SystemTime>,
     last_work: Vec<String>,
@@ -514,6 +527,8 @@ struct Inner {
     admin_password_once: Option<String>,
     password_reset_inflight: bool,
     upgrade: Option<UpgradeView>,
+    /// Left-over process groups the last open could not stop, by agent name.
+    leftovers: Vec<(String, String)>,
     sequence: u64,
     stopping: bool,
     generation: u64,
@@ -559,6 +574,10 @@ impl Inner {
             state
         };
         let repositories = Vec::new();
+        let mut events = VecDeque::new();
+        if let Some(event) = settings.forgejo.last_event.clone() {
+            events.push_back(event);
+        }
         let mut forgejo = ForgejoRuntime {
             state,
             url: port
@@ -580,7 +599,7 @@ impl Inner {
             provision_inflight: false,
             provision_retry_at: None,
             repositories,
-            events: VecDeque::new(),
+            events,
             repositories_refreshed_at: None,
             repositories_inflight: false,
         };
@@ -606,6 +625,7 @@ impl Inner {
             admin_password_once: None,
             password_reset_inflight: false,
             upgrade: None,
+            leftovers: Vec::new(),
             sequence: 0,
             stopping: false,
             generation: 0,
@@ -617,6 +637,13 @@ impl Inner {
         let names = inner.settings.names();
         for name in names {
             inner.agents.push(AgentRuntime::load(&inner, &name));
+        }
+        // A group the last open could not reap is reported on its agent's card,
+        // not hidden in the recovery log (F-02/F-03).
+        for (name, reason) in inner.leftovers.clone() {
+            if let Some(index) = inner.agent_index(&name) {
+                inner.agents[index].leftover = Some(reason);
+            }
         }
         #[cfg(test)]
         if inner.options.forgejo_ready {
@@ -827,6 +854,7 @@ impl AgentRuntime {
             last_error,
             last_result,
             last_failure,
+            leftover: None,
             current_tool: None,
             current_tool_since: None,
             last_work,
@@ -1140,6 +1168,17 @@ impl Inner {
         }
         if let Some((end, started, run_dir, pid)) = ended {
             self.observe_confinement_refusal(&run_dir);
+            // A supervisor killed from outside can leave the shell it started in
+            // the run's process group. Reap the group at this boundary, before the
+            // next run is allowed to start; a process that survives is reported on
+            // the card instead of being hidden (F-02/F-03).
+            let leftover = run::reap_process_group(pid, &run_dir, self.options.stop_grace);
+            if leftover.is_ok() {
+                // The run and its group are over: no later reopen may act on the
+                // stale records (including the shell record written at spawn).
+                run::clear_process_records(&run_dir);
+            }
+            self.agents[index].leftover = leftover.err();
             // A stopped, killed or crashed run gets no chance to run its own
             // destructor: the engine removes its private askpass tree here (F-01).
             if let Some(run_id) = run_id_in(&run_dir) {
@@ -1655,7 +1694,10 @@ impl EngineApi for Engine {
             key_present: inner.credential_key_present(),
             test: inner.endpoint_test.clone(),
         };
-        let terms_acknowledged = inner.settings.terms_acknowledged;
+        // An upgrade whose warnings changed shows them once more before the board;
+        // a same-version open keeps the acknowledgement (F-06).
+        let terms_acknowledged = inner.settings.terms_acknowledged
+            && !(inner.upgrade.is_some() && inner.settings.terms_version < TERMS_VERSION);
         let setup_complete =
             inner.settings.endpoint.configured() && !inner.settings.agents.is_empty();
         let forgejo = ForgejoView {
@@ -1701,7 +1743,11 @@ impl EngineApi for Engine {
                 activity_at: agent.activity_at,
                 last_error: agent.last_error.clone(),
                 last_result: agent.last_result.clone(),
-                last_failure: agent.last_failure.clone(),
+                last_failure: agent
+                    .leftover
+                    .clone()
+                    .or_else(|| agent.last_failure.clone()),
+                leftover: agent.leftover.clone(),
                 current_tool: agent.current_tool.clone(),
                 current_tool_seconds: agent
                     .current_tool_since
@@ -1752,6 +1798,7 @@ impl EngineApi for Engine {
         match command {
             Command::AcknowledgeTerms => {
                 inner.settings.terms_acknowledged = true;
+                inner.settings.terms_version = TERMS_VERSION;
                 inner.save_settings()?;
                 inner.note("the terms are recorded");
                 Ok(())
@@ -1948,6 +1995,18 @@ impl EngineApi for Engine {
             .map(|run| run.run_dir.clone())
             .or_else(|| runtime.newest_run.clone())?;
         Some((dir.join(LOG_FILE), dir.join(TRANSCRIPT_FILE)))
+    }
+
+    fn readable_transcript(&self, agent: &str) -> Option<PathBuf> {
+        let inner = self.inner.lock().ok()?;
+        let index = inner.agent_index(agent)?;
+        let runtime = &inner.agents[index];
+        let dir = runtime
+            .running
+            .as_ref()
+            .map(|run| run.run_dir.clone())
+            .or_else(|| runtime.newest_run.clone())?;
+        run::write_readable_transcript(&dir).ok()
     }
 
     fn shutdown(&mut self, grace: Duration) {
@@ -2181,21 +2240,31 @@ fn run_id_in(run_dir: &Path) -> Option<&str> {
     run_dir.file_name().and_then(std::ffi::OsStr::to_str)
 }
 
-/// Stop every `--run-agent` process an earlier program left behind.
+/// Stop every run process group an earlier program left behind.
 ///
 /// The state root is walked without following the agents' own settings: a run
-/// directory is two levels down, and its pid record is believed only when the live
-/// command line still names that run directory and the run-agent mode.
-fn recover_stale_sessions(layout: &Layout, grace: Duration) -> Result<Vec<u32>, String> {
+/// directory is two levels down. A `session.pid` whose supervisor is still alive,
+/// a supervisor killed by `SIGKILL`, and a shell whose supervisor removed its own
+/// records are all found from the run directory: the supervisor's `session.*`
+/// records or the shell record written at spawn. The group is never believed from
+/// a bare number; the process environment is never read. The `run_stopped` record
+/// is written before the caller opens (F-02/F-03).
+#[allow(clippy::type_complexity)]
+fn recover_stale_sessions(
+    layout: &Layout,
+    grace: Duration,
+) -> Result<(Vec<u32>, Vec<(String, String)>), String> {
     let mut stopped = Vec::new();
+    let mut leftovers = Vec::new();
     let Ok(agents) = fs::read_dir(layout.state_root()) else {
-        return Ok(stopped);
+        return Ok((stopped, leftovers));
     };
     for agent in agents.flatten() {
         let agent_path = agent.path();
         if !agent_path.is_dir() {
             continue;
         }
+        let agent_name = agent.file_name().to_str().unwrap_or("an agent").to_owned();
         let Ok(runs) = fs::read_dir(&agent_path) else {
             continue;
         };
@@ -2204,36 +2273,24 @@ fn recover_stale_sessions(layout: &Layout, grace: Duration) -> Result<Vec<u32>, 
             if !run_dir.is_dir() {
                 continue;
             }
-            let record = run_dir.join(session::PID_FILE);
-            let Ok(text) = fs::read_to_string(&record) else {
+            let Some((pid, _pgid)) = run::recorded_group(&run_dir) else {
                 continue;
             };
-            let Ok(pid) = text.trim().parse::<u32>() else {
-                let _ = fs::remove_file(&record);
-                continue;
-            };
-            let expected = run_dir.display().to_string();
-            let matches = bundled_forgejo::command_line(pid).is_some_and(|parts| {
-                parts.iter().any(|part| part == "--run-agent")
-                    && parts.iter().any(|part| part == &expected)
-            });
-            if !matches {
-                let _ = fs::remove_file(&record);
-                continue;
+            match run::reap_leftover_run(&run_dir, grace) {
+                Ok(true) => stopped.push(pid),
+                Ok(false) => {
+                    // Nothing was alive: the records are stale, not evidence of a
+                    // process this program must keep watching. They were removed
+                    // with the run's shell record already.
+                }
+                Err(reason) => leftovers.push((agent_name.clone(), reason)),
             }
-            if !bundled_forgejo::stop_recorded_pid(pid, grace) {
-                return Err(format!(
-                    "the run left by an earlier start (pid {pid}) could not be stopped"
-                ));
-            }
-            let _ = fs::remove_file(&record);
             if let Some(run_id) = run_id_in(&run_dir) {
                 crate::confinement::remove_run_temp(pid, run_id);
             }
-            stopped.push(pid);
         }
     }
-    Ok(stopped)
+    Ok((stopped, leftovers))
 }
 
 fn ensure_agent_paths(layout: &Layout, name: &str) -> Result<(), String> {
@@ -2629,7 +2686,8 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
                 .iter()
                 .map(|repository| repository.full_name.clone())
                 .collect();
-            for event in repository_events(&before, &after) {
+            let seen = repository_events(&before, &after);
+            for event in seen {
                 inner.forgejo.events.push_back(event);
             }
             while inner.forgejo.events.len() > 5 {
@@ -2637,6 +2695,8 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
             }
             if before != after {
                 if let Some(event) = inner.forgejo.events.back().cloned() {
+                    inner.settings.forgejo.last_event = Some(event.clone());
+                    let _ = inner.save_settings();
                     inner.note(event);
                 }
             }
@@ -3025,6 +3085,7 @@ mod tests {
         settings.endpoint.url = "http://127.0.0.1:9/v1/chat/completions".to_owned();
         settings.endpoint.model = "lab-chat-1".to_owned();
         settings.terms_acknowledged = true;
+        settings.terms_version = TERMS_VERSION;
         for (name, desired) in agents {
             settings.add_agent(name, *desired).expect("agent");
             let paths = layout.ensure_agent(name).expect("paths");

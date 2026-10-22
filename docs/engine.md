@@ -71,7 +71,9 @@ the password shown before that moment stops working.
 The administrator API's repository list is polled every two seconds. A name that
 disappeared or appeared between polls becomes an event on the board and on the Forgejo
 page (`team/scratch was deleted`, `team/website was created`), so a destroyed
-repository is never traceless. The count and the event are replaced in the same tick;
+repository is never traceless. The newest event is written to the settings file and
+loaded again on open, so it survives a reopen. The count and the event are replaced in
+the same tick;
 a failed poll is retried on the next tick instead of keeping an old count for another
 interval (W31-8). The administrator's list includes private repositories, so a private
 repository's deletion produces the same event. The process runs as `web` in
@@ -193,13 +195,26 @@ with `ps`.
 ### Left-over processes and the program's own ending
 
 The running server writes its pid into `forgejo/instance/forgejo.pid`; each session
-writes `session.pid` in its run directory. The files are removed when the processes
-are reaped. If the program is killed outright, the next `open` reads those records,
-believes a pid only when `/proc/<pid>/cmdline` still names the expected command (this
-instance's `app.ini` and `web` for Forgejo; the run directory and `--run-agent` for a
-session), and stops the process group politely then by force. It never guesses from a
-bare number, and a reused pid is never killed. Only after that recovery does the engine
-start a fresh Forgejo, so two servers never share one data directory.
+writes `session.pid` and the process group it leads into `session.pgid` in its run
+directory. The run supervisor also writes the shell's own `shell.pid` and
+`shell.pgid` as soon as each command's shell exists, so a group is still named after a
+supervisor is gone and its `session.*` records were removed. The files are removed when
+the process group is reaped. If the program is killed outright, the next `open` walks
+every run directory and stops each recorded group, politely then by force, before it
+opens. A group is believed only through the run's own records: a live member that names
+the run directory on its command line, the recorded supervisor or shell still alive in
+the group, or the shell record naming that group. No other process's environment is
+read. A bare or reused number is never signalled; zombies are not counted as live, so
+a killed shell does not hold the recovery open. The engine writes `run-stopped.json`
+and a `run_stopped` terminal record into the run directory before it opens. If a process
+survives the reap, the sentence is kept and drawn on the agent's card; the engine does
+not hide it and does not refuse to open.
+A run agent also asks the kernel for `PR_SET_PDEATHSIG`, so a product killed with
+`SIGKILL` ends its supervisor; the shell it started stays in the group and is reaped by
+the next open. At each run boundary the engine reaps the finished run's group before the
+next run is allowed to start, so a supervisor killed from outside cannot leave an old
+command running beside the new one. Only after that recovery does the engine start a
+fresh Forgejo, so two servers never share one data directory.
 
 `q`, the terminal closing (`SIGHUP`) and the window manager ending the program
 (`SIGTERM`) all take the same path: stop every session and Forgejo, leave the alternate
@@ -248,8 +263,14 @@ installation were fresh.
 `last-seen.toml` records the newest version that opened the configuration. It is
 written at open and on a clean exit. When the recorded version is older than this
 build, the first open shows one Upgrade screen: the version it was, the version it is,
-how many agents, instructions and runs were found, what is reused, that the old
-`config.toml` is ignored, and the release page address.
+how many agents, instructions and runs were found, what is reused, one line from this
+release's notes naming what changed, that the old `config.toml` is ignored, and the
+release page address. `terms_version` records the wording of the first-run warnings the
+person agreed to; when a later build changes them, the upgrade screen says so and the
+next screen shows the warnings again. After they are agreed the program returns to the
+board through the same `after_upgrade()` choice a normal open uses — the first-run
+model/picker flow is not entered and an existing installation's agents are never
+re-created.
 
 Builds before 0.1.31 wrote no marker, so a real upgrade from 0.1.30 has none. The
 installer reads the installed binary's `--version` before replacing it and writes the

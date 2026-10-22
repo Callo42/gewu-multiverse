@@ -49,8 +49,8 @@ requests are its own. The board shows the whole thing at a glance:
   the last work block (typed, and kept until a later run does new work), the
   instruction's first line, always, and `… (N more lines)` where N counts the
   document's **file** lines (not wrapped display rows), the bounded run marks with
-  their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`; at
-  72 columns the same entries are whole as `∅ none`), the newest mark's word, the last
+  their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`,
+  wrapped whole on two rows at 72 columns), the newest mark's word, the last
   tool failure and the newest run's reason. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
   every element of `PIPESTATUS`, so a failed command in a pipeline, a condition or a
   nested `bash -c`/`#!/bin/bash` script that reads the prelude can never hide behind
@@ -75,18 +75,25 @@ requests are its own. The board shows the whole thing at a glance:
   summary says it could not do the instruction, or whose tool results show a refused
   write, is `⊘ refused`; a refused **read** is `⚠`, never `⊘`. One whose assigned-issues
   list came back empty and that wrote nothing is `∅ no work`, even when its own
-  sentence says everything is done; one whose tool results include a failed command is
-  `⚠` with the command's cause as its row. None of those is `✓`. A refused write's
+  sentence says everything is done; a check that read its issue and wrote nothing and
+  says `nothing new to add` is the same neutral `∅ no work`, not a green tick; one
+  whose tool results include a failed command is `⚠` with the command's cause as its
+  row. None of those is `✓`. A refused write's
   cause row says `⊘ write refused: …`, matching the strip. The
   summary line prefers the newest run that did work (`last work: …`); a later no-op's
   reason is labelled `no work: …`. Started agents keep
-  a visible idle between runs (`next run in 5s`). The selected card is marked `▸`, and
+  a visible idle between runs (`next run in 5s`); a no-work run's longer back-off says
+  `next run in 20s · no work`. The selected card is marked `▸`, and
   a window from 140 to 160 columns uses its width for the repository names and card
   detail; a wider one centres the same picture in 160.
 
 The program keeps the Forgejo running while it is open. When an agent is started, it
 runs its instruction, and when that run ends it starts another one after a short
-visible idle, until you stop it. An agent's shell is confined where the computer allows
+visible idle, until you stop it. Each run's process group is written down; if the
+program or a run's supervisor is killed outright, the next start stops every recorded
+group that is still alive and writes its `run_stopped` record before the board opens,
+so a shell cannot keep editing beside the new run. A process the engine still cannot
+stop is named on the agent's card. An agent's shell is confined where the computer allows
 it. **Landlock is the automatic mechanism**: it denies the product's roots, and is not
 chosen when one of them lies inside a tree it must allow. The product claims Landlock
 only after a child process proved that a ruleset is fully enforced — it reads a file it
@@ -105,17 +112,34 @@ the run's private `TMPDIR`, the network and the tools you installed stay visible
 the system's `/etc`, `/proc`, `/sys` and `/run`. The warnings screen states what is true on **this** computer: `runs on this computer
 are confined (Landlock)` (or `bwrap`/`unshare`) after the second warning, or the same
 negative line when the computer offers no mechanism or the layout cannot be confined.
-The board repeats the negative sentence. The 72×18 board draws compact cards while they
-fit; once they would need a scroll it is a one-line-per-agent list, so every agent the
-picker offers is on screen. The 80×24 board keeps the organisation, the repository
-count, the login, the version and the newest repository event; a crowded home takes
-the same one-line form rather than dropping them. The newest event, when the Forgejo
-box is too short for it, has a footer row of its own and never overwrites the keys.
+The warnings are one compact numbered block: five warnings, or six when this computer
+cannot confine a run; the footer states the count, and the fact about this computer is
+the first line under item 2.
+The board repeats the negative sentence. One layout rule holds for 1–12 agents at
+72×18, 80×24, 100×30, 120×40 and 200×60: cards never collide, truncate a name or leave
+a dangling connector; the grid keeps its columns fixed so a wrapped last row cannot
+move under the wire. When the cards cannot keep a whole title and their facts, the
+board takes a compact list: one wired box with a line (or two columns) per agent,
+keeping the name, login, run count, state mark and last-work word on the frame. The
+72×18 Forgejo box keeps the address, repository count, agent count and login on three
+rows (the version stays on the top border); the 80×24 box keeps the organisation, the
+repository names that fit and the login on four rows; from 100×30 the box is six rows.
+The version and then the names are the first facts given up when the box is tight. The newest repository event is stored
+with the settings, so it survives a reopen and has a footer row of its own when the box
+is too short for it, never overwriting the keys.
+
+The last-work word keeps its number: `pull request #100` is `#100`, never `#10`, and
+`#10000` stays whole — the label is shortened, not the number. A failed run's word
+starts with the HTTP status (`✗ HTTP 500 from the model`) and is cut on whole words, and
+a single-column connector is placed after the label so it never crosses the word.
 
 After an upgrade, the first open shows one screen: the version this installation was,
-the version this is, what was found (settings, agents, instructions and runs) and what
-is reused or ignored, with the release page address. The next open goes straight to
-the board. The installer records the old version before it replaces the binary, and a
+the version this is, what was found (settings, agents, instructions and runs), what is
+reused or ignored, one line from this release's notes naming what changed, and the
+release page address. If the first-run warnings changed since this installation last
+agreed to them, the screen says so and the next screen shows them again; after they are
+agreed the program returns to the board, never into the first-run model and picker
+flow. The next open goes straight to the board. The installer records the old version before it replaces the binary, and a
 home whose old build wrote no version marker (0.1.30 and earlier) still gets the
 screen, naming the version as an earlier one when it cannot know it exactly.
 
@@ -158,7 +182,8 @@ and you can change any of them later.
    configuration, saved keys, Forgejo data, home or another run's login file; when it
    cannot, the same screen says, in one sentence,
    `runs are not confined on this computer`; on a host that can confine, it says
-   `runs on this computer are confined (Landlock)` after the second warning. Landlock is the automatic
+   `runs on this computer are confined (Landlock)` under the second warning. The screen
+   is one numbered block and its footer states how many warnings there are. Landlock is the automatic
    mechanism; `bwrap` and `unshare` are opt-in with
    `GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare` and are tested but not yet
    proven on a real user-namespace host. Press `y` after you have read every one.
@@ -167,8 +192,13 @@ and you can change any of them later.
    works. The address suffix and an empty key are checked before anything is sent;
    every other failure names the provider's status and its own message, kept whole and
    wrapped to the form's rows at 80 columns (a 404 on a `/chat/completions` address
-   without `/v1` says so first). `↑`/`↓` moves between fields and `⏎` keeps a field and
-   moves to the next; on the key it finishes editing. Press `⏎` again to go on.
+   without `/v1` says so first). `↑`/`↓` moves between fields; `⏎` keeps a field and
+   selects the next one without entering its edit mode, so `t` still tests; `Ctrl-U`
+   (shown as `ctrl-u clear`) empties the selected field. Continuing past the model step
+   runs the same address and key check: a wrong address stays on the form with the `✗`
+   line, and a valid but untested one says `not tested — t to test`. The saved and the
+   edited key are both shown as eight bullets, and a test result disappears on the
+   first edit.
 3. **Choose how many agents.** `←` / `→` changes the number from 1 to 12. Press `⏎` to
    create them. The board shows `downloading n%`, `setting up`, `starting`, then
    `● running` while your Forgejo is prepared.
@@ -212,7 +242,9 @@ setup)`.
 The password is never written down. Open the Forgejo page and press `p`: the product
 resets it through Forgejo's administration API, with the new value in the request body,
 and the new value is shown, wrapped in full, for ten seconds — deliberately two lines
-at 80 columns, never cut. The one-line consequence is a static row on the page:
+at 80 columns, never cut. `c` puts the shown value on the terminal clipboard with one
+OSC 52 sequence and shows `copied`; a terminal without OSC 52 ignores the sequence and
+the value is still on screen. The one-line consequence is a static row on the page:
 `p resets it, c copies — shown for 10 s, old stops`, so the password shown before that
 moment no longer works. While the value is on show, `c` puts it on the terminal's
 clipboard with one OSC 52 sequence (base64) — never into a file, a log or a second
@@ -227,15 +259,21 @@ A relative folder is taken from the folder you started the program in.
 
 - `s` stops the selected agent. Its current run is asked to stop, and then made to stop
   if it does not; nothing new starts.
-- `q` quits. If an agent is started, the board first names the agents that will stop —
-  `quit stops agent-2 and agent-3, and Forgejo`; press `q` again. It stops every started
-  agent and the Forgejo, and prints one line (`stopped 1 agent`, not `1 agents`).
+- `q` quits. If an agent is running, the board first names the agents that will stop —
+  `quit stops agent-2 and agent-3, and Forgejo; they start again on reopen — q again
+  quits`; press `q` again. An agent that is only
+  started and waiting for an instruction is not named, because it is not running. It
+  stops every started agent and the Forgejo, and prints one line (`stopped 1 agent`, not
+  `1 agents`).
   Closing the terminal window does the same.
 - Opening the program again starts the Forgejo, and starts the agents you had left
   started, with the same instructions.
-- If the program was killed outright, the next start finds the Forgejo and any runs it
-  left behind, stops them, and only then opens. It believes a saved process number only
-  when the command line still matches what it started. A stopped, killed or crashed run's
+- If the program was killed outright, the next start finds the Forgejo and any run
+  process groups it left behind, stops them, writes each run's `run_stopped` record, and
+  only then opens. A group is believed only through the run's own records (the
+  supervisor's pid/group records or the shell record written when its command started,
+  a member naming the run directory, or the recorded leader still alive); no other
+  process's environment is read. A stopped, killed or crashed run's
   private temporary directory — including the per-run `askpass.toml` that held its own
   login — is removed by the run on every exit it sees and by the engine or the next open
   otherwise; a live run's directory is never touched.
@@ -272,8 +310,9 @@ Nothing else is installed: no service, no system-wide file, no other account.
   `/chat/completions` path without `/v1`, add `/v1`), or `✗ no answer within 15 s`
   (the provider did not answer; try again).
 - **An agent keeps failing.** Its card shows `next run in Ns` and its last runs as
-  `✓`, `⊘`, `∅`, `⚠`, `✗`, `■` and `◷`. Open it with `⏎`; `l` opens the newest log and `t` the full record in
-  your pager. The wait between attempts starts at 10 seconds and doubles up to 5
+  `✓`, `⊘`, `∅`, `⚠`, `✗`, `■` and `◷`. Open it with `⏎`; `l` opens the newest log,
+  `t` a readable transcript (turns, tools and their output) and `j` the raw JSONL
+  record, in your pager. The wait between attempts starts at 10 seconds and doubles up to 5
   minutes, so a broken instruction does not spin. Fix the instruction with `e` or the
   model with `m`, then stop and start the agent with `s`.
 - **Forgejo stops unexpectedly.** The board says

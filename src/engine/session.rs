@@ -90,6 +90,11 @@ pub struct PreparedSession {
 /// nothing but the number.
 pub const PID_FILE: &str = "session.pid";
 
+/// The run's process-group record, written beside its pid. The group id outlives
+/// the supervisor that leads it, so a later start can stop a shell whose supervisor
+/// was killed (F-02/F-03).
+pub const PGID_FILE: &str = "session.pgid";
+
 /// A running child, as the engine polls it.
 pub trait RunningSession: Send {
     /// The child's pid, which is also its process-group id.
@@ -252,7 +257,8 @@ impl SessionSpawner for RealSpawner {
                     let pid = child.id();
                     // The record is written before the engine is told the pid, so a
                     // kill between these two lines still leaves a trace to recover.
-                    let recorded = write_pid(&run_dir, pid);
+                    let recorded =
+                        write_pid(&run_dir, pid).and_then(|()| write_pgid(&run_dir, pid));
                     if let Err(reason) = recorded {
                         let _ = nix::sys::signal::killpg(
                             nix::unistd::Pid::from_raw(pid as i32),
@@ -265,6 +271,7 @@ impl SessionSpawner for RealSpawner {
                     let _ = ready_tx.send(Ok(pid));
                     let status = child.wait();
                     let _ = fs::remove_file(run_dir.join(PID_FILE));
+                    let _ = fs::remove_file(run_dir.join(PGID_FILE));
                     let _ = status_tx.send(status);
                 }
                 Err(error) => {
@@ -565,6 +572,12 @@ impl RunningSession for FakeHandle {
 fn write_pid(run_dir: &Path, pid: u32) -> Result<(), String> {
     crate::mode::write_private(run_dir.join(PID_FILE), pid.to_string().as_bytes())
         .map_err(|error| format!("the session's pid record cannot be written: {error}"))
+}
+
+/// Write one run's process-group id at 0600.
+fn write_pgid(run_dir: &Path, pgid: u32) -> Result<(), String> {
+    crate::mode::write_private(run_dir.join(PGID_FILE), pgid.to_string().as_bytes())
+        .map_err(|error| format!("the session's process-group record cannot be written: {error}"))
 }
 
 /// Ensure one run's directory exists at 0700.

@@ -34,6 +34,10 @@ pub struct Settings {
     /// The first-run terms were recorded.
     #[serde(default)]
     pub terms_acknowledged: bool,
+    /// The wording of the terms that were recorded. A later build whose warnings
+    /// changed re-shows them once, on its upgrade screen (F-06).
+    #[serde(default)]
+    pub terms_version: u32,
     /// The one model endpoint every agent uses.
     #[serde(default)]
     pub endpoint: EndpointSettings,
@@ -99,6 +103,10 @@ pub struct ForgejoSettings {
     /// The person's administrator login.
     #[serde(default)]
     pub admin_login: String,
+    /// The newest repository change seen by any run of this installation. It
+    /// survives a reopen so a destroyed repository is never traceless (W67-4).
+    #[serde(default)]
+    pub last_event: Option<String>,
 }
 
 /// One agent's saved facts.
