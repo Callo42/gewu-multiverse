@@ -119,6 +119,12 @@ a screen. `credential.helper` is
 disabled for every git command the product runs, so the key is not copied into a git
 credential store.
 
+Because `git` inside a run must push, the run holds its own Forgejo account's token,
+and a model can therefore learn that token. It reaches only that one account on the
+person's loopback Forgejo; removal deletes it and deactivates the account, so it stops
+working. The administrator credential, the other agents' tokens, the person's files
+and the product's own state are out of the run's reach; the security audit proved each.
+
 The account, its commits and its run records stay when the agent is removed. Removal
 deletes the token on the server by its recorded name, removes the account from team
 `agents`, deactivates the account (`active = false` and `prohibit_login = true`, so a

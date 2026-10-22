@@ -177,6 +177,12 @@ hide, so a run started by an older build stays unconfined rather than being
 retroactively promised a boundary. A plan that is refused at run time is rewritten to
 `none` and marked; the engine takes that refusal onto the board.
 
+Landlock confines what a run can read and write, not processes. A command that
+detaches itself — with `setsid`, `nohup` or `disown` — can outlive the run and the
+product. Cleanup is best-effort: the engine stops the run's process group, but a
+process that left the group is not reachable, and the person can see such a process
+with `ps`.
+
 ### Left-over processes and the program's own ending
 
 The running server writes its pid into `forgejo/instance/forgejo.pid`; each session
