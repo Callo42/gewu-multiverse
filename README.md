@@ -116,6 +116,10 @@ One line, no Rust:
 curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
 ```
 
+The one-liner trusts the TLS connection to GitHub and the repository's release page —
+the checksum detects a damaged download, not a replaced release — and the bundled
+Forgejo binary is additionally pinned by digest and signed upstream.
+
 It downloads the current prebuilt program to `~/.local/bin/gewu-multiverse`, and the
 Forgejo it needs (about 122 MB) to `~/.local/share/gewu-multiverse/`. If `~/.local/bin`
 is not on your `PATH`, the installer says how to add it. The prebuilt program is for
