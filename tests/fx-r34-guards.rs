@@ -1752,8 +1752,7 @@ fn spawn_inaccessible_reader() -> Child {
 fn an_inaccessible_unrelated_process_does_not_hide_a_readable_holder() {
     let _process_test = process_test_lock();
     // Start this process before the capability exists: it cannot inherit it.
-    let reader = spawn_inaccessible_reader();
-    let reader_pid = reader.id();
+    let mut reader = spawn_inaccessible_reader();
     let root = scratch("readable-holder");
     let layout = Layout::rooted_at(root.clone()).expect("layout");
     let run_dir = write_run(&layout, "agent-1", "run-1700000000031-0001");
@@ -1767,8 +1766,10 @@ fn an_inaccessible_unrelated_process_does_not_hide_a_readable_holder() {
     if !stopped {
         stop_unrelated(holder);
     }
-    let reader_survived = unrelated_alive(reader_pid);
-    stop_unrelated(reader);
+    let reader_survived = reader.try_wait().expect("unrelated process status").is_none();
+    if reader_survived {
+        stop_unrelated(reader);
+    }
     assert!(result.expect("unrelated inspection failure must not hide the holder"));
     assert!(stopped, "the verified holder survived");
     assert!(reader_survived, "the unrelated reader was signalled");
