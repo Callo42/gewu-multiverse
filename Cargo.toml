@@ -42,6 +42,9 @@ sha2 = "0.10"
 # kernel feature is Linux 5.13+; where it is absent the board says runs are not
 # confined. This is the one dependency the confinement needs; docs/engine.md names it.
 landlock = "0.4"
+# rustix — safe pidfd handles for the recovery signal path. It is already in the tree
+# through crossterm; naming it here makes the use direct (the signal-hook precedent).
+rustix = { version = "0.38", features = ["process"] }
 
 [lints.rust]
 unsafe_code = "forbid"

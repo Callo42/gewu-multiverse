@@ -290,6 +290,34 @@ fn a_left_over_session_is_stopped_before_a_new_engine_starts() {
         Layout::rooted_at(root.path().join("config")).expect("the test layout is absolute");
     let run_dir = layout.agent("agent-1").expect("paths").run_dir("run-1");
     fs::create_dir_all(&run_dir).expect("the run directory");
+    // The modern ownership record: an inherited anonymous capability. The fake
+    // session is not the product supervisor executable, so its argv alone must not
+    // own the group; it must hold the capability like a real run child.
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+    let fd = nix::sys::memfd::memfd_create(
+        "gewu-stale-session-capability",
+        nix::sys::memfd::MFdFlags::empty(),
+    )
+    .expect("memfd");
+    let mut capability = fs::File::from(fd);
+    let token = [0x3c_u8; 16];
+    capability.write_all(&token).expect("token");
+    capability.seek(SeekFrom::Start(0)).expect("seek");
+    let metadata = capability.metadata().expect("metadata");
+    fs::write(
+        run_dir.join("shell.capability"),
+        format!(
+            "{} {} {}\n",
+            metadata.dev(),
+            metadata.ino(),
+            token
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+    )
+    .expect("capability record");
     let mut child = ProcessCommand::new("/bin/sh")
         .arg("-c")
         .arg("sleep 60")
@@ -301,6 +329,7 @@ fn a_left_over_session_is_stopped_before_a_new_engine_starts() {
         .process_group(0)
         .spawn()
         .expect("the fake session runs");
+    drop(capability);
     let pid = child.id();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

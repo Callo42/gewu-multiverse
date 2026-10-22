@@ -302,9 +302,17 @@ fn build(
     let (_, leftovers) = recover_stale_sessions(&options.layout, options.stop_grace)?;
     remove_stale_run_temps();
     let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
-    let mut inner = Inner::new(options.clone(), settings_path, settings, credentials)?;
+    // The recovery result is part of the first picture: Inner::new must receive it
+    // before it loads the agent cards, or a failed cleanup is silently dropped and
+    // the engine starts a replacement run beside the old process (review-3).
+    let mut inner = Inner::new(
+        options.clone(),
+        settings_path,
+        settings,
+        credentials,
+        leftovers,
+    )?;
     inner.upgrade = upgrade;
-    inner.leftovers = leftovers;
     last_seen::write(options.layout.root(), env!("CARGO_PKG_VERSION"))?;
     // An installation from the old screens may still hold `config.toml`. The new
     // engine does not read it and does not convert it; it says once, on the first
@@ -436,6 +444,14 @@ struct RunningState {
 }
 
 /// One agent's engine state, beside its saved settings.
+/// A recovery scope whose cleanup failed: one run directory, or an agent
+/// directory that could not be enumerated and must be rescanned (review-3b).
+#[derive(Debug, Clone)]
+enum RecoveryTarget {
+    Run(PathBuf),
+    Agent(PathBuf),
+}
+
 struct AgentRuntime {
     name: String,
     desired: Desired,
@@ -461,6 +477,9 @@ struct AgentRuntime {
     last_failure: Option<String>,
     /// A left-over process group this engine could not reap, one plain sentence.
     leftover: Option<String>,
+    /// The recovery scopes whose cleanup failed, so Start can retry the reap or
+    /// rescan before any replacement run is allowed.
+    leftover_targets: Vec<RecoveryTarget>,
     current_tool: Option<String>,
     current_tool_since: Option<SystemTime>,
     last_work: Vec<String>,
@@ -527,8 +546,10 @@ struct Inner {
     admin_password_once: Option<String>,
     password_reset_inflight: bool,
     upgrade: Option<UpgradeView>,
-    /// Left-over process groups the last open could not stop, by agent name.
-    leftovers: Vec<(String, String)>,
+    /// Left-over process groups the last open could not stop: agent, run
+    /// directory and the reason, so the card can keep both the sentence and a
+    /// retry route.
+    leftovers: Vec<(String, RecoveryTarget, String)>,
     sequence: u64,
     stopping: bool,
     generation: u64,
@@ -540,6 +561,7 @@ impl Inner {
         settings_path: PathBuf,
         settings: Settings,
         credentials: PathBuf,
+        leftovers: Vec<(String, RecoveryTarget, String)>,
     ) -> Result<Self, String> {
         let binary = bundled_forgejo::binary_path(&options.data_root);
         let paths = bundled_forgejo::InstancePaths::under(&options.data_root);
@@ -625,7 +647,7 @@ impl Inner {
             admin_password_once: None,
             password_reset_inflight: false,
             upgrade: None,
-            leftovers: Vec::new(),
+            leftovers,
             sequence: 0,
             stopping: false,
             generation: 0,
@@ -639,10 +661,17 @@ impl Inner {
             inner.agents.push(AgentRuntime::load(&inner, &name));
         }
         // A group the last open could not reap is reported on its agent's card,
-        // not hidden in the recovery log (F-02/F-03).
-        for (name, reason) in inner.leftovers.clone() {
+        // not hidden in the recovery log (F-02/F-03). The run directory is kept
+        // so Start can retry the reap, and the blocked state stops the scheduler
+        // from starting a replacement beside a real old process.
+        for (name, target, reason) in inner.leftovers.clone() {
             if let Some(index) = inner.agent_index(&name) {
                 inner.agents[index].leftover = Some(reason);
+                inner.agents[index].leftover_targets.push(target);
+                inner.agents[index].session = SessionState::Blocked {
+                    reason: "an earlier run's cleanup is incomplete".to_owned(),
+                };
+                inner.agents[index].next_at = None;
             }
         }
         #[cfg(test)]
@@ -855,6 +884,7 @@ impl AgentRuntime {
             last_result,
             last_failure,
             leftover: None,
+            leftover_targets: Vec::new(),
             current_tool: None,
             current_tool_since: None,
             last_work,
@@ -1179,6 +1209,11 @@ impl Inner {
                 run::clear_process_records(&run_dir);
             }
             self.agents[index].leftover = leftover.err();
+            if self.agents[index].leftover.is_some() {
+                self.agents[index].leftover_targets = vec![RecoveryTarget::Run(run_dir.clone())];
+            } else {
+                self.agents[index].leftover_targets.clear();
+            }
             // A stopped, killed or crashed run gets no chance to run its own
             // destructor: the engine removes its private askpass tree here (F-01).
             if let Some(run_id) = run_id_in(&run_dir) {
@@ -1190,6 +1225,14 @@ impl Inner {
             let state_root = self.options.layout.state_root().to_path_buf();
             let agent = &mut self.agents[index];
             finish_session(agent, end, now, started, &state_root);
+            if agent.leftover.is_some() {
+                // A surviving old process outranks the normal restart: block the
+                // agent (and say why) until Start retries the cleanup.
+                agent.session = SessionState::Blocked {
+                    reason: "an earlier run's cleanup is incomplete".to_owned(),
+                };
+                agent.next_at = None;
+            }
         } else if let Some(run_dir) = self.agents[index]
             .running
             .as_ref()
@@ -1256,6 +1299,11 @@ impl Inner {
 
     fn block_reason(&self, index: usize) -> Option<String> {
         let agent = &self.agents[index];
+        if agent.leftover.is_some() {
+            // Never start a replacement beside a process the last cleanup could
+            // not stop; the card says why and Start retries the cleanup.
+            return Some("an earlier run's cleanup is incomplete".to_owned());
+        }
         if !self.settings.endpoint.configured() || !self.credential_key_present() {
             return Some("needs a model".to_owned());
         }
@@ -1882,6 +1930,39 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                // A cleanup that failed at open or at a run boundary is retried
+                // before any replacement run. Until it succeeds, Start reports the
+                // reason and does not start; once the old group is gone, the
+                // records are cleared and the run can start normally.
+                let leftover_targets = inner.agents[index].leftover_targets.clone();
+                if !leftover_targets.is_empty() {
+                    let mut failed = None;
+                    for target in &leftover_targets {
+                        let result = match target {
+                            RecoveryTarget::Run(run_dir) => {
+                                run::reap_leftover_run(run_dir, inner.options.stop_grace)
+                                    .map(|_| ())
+                            }
+                            RecoveryTarget::Agent(agent_dir) => {
+                                recover_agent_directory(agent_dir, inner.options.stop_grace)
+                            }
+                        };
+                        if let Err(reason) = result {
+                            failed = Some(reason);
+                            break;
+                        }
+                    }
+                    if let Some(reason) = failed {
+                        inner.agents[index].leftover = Some(reason.clone());
+                        let sentence = format!("an earlier run's cleanup is incomplete: {reason}");
+                        inner.note(sentence.clone());
+                        return Err(sentence);
+                    }
+                    inner.agents[index].leftover = None;
+                    inner.agents[index].leftover_targets.clear();
+                    inner.agents[index].session = SessionState::Idle;
+                    inner.agents[index].next_at = None;
+                }
                 inner.set_desired(index, Desired::Started);
                 let agent = &mut inner.agents[index];
                 agent.sessions_since_start = 0;
@@ -2240,6 +2321,42 @@ fn run_id_in(run_dir: &Path) -> Option<&str> {
     run_dir.file_name().and_then(std::ffi::OsStr::to_str)
 }
 
+/// Re-enumerate one agent's run directories for a retried cleanup. An unreadable
+/// agent directory remains a failure; a repaired one is rescanned instead of being
+/// handed to the single-run reaper (review-3b).
+fn recover_agent_directory(agent_dir: &Path, grace: Duration) -> Result<(), String> {
+    let runs = fs::read_dir(agent_dir).map_err(|error| {
+        format!(
+            "the agent's run directory {} cannot be read: {error}",
+            agent_dir.display()
+        )
+    })?;
+    let mut reasons = Vec::new();
+    for run in runs.flatten() {
+        let run_dir = run.path();
+        match fs::metadata(&run_dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                reasons.push(format!(
+                    "a run directory under {} cannot be inspected: {error}",
+                    agent_dir.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(reason) = run::reap_leftover_run(&run_dir, grace) {
+            reasons.push(reason);
+        }
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons.join("; "))
+    }
+}
+
 /// Stop every run process group an earlier program left behind.
 ///
 /// The state root is walked without following the agents' own settings: a run
@@ -2253,11 +2370,21 @@ fn run_id_in(run_dir: &Path) -> Option<&str> {
 fn recover_stale_sessions(
     layout: &Layout,
     grace: Duration,
-) -> Result<(Vec<u32>, Vec<(String, String)>), String> {
+) -> Result<(Vec<u32>, Vec<(String, RecoveryTarget, String)>), String> {
     let mut stopped = Vec::new();
     let mut leftovers = Vec::new();
-    let Ok(agents) = fs::read_dir(layout.state_root()) else {
-        return Ok((stopped, leftovers));
+    let agents = match fs::read_dir(layout.state_root()) {
+        Ok(agents) => agents,
+        // A fresh installation has no state root yet: that is "no runs", not a
+        // recovery failure.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((stopped, leftovers));
+        }
+        Err(error) => {
+            return Err(format!(
+                "the state root cannot be read, so an earlier run cannot be checked: {error}"
+            ));
+        }
     };
     for agent in agents.flatten() {
         let agent_path = agent.path();
@@ -2265,27 +2392,76 @@ fn recover_stale_sessions(
             continue;
         }
         let agent_name = agent.file_name().to_str().unwrap_or("an agent").to_owned();
-        let Ok(runs) = fs::read_dir(&agent_path) else {
-            continue;
+        // read permission is not search permission; a child-name stat makes that
+        // distinction visible instead of looking like an empty agent.
+        match fs::metadata(agent_path.join(".gewu-search-probe")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                leftovers.push((
+                    agent_name.clone(),
+                    RecoveryTarget::Agent(agent_path.clone()),
+                    format!("the agent's run directory cannot be searched: {error}"),
+                ));
+                continue;
+            }
+        }
+        let runs = match fs::read_dir(&agent_path) {
+            Ok(runs) => runs,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                leftovers.push((
+                    agent_name.clone(),
+                    RecoveryTarget::Agent(agent_path.clone()),
+                    format!("the agent's run directory cannot be read: {error}"),
+                ));
+                continue;
+            }
         };
         for run in runs.flatten() {
             let run_dir = run.path();
-            if !run_dir.is_dir() {
-                continue;
+            match fs::metadata(&run_dir) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    leftovers.push((
+                        agent_name.clone(),
+                        RecoveryTarget::Agent(agent_path.clone()),
+                        format!(
+                            "a run directory under {} cannot be inspected: {error}",
+                            agent_path.display()
+                        ),
+                    ));
+                    continue;
+                }
             }
-            let Some((pid, _pgid)) = run::recorded_group(&run_dir) else {
-                continue;
-            };
+            // `recorded_group` is only the supervisor pid for the private run-temp
+            // path; recovery itself runs even when the records are unreadable, so
+            // the failure can reach the card.
+            let recorded = run::recorded_group(&run_dir);
             match run::reap_leftover_run(&run_dir, grace) {
-                Ok(true) => stopped.push(pid),
+                Ok(true) => {
+                    if let Some((pid, _)) = recorded {
+                        stopped.push(pid);
+                    }
+                }
                 Ok(false) => {
                     // Nothing was alive: the records are stale, not evidence of a
                     // process this program must keep watching. They were removed
                     // with the run's shell record already.
                 }
-                Err(reason) => leftovers.push((agent_name.clone(), reason)),
+                Err(reason) => {
+                    leftovers.push((
+                        agent_name.clone(),
+                        RecoveryTarget::Run(run_dir.clone()),
+                        reason,
+                    ));
+                }
             }
-            if let Some(run_id) = run_id_in(&run_dir) {
+            if let Some((pid, _)) = recorded
+                && let Some(run_id) = run_id_in(&run_dir)
+            {
                 crate::confinement::remove_run_temp(pid, run_id);
             }
         }

@@ -89,13 +89,15 @@ requests are its own. The board shows the whole thing at a glance:
 
 The program keeps the Forgejo running while it is open. When an agent is started, it
 runs its instruction, and when that run ends it starts another one after a short
-visible idle, until you stop it. Each run's process group is written down; if the
-program or a run's supervisor is killed outright, the next start stops every recorded
-group that is still alive and writes its `run_stopped` record before the board opens,
-so a shell cannot keep editing beside the new run. A process the engine still cannot
-stop is named on the agent's card. An agent's shell is confined where the computer allows
-it. **Landlock is the automatic mechanism**: it denies the product's roots, and is not
-chosen when one of them lies inside a tree it must allow. The product claims Landlock
+visible idle, until you stop it. Each run's process group and the shell's boot/start
+identity are written down; if the program or a run's supervisor is killed outright, the
+next start checks the live process identity, binds each process to a kernel pidfd, stops
+the group through those handles, and writes its `run_stopped` record before the board
+opens, so a shell cannot keep editing beside the new run. A process the engine still cannot stop is named on the agent's card,
+and the agent stays blocked until `Start` retries the cleanup successfully. An agent's
+shell is confined where the computer allows it. **Landlock is the automatic mechanism**:
+it denies the product's roots, and is not chosen when one of them lies inside a tree it
+must allow. The product claims Landlock
 only after a child process proved that a ruleset is fully enforced — it reads a file it
 allows and is denied one it does not — so a kernel without Landlock gets the `none`
 sentence below, not a promise. **bwrap or unshare are
@@ -270,11 +272,15 @@ A relative folder is taken from the folder you started the program in.
   started, with the same instructions.
 - If the program was killed outright, the next start finds the Forgejo and any run
   process groups it left behind, stops them, writes each run's `run_stopped` record, and
-  only then opens. A group is believed only through the run's own records (the
-  supervisor's pid/group records or the shell record written when its command started,
-  a member naming the run directory, or the recorded leader still alive); no other
-  process's environment is read. A stopped, killed or crashed run's
-  private temporary directory — including the per-run `askpass.toml` that held its own
+  only then opens. A group is believed only through live identity: the shell's recorded
+  boot id and start time checked against the live process, or the inherited anonymous
+  capability, or the actual supervisor executable with its exact run invocation.
+  A run-directory path in some other process's argv does not own the group;
+  stored pid/group numbers alone are never trusted; no other process's environment is
+  read. A process that survives, or a live group the
+  engine cannot prove is this run's, is named on the agent's card and blocks a replacement
+  run until `Start` retries the cleanup. A stopped, killed
+  or crashed run's private temporary directory — including the per-run `askpass.toml` that held its own
   login — is removed by the run on every exit it sees and by the engine or the next open
   otherwise; a live run's directory is never touched.
 

@@ -13,6 +13,7 @@
 //! `run_stopped` record before opening.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,6 +33,16 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 const SIZES: [(u16, u16); 5] = [(72, 18), (80, 24), (100, 30), (120, 40), (200, 60)];
+
+/// Tests that spawn or signal real processes are serialized: a test's own exact
+/// group cleanup must never race another test's child or a reused pid/group.
+static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn process_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 const COUNTS: [usize; 5] = [1, 3, 4, 7, 12];
 
 struct Fixed(BoardView);
@@ -799,7 +810,54 @@ fn spawn_supervisor(run_dir: &Path) -> Child {
 }
 
 #[test]
+fn a_supervisor_waiting_for_the_model_is_reaped_before_its_first_shell() {
+    let _process_test = process_test_lock();
+    let root = scratch("supervisor-before-shell");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000030-0001");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("model fixture");
+    listener.set_nonblocking(true).expect("nonblocking accept");
+    let mut plan = RunPlan::read(&run_dir).expect("plan");
+    plan.steps.clear();
+    plan.endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    plan.write(&run_dir).expect("model plan");
+    let mut supervisor = spawn_supervisor(&run_dir);
+    write_records(&run_dir, supervisor.id());
+    let mut request = None;
+    let waiting = wait_until(Duration::from_secs(5), || {
+        if let Ok((stream, _)) = listener.accept() {
+            request = Some(stream);
+        }
+        request.is_some()
+    });
+    let no_capability = !run_dir.join("shell.capability").exists();
+    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    let stopped = wait_until(Duration::from_secs(2), || {
+        supervisor.try_wait().is_ok_and(|status| status.is_some())
+    });
+    if !stopped {
+        stop_unrelated(supervisor);
+    }
+    drop(request);
+    assert!(
+        waiting,
+        "the actual supervisor never reached the model fixture"
+    );
+    assert!(
+        no_capability,
+        "this control must precede the first shell capability"
+    );
+    assert!(result.expect("the actual supervisor is owned"));
+    assert!(stopped, "the model-waiting supervisor survived cleanup");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_killed_supervisors_shell_is_reaped_at_the_next_start() {
+    let _process_test = process_test_lock();
     let root = scratch("killed-supervisor");
     let layout = Layout::rooted_at(root.clone()).expect("layout");
     let run_id = "run-1700000000001-0001";
@@ -846,6 +904,7 @@ fn a_killed_supervisors_shell_is_reaped_at_the_next_start() {
 
 #[test]
 fn a_killed_products_left_over_shell_is_reaped_on_reopen() {
+    let _process_test = process_test_lock();
     let root = scratch("killed-product");
     let layout = Layout::rooted_at(root.clone()).expect("layout");
     let run_id = "run-1700000000002-0001";
@@ -931,12 +990,924 @@ fn a_killed_products_left_over_shell_is_reaped_on_reopen() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Spawn an unrelated process in its own group, so a stale record can be shown
+/// never to own it. The process is task-owned and is stopped exactly in cleanup.
+fn spawn_unrelated_group(tag: &str) -> Child {
+    let _ = tag;
+    Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the unrelated group starts")
+}
+
+fn stop_unrelated(mut child: Child) {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    let _ = child.wait();
+}
+
+fn unrelated_alive(pid: u32) -> bool {
+    process_cmdline(pid).contains("sleep 30")
+}
+
+fn stat_start(pid: u32) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let rest = stat.rsplit_once(')').expect("comm").1;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next();
+    let _ppid = fields.next();
+    let _pgrp = fields.next();
+    for _ in 6..=21 {
+        let _ = fields.next();
+    }
+    fields.next().expect("start").parse().expect("start number")
+}
+
+/// A stale `shell.pid`/`shell.pgid` naming a live unrelated group must not be
+/// believed: stored numbers are not identity (review-3 blocker 1).
+#[test]
+fn a_stale_shell_record_never_owns_an_unrelated_group() {
+    let _process_test = process_test_lock();
+    let root = scratch("stale-shell");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000010-0001");
+    let child = spawn_unrelated_group("stale-shell");
+    let pid = child.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the unrelated process did not start"
+    );
+    fs::write(run_dir.join("shell.pid"), pid.to_string()).expect("shell pid");
+    fs::write(run_dir.join("shell.pgid"), pid.to_string()).expect("shell pgid");
+    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect_err("a live unverified group must be reported, not discarded");
+    assert!(
+        error.contains("cannot be verified") || error.contains("cannot be read"),
+        "the unverified group was not named: {error}"
+    );
+    assert!(
+        unrelated_alive(pid),
+        "an unrelated process group was killed from a stale record"
+    );
+    assert!(
+        run_dir.join("shell.pgid").is_file(),
+        "the unverified group's records were silently discarded"
+    );
+    assert!(
+        !run_dir.join("run-stopped.json").is_file(),
+        "a stale record got a false run_stopped claim"
+    );
+    stop_unrelated(child);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A reused supervisor pid, with no shell identity and no command line naming the
+/// run, is a number, not a process of this run.
+#[test]
+fn a_reused_supervisor_pid_is_never_identity() {
+    let _process_test = process_test_lock();
+    let root = scratch("stale-session");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000011-0001");
+    let child = spawn_unrelated_group("stale-session");
+    let pid = child.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the unrelated process did not start"
+    );
+    fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
+    fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
+    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect_err("a live unverified group must be reported, not discarded");
+    assert!(
+        error.contains("cannot be verified") || error.contains("cannot be read"),
+        "the unverified group was not named: {error}"
+    );
+    assert!(
+        unrelated_alive(pid),
+        "an unrelated process group was killed from a reused pid"
+    );
+    assert!(
+        run_dir.join("session.pgid").is_file(),
+        "the unverified group's records were silently discarded"
+    );
+    assert!(
+        !run_dir.join("run-stopped.json").is_file(),
+        "a reused pid got a false run_stopped claim"
+    );
+    stop_unrelated(child);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The shell record's identity must match the live process's boot and kernel start
+/// time. A record with the right numbers but the wrong start time is not ours.
+#[test]
+fn an_unverified_shell_identity_never_signals_the_group() {
+    let _process_test = process_test_lock();
+    let root = scratch("stale-identity");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000012-0001");
+    let child = spawn_unrelated_group("stale-identity");
+    let pid = child.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the unrelated process did not start"
+    );
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("boot id")
+        .trim()
+        .to_owned();
+    let wrong_start = stat_start(pid).saturating_add(1);
+    fs::write(run_dir.join("shell.pid"), pid.to_string()).expect("shell pid");
+    fs::write(run_dir.join("shell.pgid"), pid.to_string()).expect("shell pgid");
+    fs::write(
+        run_dir.join("shell.identity"),
+        format!("{pid} {pid} {boot} {wrong_start}\n"),
+    )
+    .expect("shell identity");
+    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect_err("a live unverified group must be reported, not discarded");
+    assert!(
+        error.contains("cannot be verified") || error.contains("cannot be read"),
+        "the unverified group was not named: {error}"
+    );
+    assert!(
+        unrelated_alive(pid),
+        "an unrelated process group was killed from a mismatched identity record"
+    );
+    assert!(
+        run_dir.join("shell.identity").is_file(),
+        "the unverified group's records were silently discarded"
+    );
+    assert!(
+        !run_dir.join("run-stopped.json").is_file(),
+        "a mismatched identity got a false run_stopped claim"
+    );
+    stop_unrelated(child);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A failed cleanup must reach the card, keep its reason, and stop a replacement
+/// run. Start retries the cleanup; once the obstruction is gone, it starts.
+#[test]
+fn a_failed_cleanup_reaches_the_card_and_blocks_a_replacement_run() {
+    let _process_test = process_test_lock();
+    let root = scratch("leftover-card");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000013-0001");
+    let mut supervisor = spawn_supervisor(&run_dir);
+    let pgid = supervisor.id();
+    write_records(&run_dir, pgid);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            run_dir.join("shell.pgid").is_file() && !shell_members(pgid).is_empty()
+        }),
+        "the shell or its run-directory record never appeared"
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pgid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("kill the supervisor");
+    let _ = supervisor.wait();
+    assert!(
+        !shell_members(pgid).is_empty(),
+        "the shell did not survive; the test cannot prove the failed cleanup"
+    );
+    // The group is reaped, but the run-directory record write cannot happen: a
+    // cleanup failure a person can see.
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o555))
+        .expect("make the run directory read-only");
+    let mut settings = gewu_multiverse::engine::settings::Settings {
+        terms_acknowledged: true,
+        terms_version: TERMS_VERSION,
+        ..Default::default()
+    };
+    settings.endpoint.url = "http://127.0.0.1:9/v1/chat/completions".to_owned();
+    settings.endpoint.model = "demo".to_owned();
+    settings
+        .add_agent("agent-1", Desired::Stopped)
+        .expect("an agent");
+    settings
+        .save(&gewu_multiverse::engine::settings::path_in(&root))
+        .expect("settings");
+    let mut options = EngineOptions::new(layout.clone(), root.join("data")).expect("options");
+    options.auto_start_forgejo = false;
+    let mut engine = engine::open_with(options).expect("the engine opens");
+    let board = engine.board();
+    let reason = board.agents[0]
+        .leftover
+        .clone()
+        .expect("the failed cleanup is not on the card");
+    assert!(
+        reason.contains("cannot be written"),
+        "the card reason is not the cleanup failure: {reason}"
+    );
+    assert!(
+        matches!(&board.agents[0].session, SessionState::Blocked { .. }),
+        "a failed cleanup did not block the agent: {:?}",
+        board.agents[0].session
+    );
+    assert_eq!(
+        board.agents[0].last_failure.as_deref(),
+        Some(reason.as_str()),
+        "the cleanup reason is not on the engine view"
+    );
+    let error = engine
+        .send(BoardCommand::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect_err("Start must not start a replacement while the cleanup fails");
+    assert!(
+        error.contains("cannot be written"),
+        "Start did not report the cleanup failure: {error}"
+    );
+    assert!(
+        engine.board().agents[0].leftover.is_some(),
+        "Start cleared the leftover although its retry failed"
+    );
+    // The truthful route: repair the obstruction, Start retries, and only then is
+    // the agent allowed to start.
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .expect("make the run directory writable again");
+    engine
+        .send(BoardCommand::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect("Start retries the cleanup after it is repaired");
+    let after = engine.board();
+    assert!(
+        after.agents[0].leftover.is_none(),
+        "the repaired cleanup did not clear the leftover"
+    );
+    drop(engine);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The anonymous memfd capability is live identity even before
+/// `shell.pid`/`shell.identity`: the shell inherits the descriptor, and record
+/// numbers alone do not make a group ours (review-3b).
+#[test]
+fn an_inherited_capability_finds_the_group_before_its_pid_record() {
+    let _process_test = process_test_lock();
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let root = scratch("group-capability");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000014-0001");
+    let fd =
+        nix::sys::memfd::memfd_create("gewu-test-capability", nix::sys::memfd::MFdFlags::empty())
+            .expect("memfd");
+    let mut capability = fs::File::from(fd);
+    let token = [0x5a_u8; 16];
+    capability.write_all(&token).expect("token");
+    capability.seek(SeekFrom::Start(0)).expect("seek");
+    let metadata = capability.metadata().expect("metadata");
+    fs::write(
+        run_dir.join("shell.capability"),
+        format!(
+            "{} {} {}\n",
+            metadata.dev(),
+            metadata.ino(),
+            token
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+    )
+    .expect("capability record");
+    let child = spawn_unrelated_group("group-capability");
+    let pid = child.id();
+    drop(capability);
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the capability-holding process did not start"
+    );
+    // No shell record yet; only the inherited capability and the group number.
+    fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
+    fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
+    let reaped = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect("the capability group is reaped");
+    assert!(
+        reaped,
+        "the inherited capability was not accepted as identity"
+    );
+    assert!(
+        !unrelated_alive(pid),
+        "the capability-holding group was not stopped"
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    let mut child = child;
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The reviewer's unrelated-open probe: a live process that merely opens the old
+/// named `shell.marker` path is not this run's owner and must survive.
+#[test]
+fn an_unrelated_process_opening_the_named_marker_is_not_owned() {
+    let _process_test = process_test_lock();
+    let root = scratch("opened-marker");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000018-0001");
+    let marker = run_dir.join("shell.marker");
+    fs::write(&marker, b"").expect("marker");
+    let opener = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(format!("exec 3<{}; sleep 30", marker.display()))
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the unrelated opener starts");
+    let pid = opener.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the unrelated opener did not start"
+    );
+    fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
+    fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
+    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect_err("a merely opened marker path must not be ownership");
+    assert!(
+        error.contains("cannot be verified") || error.contains("cannot be read"),
+        "the unowned group was not reported: {error}"
+    );
+    assert!(
+        unrelated_alive(pid),
+        "an unrelated process that opened the marker path was killed"
+    );
+    stop_unrelated(opener);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The capability *record* is a description, not ownership: an unrelated process
+/// that opens the record path must not be killed (review-3b).
+#[test]
+fn an_unrelated_process_opening_the_capability_record_is_not_owned() {
+    let _process_test = process_test_lock();
+    let root = scratch("opened-capability");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000024-0001");
+    let record = run_dir.join("shell.capability");
+    fs::write(
+        &record,
+        b"1 2 00112233445566778899aabbccddeeff
+",
+    )
+    .expect("record");
+    let opener = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(format!("exec 3<{}; sleep 30", record.display()))
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the unrelated opener starts");
+    let pid = opener.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the unrelated opener did not start"
+    );
+    fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
+    fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
+    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect_err("opening the record file must not be ownership");
+    assert!(
+        error.contains("cannot be verified") || error.contains("cannot be read"),
+        "the unowned group was not reported: {error}"
+    );
+    assert!(
+        unrelated_alive(pid),
+        "an unrelated process that opened the capability record was killed"
+    );
+    stop_unrelated(opener);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// If the inherited marker cannot be prepared, the shell must not run at all:
+/// there must be no unprotected window (review-3).
+#[test]
+fn a_capability_preparation_failure_stops_the_run() {
+    let _process_test = process_test_lock();
+    let root = scratch("marker-failure");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000017-0001");
+    // A directory in the marker's place makes the marker file impossible to open
+    // while leaving the rest of the run directory writable.
+    fs::create_dir(run_dir.join("shell.capability")).expect("capability obstruction");
+    let mut supervisor = spawn_supervisor(&run_dir);
+    let pgid = supervisor.id();
+    // The supervisor may spend a moment failing the step; what matters is that no
+    // shell exists in the window, not that the model loop has already exited.
+    let _ = wait_until(Duration::from_secs(2), || {
+        !shell_members(pgid).is_empty()
+            || fs::read_to_string(run_dir.join("run.log"))
+                .is_ok_and(|log| log.contains("capability") || log.contains("cannot be written"))
+    });
+    assert!(
+        shell_members(pgid).is_empty(),
+        "a shell ran without its recovery capability: {:?}",
+        shell_members(pgid)
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pgid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    let _ = supervisor.wait();
+    fs::remove_dir_all(run_dir.join("shell.capability")).expect("obstruction");
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn mark_run_started(run_dir: &Path) {
+    let mut transcript =
+        gewu_multiverse::transcript::Transcript::open(run_dir).expect("the transcript opens");
+    transcript
+        .append(&gewu_multiverse::transcript::Record::run_started(
+            "run-test",
+            "agent-1",
+            std::process::id(),
+            "/tmp/workspace",
+        ))
+        .expect("the started record");
+}
+
+fn settings_with_agent(root: &Path) {
+    let mut settings = gewu_multiverse::engine::settings::Settings {
+        terms_acknowledged: true,
+        terms_version: TERMS_VERSION,
+        ..Default::default()
+    };
+    settings.endpoint.url = "http://127.0.0.1:9/v1/chat/completions".to_owned();
+    settings.endpoint.model = "demo".to_owned();
+    settings
+        .add_agent("agent-1", Desired::Stopped)
+        .expect("an agent");
+    settings
+        .save(&gewu_multiverse::engine::settings::path_in(root))
+        .expect("settings");
+}
+
+/// A started run whose process records are gone is not cleared into a
+/// replacement: it reaches the card and blocks Start until the lost identity is
+/// honestly resolved (review-3b).
+#[test]
+fn a_started_run_with_lost_process_records_blocks_start() {
+    let root = scratch("lost-records");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let _run_dir = write_run(&layout, "agent-1", "run-1700000000019-0001");
+    mark_run_started(&_run_dir);
+    settings_with_agent(&root);
+    let mut options = EngineOptions::new(layout.clone(), root.join("data")).expect("options");
+    options.auto_start_forgejo = false;
+    let mut engine = engine::open_with(options).expect("the engine opens");
+    let board = engine.board();
+    let reason = board.agents[0]
+        .leftover
+        .clone()
+        .expect("the lost process record is not on the card");
+    assert!(
+        reason.contains("records are lost") || reason.contains("cannot be verified"),
+        "the card reason is not the lost record: {reason}"
+    );
+    let error = engine
+        .send(BoardCommand::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect_err("Start must not replace a run with lost process records");
+    assert!(
+        error.contains("records are lost") || error.contains("cannot be verified"),
+        "Start did not report the lost record: {error}"
+    );
+    assert_eq!(engine.board().agents[0].runs_total, 1);
+    drop(engine);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A repaired unreadable agent directory is re-enumerated on Start; it is not
+/// handed to the single-run reaper (review-3b).
+#[test]
+fn a_repaired_agent_directory_is_rescanned_before_start() {
+    let _process_test = process_test_lock();
+    let root = scratch("agent-retry");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000020-0001");
+    settings_with_agent(&root);
+    let child = spawn_unrelated_group("agent-retry");
+    let pid = child.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the run's old process did not start"
+    );
+    fs::write(run_dir.join("shell.pid"), pid.to_string()).expect("shell pid");
+    fs::write(run_dir.join("shell.pgid"), pid.to_string()).expect("shell pgid");
+    let agent_dir = run_dir.parent().expect("agent dir");
+    fs::set_permissions(agent_dir, fs::Permissions::from_mode(0o400))
+        .expect("make the agent directory readable but not searchable");
+    let mut options = EngineOptions::new(layout.clone(), root.join("data")).expect("options");
+    options.auto_start_forgejo = false;
+    let mut engine = engine::open_with(options).expect("the engine opens");
+    let reason = engine.board().agents[0]
+        .leftover
+        .clone()
+        .expect("the partial agent directory is not on the card");
+    assert!(
+        reason.contains("searched") || reason.contains("cannot be read"),
+        "the card reason is not the agent permission: {reason}"
+    );
+    fs::set_permissions(agent_dir, fs::Permissions::from_mode(0o700))
+        .expect("repair the agent directory");
+    let error = engine
+        .send(BoardCommand::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect_err("Start must rescan the repaired agent directory and still block");
+    assert!(
+        error.contains("cannot be verified") || error.contains("cannot be read"),
+        "Start did not rescan the agent directory: {error}"
+    );
+    assert!(
+        unrelated_alive(pid),
+        "the old group was touched instead of reported"
+    );
+    stop_unrelated(child);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Readable but not searchable run directories and denied record metadata are
+/// failures, not absent files (review-3b).
+#[test]
+fn a_readable_but_unsearchable_run_directory_reaches_the_card() {
+    let root = scratch("partial-perm");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000021-0001");
+    mark_run_started(&run_dir);
+    settings_with_agent(&root);
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o400))
+        .expect("readable, not searchable");
+    let mut options = EngineOptions::new(layout.clone(), root.join("data")).expect("options");
+    options.auto_start_forgejo = false;
+    let mut engine = engine::open_with(options).expect("the engine opens");
+    let board = engine.board();
+    let reason = board.agents[0]
+        .leftover
+        .clone()
+        .expect("the partial permission is not on the card");
+    assert!(
+        reason.contains("cannot be searched") || reason.contains("cannot be read"),
+        "the card reason is not the partial permission: {reason}"
+    );
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).expect("repair permissions");
+    // The started run still has no verifiable process identity, so the repaired
+    // directory is rescanned and remains blocked rather than starting a replacement.
+    assert!(
+        engine
+            .send(BoardCommand::Start {
+                name: "agent-1".to_owned(),
+            })
+            .is_err(),
+        "Start admitted a replacement although the started run has no records"
+    );
+    drop(engine);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A live group with no selected target is not "gone": a surviving unverified
+/// member is a visible failed cleanup (review-3b).
+#[test]
+fn an_empty_target_list_with_a_live_member_is_an_error() {
+    let _process_test = process_test_lock();
+    let root = scratch("empty-targets");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000022-0001");
+    let child = spawn_unrelated_group("empty-targets");
+    let pgid = child.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pgid)),
+        "the unrelated process did not start"
+    );
+    let error = run::reap_process_group(pgid, &run_dir, Duration::from_millis(100))
+        .expect_err("a live member must not be reported as gone");
+    assert!(
+        error.contains("cannot be verified") || error.contains("surviving member"),
+        "the live member was not named: {error}"
+    );
+    assert!(unrelated_alive(pgid), "the unrelated process was touched");
+    stop_unrelated(child);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// An unreadable state root is a visible open failure, not "no runs" (review-3b).
+#[test]
+fn an_unreadable_state_root_is_an_open_failure() {
+    let root = scratch("state-root-perm");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    layout.ensure_root().expect("root");
+    let state = layout.state_root().to_path_buf();
+    fs::create_dir_all(&state).expect("state root");
+    settings_with_agent(&root);
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o000))
+        .expect("make the state root unreadable");
+    let mut options = EngineOptions::new(layout.clone(), root.join("data")).expect("options");
+    options.auto_start_forgejo = false;
+    let error = match engine::open_with(options) {
+        Ok(_) => panic!("the engine opened with an unreadable state root"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("state root") && error.contains("cannot be read"),
+        "the open failure does not name the state root: {error}"
+    );
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("repair");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A denied process-record metadata read is a failure, not an absent record.
+#[test]
+fn a_denied_record_metadata_is_a_visible_failure() {
+    let root = scratch("record-metadata");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000023-0001");
+    mark_run_started(&run_dir);
+    fs::write(run_dir.join("shell.pid"), "12345").expect("shell pid");
+    fs::set_permissions(run_dir.join("shell.pid"), fs::Permissions::from_mode(0o000))
+        .expect("deny the record");
+    settings_with_agent(&root);
+    let mut options = EngineOptions::new(layout.clone(), root.join("data")).expect("options");
+    options.auto_start_forgejo = false;
+    let mut engine = engine::open_with(options).expect("the engine opens");
+    let reason = engine.board().agents[0]
+        .leftover
+        .clone()
+        .expect("the denied record is not on the card");
+    assert!(
+        reason.contains("cannot be read") || reason.contains("cannot be inspected"),
+        "the card reason is not the denied record: {reason}"
+    );
+    fs::set_permissions(run_dir.join("shell.pid"), fs::Permissions::from_mode(0o600))
+        .expect("repair the record");
+    engine
+        .send(BoardCommand::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect("Start retries after the denied record is repaired");
+    assert!(
+        engine.board().agents[0].leftover.is_none(),
+        "the repaired record did not clear the leftover"
+    );
+    drop(engine);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// An unrelated file reader that merely has the run directory in its argv (the
+/// reviewer's `find <run_dir> -exec sleep 60 ;`) never inherits the run's
+/// capability and must not be signalled from stale numeric records (review-c4).
+#[test]
+fn a_find_reader_of_the_run_directory_is_not_owned() {
+    let _process_test = process_test_lock();
+    let root = scratch("find-reader");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000025-0001");
+    let mut reader = Command::new("/usr/bin/find")
+        .arg(&run_dir)
+        .args(["-exec", "sleep", "30", ";"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the unrelated find reader starts");
+    let pid = reader.id();
+    assert!(
+        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        "the unrelated find reader did not start"
+    );
+    // Stale numeric records name the reader's group.
+    fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
+    fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
+    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect_err("a run-directory argv is not ownership");
+    assert!(
+        error.contains("cannot be verified") || error.contains("cannot be read"),
+        "the unowned reader was not reported: {error}"
+    );
+    assert!(
+        unrelated_alive(pid),
+        "an unrelated find reader was killed from a run-directory argv"
+    );
+    assert!(
+        !run_dir.join("run-stopped.json").is_file(),
+        "a false run_stopped was written for the file reader"
+    );
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    let _ = reader.wait();
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fx_r34_inaccessible_capability_helper() {
+    if std::env::var_os("GEWU_FX_R34_INACCESSIBLE_CAPABILITY").is_none() {
+        return;
+    }
+    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+fn spawn_inaccessible_reader() -> Child {
+    let child = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "fx_r34_inaccessible_capability_helper",
+            "--nocapture",
+        ])
+        .env("GEWU_FX_R34_INACCESSIBLE_CAPABILITY", "1")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("unrelated non-dumpable process");
+    assert!(wait_until(Duration::from_secs(5), || {
+        fs::read_dir(format!("/proc/{}/fd", child.id())).is_err()
+    }));
+    child
+}
+
+#[test]
+fn an_inaccessible_unrelated_process_does_not_hide_a_readable_holder() {
+    let _process_test = process_test_lock();
+    // Start this process before the capability exists: it cannot inherit it.
+    let reader = spawn_inaccessible_reader();
+    let reader_pid = reader.id();
+    let root = scratch("readable-holder");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000031-0001");
+    let capability = run::prepare_shell_capability(&run_dir).expect("capability");
+    let mut holder = spawn_unrelated_group("readable-holder");
+    drop(capability);
+    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    let stopped = wait_until(Duration::from_secs(2), || {
+        holder.try_wait().is_ok_and(|status| status.is_some())
+    });
+    if !stopped {
+        stop_unrelated(holder);
+    }
+    let reader_survived = unrelated_alive(reader_pid);
+    stop_unrelated(reader);
+    assert!(result.expect("unrelated inspection failure must not hide the holder"));
+    assert!(stopped, "the verified holder survived");
+    assert!(reader_survived, "the unrelated reader was signalled");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_inaccessible_unrelated_process_does_not_block_previous_boot_disposition() {
+    let _process_test = process_test_lock();
+    let reader = spawn_inaccessible_reader();
+    let root = scratch("previous-boot-capability");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000032-0001");
+    let capability = run::prepare_shell_capability(&run_dir).expect("capability");
+    drop(capability);
+    let old = fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+    for name in ["plan.json", "shell.capability"] {
+        fs::File::open(run_dir.join(name))
+            .expect("record")
+            .set_times(old)
+            .expect("old record");
+    }
+    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    stop_unrelated(reader);
+    assert!(!result.expect("a reboot proves no old holder can survive"));
+    assert!(run_dir.join("run-stopped.json").is_file());
+    assert!(!run_dir.join("shell.capability").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A durable capability record plus a genuine non-dumpable holder whose fd table
+/// is unreadable is uncertainty, not "never started": it must reach the card and
+/// block Start while keeping the capability evidence (review-c4).
+#[test]
+fn an_inaccessible_capability_holder_blocks_start_and_keeps_evidence() {
+    let _process_test = process_test_lock();
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let root = scratch("inaccessible-capability");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000026-0001");
+    let fd = nix::sys::memfd::memfd_create(
+        "gewu-inaccessible-capability",
+        nix::sys::memfd::MFdFlags::empty(),
+    )
+    .expect("memfd");
+    let mut capability = fs::File::from(fd);
+    let token = [0xa5_u8; 16];
+    capability.write_all(&token).expect("token");
+    capability.seek(SeekFrom::Start(0)).expect("seek");
+    let metadata = capability.metadata().expect("metadata");
+    fs::write(
+        run_dir.join("shell.capability"),
+        format!(
+            "{} {} {}\n",
+            metadata.dev(),
+            metadata.ino(),
+            token
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+    )
+    .expect("capability record");
+    let mut holder = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "fx_r34_inaccessible_capability_helper",
+            "--nocapture",
+        ])
+        .env("GEWU_FX_R34_INACCESSIBLE_CAPABILITY", "1")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the inaccessible holder starts");
+    let holder_pid = holder.id();
+    drop(capability);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fs::read_dir(format!("/proc/{holder_pid}/fd")).is_err()
+        }),
+        "the holder's fd table did not become inaccessible"
+    );
+    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+        .expect_err("an inaccessible capability holder is unresolved uncertainty");
+    assert!(
+        error.contains("file descriptors cannot be read") || error.contains("cleanup is uncertain"),
+        "the inaccessible holder was not reported: {error}"
+    );
+    assert!(
+        run_dir.join("shell.capability").is_file(),
+        "the capability evidence was cleared while the holder was inaccessible"
+    );
+    assert!(
+        !run_dir.join("run-stopped.json").is_file(),
+        "a false run_stopped was written for the inaccessible holder"
+    );
+    // Actual engine view/card/Start propagation.
+    settings_with_agent(&root);
+    let mut options = EngineOptions::new(layout.clone(), root.join("data")).expect("options");
+    options.auto_start_forgejo = false;
+    let mut engine = engine::open_with(options).expect("the engine opens");
+    let reason = engine.board().agents[0]
+        .leftover
+        .clone()
+        .expect("the inaccessible holder is not on the card");
+    assert!(
+        reason.contains("file descriptors cannot be read")
+            || reason.contains("cleanup is uncertain"),
+        "the card reason is not the inaccessible holder: {reason}"
+    );
+    engine
+        .send(BoardCommand::Start {
+            name: "agent-1".to_owned(),
+        })
+        .expect_err("Start must not replace a run whose holder cannot be inspected");
+    assert!(
+        run_dir.join("shell.capability").is_file(),
+        "Start cleared the capability evidence"
+    );
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(holder_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    let _ = holder.wait();
+    drop(engine);
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// The reviewer's `orphan-no-pid` probe: a live shell whose supervisor is gone
 /// and whose `session.pid`/`session.pgid` records were removed. The run
 /// directory's own shell record must still lead a reopen to the group (F-02/F-03
 /// review blocker 6).
 #[test]
 fn a_shell_whose_session_pid_is_gone_is_reaped_from_the_run_directory() {
+    let _process_test = process_test_lock();
     let root = scratch("orphan-no-pid");
     let layout = Layout::rooted_at(root.clone()).expect("layout");
     let run_id = "run-1700000000006-0001";

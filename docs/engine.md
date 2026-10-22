@@ -196,19 +196,56 @@ with `ps`.
 
 The running server writes its pid into `forgejo/instance/forgejo.pid`; each session
 writes `session.pid` and the process group it leads into `session.pgid` in its run
-directory. The run supervisor also writes the shell's own `shell.pid` and
-`shell.pgid` as soon as each command's shell exists, so a group is still named after a
-supervisor is gone and its `session.*` records were removed. The files are removed when
-the process group is reaped. If the program is killed outright, the next `open` walks
-every run directory and stops each recorded group, politely then by force, before it
-opens. A group is believed only through the run's own records: a live member that names
-the run directory on its command line, the recorded supervisor or shell still alive in
-the group, or the shell record naming that group. No other process's environment is
-read. A bare or reused number is never signalled; zombies are not counted as live, so
-a killed shell does not hold the recovery open. The engine writes `run-stopped.json`
-and a `run_stopped` terminal record into the run directory before it opens. If a process
-survives the reap, the sentence is kept and drawn on the agent's card; the engine does
-not hide it and does not refuse to open.
+directory. The run supervisor also writes the shell's own `shell.pid`, `shell.pgid` and
+`shell.identity` as soon as each command's shell exists. The identity is the kernel boot
+id and the process start time read from `/proc/<pid>/stat`, so a group is still named
+after a supervisor is gone and its `session.*` records were removed. The supervisor
+also creates an anonymous `memfd` ownership capability before the spawn and records
+its device, inode and a random token in `shell.capability`; the shell and its children
+inherit the descriptor, so the group is identifiable even before `shell.identity` is
+written and while a child outlives the shell. The record is a description, not the
+capability: an unrelated process can read or open the record path, but cannot acquire
+the unnamed object, and an inode reused by another memfd fails the token check. The
+files are removed when the process group is reaped. If the program is killed outright, the next
+`open` walks every run directory and stops each recorded group, politely then by force,
+before it opens. A stored number is never identity: each candidate is bound to a kernel
+**pidfd** before its live boot id, start time and process group are read, and every TERM
+and KILL is sent through that descriptor. Ownership is the inherited anonymous memory
+file, not a named path. A pid that changes between the check and the
+signal cannot be retargeted; there is no numeric `kill`/`killpg` on this path. If the
+shell has died, the child processes observed under its live capability are remembered
+by their own boot/start identity and only those exact pidfds are signalled. An arbitrary
+argv path is not ownership: an unrelated `find <run_dir>` that reads the directory and
+retains the path does not hold the run's capability. Before the first shell command,
+the product supervisor is recognized by its executable and exact `--run-agent <run_dir>`
+invocation; it has no shell capability yet. A bare `session.pid`, `session.pgid` or
+`shell.pgid` is not identity. If a group is still live but cannot be proved this
+run's — numbers-only old records, or a run directory whose records cannot be read — no
+signal is sent and the failure is not hidden: the run records stay, the card carries the
+reason, and the agent is blocked. Records that are only numbers are never enough to kill
+an unrelated group; the safe direction is to report and block, not to discard and start a
+replacement. A durable `shell.capability` record with no verified holder is start
+evidence even when the transcript and numeric records are gone: on the current boot it
+stays visible and blocks `Start`; a record from before this boot is closed with one final
+`run_stopped`. A non-dumpable same-user holder whose `/proc/<pid>/fd` cannot be read is
+that same uncertainty; unrelated inaccessible system processes are not a global blocker. A started run (its transcript has a record) whose process records are gone
+is not cleared into a replacement either: it stays visible and blocking. A plan alone is
+only a prepared run and may be cleared; a transcript that exists but cannot be read is a
+failure. An unreadable state root, agent directory, run directory, record file or
+`/proc` identity inspection is a failure, not "nothing alive"; a partial permission
+(readable but not searchable, denied record metadata) is a failure too. A repaired agent
+directory is re-enumerated and every run below it is checked before `Start` clears the
+leftover. A recordless started run from before the current boot cannot have a live
+process and receives one final `run_stopped` record instead of a permanent false block.
+An empty selected target list never means "group empty": if any live member remains
+unverified, the cleanup is visibly blocked and its evidence kept. No process environment
+is read. A zombie is not counted as live, so a killed shell does not hold the recovery
+open. The engine writes `run-stopped.json` and a
+`run_stopped` terminal record into the run directory before it opens. If a process
+survives the reap, the sentence is kept and drawn on the agent's card; the agent is
+marked blocked and the engine does not start a replacement run beside it. `Start`
+retries the cleanup: if the old process is gone and the record can be written, the
+leftover is cleared and the run may start; if not, the same reason is reported.
 A run agent also asks the kernel for `PR_SET_PDEATHSIG`, so a product killed with
 `SIGKILL` ends its supervisor; the shell it started stays in the group and is reaped by
 the next open. At each run boundary the engine reaps the finished run's group before the

@@ -16,6 +16,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::prelude::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -873,6 +874,18 @@ pub const SHELL_PID_FILE: &str = "shell.pid";
 /// The shell's process group, beside its pid.
 pub const SHELL_PGID_FILE: &str = "shell.pgid";
 
+/// The shell's live identity: its pid, its group, the kernel's boot id and the
+/// process start time read from `/proc/<pid>/stat`. A stored number alone is not
+/// identity after a reboot or pid reuse; this record is checked against the live
+/// process before any signal.
+pub const SHELL_IDENTITY_FILE: &str = "shell.identity";
+
+/// The run's unnamed ownership capability: a record of the memfd's device,
+/// inode and random token, plus the supervisor's inherited descriptor. Only a
+/// process that inherited the descriptor can hold the object; the record alone
+/// is not a capability and a named path cannot be opened into it.
+pub const SHELL_CAPABILITY_FILE: &str = "shell.capability";
+
 /// The marker written when a run's left-over group was stopped by a later start.
 pub const STOPPED_FILE: &str = "run-stopped.json";
 
@@ -918,12 +931,276 @@ fn read_number(run_dir: &Path, name: &str) -> Option<u32> {
         .and_then(|text| text.trim().parse::<u32>().ok())
 }
 
+/// One process's live identity: a boot id and the kernel's start time. The
+/// combination survives pid reuse and reboot checks without reading any process
+/// environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessIdentity {
+    boot: String,
+    start: u64,
+}
+
+/// One shell record read back from a run directory.
+#[derive(Debug, Clone)]
+struct ShellRecord {
+    pid: u32,
+    pgid: u32,
+    identity: ProcessIdentity,
+}
+
+/// The kernel boot id, read once. A process start time is only meaningful inside
+/// one boot, so the pair is the identity. A read failure is an error, never a
+/// silent "not this boot".
+fn boot_id() -> io::Result<String> {
+    static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let value = BOOT.get_or_init(|| {
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+    });
+    value
+        .clone()
+        .ok_or_else(|| io::Error::other("the kernel boot id cannot be read"))
+}
+
+fn parse_stat_line(stat: &str) -> Option<(char, u32, u64)> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _ppid = fields.next()?;
+    let group = fields.next()?.parse::<u32>().ok()?;
+    // After state, ppid and pgrp come fields 6..=21; field 22 is starttime.
+    for _ in 6..=21 {
+        fields.next()?;
+    }
+    let start = fields.next()?.parse::<u64>().ok()?;
+    Some((state, group, start))
+}
+
+/// State, process group and start time from `/proc/<pid>/stat`. A process that
+/// has just gone is `Ok(None)`; a process whose stat cannot be read (permission,
+/// malformed procfs) is an error, so uncertainty is never "nothing alive".
+fn process_facts(pid: u32) -> io::Result<Option<(char, u32, u64)>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "process {pid}'s stat cannot be read: {error}"
+            )));
+        }
+    };
+    Ok(parse_stat_line(&stat))
+}
+
+/// The live identity of `pid`, with its current process group. Zombies are not
+/// live; they have already ended and only their parent's reaping is left.
+fn process_identity(pid: u32) -> io::Result<Option<(u32, ProcessIdentity)>> {
+    let Some((state, group, start)) = process_facts(pid)? else {
+        return Ok(None);
+    };
+    if state == 'Z' {
+        return Ok(None);
+    }
+    Ok(Some((
+        group,
+        ProcessIdentity {
+            boot: boot_id()?,
+            start,
+        },
+    )))
+}
+
+fn read_shell_record(run_dir: &Path) -> Option<ShellRecord> {
+    let text = fs::read_to_string(run_dir.join(SHELL_IDENTITY_FILE)).ok()?;
+    let mut fields = text.split_whitespace();
+    let pid = fields.next()?.parse::<u32>().ok()?;
+    let pgid = fields.next()?.parse::<u32>().ok()?;
+    let boot = fields.next()?.to_owned();
+    let start = fields.next()?.parse::<u64>().ok()?;
+    Some(ShellRecord {
+        pid,
+        pgid,
+        identity: ProcessIdentity { boot, start },
+    })
+}
+
+/// Whether the shell record is still the same live process in the same group.
+///
+/// This is the only thing that makes a recorded group ours when the supervisor is
+/// gone: the pid, boot and start time must all match the kernel's current answer.
+fn shell_identity_is_live(run_dir: &Path, pgid: u32) -> io::Result<bool> {
+    let Some(record) = read_shell_record(run_dir) else {
+        return Ok(false);
+    };
+    if record.pgid != pgid {
+        return Ok(false);
+    }
+    // A zombie shell still holds the group id and its pid cannot be reused
+    // until it is reaped, so it can still prove the group is ours; the children
+    // that survive under it are the live members `group_members` returns.
+    let Some((_, live_group, start)) = process_facts(record.pid)? else {
+        return Ok(false);
+    };
+    let boot = boot_id()?;
+    Ok(live_group == pgid && ProcessIdentity { boot, start } == record.identity)
+}
+
 /// Record a command's shell so its group is found even after the supervisor and
 /// its `session.*` records are gone. The supervisor writes this; the shell never
-/// reads or changes it.
-pub fn write_shell_record(run_dir: &Path, pid: u32, pgid: u32) -> io::Result<()> {
+/// reads or changes it. The identity record is written first, so a crash at any
+/// point leaves either a verifiable identity or no record that recovery would
+/// trust.
+pub fn write_shell_record(run_dir: &Path, pid: u32, _pgid: u32) -> io::Result<()> {
+    let (live_group, identity) = process_identity(pid)?
+        .ok_or_else(|| io::Error::other("the shell's live identity cannot be read from /proc"))?;
+    let line = format!("{pid} {live_group} {} {}\n", identity.boot, identity.start);
+    crate::mode::write_private(run_dir.join(SHELL_IDENTITY_FILE), line.as_bytes())?;
     crate::mode::write_private(run_dir.join(SHELL_PID_FILE), pid.to_string().as_bytes())?;
-    crate::mode::write_private(run_dir.join(SHELL_PGID_FILE), pgid.to_string().as_bytes())
+    crate::mode::write_private(
+        run_dir.join(SHELL_PGID_FILE),
+        live_group.to_string().as_bytes(),
+    )
+}
+
+/// Create the run's anonymous ownership capability and record its object.
+///
+/// A memfd has no path an unrelated process can open; the supervisor holds the
+/// descriptor before spawn, and the shell and every child inherit it. The record
+/// gives recovery the object (device, inode) and a random token so an inode
+/// reused by a later unrelated memfd is not mistaken for this run. The record
+/// file itself is only a description; possessing it grants no capability.
+pub fn prepare_shell_capability(run_dir: &Path) -> io::Result<fs::File> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    let fd =
+        nix::sys::memfd::memfd_create("gewu-run-capability", nix::sys::memfd::MFdFlags::empty())
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    let mut file = fs::File::from(fd);
+    let token = random_token();
+    file.write_all(&token)?;
+    file.seek(SeekFrom::Start(0))?;
+    let metadata = file.metadata()?;
+    let record = format!("{} {} {}\n", metadata.dev(), metadata.ino(), hex(&token));
+    crate::mode::write_private(run_dir.join(SHELL_CAPABILITY_FILE), record.as_bytes())?;
+    Ok(file)
+}
+
+fn random_token() -> [u8; 16] {
+    use std::io::Read;
+    let mut token = [0_u8; 16];
+    if let Ok(mut random) = fs::File::open("/dev/urandom")
+        && random.read_exact(&mut token).is_ok()
+    {
+        return token;
+    }
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+        ^ (std::process::id() as u128) << 64;
+    for (index, byte) in token.iter_mut().enumerate() {
+        *byte = (seed >> ((index % 16) * 8)) as u8 ^ index as u8;
+    }
+    token
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[derive(Debug, Clone)]
+struct Capability {
+    device: u64,
+    inode: u64,
+    token: String,
+}
+
+fn read_capability(run_dir: &Path) -> Option<Capability> {
+    let text = fs::read_to_string(run_dir.join(SHELL_CAPABILITY_FILE)).ok()?;
+    let mut fields = text.split_whitespace();
+    let device = fields.next()?.parse::<u64>().ok()?;
+    let inode = fields.next()?.parse::<u64>().ok()?;
+    let token = fields.next()?.to_owned();
+    let _ = (device, inode);
+    Some(Capability {
+        device,
+        inode,
+        token,
+    })
+}
+
+/// Whether one process holds the run's memfd capability. Permission/fd errors
+/// are visible only for a process already known to be in the run's group.
+fn pid_holds_capability(pid: u32, capability: &Capability) -> Result<bool, String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let fds = match fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(fds) => fds,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => match process_facts(pid) {
+            Ok(Some((state, _, _))) if state != 'Z' => {
+                return Err(format!(
+                    "process {pid}'s file descriptors cannot be read while checking the run's capability: {error}"
+                ));
+            }
+            Ok(_) => return Ok(false),
+            Err(_) => return Ok(false),
+        },
+    };
+    for fd in fds.flatten() {
+        let target = match fs::metadata(fd.path()) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "process {pid}'s file descriptor cannot be inspected: {error}"
+                ));
+            }
+        };
+        if target.dev() != capability.device || target.ino() != capability.inode {
+            continue;
+        }
+        let mut file = match fs::File::open(fd.path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "process {pid}'s capability cannot be opened: {error}"
+                ));
+            }
+        };
+        let mut token = [0_u8; 16];
+        if file.read_exact(&mut token).is_ok() && hex(&token) == capability.token {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn capability_holders(pgid: u32, run_dir: &Path) -> Result<Vec<u32>, String> {
+    let Some(capability) = read_capability(run_dir) else {
+        return Ok(Vec::new());
+    };
+    let members = group_members(pgid).map_err(|error| error.to_string())?;
+    let mut holders = Vec::new();
+    for pid in members {
+        if pid_holds_capability(pid, &capability)? {
+            holders.push(pid);
+        }
+    }
+    Ok(holders)
+}
+
+fn group_holds_capability(pgid: u32, run_dir: &Path) -> Result<bool, String> {
+    Ok(!capability_holders(pgid, run_dir)?.is_empty())
 }
 
 /// Remove every process record for a run whose group was reaped (or was found
@@ -934,6 +1211,8 @@ pub fn clear_process_records(run_dir: &Path) {
         PGID_FILE,
         SHELL_PID_FILE,
         SHELL_PGID_FILE,
+        SHELL_IDENTITY_FILE,
+        SHELL_CAPABILITY_FILE,
     ] {
         let _ = fs::remove_file(run_dir.join(name));
     }
@@ -953,22 +1232,19 @@ pub fn recorded_group(run_dir: &Path) -> Option<(u32, u32)> {
     if let Some(pid) = read_number(run_dir, SHELL_PID_FILE) {
         return Some((pid, read_number(run_dir, SHELL_PGID_FILE).unwrap_or(pid)));
     }
-    read_number(run_dir, SHELL_PGID_FILE).map(|pgid| (pgid, pgid))
-}
-
-/// The pid the run directory itself names: the supervisor, or the shell it left.
-fn recorded_leader(run_dir: &Path) -> Option<u32> {
-    read_number(run_dir, crate::engine::session::PID_FILE)
-        .or_else(|| read_number(run_dir, SHELL_PID_FILE))
+    if let Some(pgid) = read_number(run_dir, SHELL_PGID_FILE) {
+        return Some((pgid, pgid));
+    }
+    read_shell_record(run_dir).map(|record| (record.pid, record.pgid))
 }
 
 /// Every process in a recorded group, read from the kernel's `stat` only. No
-/// process environment is read (F-02 review).
-fn group_members(pgid: u32) -> Vec<u32> {
+/// process environment is read (F-02 review). An unreadable process table or
+/// stat is an error, not an empty group (review-3b).
+fn group_members(pgid: u32) -> io::Result<Vec<u32>> {
     let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return found;
-    };
+    let entries = fs::read_dir("/proc")
+        .map_err(|error| io::Error::other(format!("the process table cannot be read: {error}")))?;
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -980,75 +1256,455 @@ fn group_members(pgid: u32) -> Vec<u32> {
         if pid == std::process::id() {
             continue;
         }
-        let stat = fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
-        let Some((_, rest)) = stat.rsplit_once(')') else {
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "process {pid}'s stat cannot be read: {error}"
+                )));
+            }
+        };
+        let Some((state, group, _)) = parse_stat_line(&stat) else {
             continue;
         };
-        let mut fields = rest.split_whitespace();
         // A zombie has already ended; only its parent's reaping is left. Counting
         // it as live would wait forever for a process that can no longer run.
-        if fields.next() == Some("Z") {
+        if state == 'Z' {
             continue;
         }
-        let group = fields.nth(1).and_then(|text| text.parse::<u32>().ok());
-        if group == Some(pgid) {
+        if group == pgid {
             found.push(pid);
         }
     }
-    found
+    Ok(found)
 }
 
-/// The live members of a run's recorded group, believed only through the run's own
-/// records: a member carrying the run directory on its command line, the recorded
-/// supervisor or shell still alive in the group, or the shell record naming this
-/// group. A bare recycled group id is never signalled.
-fn live_run_pids(pgid: u32, run_dir: &Path) -> Vec<u32> {
-    let members = group_members(pgid);
+/// The live members of a run's recorded group, believed only through live
+/// identity: the shell record still names the same live process in this group,
+/// the inherited anonymous capability is held by a member, or the actual product
+/// supervisor has the exact invocation for this run. A bare pgid or stored pid
+/// number alone is never identity.
+fn live_run_pids(pgid: u32, run_dir: &Path) -> Result<Vec<u32>, String> {
+    let members = group_members(pgid).map_err(|error| error.to_string())?;
     if members.is_empty() {
-        return members;
+        return Ok(members);
     }
-    let expected_dir = run_dir.display().to_string();
-    let named = members.iter().any(|pid| {
-        crate::bundled_forgejo::command_line(*pid)
-            .is_some_and(|parts| parts.iter().any(|part| part == &expected_dir))
+    if shell_identity_is_live(run_dir, pgid).map_err(|error| error.to_string())?
+        || group_holds_capability(pgid, run_dir)?
+    {
+        return Ok(members);
+    }
+    // Before its first shell command, a supervisor has no shell capability yet.
+    // Require both the executable and the complete private invocation; a path
+    // retained by an unrelated directory reader is never enough.
+    let supervisor = members.iter().any(|pid| {
+        let Some(parts) = crate::bundled_forgejo::command_line(*pid) else {
+            return false;
+        };
+        if parts.len() != 3 || parts[1] != "--run-agent" || Path::new(&parts[2]) != run_dir {
+            return false;
+        }
+        let Ok(executable) = fs::read_link(format!("/proc/{pid}/exe")) else {
+            return false;
+        };
+        let text = executable.to_string_lossy();
+        let path = Path::new(text.strip_suffix(" (deleted)").unwrap_or(&text));
+        path.file_name()
+            .is_some_and(|name| name == "gewu-multiverse")
+            || std::env::current_exe().is_ok_and(|ours| ours == path)
     });
-    let leader_alive = recorded_leader(run_dir).is_some_and(|pid| members.contains(&pid));
-    let shell_group = read_number(run_dir, SHELL_PGID_FILE) == Some(pgid);
-    if named || leader_alive || shell_group {
-        members
+    Ok(if supervisor { members } else { Vec::new() })
+}
+
+/// Members already observed while the group's live identity held. When the shell
+/// dies after `SIGTERM`, its children stay in the group; their own boot/start
+/// identity is remembered and rechecked individually, so escalation never signals
+/// a reused pid.
+type KnownMember = (u32, ProcessIdentity);
+
+/// One process bound to a kernel pidfd. The handle names that exact process, not
+/// a number that can be reused before the signal.
+struct ReapTarget {
+    pid: u32,
+    pidfd: OwnedFd,
+}
+
+fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
+    let pid = rustix::process::Pid::from_raw(pid as i32)
+        .ok_or_else(|| io::Error::other("the process id is not positive"))?;
+    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+fn pidfd_signal(target: &ReapTarget, signal: rustix::process::Signal) -> io::Result<()> {
+    rustix::process::pidfd_send_signal(&target.pidfd, signal)
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+fn rustix_signal(signal: nix::sys::signal::Signal) -> rustix::process::Signal {
+    match signal {
+        nix::sys::signal::Signal::SIGTERM => rustix::process::Signal::Term,
+        nix::sys::signal::Signal::SIGKILL => rustix::process::Signal::Kill,
+        _ => rustix::process::Signal::Term,
+    }
+}
+
+/// Whether a run directory's process records can be read. A permission failure
+/// must be visible, not look like "no records" (review-3).
+fn process_records_readable(run_dir: &Path) -> Result<(), String> {
+    if let Err(error) = fs::read_dir(run_dir) {
+        return Err(format!("the run directory cannot be read: {error}"));
+    }
+    // read permission alone is not search permission; stat a name that should not
+    // exist so EACCES cannot masquerade as an absent record.
+    match fs::metadata(run_dir.join(".gewu-search-probe")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("the run directory cannot be searched: {error}"));
+        }
+    }
+    for name in [
+        crate::engine::session::PID_FILE,
+        PGID_FILE,
+        SHELL_PID_FILE,
+        SHELL_PGID_FILE,
+        SHELL_IDENTITY_FILE,
+        SHELL_CAPABILITY_FILE,
+        PLAN_FILE,
+        crate::transcript::TRANSCRIPT_FILE,
+    ] {
+        let path = run_dir.join(name);
+        match fs::metadata(&path) {
+            Ok(_) => {
+                if fs::read(&path).is_err() {
+                    return Err(format!("the run's {name} record cannot be read"));
+                }
+            }
+            // A truly absent record is not a failure. Permission/search failure
+            // inside a readable directory is (review-3b).
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "the run's {name} record cannot be inspected: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The group of a live holder of the run's anonymous capability. This finds the
+/// pre-record window and lost-record cases without any named object.
+fn capability_group(run_dir: &Path) -> Result<Option<u32>, String> {
+    let Some(capability) = read_capability(run_dir) else {
+        return Ok(None);
+    };
+    let entries = fs::read_dir("/proc")
+        .map_err(|error| format!("the process table cannot be read: {error}"))?;
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|text| text.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        match pid_holds_capability(pid, &capability) {
+            Ok(true) => {
+                if let Some((_, group, _)) =
+                    process_facts(pid).map_err(|error| error.to_string())?
+                {
+                    return Ok(Some(group));
+                }
+            }
+            Ok(false) => {}
+            // An inaccessible unrelated process must not hide a readable holder
+            // later in the scan. If no holder can be verified, the durable
+            // capability record below still blocks replacement on this boot;
+            // skipping an inspection is never proof the run has no processes.
+            Err(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Observe the run's group, binding each candidate to a pidfd before its live
+/// identity is checked. A pid is never signalled by number afterwards. While the
+/// group has a live owner the observed identities are remembered; after the owner
+/// is gone, only those exact processes are returned.
+fn observe_run_group(
+    pgid: u32,
+    run_dir: &Path,
+    known: &mut Vec<KnownMember>,
+) -> (Vec<ReapTarget>, Option<String>) {
+    let members = match group_members(pgid) {
+        Ok(members) => members,
+        Err(error) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "the run's process group cannot be inspected: {error}"
+                )),
+            );
+        }
+    };
+    if members.is_empty() {
+        known.clear();
+        return (Vec::new(), None);
+    }
+    let owned_before = match live_run_pids(pgid, run_dir) {
+        Ok(members) => !members.is_empty(),
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+    let mut targets = Vec::new();
+    let mut observed = Vec::new();
+    let mut blocked = None;
+    for pid in members {
+        // Bind the kernel handle first: the identity read below is then about the
+        // process the descriptor names, and a later reuse cannot retarget it.
+        let pidfd = match open_pidfd(pid) {
+            Ok(pidfd) => pidfd,
+            Err(error) => {
+                if error.raw_os_error() != Some(nix::errno::Errno::ESRCH as i32) {
+                    blocked = Some(format!("pid {pid} has no kernel process handle: {error}"));
+                }
+                continue;
+            }
+        };
+        let identity = match process_identity(pid) {
+            Ok(Some((live_group, identity))) if live_group == pgid => identity,
+            Ok(_) => continue,
+            Err(error) => {
+                blocked = Some(format!("pid {pid}'s identity cannot be read: {error}"));
+                continue;
+            }
+        };
+        observed.push((pid, identity));
+        targets.push(ReapTarget { pid, pidfd });
+    }
+
+    let owned_now = match live_run_pids(pgid, run_dir) {
+        Ok(members) => !members.is_empty(),
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+    let mut selected = Vec::new();
+    if owned_before && owned_now {
+        known.clear();
+        known.extend(observed.iter().cloned());
+        // The recorded shell is the owner's own process; only keep it while its
+        // boot/start identity still matches. Children ride on the owner/capability
+        // identity that made the group ours.
+        let shell = read_shell_record(run_dir);
+        for target in targets {
+            if let Some(shell) = shell.as_ref()
+                && target.pid == shell.pid
+            {
+                match shell_identity_is_live(run_dir, pgid) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        return (
+                            Vec::new(),
+                            Some(format!("the shell identity cannot be read: {error}")),
+                        );
+                    }
+                }
+            }
+            selected.push(target);
+        }
     } else {
-        Vec::new()
+        // No current owner: only the exact processes observed under the last live
+        // owner, matched by pid and boot/start identity after the pidfd was opened.
+        for target in targets {
+            if let Some((pid, identity)) = observed.iter().find(|(pid, _)| *pid == target.pid)
+                && known.iter().any(|(known_pid, known_identity)| {
+                    known_pid == pid && known_identity == identity
+                })
+            {
+                selected.push(target);
+            }
+        }
     }
+    (selected, blocked)
 }
 
-fn any_live(pgid: u32, run_dir: &Path) -> Vec<u32> {
-    live_run_pids(pgid, run_dir)
-}
-
-fn signal_pids(pids: &[u32], signal: nix::sys::signal::Signal) {
-    for pid in pids {
-        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid as i32), signal);
+fn signal_targets(targets: &[ReapTarget], signal: nix::sys::signal::Signal) -> Result<(), String> {
+    for target in targets {
+        match pidfd_signal(target, rustix_signal(signal)) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => {}
+            Err(error) => {
+                return Err(format!(
+                    "a process from the run (pid {}) cannot be signalled: {error}",
+                    target.pid
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
-/// Stop a run's left-over process group, then write its `run_stopped` record.
+/// Whether a run ever started: its transcript holds a record. A plan alone is a
+/// prepared run, not a started one; an unreadable transcript is an error, never
+/// "never started" (review-3b).
+fn run_started(run_dir: &Path) -> Result<bool, String> {
+    let file = match crate::transcript::read(run_dir) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "the run's transcript cannot be read, so its start cannot be verified: {error}"
+            ));
+        }
+    };
+    Ok(!file.records.is_empty() || file.partial.is_some())
+}
+
+/// The wall-clock boot time from `/proc/stat`'s `btime`.
+fn boot_epoch() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// A run whose durable records were all created before this boot cannot have a
+/// live process from that run; this is the bounded disposition for a stale,
+/// recordless run. File mtimes, not the directory mtime, are used so touching the
+/// directory neither extends nor creates a false block.
+fn run_predates_boot(run_dir: &Path) -> bool {
+    let Some(boot) = boot_epoch() else {
+        return false;
+    };
+    let mut newest = 0_u64;
+    let mut found = false;
+    for name in [
+        PLAN_FILE,
+        crate::transcript::TRANSCRIPT_FILE,
+        SHELL_IDENTITY_FILE,
+        SHELL_CAPABILITY_FILE,
+    ] {
+        let Ok(metadata) = fs::metadata(run_dir.join(name)) else {
+            continue;
+        };
+        found = true;
+        if let Ok(time) = metadata.modified()
+            && let Ok(time) = time.duration_since(std::time::UNIX_EPOCH)
+        {
+            newest = newest.max(time.as_secs());
+        }
+    }
+    if !found
+        && let Ok(metadata) = fs::metadata(run_dir)
+        && let Ok(time) = metadata.modified()
+        && let Ok(time) = time.duration_since(std::time::UNIX_EPOCH)
+    {
+        newest = time.as_secs();
+    }
+    newest > 0 && newest < boot
+}
+
+/// Why a live group with no selected pidfd target is still not gone.
+fn unverified_group(pgid: u32) -> Result<bool, String> {
+    let members = group_members(pgid).map_err(|error| error.to_string())?;
+    Ok(!members.is_empty())
+}
+
 ///
 /// A supervisor can die by `SIGKILL` before it removes its pid record, leaving the
 /// shell and the command it started in its process group. A later start calls this
 /// for every recorded run before it opens; the run boundary calls it before the next
 /// run starts. The group is believed only when a member still carries the run's own
-/// id or command line, so a reused pid is never signalled.
+/// inherited capability or recorded shell identity, so a reused pid or a path in
+/// arbitrary argv is never signalled.
 ///
 /// `Ok(true)` means a group was found and stopped; `Ok(false)` means there was
 /// nothing left. `Err` is one plain sentence for the card when a process survives.
 pub fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
-    let Some((_pid, pgid)) = recorded_group(run_dir) else {
+    // A permissions failure is a recovery failure, not "no records": it must
+    // reach the card and block a replacement run (review-3).
+    process_records_readable(run_dir)?;
+    // A live shell identity names the group even if an old `session.*` pair has
+    // been overtaken by pid reuse. `recorded_group` stays the supervisor-first
+    // record for the private run-temp path. The inherited anonymous capability
+    // finds the group in the pre-record window and when records were lost.
+    let live_shell = match read_shell_record(run_dir) {
+        Some(record) => {
+            match shell_identity_is_live(run_dir, record.pgid).map_err(|error| error.to_string())? {
+                true => Some(record.pgid),
+                false => None,
+            }
+        }
+        None => None,
+    };
+    let pgid = match live_shell {
+        Some(pgid) => Some(pgid),
+        None => match recorded_group(run_dir) {
+            Some((_, pgid)) => Some(pgid),
+            None => capability_group(run_dir)?,
+        },
+    };
+    let has_capability = run_dir.join(SHELL_CAPABILITY_FILE).is_file();
+    let Some(pgid) = pgid else {
+        if transcript::terminal_record(run_dir).is_some() {
+            clear_process_records(run_dir);
+            return Ok(false);
+        }
+        // No process record, identity or verified holder. A capability record is
+        // durable evidence that spawn may have happened, so it is start evidence
+        // even without a transcript. A run that never started is stale and can
+        // go; a started/uncertain run is bounded by the boot.
+        if run_started(run_dir)? || has_capability {
+            if run_predates_boot(run_dir) {
+                if let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) {
+                    write_run_stopped(
+                        run_dir,
+                        run_id,
+                        0,
+                        "the run predates this boot; no process from it can be alive",
+                    )
+                    .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+                }
+                clear_process_records(run_dir);
+                return Ok(false);
+            }
+            if has_capability {
+                return Err(
+                    "the run's capability record exists but no live holder can be verified; cleanup is uncertain"
+                        .to_owned(),
+                );
+            }
+            return Err(
+                "the run started but its process records are lost; cleanup cannot be verified"
+                    .to_owned(),
+            );
+        }
+        clear_process_records(run_dir);
         return Ok(false);
     };
     let reaped = reap_process_group(pgid, run_dir, grace)?;
-    if !reaped && transcript::terminal_record(run_dir).is_none() {
-        // The pid record survived but nothing is alive: the supervisor died before
-        // it could close the run. Give it the ending the reopen is owed (F-02).
+    if !reaped && unverified_group(pgid)? {
+        // A live group whose ownership cannot be established is not touched, but
+        // it is not hidden either: the open reports it, the card names it and
+        // Start refuses a replacement until it is resolved.
+        return Err(format!(
+            "a live process group (pgid {pgid}) cannot be verified as this run's; it was left untouched"
+        ));
+    }
+    if !reaped && !unverified_group(pgid)? && transcript::terminal_record(run_dir).is_none() {
+        // The recorded numbers survived but nothing is alive: the supervisor died
+        // before it could close the run. Give it the ending the reopen is owed
+        // (F-02).
         if let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) {
             write_run_stopped(
                 run_dir,
@@ -1077,18 +1733,32 @@ pub fn reap_process_group(
     let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) else {
         return Ok(false);
     };
-    let mut live = any_live(pgid, run_dir);
-    if live.is_empty() {
+    let mut known: Vec<KnownMember> = Vec::new();
+    let (targets, blocked) = observe_run_group(pgid, run_dir, &mut known);
+    if let Some(reason) = blocked {
+        return Err(reason);
+    }
+    if targets.is_empty() {
+        if unverified_group(pgid)? {
+            return Err(format!(
+                "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+            ));
+        }
         return Ok(false);
     }
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pgid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    );
-    signal_pids(&live, nix::sys::signal::Signal::SIGTERM);
+    signal_targets(&targets, nix::sys::signal::Signal::SIGTERM)?;
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
-        if any_live(pgid, run_dir).is_empty() {
+        let (targets, blocked) = observe_run_group(pgid, run_dir, &mut known);
+        if let Some(reason) = blocked {
+            return Err(reason);
+        }
+        if targets.is_empty() {
+            if unverified_group(pgid)? {
+                return Err(format!(
+                    "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+                ));
+            }
             write_run_stopped(
                 run_dir,
                 run_id,
@@ -1100,15 +1770,40 @@ pub fn reap_process_group(
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let _ = nix::sys::signal::killpg(
-        nix::unistd::Pid::from_raw(pgid as i32),
-        nix::sys::signal::Signal::SIGKILL,
-    );
-    signal_pids(&live, nix::sys::signal::Signal::SIGKILL);
+    // Rebind before the force: every KILL goes through a fresh pidfd whose
+    // identity was checked after the handle was opened.
+    let (targets, blocked) = observe_run_group(pgid, run_dir, &mut known);
+    if let Some(reason) = blocked {
+        return Err(reason);
+    }
+    if targets.is_empty() {
+        if unverified_group(pgid)? {
+            return Err(format!(
+                "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+            ));
+        }
+        write_run_stopped(
+            run_dir,
+            run_id,
+            pgid,
+            "an earlier start's run was still running and was stopped",
+        )
+        .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+        return Ok(true);
+    }
+    signal_targets(&targets, nix::sys::signal::Signal::SIGKILL)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while std::time::Instant::now() < deadline {
-        live = any_live(pgid, run_dir);
-        if live.is_empty() {
+        let (targets, blocked) = observe_run_group(pgid, run_dir, &mut known);
+        if let Some(reason) = blocked {
+            return Err(reason);
+        }
+        if targets.is_empty() {
+            if unverified_group(pgid)? {
+                return Err(format!(
+                    "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+                ));
+            }
             write_run_stopped(
                 run_dir,
                 run_id,
@@ -1122,7 +1817,7 @@ pub fn reap_process_group(
     }
     Err(format!(
         "a process from run {run_id} (pid {}) could not be stopped",
-        live.first().copied().unwrap_or(pgid)
+        targets.first().map(|target| target.pid).unwrap_or(pgid)
     ))
 }
 
@@ -1289,4 +1984,95 @@ fn bounded(text: &str, limit: usize) -> String {
         out.push_str(" …");
     }
     out
+}
+
+#[cfg(test)]
+mod review3_identity_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    fn own_group_process() -> std::process::Child {
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the unrelated process starts")
+    }
+
+    fn wait_for(pid: u32) {
+        for _ in 0..200 {
+            if crate::bundled_forgejo::command_line(pid)
+                .is_some_and(|parts| parts.iter().any(|part| part == "30"))
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the unrelated process never became visible");
+    }
+
+    /// The signal site rechecks the boot/start identity of every known member: an
+    /// identity that no longer matches is not selected, even though the pid is in
+    /// the observed group.
+    #[test]
+    fn a_changed_identity_is_not_signalled() {
+        let run_dir = crate::test_support::scratch_root("identity-change-signal");
+        let mut child = own_group_process();
+        let pid = child.id();
+        wait_for(pid);
+        let (group, identity) = process_identity(pid)
+            .expect("identity")
+            .expect("a live identity");
+        let changed = ProcessIdentity {
+            boot: identity.boot.clone(),
+            start: identity.start.saturating_add(1),
+        };
+        let mut known = vec![(pid, changed)];
+        let (targets, blocked) = observe_run_group(group, &run_dir, &mut known);
+        assert!(blocked.is_none());
+        assert!(targets.is_empty(), "a changed identity was selected");
+        assert!(
+            child.try_wait().expect("status").is_none(),
+            "a changed identity was signalled"
+        );
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    /// The owned path (a live shell identity) selects the process and signals it
+    /// through the pidfd that was opened before the identity check.
+    #[test]
+    fn an_owned_identity_is_signalled_through_its_pidfd() {
+        let run_dir = crate::test_support::scratch_root("identity-same-signal");
+        let mut child = own_group_process();
+        let pid = child.id();
+        wait_for(pid);
+        let (group, _identity) = process_identity(pid)
+            .expect("identity")
+            .expect("a live identity");
+        write_shell_record(&run_dir, pid, group).expect("shell record");
+        let mut known = Vec::new();
+        let (targets, blocked) = observe_run_group(group, &run_dir, &mut known);
+        assert!(blocked.is_none());
+        assert_eq!(targets.len(), 1, "the owned process was not selected");
+        signal_targets(&targets, nix::sys::signal::Signal::SIGTERM).expect("signal");
+        let mut ended = false;
+        for _ in 0..200 {
+            if child.try_wait().expect("status").is_some() {
+                ended = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ended, "the verified process was not signalled");
+        let _ = fs::remove_dir_all(&run_dir);
+    }
 }

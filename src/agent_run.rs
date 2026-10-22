@@ -3158,9 +3158,29 @@ fn run_shell(
             child_command.env(crate::workspace::ASKPASS_LOGIN, login);
         }
     }
-    let mut child = child_command
-        .spawn()
-        .map_err(|error| format!("the command `{command}` cannot be started: {error}"))?;
+    // An anonymous memfd ownership capability created before the spawn is inherited
+    // by the shell and its children. It is live identity for the group even in the
+    // small window before the shell's own identity record is written, and it
+    // survives the shell's exit while a child still holds it (review-3b). No shell
+    // may run without it: a capability that cannot be created is a failed run, not
+    // a permission to continue.
+    let shell_capability = crate::run::prepare_shell_capability(&shell.run_dir).map_err(|error| {
+        format!(
+            "the shell's ownership capability cannot be written, so the command was not started: {error}"
+        )
+    })?;
+    let mut child = match child_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            drop(shell_capability);
+            let _ = std::fs::remove_file(shell.run_dir.join(crate::run::SHELL_CAPABILITY_FILE));
+            return Err(format!(
+                "the command `{command}` cannot be started: {error}"
+            ));
+        }
+    };
+    // The child holds its own descriptor now; the supervisor does not need one.
+    drop(shell_capability);
     // Record the shell's own group before the command runs. If this supervisor is
     // killed and its `session.*` records are removed or never written, a later
     // start still finds the group from the run directory (F-02/F-03).
