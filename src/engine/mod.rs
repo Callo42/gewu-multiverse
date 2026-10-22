@@ -90,6 +90,14 @@ pub const REPOSITORY_REFRESH: Duration = Duration::from_secs(2);
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.
+pub const TERMS_VERSION: u32 = 2;
+
+/// The one line from this release's notes that the upgrade screen shows.
+pub const WHATS_NEW: &str =
+    "run marks say exactly what happened, and a started agent's runs never outlive it";
+
+/// The terms the first-run screen shows, one short item each. They are the product's
+/// fixed words, in the first-time reader's language.
 pub const TERMS: &[&str] = &[
     "Agents use this computer with your permissions.",
     "When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.",
@@ -291,10 +299,19 @@ fn build(
     // their recorded pids, believed only when their command line is the one this
     // product started, and stopped before a fresh one can start.
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
-    recover_stale_sessions(&options.layout, options.stop_grace)?;
+    let (_, leftovers) = recover_stale_sessions(&options.layout, options.stop_grace)?;
     remove_stale_run_temps();
     let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
-    let mut inner = Inner::new(options.clone(), settings_path, settings, credentials)?;
+    // The recovery result is part of the first picture: Inner::new must receive it
+    // before it loads the agent cards, or a failed cleanup is silently dropped and
+    // the engine starts a replacement run beside the old process (review-3).
+    let mut inner = Inner::new(
+        options.clone(),
+        settings_path,
+        settings,
+        credentials,
+        leftovers,
+    )?;
     inner.upgrade = upgrade;
     last_seen::write(options.layout.root(), env!("CARGO_PKG_VERSION"))?;
     // An installation from the old screens may still hold `config.toml`. The new
@@ -366,6 +383,8 @@ fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> O
             "https://github.com/{}/releases",
             bundled_forgejo::REPOSITORY
         ),
+        whats_new: WHATS_NEW.to_owned(),
+        warnings_changed: settings.terms_version < TERMS_VERSION,
     })
 }
 
@@ -425,6 +444,14 @@ struct RunningState {
 }
 
 /// One agent's engine state, beside its saved settings.
+/// A recovery scope whose cleanup failed: one run directory, or an agent
+/// directory that could not be enumerated and must be rescanned (review-3b).
+#[derive(Debug, Clone)]
+enum RecoveryTarget {
+    Run(PathBuf),
+    Agent(PathBuf),
+}
+
 struct AgentRuntime {
     name: String,
     desired: Desired,
@@ -448,6 +475,11 @@ struct AgentRuntime {
     last_error: Option<String>,
     last_result: Option<String>,
     last_failure: Option<String>,
+    /// A left-over process group this engine could not reap, one plain sentence.
+    leftover: Option<String>,
+    /// The recovery scopes whose cleanup failed, so Start can retry the reap or
+    /// rescan before any replacement run is allowed.
+    leftover_targets: Vec<RecoveryTarget>,
     current_tool: Option<String>,
     current_tool_since: Option<SystemTime>,
     last_work: Vec<String>,
@@ -514,6 +546,10 @@ struct Inner {
     admin_password_once: Option<String>,
     password_reset_inflight: bool,
     upgrade: Option<UpgradeView>,
+    /// Left-over process groups the last open could not stop: agent, run
+    /// directory and the reason, so the card can keep both the sentence and a
+    /// retry route.
+    leftovers: Vec<(String, RecoveryTarget, String)>,
     sequence: u64,
     stopping: bool,
     generation: u64,
@@ -525,6 +561,7 @@ impl Inner {
         settings_path: PathBuf,
         settings: Settings,
         credentials: PathBuf,
+        leftovers: Vec<(String, RecoveryTarget, String)>,
     ) -> Result<Self, String> {
         let binary = bundled_forgejo::binary_path(&options.data_root);
         let paths = bundled_forgejo::InstancePaths::under(&options.data_root);
@@ -559,6 +596,10 @@ impl Inner {
             state
         };
         let repositories = Vec::new();
+        let mut events = VecDeque::new();
+        if let Some(event) = settings.forgejo.last_event.clone() {
+            events.push_back(event);
+        }
         let mut forgejo = ForgejoRuntime {
             state,
             url: port
@@ -580,7 +621,7 @@ impl Inner {
             provision_inflight: false,
             provision_retry_at: None,
             repositories,
-            events: VecDeque::new(),
+            events,
             repositories_refreshed_at: None,
             repositories_inflight: false,
         };
@@ -606,6 +647,7 @@ impl Inner {
             admin_password_once: None,
             password_reset_inflight: false,
             upgrade: None,
+            leftovers,
             sequence: 0,
             stopping: false,
             generation: 0,
@@ -617,6 +659,20 @@ impl Inner {
         let names = inner.settings.names();
         for name in names {
             inner.agents.push(AgentRuntime::load(&inner, &name));
+        }
+        // A group the last open could not reap is reported on its agent's card,
+        // not hidden in the recovery log (F-02/F-03). The run directory is kept
+        // so Start can retry the reap, and the blocked state stops the scheduler
+        // from starting a replacement beside a real old process.
+        for (name, target, reason) in inner.leftovers.clone() {
+            if let Some(index) = inner.agent_index(&name) {
+                inner.agents[index].leftover = Some(reason);
+                inner.agents[index].leftover_targets.push(target);
+                inner.agents[index].session = SessionState::Blocked {
+                    reason: "an earlier run's cleanup is incomplete".to_owned(),
+                };
+                inner.agents[index].next_at = None;
+            }
         }
         #[cfg(test)]
         if inner.options.forgejo_ready {
@@ -827,6 +883,8 @@ impl AgentRuntime {
             last_error,
             last_result,
             last_failure,
+            leftover: None,
+            leftover_targets: Vec::new(),
             current_tool: None,
             current_tool_since: None,
             last_work,
@@ -1140,6 +1198,22 @@ impl Inner {
         }
         if let Some((end, started, run_dir, pid)) = ended {
             self.observe_confinement_refusal(&run_dir);
+            // A supervisor killed from outside can leave the shell it started in
+            // the run's process group. Reap the group at this boundary, before the
+            // next run is allowed to start; a process that survives is reported on
+            // the card instead of being hidden (F-02/F-03).
+            let leftover = run::reap_process_group(pid, &run_dir, self.options.stop_grace);
+            if leftover.is_ok() {
+                // The run and its group are over: no later reopen may act on the
+                // stale records (including the shell record written at spawn).
+                run::clear_process_records(&run_dir);
+            }
+            self.agents[index].leftover = leftover.err();
+            if self.agents[index].leftover.is_some() {
+                self.agents[index].leftover_targets = vec![RecoveryTarget::Run(run_dir.clone())];
+            } else {
+                self.agents[index].leftover_targets.clear();
+            }
             // A stopped, killed or crashed run gets no chance to run its own
             // destructor: the engine removes its private askpass tree here (F-01).
             if let Some(run_id) = run_id_in(&run_dir) {
@@ -1151,6 +1225,14 @@ impl Inner {
             let state_root = self.options.layout.state_root().to_path_buf();
             let agent = &mut self.agents[index];
             finish_session(agent, end, now, started, &state_root);
+            if agent.leftover.is_some() {
+                // A surviving old process outranks the normal restart: block the
+                // agent (and say why) until Start retries the cleanup.
+                agent.session = SessionState::Blocked {
+                    reason: "an earlier run's cleanup is incomplete".to_owned(),
+                };
+                agent.next_at = None;
+            }
         } else if let Some(run_dir) = self.agents[index]
             .running
             .as_ref()
@@ -1217,6 +1299,11 @@ impl Inner {
 
     fn block_reason(&self, index: usize) -> Option<String> {
         let agent = &self.agents[index];
+        if agent.leftover.is_some() {
+            // Never start a replacement beside a process the last cleanup could
+            // not stop; the card says why and Start retries the cleanup.
+            return Some("an earlier run's cleanup is incomplete".to_owned());
+        }
         if !self.settings.endpoint.configured() || !self.credential_key_present() {
             return Some("needs a model".to_owned());
         }
@@ -1655,7 +1742,10 @@ impl EngineApi for Engine {
             key_present: inner.credential_key_present(),
             test: inner.endpoint_test.clone(),
         };
-        let terms_acknowledged = inner.settings.terms_acknowledged;
+        // An upgrade whose warnings changed shows them once more before the board;
+        // a same-version open keeps the acknowledgement (F-06).
+        let terms_acknowledged = inner.settings.terms_acknowledged
+            && !(inner.upgrade.is_some() && inner.settings.terms_version < TERMS_VERSION);
         let setup_complete =
             inner.settings.endpoint.configured() && !inner.settings.agents.is_empty();
         let forgejo = ForgejoView {
@@ -1701,7 +1791,11 @@ impl EngineApi for Engine {
                 activity_at: agent.activity_at,
                 last_error: agent.last_error.clone(),
                 last_result: agent.last_result.clone(),
-                last_failure: agent.last_failure.clone(),
+                last_failure: agent
+                    .leftover
+                    .clone()
+                    .or_else(|| agent.last_failure.clone()),
+                leftover: agent.leftover.clone(),
                 current_tool: agent.current_tool.clone(),
                 current_tool_seconds: agent
                     .current_tool_since
@@ -1752,6 +1846,7 @@ impl EngineApi for Engine {
         match command {
             Command::AcknowledgeTerms => {
                 inner.settings.terms_acknowledged = true;
+                inner.settings.terms_version = TERMS_VERSION;
                 inner.save_settings()?;
                 inner.note("the terms are recorded");
                 Ok(())
@@ -1835,6 +1930,39 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                // A cleanup that failed at open or at a run boundary is retried
+                // before any replacement run. Until it succeeds, Start reports the
+                // reason and does not start; once the old group is gone, the
+                // records are cleared and the run can start normally.
+                let leftover_targets = inner.agents[index].leftover_targets.clone();
+                if !leftover_targets.is_empty() {
+                    let mut failed = None;
+                    for target in &leftover_targets {
+                        let result = match target {
+                            RecoveryTarget::Run(run_dir) => {
+                                run::reap_leftover_run(run_dir, inner.options.stop_grace)
+                                    .map(|_| ())
+                            }
+                            RecoveryTarget::Agent(agent_dir) => {
+                                recover_agent_directory(agent_dir, inner.options.stop_grace)
+                            }
+                        };
+                        if let Err(reason) = result {
+                            failed = Some(reason);
+                            break;
+                        }
+                    }
+                    if let Some(reason) = failed {
+                        inner.agents[index].leftover = Some(reason.clone());
+                        let sentence = format!("an earlier run's cleanup is incomplete: {reason}");
+                        inner.note(sentence.clone());
+                        return Err(sentence);
+                    }
+                    inner.agents[index].leftover = None;
+                    inner.agents[index].leftover_targets.clear();
+                    inner.agents[index].session = SessionState::Idle;
+                    inner.agents[index].next_at = None;
+                }
                 inner.set_desired(index, Desired::Started);
                 let agent = &mut inner.agents[index];
                 agent.sessions_since_start = 0;
@@ -1948,6 +2076,18 @@ impl EngineApi for Engine {
             .map(|run| run.run_dir.clone())
             .or_else(|| runtime.newest_run.clone())?;
         Some((dir.join(LOG_FILE), dir.join(TRANSCRIPT_FILE)))
+    }
+
+    fn readable_transcript(&self, agent: &str) -> Option<PathBuf> {
+        let inner = self.inner.lock().ok()?;
+        let index = inner.agent_index(agent)?;
+        let runtime = &inner.agents[index];
+        let dir = runtime
+            .running
+            .as_ref()
+            .map(|run| run.run_dir.clone())
+            .or_else(|| runtime.newest_run.clone())?;
+        run::write_readable_transcript(&dir).ok()
     }
 
     fn shutdown(&mut self, grace: Duration) {
@@ -2181,59 +2321,152 @@ fn run_id_in(run_dir: &Path) -> Option<&str> {
     run_dir.file_name().and_then(std::ffi::OsStr::to_str)
 }
 
-/// Stop every `--run-agent` process an earlier program left behind.
+/// Re-enumerate one agent's run directories for a retried cleanup. An unreadable
+/// agent directory remains a failure; a repaired one is rescanned instead of being
+/// handed to the single-run reaper (review-3b).
+fn recover_agent_directory(agent_dir: &Path, grace: Duration) -> Result<(), String> {
+    let runs = fs::read_dir(agent_dir).map_err(|error| {
+        format!(
+            "the agent's run directory {} cannot be read: {error}",
+            agent_dir.display()
+        )
+    })?;
+    let mut reasons = Vec::new();
+    for run in runs.flatten() {
+        let run_dir = run.path();
+        match fs::metadata(&run_dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                reasons.push(format!(
+                    "a run directory under {} cannot be inspected: {error}",
+                    agent_dir.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(reason) = run::reap_leftover_run(&run_dir, grace) {
+            reasons.push(reason);
+        }
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons.join("; "))
+    }
+}
+
+/// Stop every run process group an earlier program left behind.
 ///
 /// The state root is walked without following the agents' own settings: a run
-/// directory is two levels down, and its pid record is believed only when the live
-/// command line still names that run directory and the run-agent mode.
-fn recover_stale_sessions(layout: &Layout, grace: Duration) -> Result<Vec<u32>, String> {
+/// directory is two levels down. A `session.pid` whose supervisor is still alive,
+/// a supervisor killed by `SIGKILL`, and a shell whose supervisor removed its own
+/// records are all found from the run directory: the supervisor's `session.*`
+/// records or the shell record written at spawn. The group is never believed from
+/// a bare number; the process environment is never read. The `run_stopped` record
+/// is written before the caller opens (F-02/F-03).
+#[allow(clippy::type_complexity)]
+fn recover_stale_sessions(
+    layout: &Layout,
+    grace: Duration,
+) -> Result<(Vec<u32>, Vec<(String, RecoveryTarget, String)>), String> {
     let mut stopped = Vec::new();
-    let Ok(agents) = fs::read_dir(layout.state_root()) else {
-        return Ok(stopped);
+    let mut leftovers = Vec::new();
+    let agents = match fs::read_dir(layout.state_root()) {
+        Ok(agents) => agents,
+        // A fresh installation has no state root yet: that is "no runs", not a
+        // recovery failure.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((stopped, leftovers));
+        }
+        Err(error) => {
+            return Err(format!(
+                "the state root cannot be read, so an earlier run cannot be checked: {error}"
+            ));
+        }
     };
     for agent in agents.flatten() {
         let agent_path = agent.path();
         if !agent_path.is_dir() {
             continue;
         }
-        let Ok(runs) = fs::read_dir(&agent_path) else {
-            continue;
+        let agent_name = agent.file_name().to_str().unwrap_or("an agent").to_owned();
+        // read permission is not search permission; a child-name stat makes that
+        // distinction visible instead of looking like an empty agent.
+        match fs::metadata(agent_path.join(".gewu-search-probe")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                leftovers.push((
+                    agent_name.clone(),
+                    RecoveryTarget::Agent(agent_path.clone()),
+                    format!("the agent's run directory cannot be searched: {error}"),
+                ));
+                continue;
+            }
+        }
+        let runs = match fs::read_dir(&agent_path) {
+            Ok(runs) => runs,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                leftovers.push((
+                    agent_name.clone(),
+                    RecoveryTarget::Agent(agent_path.clone()),
+                    format!("the agent's run directory cannot be read: {error}"),
+                ));
+                continue;
+            }
         };
         for run in runs.flatten() {
             let run_dir = run.path();
-            if !run_dir.is_dir() {
-                continue;
+            match fs::metadata(&run_dir) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    leftovers.push((
+                        agent_name.clone(),
+                        RecoveryTarget::Agent(agent_path.clone()),
+                        format!(
+                            "a run directory under {} cannot be inspected: {error}",
+                            agent_path.display()
+                        ),
+                    ));
+                    continue;
+                }
             }
-            let record = run_dir.join(session::PID_FILE);
-            let Ok(text) = fs::read_to_string(&record) else {
-                continue;
-            };
-            let Ok(pid) = text.trim().parse::<u32>() else {
-                let _ = fs::remove_file(&record);
-                continue;
-            };
-            let expected = run_dir.display().to_string();
-            let matches = bundled_forgejo::command_line(pid).is_some_and(|parts| {
-                parts.iter().any(|part| part == "--run-agent")
-                    && parts.iter().any(|part| part == &expected)
-            });
-            if !matches {
-                let _ = fs::remove_file(&record);
-                continue;
+            // `recorded_group` is only the supervisor pid for the private run-temp
+            // path; recovery itself runs even when the records are unreadable, so
+            // the failure can reach the card.
+            let recorded = run::recorded_group(&run_dir);
+            match run::reap_leftover_run(&run_dir, grace) {
+                Ok(true) => {
+                    if let Some((pid, _)) = recorded {
+                        stopped.push(pid);
+                    }
+                }
+                Ok(false) => {
+                    // Nothing was alive: the records are stale, not evidence of a
+                    // process this program must keep watching. They were removed
+                    // with the run's shell record already.
+                }
+                Err(reason) => {
+                    leftovers.push((
+                        agent_name.clone(),
+                        RecoveryTarget::Run(run_dir.clone()),
+                        reason,
+                    ));
+                }
             }
-            if !bundled_forgejo::stop_recorded_pid(pid, grace) {
-                return Err(format!(
-                    "the run left by an earlier start (pid {pid}) could not be stopped"
-                ));
-            }
-            let _ = fs::remove_file(&record);
-            if let Some(run_id) = run_id_in(&run_dir) {
+            if let Some((pid, _)) = recorded
+                && let Some(run_id) = run_id_in(&run_dir)
+            {
                 crate::confinement::remove_run_temp(pid, run_id);
             }
-            stopped.push(pid);
         }
     }
-    Ok(stopped)
+    Ok((stopped, leftovers))
 }
 
 fn ensure_agent_paths(layout: &Layout, name: &str) -> Result<(), String> {
@@ -2629,7 +2862,8 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
                 .iter()
                 .map(|repository| repository.full_name.clone())
                 .collect();
-            for event in repository_events(&before, &after) {
+            let seen = repository_events(&before, &after);
+            for event in seen {
                 inner.forgejo.events.push_back(event);
             }
             while inner.forgejo.events.len() > 5 {
@@ -2637,6 +2871,8 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
             }
             if before != after {
                 if let Some(event) = inner.forgejo.events.back().cloned() {
+                    inner.settings.forgejo.last_event = Some(event.clone());
+                    let _ = inner.save_settings();
                     inner.note(event);
                 }
             }
@@ -3025,6 +3261,7 @@ mod tests {
         settings.endpoint.url = "http://127.0.0.1:9/v1/chat/completions".to_owned();
         settings.endpoint.model = "lab-chat-1".to_owned();
         settings.terms_acknowledged = true;
+        settings.terms_version = TERMS_VERSION;
         for (name, desired) in agents {
             settings.add_agent(name, *desired).expect("agent");
             let paths = layout.ensure_agent(name).expect("paths");

@@ -58,8 +58,9 @@ pub struct BoardLayout {
     pub wire_cells: Vec<(u16, u16)>,
     /// Whether cards are above or below the window.
     pub scrolls: bool,
-    /// Rows the footer occupies: three normally, four when a footer event and
-    /// the status line both need a row of their own (B3).
+    /// Rows the footer occupies, exactly matching the lines the footer draws:
+    /// the two key lines plus one each for the status sentence and the event
+    /// (B3), or the quit warning's wrapped lines plus its notice (review-2).
     pub footer_rows: u16,
 }
 
@@ -163,10 +164,66 @@ fn border_label(
     style: Style,
     max_width: usize,
 ) {
-    let text = format!(
-        " {} ",
-        text_util::ellipsize(text, max_width.saturating_sub(4))
-    );
+    border_label_with(buf, clip, x, y, text, style, max_width, false);
+}
+
+/// A border label cut on whole words, for a card's status line.
+///
+/// A card's bottom border carries a sentence, and a character cut turns
+/// `HTTP 500` into `HTTP 5…`. The caller puts the fact that must survive first
+/// (the HTTP status), so a word cut never removes it (F-14).
+fn border_label_words(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: Style,
+    max_width: usize,
+) {
+    border_label_with(buf, clip, x, y, text, style, max_width, true);
+}
+
+/// The tight card label: no padding around the text, so a three-row card at
+/// 80 columns can hold both `✗ HTTP 500` and `stopped` (F-14). It is still a
+/// whole-word cut, and the caps keep it safe for the connectivity guard.
+fn border_label_tight(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: Style,
+    content_room: usize,
+) {
+    let text = text_util::ellipsize_words(text, content_room);
+    let width = text_util::width(&text) as u16;
+    if width == 0 || x < clip.x || x + width + 2 > clip.right() {
+        return;
+    }
+    put_arms(buf, clip, x, y, L, style);
+    text_util::put(buf, clip, x + 1, y, &text, style);
+    put_arms(buf, clip, x + width + 1, y, R, style);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn border_label_with(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    y: u16,
+    text: &str,
+    style: Style,
+    max_width: usize,
+    whole_words: bool,
+) {
+    let room = max_width.saturating_sub(4);
+    let cut = if whole_words {
+        text_util::ellipsize_words(text, room)
+    } else {
+        text_util::ellipsize(text, room)
+    };
+    let text = format!(" {cut} ");
     let width = text_util::width(&text) as u16;
     if width == 0 || x < clip.x || x + width + 2 > clip.right() {
         return;
@@ -298,6 +355,7 @@ fn forgejo_address(view: &ForgejoView) -> &str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_forgejo_box(
     buf: &mut Buffer,
     rect: Rect,
@@ -305,9 +363,10 @@ fn draw_forgejo_box(
     agent_count: usize,
     selected: bool,
     wire: bool,
+    wire_x: Option<u16>,
     preview: bool,
 ) {
-    if rect.width < 8 || rect.height < 3 {
+    if rect.width < 8 || rect.height < 2 {
         return;
     }
     let face = status::forgejo_face(&view.state);
@@ -318,7 +377,7 @@ fn draw_forgejo_box(
     };
     draw_plain_box(buf, rect, border);
     let right = rect.right() - 1;
-    let centre = rect.x + rect.width / 2;
+    let centre: u16 = rect.x + rect.width / 2;
 
     border_label(
         buf,
@@ -329,14 +388,16 @@ fn draw_forgejo_box(
         theme::bold(theme::ACCENT),
         rect.width.saturating_sub(10) as usize,
     );
-    // The picker draws a preview, not a running server: label it so the person cannot
-    // mistake the planned state for the real one before `⏎ create` (F14).
     let (face_symbol, face_status, face_colour) = if preview {
         ('◐', "preview".to_owned(), theme::AMBER)
     } else {
         (face.symbol, face.status.clone(), face.colour)
     };
-    let state_text = format!("{face_symbol} {face_status}");
+    let state_text = if preview {
+        format!("{face_symbol} {face_status}")
+    } else {
+        format!("{face_symbol} {face_status} · {}", view.version)
+    };
     let state_width = text_util::width(&state_text) as u16 + 2;
     if state_width + 6 < rect.width {
         let state_x = right.saturating_sub(state_width + 3);
@@ -352,67 +413,122 @@ fn draw_forgejo_box(
     }
 
     let room = rect.width.saturating_sub(4) as usize;
-    if rect.height == 3 {
-        // The 72-column floor keeps the address and the live count on its one
-        // interior row; the latest event has the footer line when the box cannot
-        // hold it (F-05).
-        let info = format!(
-            "{} · {} {}",
-            forgejo_address(view),
-            agent_count,
-            plural(agent_count)
-        );
-        text_util::put(
-            buf,
-            rect,
-            rect.x + 1,
-            rect.y + 1,
-            &text_util::ellipsize(&info, rect.width.saturating_sub(2) as usize),
-            theme::fg(theme::MUTED),
-        );
-    } else {
-        // A server front: a solid accent header bar, then the facts in the order a
-        // person needs them. Facts that do not fit are dropped whole; no row is left
-        // empty. At 80x24 the box is tall enough for the organisation, the
-        // repositories, the count, the version, the latest event and the login
-        // (F-03/U1, F-05, F-09).
-        let bar = Rect::new(rect.x + 1, rect.y + 1, rect.width.saturating_sub(2), 1);
-        text_util::fill(buf, bar, Style::new().fg(theme::ACCENT).bg(theme::ACCENT));
-        let info_x = rect.x + 2;
-        let address = if forgejo_address(view) == "—" {
-            "—".to_owned()
-        } else {
-            view.url.clone()
-        };
-        let mut facts: Vec<String> = vec![
-            address,
-            repository_line(view, room),
-            format!("{} {}", agent_count, plural(agent_count)),
-            format!("version {}", view.version),
-        ];
-        if let Some(event) = view.events.last() {
-            facts.push(status::plain(event));
+    let address = forgejo_address(view);
+    let kept = if view.admin_login_kept { " (kept)" } else { "" };
+    let login = format!("your login: {}{kept}", view.admin_login);
+    let mut junction_x = wire_x
+        .unwrap_or(centre)
+        .clamp(rect.x + 3, right.saturating_sub(2));
+    match rect.height {
+        2 => {
+            // The floor: two border rows hold the whole picture. The address, the
+            // repository count, the agent count and the login stay; the version is
+            // the first fact given up (W67-7).
+            // Keep the login and the repository count: they are the two facts a
+            // person needs to open Forgejo. The organisation is the first name
+            // dropped when the line is tight, then the agent count.
+            let mut facts = format!(
+                "{address} · {} {}",
+                view.repositories,
+                repositories_plural(view.repositories)
+            );
+            let with_agents = format!("{facts} · {agent_count} {}", plural(agent_count));
+            if text_util::width(&with_agents) + text_util::width(&login) + 3 <= room {
+                facts = with_agents;
+            }
+            facts.push_str(" · ");
+            facts.push_str(&login);
+            junction_x = (rect.x + 3 + text_util::width(&facts) as u16 + 2).max(centre);
+            border_label(
+                buf,
+                rect,
+                rect.x + 1,
+                rect.bottom() - 1,
+                &text_util::ellipsize_words(&facts, junction_x.saturating_sub(rect.x + 3) as usize),
+                theme::fg(theme::MUTED),
+                junction_x.saturating_sub(rect.x + 3) as usize,
+            );
         }
-        let kept = if view.admin_login_kept { " (kept)" } else { "" };
-        facts.push(format!("your login: {}{kept}", view.admin_login));
-        let rows = rect.height.saturating_sub(3) as usize;
-        for (index, fact) in facts.iter().take(rows).enumerate() {
+        3 => {
+            // The floor's short box: the address, the repository count and the
+            // agent count on its one interior row, the login on the bottom border.
+            // The version is the fact given up first (W67-7).
+            let info = format!(
+                "{address} · {} {} · {agent_count} {}",
+                view.repositories,
+                repositories_plural(view.repositories),
+                plural(agent_count)
+            );
             text_util::put(
                 buf,
                 rect,
-                info_x,
-                rect.y + 2 + index as u16,
-                &text_util::ellipsize(fact, room),
-                theme::fg(if index == 0 { theme::FG } else { theme::MUTED }),
+                rect.x + 1,
+                rect.y + 1,
+                &text_util::ellipsize(&info, rect.width.saturating_sub(2) as usize),
+                theme::fg(theme::MUTED),
+            );
+            let label_room = junction_x.saturating_sub(rect.x + 3) as usize;
+            border_label(
+                buf,
+                rect,
+                rect.x + 1,
+                rect.bottom() - 1,
+                &text_util::ellipsize_words(&login, label_room),
+                theme::fg(theme::MUTED),
+                label_room,
+            );
+        }
+        height => {
+            let has_bar = height >= 6;
+            let info_x = rect.x + 2;
+            let mut fact_y = rect.y + 1;
+            if has_bar {
+                let bar = Rect::new(rect.x + 1, rect.y + 1, rect.width.saturating_sub(2), 1);
+                text_util::fill(buf, bar, Style::new().fg(theme::ACCENT).bg(theme::ACCENT));
+                fact_y = rect.y + 2;
+            }
+            // Reserve the agent count (and the version when the bar is there)
+            // before the repository names, so a crowded box drops a name rather
+            // than halving `7 agents` (F-09).
+            // The version is the first fact the box gives up, so the names and
+            // the counts stay whole even at 80 columns (W67-7).
+            let suffix = format!("{agent_count} {}", plural(agent_count));
+            let repo_room = room.saturating_sub(text_util::width(&suffix) + 3);
+            let repo = repository_line(view, repo_room);
+            let facts = if has_bar {
+                vec![address.to_owned(), repo, suffix]
+            } else {
+                vec![address.to_owned(), format!("{repo} · {suffix}")]
+            };
+            for (index, fact) in facts.iter().enumerate() {
+                text_util::put(
+                    buf,
+                    rect,
+                    info_x,
+                    fact_y + index as u16,
+                    &text_util::ellipsize(fact, room),
+                    theme::fg(if index == 0 { theme::FG } else { theme::MUTED }),
+                );
+            }
+            let label_room = junction_x.saturating_sub(rect.x + 3) as usize;
+            border_label(
+                buf,
+                rect,
+                rect.x + 1,
+                rect.bottom() - 1,
+                &text_util::ellipsize_words(&login, label_room),
+                theme::fg(theme::MUTED),
+                label_room,
             );
         }
     }
 
     if wire {
+        junction_x = junction_x.min(right.saturating_sub(1)).max(rect.x + 2);
         put_arms(
             buf,
             rect,
-            centre,
+            junction_x,
             rect.bottom() - 1,
             L | R | D,
             if selected {
@@ -431,11 +547,53 @@ fn draw_forgejo_box(
 /// with a wire junction, so the picture stays whole (F-03/U1).
 /// The state phrase a narrow board card can hold whole. The Agent panel and the
 /// selected-card footer keep the full sentence.
-fn board_state(face: &status::Face) -> &str {
+fn board_state(face: &status::Face) -> String {
     match face.status.as_str() {
-        "needs an instruction" => "needs instruction",
-        "waiting for Forgejo" => "waiting Forgejo",
-        other => other,
+        "needs an instruction" => "needs instruction".to_owned(),
+        "waiting for Forgejo" => "waiting Forgejo".to_owned(),
+        other => other
+            .strip_prefix("next run in ")
+            .map(|rest| format!("next {rest}"))
+            .unwrap_or_else(|| other.to_owned()),
+    }
+}
+
+/// The text a card puts on its bottom border.
+///
+/// It is built here, once, so the layout can place a single-column wire junction
+/// after it and never draw a connector through a word (F-14).
+fn card_bottom_text(agent: &AgentView, card_h: u16) -> String {
+    if card_h <= 2 {
+        let login = if agent.provisioning == Provisioning::Pending {
+            "connecting…".to_owned()
+        } else {
+            agent.login.clone()
+        };
+        let count = status::run_count(agent);
+        let mut line = format!("{login} · {count}");
+        if let Some(word) = status::card_word(agent) {
+            line.push_str(" · ");
+            line.push_str(&word);
+        }
+        line
+    } else {
+        let face = status::agent_face(agent);
+        let word = status::card_word(agent);
+        if card_h == 3 {
+            // A three-row card has no body row for the state word, so the bottom
+            // border carries both, tightly. A failed run's word comes first and is
+            // the shortest one that still names the HTTP status: a whole-word cut
+            // then keeps the status, the fact that must not disappear (F-14).
+            match status::tight_failure_word(agent) {
+                Some(word) => format!("{word} · {}", board_state(&face)),
+                None => match word {
+                    Some(word) => format!("{} · {word}", board_state(&face)),
+                    None => board_state(&face).to_owned(),
+                },
+            }
+        } else {
+            word.unwrap_or_else(|| board_state(&face))
+        }
     }
 }
 
@@ -445,6 +603,8 @@ fn draw_compact_card(
     agent: &AgentView,
     selected: bool,
     junction: bool,
+    junction_x: u16,
+    label_room: usize,
 ) {
     let face = status::agent_face(agent);
     let bg = if selected {
@@ -470,16 +630,13 @@ fn draw_compact_card(
     put_arms(buf, rect, rect.x, bottom, R | U, border);
     put_arms(buf, rect, right, bottom, L | U, border);
 
-    let junction_x = card_junction(rect);
-    let max_top = (junction_x.saturating_sub(rect.x + 3)) as usize;
     let title = if selected {
         format!("▸ {}", agent.name)
     } else {
         agent.name.clone()
     };
-    // The compact border has room for one whole state phrase; the full phrase is
-    // on the Agent panel and in the footer sentence.
     let tail = format!("{title} · {}", board_state(&face));
+    let max_top = (junction_x.saturating_sub(rect.x + 3)) as usize;
     border_label_parts(
         buf,
         rect,
@@ -505,18 +662,19 @@ fn draw_compact_card(
             },
         );
     }
-    // The second line rides its border: identity and run total, between caps so
-    // every arm of the border still meets a neighbour.
-    let count = status::run_count(agent);
-    let line = format!("{} · {count}", agent.login);
-    border_label(
+    // The bottom border carries the identity, the run total and the one last-work
+    // (or newest-failure) word, so the floor card keeps all five facts (F-08).
+    // The wire junction is placed after this label; cutting on whole words keeps
+    // the failure word's HTTP status first, and the junction is never drawn
+    // through the text (F-14).
+    border_label_words(
         buf,
         rect,
         rect.x + 1,
         bottom,
-        &line,
+        &card_bottom_text(agent, rect.height),
         theme::card(theme::MUTED, selected),
-        rect.width.saturating_sub(4) as usize,
+        label_room + 4,
     );
 }
 
@@ -525,8 +683,9 @@ fn draw_card(
     rect: Rect,
     agent: &AgentView,
     selected: bool,
-    roomy: bool,
     junction: bool,
+    junction_x: u16,
+    label_room: usize,
 ) {
     let face = status::agent_face(agent);
     let bg = if selected {
@@ -556,13 +715,12 @@ fn draw_card(
     put_arms(buf, rect, rect.x, bottom, R | U, border);
     put_arms(buf, rect, right, bottom, L | U, border);
 
-    let junction_x = card_junction(rect);
-    let max_top = (junction_x.saturating_sub(rect.x + 3)) as usize;
     let title = if selected {
         format!("▸ {}", agent.name)
     } else {
         agent.name.clone()
     };
+    let max_top = (junction_x.saturating_sub(rect.x + 3)) as usize;
     border_label_parts(
         buf,
         rect,
@@ -600,16 +758,9 @@ fn draw_card(
         rect.width.saturating_sub(2),
         rect.height.saturating_sub(2),
     );
-    // The run count is on every card, not only the roomy one (N5). On the
-    // three-row card it shares the login row, so the login gives way when the two
-    // would meet.
     let count = status::run_count(agent);
     let count_width = text_util::width(&count) as u16;
-    let login_room = if roomy {
-        interior.width.saturating_sub(2) as usize
-    } else {
-        interior.width.saturating_sub(2 + count_width + 1) as usize
-    };
+    let login_room = interior.width.saturating_sub(2 + count_width + 1) as usize;
     text_util::put(
         buf,
         interior,
@@ -618,44 +769,37 @@ fn draw_card(
         &text_util::ellipsize(&login, login_room.max(1)),
         theme::card(theme::MUTED, selected),
     );
-    if !roomy {
-        let count_x = rect.right().saturating_sub(count_width + 2);
-        text_util::put(
-            buf,
-            interior,
-            count_x,
-            rect.y + 1,
-            &count,
-            theme::card(theme::MUTED, selected),
-        );
-    }
+    let count_x = rect.right().saturating_sub(count_width + 2);
+    text_util::put(
+        buf,
+        interior,
+        count_x,
+        rect.y + 1,
+        &count,
+        theme::card(theme::MUTED, selected),
+    );
 
-    if roomy && rect.height >= 5 {
-        let status = if roomy {
-            face.status.as_str()
-        } else {
-            board_state(&face)
-        };
+    // The state word sits in the card's body from three interior rows up; the
+    // bottom border carries the one last-work (or failure) word, so a compact
+    // card shows all five facts without a paragraph.
+    let state_row = rect.y + 2;
+    if rect.height >= 4 {
         text_util::put(
             buf,
             interior,
             interior.x + 1,
-            rect.y + 2,
-            &text_util::ellipsize(status, interior.width.saturating_sub(1) as usize),
+            state_row,
+            &text_util::ellipsize(&face.status, interior.width.saturating_sub(1) as usize),
             theme::card(face.colour, selected),
         );
-        let count_x = rect.right().saturating_sub(count_width + 2);
-        text_util::put(
-            buf,
-            interior,
-            count_x,
-            rect.y + 2,
-            &count,
-            theme::card(theme::MUTED, selected),
-        );
-        if let Some(result) = status::run_result_line(agent) {
+    }
+    if rect.height >= 5 {
+        let line = status::run_result_line(agent).or_else(|| status::activity(agent));
+        if let Some(line) = line {
             let colour = if status::run_result_is_refusal(agent) {
                 theme::RED
+            } else if status::run_result_is_warning(agent) {
+                theme::AMBER
             } else {
                 theme::MUTED
             };
@@ -664,41 +808,49 @@ fn draw_card(
                 interior,
                 interior.x + 1,
                 rect.y + 3,
-                &text_util::ellipsize_words(&result, interior.width.saturating_sub(1) as usize),
+                &text_util::ellipsize_words(&line, interior.width.saturating_sub(1) as usize),
                 theme::card(colour, selected),
             );
-        } else if let Some(activity) = status::activity(agent) {
-            let lines = text_util::wrap(&activity, interior.width.saturating_sub(1) as usize);
-            let take = if rect.height >= 6 { 2 } else { 1 };
-            for (index, line) in lines.iter().take(take).enumerate() {
-                text_util::put(
-                    buf,
-                    interior,
-                    interior.x + 1,
-                    rect.y + 3 + index as u16,
-                    line,
-                    theme::card(theme::MUTED, selected),
-                );
-            }
         }
-    } else {
-        border_label(
+    }
+    let label_style = theme::card(
+        if status::last_work_is_failure(agent) {
+            theme::RED
+        } else {
+            theme::MUTED
+        },
+        selected,
+    );
+    if rect.height == 3 {
+        border_label_tight(
             buf,
             rect,
             rect.x + 1,
             bottom,
-            board_state(&face),
-            theme::card_bold(face.colour, selected),
-            rect.width.saturating_sub(2) as usize,
+            &card_bottom_text(agent, rect.height),
+            label_style,
+            label_room,
+        );
+    } else {
+        border_label_words(
+            buf,
+            rect,
+            rect.x + 1,
+            bottom,
+            &card_bottom_text(agent, rect.height),
+            label_style,
+            label_room + 4,
         );
     }
 }
 
 /// A grid of cards under a Forgejo box, with the trunk, bus and wrapped-row spine.
 ///
-/// When the cards cannot all fit, the same layout becomes [`BoardForm::List`]: one
-/// wired box with a text line per agent, laid out in as many columns as the width
-/// allows, so every agent stays on the frame (B1/B2).
+/// One geometry rule holds at every supported size: the grid columns are fixed
+/// before any row is drawn, every row starts at the same x, and the spine runs in
+/// a gap between columns. A partial last row therefore never moves under the
+/// spine, and no connector can cross a card. When the cards cannot keep a whole
+/// title and their facts, the same place becomes the compact list form.
 struct GridGeometry {
     form: BoardForm,
     columns: usize,
@@ -720,6 +872,8 @@ struct GridGeometry {
     list_col_w: u16,
     /// Left edge of the first list column's text.
     list_x: u16,
+    /// Left edge of the first card (or list box) in the fixed grid.
+    grid_start: u16,
 }
 
 /// Whether the bottom footer row has something to say: a notice, a waiting
@@ -728,162 +882,243 @@ fn status_row_needed(board: &Board) -> bool {
     board.notice().is_some() || waiting_sentence(board).is_some() || !board.view.confined
 }
 
-/// How many agent lines fit inside the list box: the content rows minus the
+/// The agents the quit warning names: started, and running or restarting.
+fn started_agent_names(board: &Board) -> Vec<&str> {
+    board
+        .view
+        .agents
+        .iter()
+        .filter(|agent| {
+            agent.desired == Desired::Started
+                && matches!(
+                    agent.session,
+                    SessionState::Running { .. } | SessionState::Restarting { .. }
+                )
+        })
+        .map(|agent| agent.name.as_str())
+        .collect()
+}
+
+/// The quit warning, chosen so its wrapped form fits the `budget` rows the
+/// geometry can give it. Naming every running agent is preferred; when the
+/// names alone would need more rows than the frame can spare, the count keeps
+/// what stops and the reopen sentence instead of losing them (F-13).
+fn quit_warning_text(board: &Board, width: u16, budget: u16) -> String {
+    let started = started_agent_names(board);
+    if started.is_empty() {
+        return "quit stops Forgejo; it starts again on reopen — q again quits".to_owned();
+    }
+    let names = join_names(&started);
+    let line = if started.len() == 1 {
+        format!("quit stops {names} and Forgejo; they start again on reopen — q again quits")
+    } else {
+        format!("quit stops {names}, and Forgejo; they start again on reopen — q again quits")
+    };
+    if text_util::wrap(&line, width.saturating_sub(2) as usize).len() as u16 <= budget {
+        return line;
+    }
+    let noun = if started.len() == 1 {
+        "agent"
+    } else {
+        "agents"
+    };
+    format!(
+        "quit stops {} {noun} and Forgejo; they start again on reopen — q again quits",
+        started.len()
+    )
+}
+
+/// How many rows the footer really needs. It is the single count both the
+/// geometry and the drawing use: the quit warning owns exactly the rows its
+/// wrapped text needs (plus the one notice it would show), the remove
+/// confirmation owns its consequence and key lines, and otherwise the two key
+/// lines, the status line and the event row are each reserved only when they
+/// have something to say. The board above gives up these rows; the footer is
+/// never asked to fit into fewer (review-2 blocker).
+fn footer_rows_for(
+    board: &Board,
+    inner: Rect,
+    forgejo_h: u16,
+    board_floor: u16,
+    build: bool,
+) -> u16 {
+    if build {
+        return 2;
+    }
+    if board.confirm_remove.is_some() {
+        return 2;
+    }
+    if board.confirm_quit {
+        let notice = u16::from(board.notice().is_some());
+        let budget = inner.height.saturating_sub(notice + board_floor).max(1);
+        let line = quit_warning_text(board, inner.width, budget);
+        let warning = text_util::wrap(&line, inner.width.saturating_sub(2) as usize)
+            .len()
+            .max(1) as u16;
+        return warning + notice;
+    }
+    let event = !board.view.forgejo.events.is_empty() && forgejo_h < 8;
+    2 + u16::from(status_row_needed(board)) + u16::from(event)
+}
+
+/// How many agent rows fit inside the list box: the content rows minus the
 /// Forgejo box, the trunk gap and the list box's own two borders.
-fn list_available_rows(content_h: u16, trunk_gap: u16) -> usize {
-    content_h.saturating_sub(3 + trunk_gap + 2).max(1) as usize
+fn list_available_rows(content_h: u16, forgejo_h: u16, trunk_gap: u16) -> usize {
+    content_h.saturating_sub(forgejo_h + trunk_gap + 2).max(1) as usize
+}
+
+/// The number of columns a card grid may use: enough cells for a whole title and
+/// a login, capped so a wide window does not become a strip of slivers.
+fn card_column_limit(usable: u16, gap: u16) -> usize {
+    (((usable + gap) / (24 + gap)) as usize).clamp(1, 6)
+}
+
+/// The balanced column count for `count` cards: six cards are three and three,
+/// seven are four and three, never six and a lonely seventh.
+fn balanced_columns(count: usize, limit: usize) -> usize {
+    let limit = limit.max(1).min(count.max(1));
+    let rows = count.max(1).div_ceil(limit);
+    count.max(1).div_ceil(rows).clamp(1, limit)
 }
 
 fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeometry {
     let inner = inner(area);
     let compact = area.width < 80;
-    // The newest event has its own footer row at the floor (B3). Keep the status
-    // line too, so the event never shares a row with the keys or the notice.
-    let event_in_footer = !build && compact && !board.view.forgejo.events.is_empty();
-    let footer_rows = if build {
-        2
-    } else if event_in_footer && status_row_needed(board) {
-        4
-    } else {
-        3
-    };
-    let footer_top = inner.bottom().saturating_sub(footer_rows);
-    let content_h = footer_top.saturating_sub(inner.y);
-    let agent_count = board.view.agents.len();
-
-    // The 72-column floor keeps the picture complete: two-row compact cards for a
-    // small team, and one line per agent when the cards would need a scroll (B1).
-    // From 80 the three-row card returns and the Forgejo box can grow tall enough
-    // for its facts; a crowded board that would cost the box a fact uses the same
-    // one-line form (B2).
-    let forgejo_h = if roomy { 6 } else { 3 };
-    let trunk_gap = if roomy {
-        2
-    } else if compact {
-        0
-    } else {
-        1
-    };
-    let card_h = if roomy {
-        5
-    } else if compact {
-        2
-    } else {
-        3
-    };
-    let gap = if roomy { 3 } else { 2 };
-    let min_card_w = if roomy { 22 } else { 24 };
-    let max_columns = if roomy { 6 } else { 4 };
-    // Keep one cell between the first card and the frame, and one at the right, the
-    // same margin a three-card row has. Without it a four-card row fills the inner
-    // width exactly and the first card touches the frame.
+    let agent_count = board.view.agents.len().max(1);
+    let gap = if compact { 0 } else { 2 };
     let usable = inner.width.saturating_sub(2);
-    let mut columns = (((usable + gap) / (min_card_w + gap)) as usize)
-        .clamp(1, max_columns)
-        .min(agent_count.max(3))
-        .max(1);
-    let max_card_w = if roomy {
-        if area.width >= 140 { 60 } else { 40 }
+
+    // The Forgejo box keeps its login and repository count at every size; the
+    // version is the first fact it gives up. At 72 it is three rows, at 80 four,
+    // and from 100 six (an accent bar, address, repositories, agents and version,
+    // with the login on the bottom border).
+    let forgejo_h = if compact {
+        3
+    } else if roomy {
+        6
     } else {
-        30
+        4
     };
-    let mut card_w =
-        ((usable.saturating_sub((columns as u16 - 1) * gap)) / columns as u16).min(max_card_w);
-    if card_w < 14 {
-        columns = 1;
-        card_w = inner.width.saturating_sub(2).min(max_card_w);
-    }
+    let trunk_gap = if compact { 0 } else { 1 };
+    // The smallest board the footer must leave room for: the Forgejo box, the
+    // trunk gap, and the compact list's bottom border plus one agent row.
+    let board_floor = forgejo_h + trunk_gap + 3;
+    let footer_rows = footer_rows_for(board, inner, forgejo_h, board_floor, build);
+    let content_h = inner.height.saturating_sub(footer_rows);
+
+    let mut use_list = false;
+    let mut columns = 1;
+    let mut card_w = usable.min(64);
+    let mut card_h: u16 = if compact { 2 } else { 3 };
+    let mut row_gap = 0_u16;
+
     if compact {
-        // The floor card keeps the width for the whole `name · state` label; the
-        // old 56-cell cap cut `needs an instruction` and `next run in 8s`.
-        columns = 1;
-        card_w = inner.width.saturating_sub(6).clamp(20, 64);
+        // The floor keeps a short vertical list of two-row cards (the old
+        // picture) while it fits; four or more take the compact list, which
+        // keeps every fact and every agent on the frame.
+        if agent_count <= 3 {
+            columns = 1;
+            card_h = 2;
+            card_w = inner.width.saturating_sub(6).clamp(20, 64);
+            let total = forgejo_h + agent_count as u16 * (1 + card_h);
+            if total > content_h {
+                use_list = true;
+            }
+        } else {
+            use_list = true;
+        }
+    } else {
+        let limit = card_column_limit(usable, gap).min(agent_count);
+        columns = balanced_columns(agent_count, limit);
+        card_w = (usable.saturating_sub((columns as u16 - 1) * gap) / columns as u16)
+            .min(if area.width >= 140 { 60 } else { 40 });
+        while card_w < 24 && columns > 1 {
+            columns -= 1;
+            card_w = (usable.saturating_sub((columns as u16 - 1) * gap) / columns as u16)
+                .min(if area.width >= 140 { 60 } else { 40 });
+        }
+        let rows = agent_count.div_ceil(columns).max(1);
+        let card_base = forgejo_h + trunk_gap + rows as u16 * (1 + card_h);
+        if card_base > content_h {
+            use_list = true;
+        } else {
+            // A little spare height makes the cards a picture; the card stops at
+            // five rows so it never turns into blank filler (F-07).
+            let spare = content_h - card_base;
+            let max_h: u16 = 5;
+            let per = (spare / rows as u16).min(max_h.saturating_sub(card_h));
+            card_h += per;
+            let used = forgejo_h + trunk_gap + rows as u16 * (1 + card_h);
+            let left = content_h.saturating_sub(used);
+            if rows > 1 {
+                row_gap = (left / (rows as u16 - 1)).min(if roomy { 2 } else { 1 });
+            }
+        }
     }
 
-    // Would every card fit, and would the Forgejo box still reach its facts? The
-    // list form is chosen only when a complete card picture is not possible.
-    let card_rows_total = agent_count.div_ceil(columns.max(1));
-    let capacity = if content_h > forgejo_h + trunk_gap {
-        ((content_h - forgejo_h - trunk_gap) / (1 + card_h)).max(1) as usize
-    } else {
-        1
-    };
-    let visible_card_rows = card_rows_total.min(capacity).max(1);
-    let fact_rows: u16 = 5 + u16::from(!board.view.forgejo.events.is_empty());
-    let max_forgejo: u16 = if compact { 3 } else { 3 + fact_rows };
-    let card_base = forgejo_h + trunk_gap + visible_card_rows as u16 * (1 + card_h);
-    let card_box_h = forgejo_h
-        + content_h
-            .saturating_sub(card_base)
-            .min(max_forgejo.saturating_sub(forgejo_h));
-    let cards_fit = card_rows_total <= capacity;
-    let facts_fit = card_box_h >= 3 + fact_rows;
-    let use_list = if compact {
-        !cards_fit
-    } else {
-        !cards_fit || (!roomy && !facts_fit)
-    };
-
-    if use_list {
-        // Use the fewest columns that keep two promises: every agent is on the
-        // frame, and the Forgejo box still reaches its facts. One column gives each
-        // line the full width (mark, name, login, run count and state); two or
-        // three are the crowded fallback.
-        // At the floor two columns are the most the 72 cells keep readable; a home
-        // past the picker's twelve still scrolls there, as it always did. Wider
-        // boards may use a third column to keep every name and the box facts.
-        let max_list_columns = if compact { 2 } else { 3 };
-        let mut list_columns = 1;
-        loop {
-            let rows = agent_count.div_ceil(list_columns);
-            let visible = rows.min(list_available_rows(content_h, trunk_gap));
-            let list_h = visible as u16 + 2;
-            let spare = content_h.saturating_sub(3 + trunk_gap + list_h);
-            let facts_kept = compact || spare >= fact_rows;
-            if (rows <= list_available_rows(content_h, trunk_gap) && facts_kept)
-                || list_columns >= max_list_columns
-            {
+    let mut layout = if use_list {
+        // The list form: one wired box of one-line entries. One column is used
+        // whenever every agent and its facts fit; a second (or third) only when
+        // the rows do not. At the floor the box spans the inner width so each
+        // line still carries the whole login and a last-work word.
+        let max_cols = if compact { 2 } else { 3 };
+        let list_w = if compact {
+            inner.width
+        } else {
+            inner.width.saturating_sub(2)
+        };
+        let mut chosen: Option<usize> = None;
+        for cols in 1..=max_cols.min(agent_count) {
+            let rows_total = agent_count.div_ceil(cols);
+            let col_w = list_text_width(list_w, cols);
+            if col_w < 26 {
+                continue;
+            }
+            let available = list_available_rows(content_h, forgejo_h, trunk_gap);
+            if rows_total <= available {
+                chosen = Some(cols);
                 break;
             }
-            list_columns += 1;
         }
-        let rows_total = agent_count.div_ceil(list_columns);
-        let available = list_available_rows(content_h, trunk_gap);
-        let visible_rows = rows_total.min(available).max(1);
-        let list_w = inner.width.saturating_sub(2).clamp(8, 100);
+        let cols = chosen.unwrap_or_else(|| {
+            // More agents than the frame can hold: keep the widest readable
+            // columns and scroll with the selection, as the board always did.
+            (1..=max_cols.min(agent_count))
+                .rev()
+                .find(|cols| list_text_width(list_w, *cols) >= 26)
+                .unwrap_or(1)
+        });
+        let rows_total = agent_count.div_ceil(cols);
+        let available = list_available_rows(content_h, forgejo_h, trunk_gap);
+        let visible = rows_total.min(available).max(1);
+        let list_h = visible as u16 + 2;
+        let block = forgejo_h + trunk_gap + list_h;
+        let block_top = inner.y + content_h.saturating_sub(block) / 2;
         let list_x = inner.x + inner.width.saturating_sub(list_w) / 2;
-        let col_w = ((list_w.saturating_sub(2)).saturating_sub(list_columns as u16 - 1))
-            / list_columns as u16;
-        let list_h = visible_rows as u16 + 2;
-        let mut forgejo_h = 3;
-        let mut spare = content_h.saturating_sub(3 + trunk_gap + list_h);
-        let add = spare.min(max_forgejo.saturating_sub(forgejo_h));
-        forgejo_h += add;
-        spare -= add;
-        let block_top = inner.y + spare / 2;
-        let list_y = block_top + forgejo_h + trunk_gap;
-        let list = Rect::new(list_x, list_y, list_w, list_h);
-        let mut row_tops = Vec::new();
-        for row in 0..visible_rows {
-            row_tops.push(list_y + 1 + row as u16);
-        }
-        let selected_row = board.selection / list_columns.max(1);
+        let list = Rect::new(list_x, block_top + forgejo_h + trunk_gap, list_w, list_h);
+        let col_w = list_text_width(list_w, cols);
+        let text_x = list.x + 1;
+        let selected_row = board.selection / cols.max(1);
         let mut scroll_row = board.scroll_row;
         if selected_row < scroll_row {
             scroll_row = selected_row;
         }
-        let last_row = rows_total.saturating_sub(visible_rows);
+        let last_row = rows_total.saturating_sub(visible);
         scroll_row = scroll_row.min(last_row);
-        if selected_row >= scroll_row + visible_rows {
-            scroll_row = selected_row + 1 - visible_rows;
+        if selected_row >= scroll_row + visible {
+            scroll_row = selected_row + 1 - visible;
         }
-        let first_visible = scroll_row.saturating_mul(list_columns);
-        let trunk_x = list_x + list_w / 2;
-        return GridGeometry {
+        let first_visible = scroll_row.saturating_mul(cols);
+        let trunk_x = list.x + list_w / 2;
+        let mut row_tops = Vec::new();
+        for row in 0..visible {
+            row_tops.push(list.y + 1 + row as u16);
+        }
+        GridGeometry {
             form: BoardForm::List,
-            columns: list_columns,
+            columns: cols,
             first_visible,
-            visible_rows,
+            visible_rows: visible,
             card_h: 1,
             card_w: col_w,
             gap: 1,
@@ -896,107 +1131,82 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             block_top,
             list: Some(list),
             list_col_w: col_w,
-            list_x: list_x + 1,
+            list_x: text_x,
+            grid_start: list_x,
+        }
+    } else {
+        let rows = agent_count.div_ceil(columns).max(1);
+        let visible = rows;
+        let block = forgejo_h
+            + trunk_gap
+            + visible as u16 * (1 + card_h)
+            + (visible.saturating_sub(1) as u16) * row_gap;
+        let block_top = inner.y + content_h.saturating_sub(block) / 2;
+        let grid_start = card_group_start(inner, columns, card_w, gap);
+        let mut row_tops = Vec::new();
+        let mut bus_ys = Vec::new();
+        for row in 0..visible {
+            let bus_y = block_top + forgejo_h + trunk_gap + row as u16 * (1 + card_h + row_gap);
+            bus_ys.push(bus_y);
+            row_tops.push(bus_y + 1);
+        }
+        let trunk_x = if columns == 1 {
+            card_junction_for(grid_start, card_w, card_h, board)
+        } else {
+            inner.x + inner.width / 2
         };
-    }
-
-    let rows_total = agent_count.div_ceil(columns.max(1));
-    let mut scroll_row = board.scroll_row;
-    let selected_row = board.selection / columns.max(1);
-    if selected_row < scroll_row {
-        scroll_row = selected_row;
-    }
-    let last_row = rows_total.saturating_sub(capacity);
-    scroll_row = scroll_row.min(last_row);
-    if selected_row >= scroll_row + capacity {
-        scroll_row = selected_row + 1 - capacity;
-    }
-    let first_visible = scroll_row.saturating_mul(columns);
-    let visible_count = (agent_count.saturating_sub(first_visible)).min(columns * capacity);
-    let mut visible_rows = visible_count.div_ceil(columns.max(1));
-    if visible_rows == 0 {
-        visible_rows = 1;
-    }
-
-    let mut forgejo_h = forgejo_h;
-    let mut trunk_gap = trunk_gap;
-    let mut card_h = card_h;
-    let mut row_gap = 0_u16;
-    let mut base = forgejo_h + trunk_gap + (visible_rows as u16) * (1 + card_h);
-    let mut spare = content_h.saturating_sub(base);
-    // The box is only as tall as its facts: address, team/repositories, agents,
-    // version, the newest event when there is one, and the login. A taller box would
-    // draw empty rows, which the layout tests refuse.
-    let max_card: u16 = if roomy {
-        if content_h >= 40 { 8 } else { 6 }
-    } else if compact {
-        2
-    } else {
-        3
+        let spine_x = if columns == 1 {
+            trunk_x
+        } else {
+            choose_spine_x(inner, columns, card_w, gap, trunk_x, grid_start)
+        };
+        GridGeometry {
+            form: BoardForm::Cards,
+            columns,
+            first_visible: 0,
+            visible_rows: visible,
+            card_h,
+            card_w,
+            gap,
+            forgejo_h,
+            footer_rows,
+            row_tops,
+            bus_ys,
+            spine_x,
+            trunk_x,
+            block_top,
+            list: None,
+            list_col_w: 0,
+            list_x: 0,
+            grid_start,
+        }
     };
-    let max_trunk = if roomy {
-        (content_h / 12).clamp(2, 4)
-    } else if compact {
-        0
-    } else {
-        1
-    };
-    let max_row_gap: u16 = if roomy { 2 } else { 0 };
+    layout.visible_rows = layout.visible_rows.max(1);
+    layout
+}
 
-    let add = spare.min(max_forgejo.saturating_sub(forgejo_h));
-    forgejo_h += add;
-    spare -= add;
+/// One list column's text width: the inner width, its border, the one-cell gap
+/// between columns, and the one-cell margin inside the box.
+fn list_text_width(box_w: u16, columns: usize) -> u16 {
+    box_w.saturating_sub(2).saturating_sub(columns as u16 - 1) / columns.max(1) as u16
+}
 
-    let per = (spare / visible_rows as u16).min(max_card.saturating_sub(card_h));
-    card_h += per;
-    spare -= per * visible_rows as u16;
-
-    let add = spare.min(max_trunk.saturating_sub(trunk_gap));
-    trunk_gap += add;
-    spare -= add;
-
-    if visible_rows > 1 {
-        let per = (spare / (visible_rows as u16 - 1)).min(max_row_gap.saturating_sub(row_gap));
-        row_gap += per;
+/// The wire junction for a single-column grid.
+///
+/// The trunk is centred when the card's bottom label is short enough; when the
+/// label would reach the centre (the floor's identity, run count and failure
+/// word), the junction moves to just after the label. A connector is never drawn
+/// through a word (F-14), and the picture keeps one straight trunk.
+fn card_junction_for(x: u16, width: u16, card_h: u16, board: &Board) -> u16 {
+    let mut junction = x + width / 2 + 2;
+    for agent in &board.view.agents {
+        let label = card_bottom_text(agent, card_h);
+        // The label starts on x+1 with a cap. The tight three-row label has no
+        // padding; every other label has a space on each side.
+        let after = if card_h == 3 { 3 } else { 5 };
+        junction = junction.max(x + text_util::width(&label) as u16 + after);
     }
-
-    base = forgejo_h
-        + trunk_gap
-        + (visible_rows as u16) * (1 + card_h)
-        + (visible_rows as u16 - 1) * row_gap;
-    let block_top = inner.y + content_h.saturating_sub(base) / 2;
-
-    let mut row_tops = Vec::new();
-    let mut bus_ys = Vec::new();
-    for row in 0..visible_rows {
-        let bus_y = block_top + forgejo_h + trunk_gap + row as u16 * (1 + card_h + row_gap);
-        bus_ys.push(bus_y);
-        row_tops.push(bus_y + 1);
-    }
-
-    let first_row = agent_count.min(columns);
-    let trunk_x = choose_trunk_x(inner, first_row, card_w, gap);
-    let spine_x = choose_spine_x(inner, columns, card_w, gap, trunk_x);
-
-    GridGeometry {
-        form: BoardForm::Cards,
-        columns,
-        first_visible,
-        visible_rows,
-        card_h,
-        card_w,
-        gap,
-        forgejo_h,
-        footer_rows,
-        row_tops,
-        bus_ys,
-        spine_x,
-        trunk_x,
-        block_top,
-        list: None,
-        list_col_w: 0,
-        list_x: 0,
-    }
+    junction.clamp(x + 2, x + width.saturating_sub(2))
 }
 
 /// Choose a gap between full-row cards for the wrapped rows' vertical spine.
@@ -1015,15 +1225,21 @@ fn card_group_start(inner: Rect, count: usize, card_w: u16, gap: u16) -> u16 {
     inner.x + 1 + usable.saturating_sub(group_w) / 2
 }
 
-fn choose_spine_x(inner: Rect, columns: usize, card_w: u16, gap: u16, trunk_x: u16) -> u16 {
+fn choose_spine_x(
+    _inner: Rect,
+    columns: usize,
+    card_w: u16,
+    gap: u16,
+    trunk_x: u16,
+    grid_start: u16,
+) -> u16 {
     if columns < 2 {
         return trunk_x;
     }
-    let start = card_group_start(inner, columns, card_w, gap);
     let mut best = trunk_x;
     let mut best_distance = u16::MAX;
     for column in 0..columns.saturating_sub(1) {
-        let gap_start = start + (column as u16 + 1) * card_w + column as u16 * gap;
+        let gap_start = grid_start + (column as u16 + 1) * card_w + column as u16 * gap;
         for offset in 0..gap {
             let x = gap_start + offset;
             let distance = x.abs_diff(trunk_x);
@@ -1084,56 +1300,6 @@ fn row_junctions(inner: Rect, count: usize, card_w: u16, gap: u16) -> Vec<u16> {
         .collect()
 }
 
-/// Draw the bus for one row and update the spine continuation.
-#[allow(clippy::too_many_arguments)]
-fn draw_bus(
-    buf: &mut Buffer,
-    clip: Rect,
-    bus_y: u16,
-    centres: &[u16],
-    spine_x: u16,
-    trunk_x: Option<u16>,
-    spine_from_above: bool,
-    spine_below: bool,
-    style: Style,
-) {
-    if centres.is_empty() {
-        return;
-    }
-    let left = centres[0];
-    let right = *centres.last().unwrap_or(&left);
-    let lo = spine_x.min(left);
-    let hi = spine_x.max(right);
-    let mut arms = vec![L | R; (hi - lo + 1) as usize];
-    let index = |x: u16| (x - lo) as usize;
-
-    arms[index(lo)] &= !L;
-    arms[index(hi)] &= !R;
-
-    // The spine's joint. It is the same cell as an end when there is one card.
-    let at = &mut arms[index(spine_x)];
-    if spine_from_above {
-        *at |= U;
-    }
-    if spine_below {
-        *at |= D;
-    }
-
-    for centre in centres {
-        arms[index(*centre)] |= D;
-    }
-
-    if let Some(trunk_x) = trunk_x {
-        if trunk_x >= lo && trunk_x <= hi {
-            arms[index(trunk_x)] |= U;
-        }
-    }
-
-    for (offset, arms) in arms.into_iter().enumerate() {
-        put_arms(buf, clip, lo + offset as u16, bus_y, arms, style);
-    }
-}
-
 fn draw_wrapped_row_spine(
     buf: &mut Buffer,
     clip: Rect,
@@ -1165,95 +1331,81 @@ fn draw_list_line(buf: &mut Buffer, rect: Rect, agent: &AgentView, selected: boo
     };
     text_util::fill(buf, rect, Style::new().fg(theme::FG).bg(bg));
     let max = rect.width as usize;
-    let mut x = rect.x;
-    let mut used = 0usize;
     let name_style = if selected {
         theme::card_bold(theme::SELECT, true)
     } else {
         theme::card_bold(theme::FG, true)
     };
-    if selected && used < max {
-        text_util::put(buf, rect, x, rect.y, "▸", name_style);
-        x += 1;
-        used += 1;
-    }
-    if used < max {
-        text_util::put(
-            buf,
-            rect,
-            x,
-            rect.y,
-            &face.symbol.to_string(),
-            theme::card_bold(face.colour, selected),
-        );
-        x += 1;
-        used += 1;
-    }
-    if used < max {
-        text_util::put(buf, rect, x, rect.y, " ", name_style);
-        x += 1;
-        used += 1;
-    }
-    let name = text_util::ellipsize(&agent.name, max.saturating_sub(used));
-    let name_width = text_util::width(&name);
-    text_util::put(buf, rect, x, rect.y, &name, name_style);
-    x += name_width as u16;
-    used += name_width;
     let login = if agent.provisioning == Provisioning::Pending {
         "connecting…".to_owned()
     } else {
         agent.login.clone()
     };
-    if used + 1 + text_util::width(&login) <= max {
-        text_util::put(buf, rect, x, rect.y, " ", name_style);
-        x += 1;
-        used += 1;
-        text_util::put(
-            buf,
-            rect,
-            x,
-            rect.y,
-            &login,
-            theme::card(theme::MUTED, selected),
-        );
-        x += text_util::width(&login) as u16;
-        used += text_util::width(&login);
-    }
-    // The run total keeps its place here too: it is the number an earlier round
-    // promised on every card (N5), and it never resets with the session.
     let count = status::run_count(agent);
-    if used + 1 + text_util::width(&count) <= max {
-        text_util::put(buf, rect, x, rect.y, " ", name_style);
-        x += 1;
-        used += 1;
-        text_util::put(
-            buf,
-            rect,
-            x,
-            rect.y,
-            &count,
-            theme::card(theme::MUTED, selected),
-        );
-        x += text_util::width(&count) as u16;
-        used += text_util::width(&count);
-    }
-    if used < max {
-        text_util::put(buf, rect, x, rect.y, " ", name_style);
-        x += 1;
-        used += 1;
-        let room = max.saturating_sub(used);
-        // A state word is a word: draw it whole or leave it to the Agent panel.
-        if text_util::width(&face.status) <= room {
-            text_util::put(
-                buf,
-                rect,
-                x,
-                rect.y,
-                &face.status,
-                theme::card_bold(face.colour, selected),
-            );
+    let word = status::last_work_word(agent);
+    let build = |selected_mark: bool, run: RunWord, no_space: bool, with_state: bool| {
+        let mut line = String::new();
+        if selected_mark {
+            line.push('▸');
         }
+        line.push(face.symbol);
+        if !no_space {
+            line.push(' ');
+        }
+        line.push_str(&agent.name);
+        line.push(' ');
+        line.push_str(&login);
+        line.push(' ');
+        let run_text = match run {
+            RunWord::Full => count.clone(),
+            RunWord::Compact => format!("run{}", agent.runs_total),
+            RunWord::Bare => agent.runs_total.to_string(),
+        };
+        line.push_str(&run_text);
+        if let Some(word) = &word {
+            line.push(' ');
+            line.push_str(word);
+        }
+        if with_state {
+            line.push(' ');
+            line.push_str(&face.status);
+        }
+        line
+    };
+    let mut line = build(selected, RunWord::Full, false, true);
+    for (run, no_space) in [
+        (RunWord::Full, false),
+        (RunWord::Compact, false),
+        (RunWord::Bare, false),
+        (RunWord::Bare, true),
+    ] {
+        if text_util::width(&line) <= max {
+            break;
+        }
+        line = build(selected, run, no_space, false);
     }
+    if text_util::width(&line) > max {
+        line = text_util::ellipsize_words(&line, max);
+    }
+    text_util::put(
+        buf,
+        rect,
+        rect.x,
+        rect.y,
+        &line,
+        if selected {
+            name_style
+        } else {
+            theme::card(theme::FG, false)
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+enum RunWord {
+    Full,
+    Compact,
+    Bare,
 }
 
 /// The one-line agent form: one wired box whose interior is a line per agent.
@@ -1270,6 +1422,19 @@ fn draw_agent_list(
     }
     text_util::fill(buf, list, Style::new().fg(theme::FG).bg(theme::CARD));
     draw_plain_box(buf, list, Style::new().fg(theme::WIRE).bg(theme::CARD));
+    // The densest form keeps the state as a mark on each line; the box's bottom
+    // border names the three marks once, so the state is still a word on screen.
+    {
+        border_label(
+            buf,
+            list,
+            list.x + 2,
+            list.bottom() - 1,
+            "● working  ◐ waiting  ○ stopped · N runs",
+            theme::fg(theme::MUTED),
+            list.width.saturating_sub(6) as usize,
+        );
+    }
     // The trunk arrives at the middle of the box's top border as one `┴`.
     put_arms(
         buf,
@@ -1327,15 +1492,12 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     let roomy = area.width >= 100 && area.height >= 30;
     let geometry = home_geometry(board, area, roomy, build);
     let agent_count = board.view.agents.len();
-    let forgejo_width = if roomy {
-        let ceiling = if area.width >= 140 { 100 } else { 72 };
-        (inner.width / 2 + 8).clamp(44, ceiling) & !1
-    } else if area.width >= 80 {
-        // 80 columns leaves room for two whole repository names beside the count;
-        // the count and a `(+N)` still say what is hidden, never a cut name (F-09).
-        (inner.width.saturating_sub(10)).clamp(50, 64) & !1
+    let forgejo_width = if area.width < 80 {
+        inner.width
+    } else if roomy {
+        (inner.width / 2 + 30).clamp(48, 100) & !1
     } else {
-        (inner.width.saturating_sub(16)).clamp(36, 50) & !1
+        inner.width.saturating_sub(2)
     };
     let forgejo_width = forgejo_width.min(inner.width);
     let forgejo_x = geometry
@@ -1355,6 +1517,7 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
         agent_count,
         !build && board.forgejo_selected,
         true,
+        Some(geometry.trunk_x),
         false,
     );
 
@@ -1369,27 +1532,61 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                 put_arms(buf, buf.area, geometry.trunk_x, y, U | D, wire_style);
             }
         }
-        for (row, bus_y) in geometry.bus_ys.iter().enumerate() {
-            if geometry.columns == 1 {
-                break;
-            }
-            let index = geometry.first_visible + row * geometry.columns;
-            let in_row = (agent_count.saturating_sub(index)).min(geometry.columns);
+        let mut layout = BoardLayout {
+            columns: geometry.columns,
+            first_visible: 0,
+            cards: Vec::new(),
+            listed: Vec::new(),
+            form: BoardForm::Cards,
+            forgejo: Some(forgejo_rect),
+            wire_cells: Vec::new(),
+            scrolls: false,
+            footer_rows: geometry.footer_rows,
+        };
+        for row in 0..geometry.visible_rows {
+            let index = row * geometry.columns;
+            let in_row = agent_count.saturating_sub(index).min(geometry.columns);
             if in_row == 0 {
                 break;
             }
-            let centres = row_junctions(inner, in_row, geometry.card_w, geometry.gap);
-            draw_bus(
+            let y = geometry.row_tops[row];
+            let mut junctions = Vec::new();
+            let mut rects = Vec::new();
+            for column in 0..in_row {
+                let agent_index = index + column;
+                let Some(agent) = board.view.agents.get(agent_index) else {
+                    continue;
+                };
+                let selected = !board.forgejo_selected && agent_index == board.selection;
+                let rect = Rect::new(
+                    geometry.grid_start + column as u16 * (geometry.card_w + geometry.gap),
+                    y,
+                    geometry.card_w,
+                    geometry.card_h,
+                );
+                let title = if selected {
+                    format!("▸ {}", agent.name)
+                } else {
+                    agent.name.clone()
+                };
+                let junction = if geometry.columns == 1 {
+                    geometry.trunk_x
+                } else {
+                    card_junction_after_title(rect, &title)
+                };
+                junctions.push(junction);
+                rects.push((agent_index, rect, selected, title, junction));
+            }
+            // The bus spans every card junction, the spine and (on the first row)
+            // the trunk. A partial row keeps the same columns, so the spine stays
+            // in a gap and never crosses a card.
+            draw_bus_any(
                 buf,
                 buf.area,
-                *bus_y,
-                &centres,
+                geometry.bus_ys[row],
+                &junctions,
                 geometry.spine_x,
-                if row == 0 {
-                    Some(geometry.trunk_x)
-                } else {
-                    None
-                },
+                (row == 0).then_some(geometry.trunk_x),
                 row > 0,
                 row + 1 < geometry.visible_rows,
                 wire_style,
@@ -1399,79 +1596,63 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                     buf,
                     buf.area,
                     geometry.spine_x,
-                    *bus_y,
+                    geometry.bus_ys[row],
                     geometry.bus_ys[row + 1],
                     wire_style,
                 );
             }
-        }
-
-        let mut layout = BoardLayout {
-            columns: geometry.columns,
-            first_visible: geometry.first_visible,
-            cards: Vec::new(),
-            listed: Vec::new(),
-            form: BoardForm::Cards,
-            forgejo: Some(forgejo_rect),
-            wire_cells: Vec::new(),
-            scrolls: agent_count > geometry.visible_rows * geometry.columns,
-            footer_rows: geometry.footer_rows,
-        };
-        for row in 0..geometry.visible_rows {
-            let index = geometry.first_visible + row * geometry.columns;
-            let in_row = (agent_count.saturating_sub(index)).min(geometry.columns);
-            if in_row == 0 {
-                break;
+            if geometry.columns == 1 {
+                let from = if row == 0 {
+                    forgejo_rect.bottom()
+                } else {
+                    geometry.row_tops[row - 1] + geometry.card_h
+                };
+                for wire_y in from..y {
+                    put_arms(buf, buf.area, junctions[0], wire_y, U | D, wire_style);
+                }
+                if row > 0 {
+                    put_arms(
+                        buf,
+                        buf.area,
+                        junctions[0],
+                        geometry.row_tops[row - 1] + geometry.card_h - 1,
+                        L | R | D,
+                        wire_style,
+                    );
+                }
             }
-            let centres = row_junctions(inner, in_row, geometry.card_w, geometry.gap);
-            let start = card_group_start(inner, in_row, geometry.card_w, geometry.gap);
-            let y = geometry.row_tops[row];
-            for (column, centre) in centres.iter().enumerate() {
-                let agent_index = index + column;
+            for (agent_index, rect, selected, _title, junction) in rects {
                 let Some(agent) = board.view.agents.get(agent_index) else {
                     continue;
                 };
-                let rect = Rect::new(
-                    start + column as u16 * (geometry.card_w + geometry.gap),
-                    y,
-                    geometry.card_w,
-                    geometry.card_h,
-                );
-                let selected = !board.forgejo_selected && agent_index == board.selection;
-                if rect.height <= 2 {
-                    draw_compact_card(buf, rect, agent, selected, true);
+                // The number of content cells the bottom label may use. On a
+                // single-column grid the wire lands on that border, so the label
+                // stops before the junction; there the three-row card uses the
+                // tight (unpadded) label so it keeps the state and HTTP status.
+                // On a multi-column grid the bottom border keeps its full width.
+                let label_room = if geometry.columns == 1 {
+                    if rect.height == 3 {
+                        junction.saturating_sub(rect.x + 3) as usize
+                    } else {
+                        junction.saturating_sub(rect.x + 5) as usize
+                    }
+                } else if rect.height == 3 {
+                    rect.width.saturating_sub(4) as usize
+                } else if rect.height <= 2 {
+                    rect.width.saturating_sub(8) as usize
                 } else {
-                    draw_card(buf, rect, agent, selected, roomy, true);
-                }
-                if geometry.columns == 1 {
-                    // One vertical list, one spine: the wire above this card leaves
-                    // the Forgejo box (first card) or the previous card's bottom
-                    // centre.
-                    let junction_x = card_junction(rect);
-                    if let Some(previous) = layout.cards.last() {
-                        put_arms(
-                            buf,
-                            buf.area,
-                            card_junction(previous.rect),
-                            previous.rect.bottom() - 1,
-                            L | R | D,
-                            wire_style,
-                        );
-                    }
-                    let from = layout
-                        .cards
-                        .last()
-                        .map(|previous| previous.rect.bottom())
-                        .unwrap_or(forgejo_rect.bottom());
-                    for wire_y in from..rect.y {
-                        put_arms(buf, buf.area, junction_x, wire_y, U | D, wire_style);
-                    }
+                    rect.width.saturating_sub(6) as usize
+                };
+                if rect.height <= 2 {
+                    draw_compact_card(buf, rect, agent, selected, true, junction, label_room);
+                } else {
+                    draw_card(buf, rect, agent, selected, true, junction, label_room);
                 }
                 layout.cards.push(CardSlot {
                     agent: agent_index,
                     rect,
                 });
-                layout.wire_cells.push((*centre, y.saturating_sub(1)));
+                layout.wire_cells.push((junction, y.saturating_sub(1)));
             }
         }
         layout
@@ -1484,6 +1665,88 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
         draw_build_footer(board, buf, inner);
     } else {
         draw_home_footer(board, buf, inner);
+    }
+}
+
+/// The junction on a card's top border, just after its title. Placing it after
+/// the name (rather than half-way across the card) keeps the whole title and the
+/// whole state word even when a crowded row makes the cards narrow.
+fn card_junction_after_title(rect: Rect, title: &str) -> u16 {
+    let width = text_util::width(title) as u16;
+    (rect.x + 2 + 1 + width + 3).clamp(rect.x + 6, rect.right().saturating_sub(3))
+}
+
+/// The picker's bus: the same drawing as the board's, with the old argument list.
+#[allow(clippy::too_many_arguments)]
+fn draw_bus(
+    buf: &mut Buffer,
+    clip: Rect,
+    bus_y: u16,
+    centres: &[u16],
+    spine_x: u16,
+    trunk_x: Option<u16>,
+    spine_from_above: bool,
+    spine_below: bool,
+    style: Style,
+) {
+    draw_bus_any(
+        buf,
+        clip,
+        bus_y,
+        centres,
+        spine_x,
+        trunk_x,
+        spine_from_above,
+        spine_below,
+        style,
+    );
+}
+
+/// Draw a bus across any set of junctions, including a spine and trunk that may
+/// lie outside the outermost card.
+#[allow(clippy::too_many_arguments)]
+fn draw_bus_any(
+    buf: &mut Buffer,
+    clip: Rect,
+    bus_y: u16,
+    centres: &[u16],
+    spine_x: u16,
+    trunk_x: Option<u16>,
+    spine_from_above: bool,
+    spine_below: bool,
+    style: Style,
+) {
+    if centres.is_empty() {
+        return;
+    }
+    let mut lo = *centres.iter().min().unwrap_or(&spine_x).min(&spine_x);
+    let mut hi = *centres.iter().max().unwrap_or(&spine_x).max(&spine_x);
+    if let Some(trunk_x) = trunk_x {
+        lo = lo.min(trunk_x);
+        hi = hi.max(trunk_x);
+    }
+    let mut arms = vec![L | R; (hi - lo + 1) as usize];
+    let index = |x: u16| (x - lo) as usize;
+    arms[index(lo)] &= !L;
+    arms[index(hi)] &= !R;
+    for centre in centres {
+        arms[index(*centre)] |= D;
+    }
+    let at = &mut arms[index(spine_x)];
+    if spine_from_above {
+        *at |= U;
+    }
+    if spine_below {
+        *at |= D;
+    }
+    if let Some(trunk_x) = trunk_x
+        && trunk_x >= lo
+        && trunk_x <= hi
+    {
+        arms[index(trunk_x)] |= U;
+    }
+    for (offset, arms) in arms.into_iter().enumerate() {
+        put_arms(buf, clip, lo + offset as u16, bus_y, arms, style);
     }
 }
 
@@ -1510,36 +1773,34 @@ fn join_names(names: &[&str]) -> String {
 }
 
 fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
-    let footer_rows = board.last.footer_rows.max(3);
+    // Exactly the rows `footer_rows_for` reserved; drawing never writes below
+    // this, and every line the footer draws has a reserved row (review-2).
+    let footer_rows = board.last.footer_rows;
     let footer_top = inner.bottom().saturating_sub(footer_rows);
     if board.confirm_quit {
-        let started: Vec<&str> = board
-            .view
-            .agents
-            .iter()
-            .filter(|agent| agent.desired == Desired::Started)
-            .map(|agent| agent.name.as_str())
-            .collect();
-        let names = join_names(&started);
-        let line = if started.len() == 1 {
-            format!(
-                "quit stops {names} and Forgejo; they start again when you reopen — q again quits"
-            )
-        } else {
-            format!(
-                "quit stops {names}, and Forgejo; they start again when you reopen — q again quits"
-            )
-        };
+        let notice = board.notice();
         let width = inner.width.saturating_sub(2) as usize;
-        for (y, part) in (footer_top..).zip(text_util::wrap(&line, width).into_iter().take(2)) {
-            text_util::put(buf, inner, inner.x + 1, y, &part, theme::bold(theme::AMBER));
-        }
-        if let Some(notice) = board.notice() {
+        // The warning owns everything the geometry gave it except the notice's
+        // one row: consequence, reopen sentence and confirmation are whole.
+        let budget = footer_rows.saturating_sub(u16::from(notice.is_some()));
+        let line = quit_warning_text(board, inner.width, budget);
+        let parts = text_util::wrap(&line, width);
+        for (offset, part) in (0..budget).zip(parts) {
             text_util::put(
                 buf,
                 inner,
                 inner.x + 1,
-                inner.bottom().saturating_sub(1),
+                footer_top + offset,
+                &part,
+                theme::bold(theme::AMBER),
+            );
+        }
+        if let Some(notice) = notice {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                footer_top + footer_rows.saturating_sub(1),
                 &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
                 theme::fg(theme::FG),
             );
@@ -1600,15 +1861,14 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     } else {
         board.view.forgejo.events.last()
     };
-    let bottom = inner.bottom().saturating_sub(1);
     // B3: the event owns a row. It is never right-aligned onto the key line, so a
     // long repository name or the scroll indicator cannot draw over a key hint.
-    let event_y = if event.is_some() && footer_rows >= 4 {
-        footer_top + 2
-    } else {
-        bottom
-    };
-    let status_y = bottom;
+    // The event row sits directly under the two key lines; the status sentence
+    // (when one is drawn) takes the row after it. `footer_rows_for` reserved
+    // exactly these rows, so the event is never placed on the status row and the
+    // status is never written past the reserved block (review-2).
+    let event_y = footer_top + 2;
+    let status_y = footer_top + 2 + u16::from(event.is_some());
     let shown = if layout.form == BoardForm::List {
         layout.listed.len()
     } else {
@@ -1664,10 +1924,10 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
             theme::fg(theme::MUTED),
         );
     }
-    // The status line has the bottom row unless the event took it (which the
-    // geometry only allows when there is no notice, no waiting sentence and a
-    // confined host).
-    if event.is_none() || event_y != status_y {
+    // The status line owns the row the geometry reserved after the event, if
+    // any was reserved; it is never written into an unreserved row.
+    let status_reserved = footer_rows > 2 + u16::from(event.is_some());
+    if status_reserved {
         if let Some(notice) = board.notice() {
             text_util::put(
                 buf,
@@ -1761,10 +2021,13 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
     // *this* computer. It is not numbered, and it scrolls with item 2. The negative
     // sentence is the engine's sixth term on a host with no mechanism.
     if let Some(method) = &board.view.confinement {
+        // The fact about this computer comes first under its item, then the
+        // conditional sentence; both are item 2's block, not a sixth warning (F-11).
         let line = format!("runs on this computer are confined ({method})");
-        let lines = text_util::wrap(&line, width);
+        let mut lines = text_util::wrap(&line, width);
         if let Some((count, block)) = blocks.get_mut(1) {
-            block.extend(lines);
+            lines.extend(block.iter().cloned());
+            *block = lines;
             *count = block.len();
         } else {
             blocks.push((lines.len().max(1), lines));
@@ -1775,7 +2038,7 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
     // separator; the numbered items still read as separate items. Never trade an
     // unseen warning for spacing.
     let spacing = if blocks.len() > 1 {
-        ((content_h as usize).saturating_sub(total_lines) / (blocks.len() - 1)).clamp(0, 4)
+        ((content_h as usize).saturating_sub(total_lines) / (blocks.len() - 1)).clamp(0, 1)
     } else {
         1
     };
@@ -1843,12 +2106,14 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::fg(theme::MUTED),
         );
     }
+    let count = board.view.terms.len();
+    let wording = if count == 1 { "warning" } else { "warnings" };
     text_util::put(
         buf,
         inner,
         inner.x + 1,
         inner.bottom().saturating_sub(2),
-        "y agree    n leave",
+        &format!("{count} {wording}   y agree    n leave"),
         theme::fg(theme::MUTED),
     );
     if let Some(notice) = board.notice() {
@@ -1932,8 +2197,12 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
             y += field_gap;
         }
     }
-    let test = &board.view.endpoint.test;
-    let (line, style) = match test {
+    let test = if board.model_test_visible() {
+        board.view.endpoint.test.clone()
+    } else {
+        EndpointTest::NotRun
+    };
+    let (line, style) = match &test {
         EndpointTest::NotRun => ("t test".to_owned(), theme::fg(theme::MUTED)),
         EndpointTest::Running => ("◐ testing".to_owned(), theme::fg(theme::AMBER)),
         EndpointTest::Passed { answer } => (format!("✓ {answer}"), theme::bold(theme::RUNNING)),
@@ -1957,9 +2226,9 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
         text_util::put(buf, form, form.x + 2, y + row as u16, &shown, style);
     }
     let actions = if board.model_editing {
-        "⏎ next field   ↑↓ field   esc cancel"
+        "⏎ next field   ctrl-u clear   ↑↓ field   esc cancel"
     } else {
-        "e edit   ↑↓ field   t test   ⏎ next   esc back"
+        "e edit   ↑↓ field   t test   ⏎ next   ctrl-u clear   esc back"
     };
     text_util::put(
         buf,
@@ -1984,14 +2253,13 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
 fn field_text(board: &Board, index: usize, editing: bool) -> String {
     let raw = &board.model_fields[index];
     let mut shown = if index == 2 {
-        if raw.is_empty() {
-            if board.view.endpoint.key_present {
-                "••••••••".to_owned()
-            } else {
-                "—".to_owned()
-            }
+        // One mask length in every state: the saved key and the key being edited
+        // are both eight bullets, and an empty field is empty — no stray dash
+        // (W67-13, F-15).
+        if raw.is_empty() && !board.view.endpoint.key_present {
+            String::new()
         } else {
-            "•".repeat(raw.chars().count().min(32))
+            "••••••••".to_owned()
         }
     } else {
         raw.clone()
@@ -2051,12 +2319,28 @@ fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
         (usable.saturating_sub((columns as u16 - 1) * preview_gap) / columns as u16).clamp(9, 18);
     let first_row = count.min(columns);
     let trunk_x = choose_trunk_x(inner, first_row, card_w, preview_gap);
-    let spine_x = choose_spine_x(inner, columns, card_w, preview_gap, trunk_x);
+    let spine_x = choose_spine_x(
+        inner,
+        columns,
+        card_w,
+        preview_gap,
+        trunk_x,
+        card_group_start(inner, columns, card_w, preview_gap),
+    );
     let forgejo_x = trunk_x
         .saturating_sub(forgejo_w / 2)
         .clamp(inner.x, inner.right().saturating_sub(forgejo_w));
     let forgejo = Rect::new(forgejo_x, block_top, forgejo_w, forgejo_h);
-    draw_forgejo_box(buf, forgejo, &board.view.forgejo, count, false, true, true);
+    draw_forgejo_box(
+        buf,
+        forgejo,
+        &board.view.forgejo,
+        count,
+        false,
+        true,
+        Some(trunk_x),
+        true,
+    );
     let count_y = forgejo.bottom();
     text_util::put(
         buf,
@@ -2166,12 +2450,27 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let content_bottom = inner.bottom().saturating_sub(3);
     let content_h = content_bottom.saturating_sub(content_top);
     let card_width = inner.width.saturating_sub(8).clamp(40, 90).min(inner.width);
-    // A tall terminal gives the instruction the spare rows instead of a fixed
-    // 14-row card with the rest of the screen empty (U4/F-11).
-    let card_height = content_h.saturating_sub(2).clamp(10, 44);
+    // The card is as tall as its content, not as tall as the window: the marks sit
+    // directly under the instruction instead of at the far edge of thirty blank
+    // rows (F-07). A tall window gives a long instruction more display rows; a
+    // short one leaves the screen's spare rows outside the card.
+    let instruction_rows = agent
+        .instruction
+        .as_deref()
+        .map(|text| {
+            text.lines()
+                .map(|line| text_util::wrap(line, card_width.saturating_sub(4) as usize).len())
+                .sum::<usize>()
+                .max(1)
+        })
+        .unwrap_or(1)
+        .min(if content_h < 26 { 4 } else { 16 });
+    let card_height = (14 + instruction_rows as u16)
+        .clamp(10, content_h.max(10))
+        .min(content_h.max(1));
     let card = Rect::new(
         inner.x + inner.width.saturating_sub(card_width) / 2,
-        content_top + content_h.saturating_sub(card_height) / 2,
+        content_top,
         card_width,
         card_height,
     );
@@ -2200,8 +2499,11 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
 
     // The rule above the run strip is a row of its own: content stops before it and
     // never paints over it (F1). It is only drawn when it cannot cut into the status
-    // rows at the top of the smallest card.
-    let strip_y = card.bottom().saturating_sub(3);
+    // rows at the top of the smallest card. A narrow card gives the legend two rows
+    // so every entry keeps the same word as at a wide size (F-09).
+    let narrow_legend = card.width.saturating_sub(4) < 61;
+    let legend_rows = if narrow_legend { 2 } else { 1 };
+    let strip_y = card.bottom().saturating_sub(2 + legend_rows);
     let rule_y = strip_y.saturating_sub(1);
     let has_rule = rule_y > card.y + 4;
     let divider = |buf: &mut Buffer, y: u16| {
@@ -2253,7 +2555,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             agent
                 .last_error
                 .as_ref()
-                .map(|error| format!("✗ {}", status::first_clause(error)))
+                .map(|error| format!("✗ {}", status::failure_words(error)))
         });
     let result = status::run_result_line(&agent);
     let result_colour = if status::run_result_is_refusal(&agent) {
@@ -2485,27 +2787,39 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         &count,
         theme::card(theme::MUTED, true),
     );
-    if card.bottom().saturating_sub(1) > strip_y + 1 {
-        // One space between the words keeps the whole legend inside the 72-column
-        // card's 58-cell row. `■ stop` is the floor spelling; from 80 columns the
-        // card has 66 cells and the whole `■ stopped` fits. The `⚠ cmd` entry is the
-        // new mark's: a finished run with a failed command (correction 4).
-        // The 72-column card has 58 cells: this spelling fits whole, with every
-        // entry's word complete. `∅ none` is the no-work mark; the longer `no work`
-        // is used where the card has room (F-04).
-        let legend = if width >= 61 {
-            "✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out"
-        } else {
-            "✓ ok ⊘ refused ∅ none ✗ failed ⚠ cmd ■ stopped ◷ timed out"
-        };
+    if card.bottom().saturating_sub(1) > strip_y + legend_rows {
+        // The same words at every size. A narrow card wraps the legend onto two
+        // rows rather than shortening `no work` or `timed out` (F-09).
+        let first = "✓ ok ⊘ refused ∅ no work ✗ failed";
+        let second = "⚠ cmd ■ stopped ◷ timed out";
         text_util::put(
             buf,
             card,
             interior_x,
             strip_y + 1,
-            &text_util::ellipsize(legend, width),
+            &text_util::ellipsize(first, width),
             theme::card(theme::MUTED, true),
         );
+        if narrow_legend {
+            text_util::put(
+                buf,
+                card,
+                interior_x,
+                strip_y + 2,
+                &text_util::ellipsize(second, width),
+                theme::card(theme::MUTED, true),
+            );
+        } else {
+            let one = format!("{first} {second}");
+            text_util::put(
+                buf,
+                card,
+                interior_x,
+                strip_y + 1,
+                &text_util::ellipsize(&one, width),
+                theme::card(theme::MUTED, true),
+            );
+        }
     }
 
     let actions_y = inner.bottom().saturating_sub(2);
@@ -2535,10 +2849,11 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::bold(theme::AMBER),
         );
     } else if text_util::width(
-        "s start/stop   e instruction   l log   t transcript   d remove   esc back",
+        "s start/stop   e instruction   l log   t transcript   j raw   d remove   esc back",
     ) <= inner.width.saturating_sub(2) as usize
     {
-        let line = "s start/stop   e instruction   l log   t transcript   d remove   esc back";
+        let line =
+            "s start/stop   e instruction   l log   t transcript   j raw   d remove   esc back";
         text_util::put(
             buf,
             inner,
@@ -2548,8 +2863,8 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::fg(theme::MUTED),
         );
     } else {
-        let line1 = "s start/stop   e instruction   l log";
-        let line2 = "t transcript   d remove   esc back";
+        let line1 = "s start/stop   e instruction   l log   t transcript";
+        let line2 = "j raw transcript   d remove   esc back";
         text_util::put(
             buf,
             inner,
@@ -2915,7 +3230,19 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::fg(theme::MUTED),
             false,
         ),
+        (
+            format!("new: {}", upgrade.whats_new),
+            theme::fg(theme::ACCENT),
+            true,
+        ),
     ];
+    if upgrade.warnings_changed {
+        lines.push((
+            "warnings changed — ⏎ shows them".to_owned(),
+            theme::fg(theme::AMBER),
+            true,
+        ));
+    }
     if upgrade.ignored_config {
         lines.push((
             "ignored: the old config.toml (left as it was)".to_owned(),
@@ -2980,8 +3307,11 @@ fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
         ("", "+ add     − remove   f Forgejo"),
         ("", "m model   ? help   q quit"),
         ("agent", "s start/stop   e instruction   l log"),
-        ("", "t transcript   d remove   esc back"),
-        ("model", "e edit   t test   ⏎ next   esc back"),
+        ("", "t transcript   j raw   d remove   esc back"),
+        (
+            "model",
+            "e edit   t test   ⏎ next   ctrl-u clear   esc back",
+        ),
         ("Forgejo", "p password   esc back"),
         ("first run", "y agree   n leave"),
     ];
@@ -3126,6 +3456,10 @@ mod tests {
         );
         assert_eq!(board_state(&face("waiting for Forgejo")), "waiting Forgejo");
         assert_eq!(board_state(&face("working")), "working");
+        assert_eq!(
+            board_state(&face("next run in 20s · no work")),
+            "next 20s · no work"
+        );
     }
 
     #[test]

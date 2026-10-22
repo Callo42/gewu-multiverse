@@ -155,6 +155,9 @@ pub struct AgentView {
     /// The last failure of a tool call inside the current or newest run: one line,
     /// `shell: exit 128 — …`'s first clause; the card adds `⚠` or `✗`.
     pub last_failure: Option<String>,
+    /// A left-over process group from an earlier run that the engine could not
+    /// stop. The card says so instead of hiding it (F-02/F-03).
+    pub leftover: Option<String>,
     /// The tool call in flight right now, if a run is inside one.
     pub current_tool: Option<String>,
     /// How many seconds that call has been in flight.
@@ -195,6 +198,11 @@ pub struct UpgradeView {
     pub ignored_config: bool,
     /// The release page address.
     pub release_url: String,
+    /// One line from this release's notes naming what changed.
+    pub whats_new: String,
+    /// The first-run warnings differ from this installation's recorded wording and
+    /// will be shown again after `⏎`.
+    pub warnings_changed: bool,
 }
 
 /// How an endpoint test went.
@@ -295,6 +303,12 @@ pub trait EngineApi {
     fn instruction_path(&self, agent: &str) -> Option<PathBuf>;
     /// The newest session's readable log and raw transcript, for the pager hand-off.
     fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)>;
+    /// The newest session's human-readable transcript, written beside the JSONL.
+    /// A test engine may not have one; the board then shows the JSONL itself.
+    fn readable_transcript(&self, agent: &str) -> Option<PathBuf> {
+        let _ = agent;
+        None
+    }
     /// Stop every session and the Forgejo; wait at most `grace` before forcing.
     fn shutdown(&mut self, grace: Duration);
 }

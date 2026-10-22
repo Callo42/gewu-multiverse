@@ -209,7 +209,7 @@ fn the_instruction_marker_counts_file_lines_not_wrapped_rows() {
 
     let mut board = Board::new(LongInstruction(ready()));
     press(&mut board, KeyCode::Enter);
-    let backend = TestBackend::new(80, 24);
+    let backend = TestBackend::new(72, 18);
     let mut terminal = Terminal::new(backend).expect("a terminal");
     terminal
         .draw(|frame| board.draw(frame))

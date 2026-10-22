@@ -14,9 +14,16 @@ The design rules are short:
   what to do next.
 - **Nothing is painted on the terminal's default background.** Every cell has the
   product's own background.
-- **The smallest window is 72×18.** At 72×18 the cards are one vertical list with one
-  spine while they fit, and a one-line-per-agent list when they do not; from 100×30
-  they grow and the Forgejo box shows its facts.
+- **One layout rule at every size and count.** The cards sit on a fixed grid: the
+  columns are chosen before any row is drawn, so a partial last row keeps the same
+  columns and the spine always runs in a gap, never through a card. A card title is
+  never truncated and a lone card has no connector stub. When the cards cannot keep
+  their titles and all five facts, the board uses one deliberate compact form: one
+  wired box with a line (or two columns at the floor) per agent. It still reads as the
+  picture — box, wire, agents — and keeps every agent's name, login, state mark, run
+  count and last-work word.
+- **The Forgejo box keeps its login and repository count at every size.** The version
+  is the first fact it gives up; the address, repository count and login stay.
 - **A wide window gets a capped picture.** Up to 160 columns the drawing uses the
   width (the repository line and the card detail grow); past that the same picture is
   centred in 160 columns instead of stretching across the screen.
@@ -36,7 +43,7 @@ in use.
 | Agent | `⏎` on a card | one agent's state, instruction and run files |
 | Forgejo | `f` or `⏎` on the Forgejo box | its address, version, login, password and agents |
 | Help | `?` | every key, grouped by screen |
-| Upgrade | first open by a newer build | what this installation was, what was found, and what is reused |
+| Upgrade | first open by a newer build | what this installation was, what was found, what is reused, and one line from this release's notes |
 
 There is no page map of the old text screens and no screen per configuration file. The
 settings file and the credentials file are written by the flow and by the engine; a
@@ -96,13 +103,14 @@ The first run is one picture filling in: terms, model, agents, then the build.
 ### 1. Before you start
 
 The engine supplies the terms, one short plain sentence each. The product shows
-exactly these five, one unnumbered status line after the second item, and a sixth
-warning — `Runs are not confined on this computer.` — only when the host offers no
-automatic confinement or the layout cannot be confined. The status line states what
-is true on *this* computer, either positively —
-`runs on this computer are confined (Landlock)` (or `bwrap`/`unshare`) — or as the
-sixth warning's negative sentence. The second item stays conditional because it
-describes every mechanism:
+exactly these five as one compact numbered block (at most one blank row between
+items), a status line under the second item, and a sixth warning — `Runs are not
+confined on this computer.` — only when the host offers no automatic confinement or
+the layout cannot be confined. The status line states what is true on *this* computer,
+either positively — `runs on this computer are confined (Landlock)` (or
+`bwrap`/`unshare`) — or as the sixth warning's negative sentence. The footer states the
+count (`5 warnings` or `6 warnings`) and the keys. The second item stays conditional
+because it describes every mechanism:
 
 ```
 Agents use this computer with your permissions.
@@ -142,10 +150,14 @@ changed.
 ```
 
 Three fields, one selected. `e` edits the selected field; `↑`/`↓` (or `tab`) move
-between fields. `⏎` keeps the field and moves to the next one; on the key it finishes
-editing, so `t` or `⏎` can act on the finished form. The footer says `↑↓ field` in both
-modes. `t` saves the model and tests it: `✓ the model answered`, or `✗` with one
-short reason. The address suffix and the empty key are checked **before any request**:
+between fields. `⏎` commits the field and selects the next one **without** entering its
+edit mode, so `t` still tests and the next keystroke cannot overwrite the next value.
+`Ctrl-U` (shown as `ctrl-u clear`) empties the selected field. The saved and the edited
+key are both eight bullets; an empty key field is empty, with no stray dash. A test
+result disappears on the first edit. Continuing with `⏎` runs the same address/key
+check as `t`: a wrong address stays on the form with its `✗` line, and a valid but
+untested form continues with `not tested — t to test` on the next screen. `t` saves
+the model and tests it: `✓ the model answered`, or `✗` with one short reason. The address suffix and the empty key are checked **before any request**:
 `✗ wrong address — it should end in /chat/completions`, `✗ the API key is empty`.
 Every other line is the provider's refusal and names its status and its own message
 (`✗ the provider answered HTTP 404: Add /v1 to the base URL`,
@@ -196,35 +208,48 @@ Forgejo stops with a reason, the box says `● stopped: <reason>` and `r` retrie
 
 ## The board
 
-The Forgejo box is centred at the top: a header bar, its state, its address,
-`team · N repositories` (or `1 repository`), `N agents`, the version, the newest
-repository event and `your login: <login>`. At 72×18 it is three rows and shows the
-state, the address (or `—`) and the agent count; the newest event has a footer row
-of its own when the box is too short for it, so it never shares a line with the keys.
-At 80×24 the box grows tall enough for the accent bar, the address, the organisation
-and the repository count, the whole names that fit and `(+N)` for the rest (never a
-half name; room for the tag is reserved by dropping the last shown name), the agent
-count, the version, the newest event and the login. When a crowded home would squeeze
-the box below those facts, the agents take the one-line form and the box keeps every
-fact. From 100×30 it keeps the same facts. The box is only as tall as its facts; no
-row inside it is left empty.
+The Forgejo box is centred at the top: its state and version on the top border, its
+address, `team · N repositories` (or `1 repository`) and `N agents`, its newest
+repository event on the board's footer row, and `your login: <login>` on its bottom
+border. At 72×18 it is three rows: the state and version on top, the address, the
+repository count and the agent count in the middle, and the login on the bottom. At
+80×24 it grows by one row for the organisation, the whole names that fit and `(+N)` for
+the rest (never a half name; room for the tag is reserved before a name is dropped),
+and the login; the version is already on the top border. From 100×30 the box is six
+rows: an accent bar, the address, the organisation with the whole names, the agent
+count, and the login. The version is the first fact given
+up when the border is too tight. The box keeps the login and repository count at every
+size, is only as tall as its facts, and no row inside it is left empty. The newest
+repository event is stored with the settings, so it survives a reopen; when the box
+cannot hold it, the board's footer gives it a row of its own, never sharing the keys.
 
-At 72×18 the board is one vertical list of compact cards while they fit: one text line
-per agent under the Forgejo box, wired by one spine. The top border carries the state
-symbol, name and state; the bottom border carries the login and `run N`. When the cards
-would need a scroll, the same place becomes the one-line form: one wired box with a
-line per agent, in one column while the line keeps the mark, name, login, run count and
-state, otherwise in two columns. Every agent of the twelve the picker offers is then on
-the screen at once. A home past twelve (the settings' twenty) keeps two columns and
-scrolls with the selection.
+At 72×18 the board is one vertical list of two-row cards while up to three fit: the
+top border carries the state symbol, name and state; the bottom border carries the
+login, `run N` and the last-work (or newest-failure) word. When four or more would need
+a scroll, the same place becomes the compact list: one wired box with a line per
+agent, in one column while the line keeps the mark, name, login, run count and word,
+otherwise in two columns. The box's bottom border names the three state marks. Every
+agent of the twelve the picker offers is then on the screen at once. A home past twelve
+(the settings' twenty) keeps two columns and scrolls with the selection.
 
-At 80×24 the cards are three rows in up to three columns; the login row also carries
-the total `run N` on the right, and the bottom border carries the status. From 100×30 a board
-card is taller: state symbol and name and `run N` on the first row, the login, the
-status, and the newest activity (`last: … · 2m ago` after a run ends). From 140
-columns the picture grows with the window: the Forgejo box widens to 100 cells (so
-every repository name fits) and cards widen to 60; above 160 the whole picture is
-centred in 160 columns, as above.
+At 80×24 the cards are three to five rows in up to three columns; the login row also
+carries the total `run N` on the right. A three-row card keeps the state word beside
+the last-work word on the bottom border, in a tight label with no side padding, so even
+`✗ HTTP 500 · stopped` fits; a four- or five-row card gives the state its own body row
+and puts only the last-work (or failure) word on the border. From 100×30
+a board card is taller: state symbol and name, the login and `run N`, the state word,
+the newest activity (`last: … · 2m ago` after a run ends) and the last-work or
+newest-failure word. From 140 columns the picture grows with the window: the Forgejo
+box widens (so every repository name fits) and cards widen; above 160 the whole picture
+is centred in 160 columns, as above.
+
+The one word for the newest work keeps its number: `pull request #100` is `#100`, never
+`#10`, and `#10000` stays whole. When the newest run failed, the word starts with the
+HTTP status (`✗ HTTP 500 from the model`, or `✗ 500` on a one-line list line) and is cut
+on whole words, so the status is never the part that disappears. On a single-column
+board the wire junction is placed after the label; a connector is never drawn through
+the word.
+
 
 **The rich details are on the Agent screen, not on the board card.** The board keeps
 the few words — name, login, state, one last line, run count. `run N` is the total from
@@ -391,7 +416,7 @@ last agent cannot be removed and the screen says so.
 │        │ last runs  ✓ ⊘ ∅ ✗          run 7    │      │
 │        ╰──────────────────────────────────────╯      │
 │  s stop   e instruction   l log   t transcript       │
-│  d remove   esc back                                 │
+│  j raw JSONL   d remove   esc back                   │
 ╰──────────────────────────────────────────────────────╯
 ```
 
@@ -400,15 +425,16 @@ lines (or `no instruction — e writes one`) and a strip of the newest run ends:
 succeeded, `⊘` **write** refused, `∅` no work, `⚠` finished with a failed command,
 `✗` failed, `◷` timed out, `■` stopped. The label is `last runs`, at most five marks
 then `+N`, the newest mark's one-word label (`⊘ refused`, `∅ no work`, `⚠ cmd failed`),
-a one-line legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`; at
-the 72-column floor every entry is whole: `✓ ok ⊘ refused ∅ none ✗ failed ⚠ cmd
-■ stopped ◷ timed out`), and the total count `run 7`. A refused read is never `⊘`: a
+the same legend at every size (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷
+timed out`; at the 72-column floor it wraps whole on two rows), and the total count
+`run 7`. A refused read is never `⊘`: a
 failed read inside a clean run is `⚠`. The summary line prefers the newest run that did
 work (`last work: …`); a later no-op's own reason is labelled `no work: …`, so it is
 not presented as the agent's work.
 
-`s` starts or stops; `e` hands `instruction_path` to `$EDITOR`; `l` and `t` hand the
-newest run's log or transcript from `session_files` to the pager. `d` draws the
+`s` starts or stops; `e` hands `instruction_path` to `$EDITOR`; `l` hands the newest
+run's log to the pager; `t` writes and shows a readable transcript (turns, tools and
+their output) and `j` shows the raw JSONL record. `d` draws the
 consequence and the keys before it acts: `remove agent-1? login revoked, account
 deactivated, history kept` on one line and `y remove   n keep` under it. The account row and its history stay;
 the Forgejo account is deactivated, so a web sign-in is refused too. `d` on the last
@@ -457,7 +483,8 @@ whole at 80 columns — deliberately two lines at that width, never cut with `�
 the static row says `p resets it, c copies — shown for 10 s, old stops`: the password
 shown before that moment no longer works. `c` puts the shown value on the terminal's
 clipboard with one OSC 52 sequence (base64), never a file, a log or a second plaintext
-line; a terminal without OSC 52 ignores it and the screen still shows the value. The agents' own logins are listed, never their
+line, and shows `copied`; a terminal without OSC 52 ignores the sequence and the screen
+still shows the value. The agents' own logins are listed, never their
 keys.
 
 ## Model and keys
@@ -472,8 +499,9 @@ board    ←→ pick   ⏎ open   s start/stop
          + add     − remove   f Forgejo
          m model   ? help   q quit
 agent    s start/stop   e instruction   l log
-         t transcript   d remove   esc back
-model    e edit   ↑↓ field   t test   ⏎ next   esc back
+         t transcript   j raw   d remove   esc back
+model    e edit   ↑↓ field   t test   ⏎ next
+         ctrl-u clear   esc back
 Forgejo  p password   esc back
 first run  y agree   n leave
 ```
@@ -481,15 +509,22 @@ first run  y agree   n leave
 `q` stops everything. If any agent is started, the footer first says exactly:
 
 ```
-quit stops 3 agents and Forgejo; they start again when you reopen — q again quits
+quit stops 3 agents and Forgejo; they start again on reopen — q again quits
 ```
 
-The noun agrees (`1 agent`, `2 agents`), and the warning names the agents:
-`quit stops agent-2 and agent-3, and Forgejo; they start again when you reopen — q again
-quits`.
+The noun agrees (`1 agent`, `2 agents`), and the warning names only agents with a live
+run (running or waiting for the next run):
+`quit stops agent-2 and agent-3, and Forgejo; they start again on reopen — q again
+quits`. An agent that is started but has no instruction is not named.
 
-At 72 columns the line wraps; it is never abbreviated. A second `q` sends `shutdown`.
-With every agent stopped, `q` quits at once and draws no warning.
+The footer geometry reserves exactly the rows the warning will draw: the wrapped
+warning itself plus one row for a notice, and the board above gives up those rows. The
+warning wraps on whole words, is never abbreviated, and the consequence, the reopen
+sentence and `q again quits` are always kept (at 72 and 80 columns with twelve agents
+it takes three rows). If a home past twelve had names so long that the warning would
+need more rows than the board can spare, the count keeps what stops rather than
+dropping the consequence. Drawing writes only the reserved rows. A second `q` sends
+`shutdown`. With every agent stopped, `q` quits at once and draws no warning.
 
 ## Key map
 
@@ -518,7 +553,7 @@ With every agent stopped, `q` quits at once and draws no warning.
 | | `f` `m` `?` | Forgejo, model, help |
 | | `q` | quit; asks once when an agent is started |
 | agent | `s` | `Start` or `Stop` |
-| | `e` `l` `t` | editor, log, transcript hand-off |
+| | `e` `l` `t` `j` | editor, log, readable transcript, raw JSONL hand-off |
 | | `d` | ask once, then `RemoveAgent` |
 | | `esc` | back |
 | Forgejo | `p` | `RevealAdminPassword` |

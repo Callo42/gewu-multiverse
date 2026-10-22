@@ -754,6 +754,11 @@ fn shell_writes(command: &str) -> bool {
 }
 
 fn segment_writes(segment: &str) -> bool {
+    // `2>&1` is a descriptor redirection, not a write. The stripped form is what
+    // the command-level check already used; stripping here too keeps a failed read
+    // with `2>&1` from being called a refused write (F-04).
+    let stripped = strip_descriptor_redirections(segment);
+    let segment = stripped.as_str();
     let words = shell_words(segment);
     let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
     let next_is = |index: usize, name: &str| lower.get(index + 1).is_some_and(|word| word == name);
@@ -1135,6 +1140,14 @@ pub fn ending_for_instruction(
         "no assigned issue",
         "nothing to do",
         "nothing was assigned",
+        "nothing new",
+        "nothing to add",
+        "nothing to change",
+        "nothing to fix",
+        "no further",
+        "already up to date",
+        "already correct",
+        "already fixed",
         "no typos",
         "no typo",
         "there are no open",
@@ -1142,7 +1155,7 @@ pub fn ending_for_instruction(
         "no changes",
         "nothing to commit",
     ];
-    if no_work.iter().any(|needle| lower.contains(needle)) {
+    if no_work.iter().any(|needle| lower.contains(needle)) && !evidence.wrote {
         return if evidence.failed_call().is_some() {
             RunEnding::Warned
         } else {
@@ -2826,6 +2839,9 @@ struct ToolOutcome {
 /// the directory is the last thing the run does with it, on success or failure.
 struct Shell {
     method: crate::confinement::Method,
+    /// The run directory whose records name this shell's process group, so a
+    /// later start can find it after the supervisor is gone.
+    run_dir: std::path::PathBuf,
     /// The workspace the shell is actually rooted in, resolved with `realpath`.
     workspace: std::path::PathBuf,
     hide: Vec<std::path::PathBuf>,
@@ -2910,6 +2926,7 @@ impl Shell {
         if !method.confined() {
             return Ok(Self {
                 method,
+                run_dir: run_dir.to_path_buf(),
                 workspace,
                 hide: Vec::new(),
                 temp: None,
@@ -2972,6 +2989,7 @@ impl Shell {
         };
         Ok(Self {
             method,
+            run_dir: run_dir.to_path_buf(),
             workspace,
             hide,
             temp: Some(temp.clone()),
@@ -3140,9 +3158,41 @@ fn run_shell(
             child_command.env(crate::workspace::ASKPASS_LOGIN, login);
         }
     }
-    let mut child = child_command
-        .spawn()
-        .map_err(|error| format!("the command `{command}` cannot be started: {error}"))?;
+    // An anonymous memfd ownership capability created before the spawn is inherited
+    // by the shell and its children. It is live identity for the group even in the
+    // small window before the shell's own identity record is written, and it
+    // survives the shell's exit while a child still holds it (review-3b). No shell
+    // may run without it: a capability that cannot be created is a failed run, not
+    // a permission to continue.
+    let shell_capability = crate::run::prepare_shell_capability(&shell.run_dir).map_err(|error| {
+        format!(
+            "the shell's ownership capability cannot be written, so the command was not started: {error}"
+        )
+    })?;
+    let mut child = match child_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            drop(shell_capability);
+            let _ = std::fs::remove_file(shell.run_dir.join(crate::run::SHELL_CAPABILITY_FILE));
+            return Err(format!(
+                "the command `{command}` cannot be started: {error}"
+            ));
+        }
+    };
+    // The child holds its own descriptor now; the supervisor does not need one.
+    drop(shell_capability);
+    // Record the shell's own group before the command runs. If this supervisor is
+    // killed and its `session.*` records are removed or never written, a later
+    // start still finds the group from the run directory (F-02/F-03).
+    let shell_pid = child.id();
+    let shell_pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(shell_pid as i32)))
+        .map(|pgid| pgid.as_raw() as u32)
+        .unwrap_or(shell_pid);
+    if let Err(error) = crate::run::write_shell_record(&shell.run_dir, shell_pid, shell_pgid) {
+        log.line(&format!(
+            "the shell's process record cannot be written: {error}"
+        ));
+    }
 
     let mut stdout = child
         .stdout
@@ -6573,5 +6623,43 @@ mod tests {
             "the transcript word does not read back"
         );
         assert!(reason.contains("could not delete"), "{reason}");
+    }
+    #[test]
+    fn a_denied_read_with_descriptor_redirection_is_warned_not_a_write_refusal() {
+        // The wave-33 regression: `cat … 2>&1` was classed as a write because the
+        // descriptor redirection was only stripped for the whole command, not for
+        // the failed segment the shell recorded. The run's only failure is a denied
+        // read, so it is `⚠`, never `⊘ write refused` (F-04).
+        let command = "echo SETTINGS; cat /tmp/private/multiverse.toml 2>&1; echo rc=$?";
+        let outcome = ToolOutcome {
+            exit_code: Some(0),
+            signal: None,
+            excerpt: "cat: /tmp/private/multiverse.toml: Permission denied\nrc=1\n".to_owned(),
+            segments: vec![
+                transcript::CommandSegment {
+                    command: "cat /tmp/private/multiverse.toml 2>&1".to_owned(),
+                    status: 1,
+                },
+                transcript::CommandSegment {
+                    command: "echo rc=$?".to_owned(),
+                    status: 0,
+                },
+            ],
+            raw_failures: vec![1],
+            shell_prefixes: vec!["bash".to_owned()],
+        };
+        let mut evidence = RunEvidence::default();
+        assert!(evidence.note_shell(command, &outcome));
+        assert!(
+            evidence.refused_write().is_none(),
+            "a denied read was called a write refusal: {:?}",
+            evidence.refused_write()
+        );
+        assert!(evidence.failed_call().is_some());
+        assert_eq!(
+            ending_with_evidence("", &evidence),
+            RunEnding::Warned,
+            "a denied read is not the write mark"
+        );
     }
 }

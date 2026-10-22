@@ -11,7 +11,9 @@ pub mod status;
 mod text;
 mod theme;
 
-use crate::engine_api::{AgentView, BoardView, Command, Desired, EngineApi, Provisioning};
+use crate::engine_api::{
+    AgentView, BoardView, Command, Desired, EndpointTest, EngineApi, Provisioning,
+};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
@@ -85,6 +87,9 @@ pub struct Board {
     model_focus: usize,
     model_editing: bool,
     model_cursor: usize,
+    /// The fields changed since the last test, so a stale `✓` is not shown beside
+    /// a value the provider never saw (W67-13).
+    model_edited: bool,
     model_origin: ModelOrigin,
     agent_count: usize,
     build_ready_ticks: u8,
@@ -136,6 +141,7 @@ impl Board {
             model_focus: 0,
             model_editing: false,
             model_cursor: 0,
+            model_edited: false,
             model_origin: ModelOrigin::FirstRun,
             agent_count: 3,
             build_ready_ticks: 0,
@@ -259,7 +265,27 @@ impl Board {
         self.model_fields[2].clear();
         self.model_focus = 0;
         self.model_editing = false;
+        self.model_edited = false;
         self.model_cursor = self.model_fields[0].chars().count();
+    }
+
+    /// Whether the current field values are the ones the last passing test saw.
+    fn endpoint_tested(&self) -> bool {
+        !self.model_edited
+            && matches!(self.view.endpoint.test, EndpointTest::Passed { .. })
+            && self.model_fields[0].trim() == self.view.endpoint.url.trim()
+            && self.model_fields[1].trim() == self.view.endpoint.model.trim()
+    }
+
+    /// Whether a test result is still about the values on screen.
+    pub fn model_test_visible(&self) -> bool {
+        !self.model_edited
+    }
+
+    fn address_names_completions(&self) -> bool {
+        let url = self.model_fields[0].trim();
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        path.trim_end_matches('/').ends_with("/chat/completions")
     }
 
     fn endpoint_command(&self) -> Command {
@@ -336,10 +362,22 @@ impl Board {
         match plain(key) {
             Some('y') => {
                 if self.terms_seen.iter().all(|seen| *seen) {
+                    // The acknowledgement is recorded first, so the view this
+                    // transition reads already says the warnings are agreed. An
+                    // upgrade whose warnings changed goes back to the board then,
+                    // not into the first-run model/picker flow (F-06).
                     self.send(Command::AcknowledgeTerms);
-                    self.screen = Screen::Model;
-                    self.model_origin = ModelOrigin::FirstRun;
-                    self.set_model_from_view();
+                    self.screen = self.after_upgrade();
+                    if self.screen == Screen::Model {
+                        // First run has no agents; an upgrade with agents but no
+                        // model returns to the board once the model is set.
+                        self.model_origin = if self.view.agents.is_empty() {
+                            ModelOrigin::FirstRun
+                        } else {
+                            ModelOrigin::Board
+                        };
+                        self.set_model_from_view();
+                    }
                 } else {
                     self.set_notice("read every item, then y");
                 }
@@ -354,6 +392,12 @@ impl Board {
     }
 
     fn keys_model(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u')) {
+            clear_string(&mut self.model_fields[self.model_focus]);
+            self.model_cursor = 0;
+            self.model_edited = true;
+            return;
+        }
         if self.model_editing {
             // One Tab behaviour in both modes: Tab keeps the field being edited and
             // moves to the next one. Only Enter finishes editing and stays.
@@ -397,15 +441,26 @@ impl Board {
                     self.set_notice("API address and model needed, then ⏎");
                     return;
                 }
+                // The same local checks `t` runs, before anything is saved or sent.
+                // An address the product itself rejects is never left behind by a
+                // silent continue (W67-1).
+                if !self.address_names_completions() {
+                    self.set_notice("✗ wrong address — it should end in /chat/completions");
+                    return;
+                }
                 if !self.key_available() {
                     self.set_notice("✗ the API key is empty");
                     return;
                 }
+                let tested = self.endpoint_tested();
                 self.send(self.endpoint_command());
                 self.screen = match self.model_origin {
                     ModelOrigin::FirstRun => Screen::Picker,
                     ModelOrigin::Board => Screen::Home,
                 };
+                if !tested {
+                    self.set_notice("not tested — t to test");
+                }
             }
             KeyCode::Esc => {
                 self.screen = match self.model_origin {
@@ -428,6 +483,7 @@ impl Board {
                         // own line is the only verdict on this model.
                         self.notice = None;
                         self.notice_ticks = 0;
+                        self.model_edited = false;
                     }
                 }
                 Some('e') => self.begin_edit(),
@@ -451,12 +507,11 @@ impl Board {
     fn edit_field(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                // U2: `⏎` moves to the next field, so the person never has to guess
-                // that Tab or a Down arrow is the way on. On the last field it ends
-                // editing, so `t` and `⏎` can act on the finished form.
-                if self.model_focus + 1 >= 3 {
-                    self.model_editing = false;
-                } else {
+                // `⏎` commits the field and selects the next one without entering
+                // its edit mode, so `t` still tests and a key cannot be overwritten
+                // by the next keystroke (F-05/W67-5).
+                self.model_editing = false;
+                if self.model_focus + 1 < 3 {
                     self.next_model_field();
                 }
             }
@@ -472,10 +527,12 @@ impl Board {
                 if self.model_cursor > 0 {
                     self.model_cursor -= 1;
                     remove_char(&mut self.model_fields[self.model_focus], self.model_cursor);
+                    self.model_edited = true;
                 }
             }
             KeyCode::Delete => {
                 remove_char(&mut self.model_fields[self.model_focus], self.model_cursor);
+                self.model_edited = true;
             }
             _ => {
                 if let Some(ch) = plain(key) {
@@ -486,6 +543,7 @@ impl Board {
                             ch,
                         );
                         self.model_cursor += 1;
+                        self.model_edited = true;
                     }
                 }
             }
@@ -677,6 +735,7 @@ impl Board {
                 },
                 Some('l') => self.offer_session_file(true),
                 Some('t') => self.offer_session_file(false),
+                Some('j') => self.offer_raw_transcript(),
                 Some('d') => {
                     if self.view.agents.len() <= 1 {
                         self.set_notice("the last agent cannot be removed");
@@ -714,7 +773,7 @@ impl Board {
                     // the sequence and the screen value is still there.
                     Some((password, _)) => {
                         self.clipboard = Some(osc52(password));
-                        self.set_notice("password copied — if your terminal supports it");
+                        self.set_notice("copied");
                     }
                     None => self.set_notice("press p to show the password, then c copies it"),
                 },
@@ -772,7 +831,11 @@ impl Board {
         let (path, kind, label) = if log {
             (log_path, HandoffKind::View, "log")
         } else {
-            (transcript, HandoffKind::View, "transcript")
+            let readable = self
+                .engine
+                .readable_transcript(&self.agent_name)
+                .unwrap_or(transcript);
+            (readable, HandoffKind::View, "transcript")
         };
         self.handoff = Some(Handoff {
             kind,
@@ -781,12 +844,27 @@ impl Board {
         });
     }
 
+    fn offer_raw_transcript(&mut self) {
+        let Some((_log, transcript)) = self.engine.session_files(&self.agent_name) else {
+            self.set_notice("no transcript yet — s starts a run");
+            return;
+        };
+        self.handoff = Some(Handoff {
+            kind: HandoffKind::View,
+            path: transcript,
+            label: format!("{}/transcript (JSONL)", self.agent_name),
+        });
+    }
+
     fn request_quit(&mut self) {
-        let started = self
-            .view
-            .agents
-            .iter()
-            .any(|agent| agent.desired == Desired::Started);
+        let started = self.view.agents.iter().any(|agent| {
+            agent.desired == Desired::Started
+                && matches!(
+                    agent.session,
+                    crate::engine_api::SessionState::Running { .. }
+                        | crate::engine_api::SessionState::Restarting { .. }
+                )
+        });
         if !started {
             self.leave_without_warning();
             return;
@@ -928,6 +1006,11 @@ fn osc52(text: &str) -> String {
     }
     out.push('\x07');
     out
+}
+
+/// Empty a model field in one gesture.
+fn clear_string(field: &mut String) {
+    field.clear();
 }
 
 /// A character key without control or alt, so `t` can type a `t` in a field and

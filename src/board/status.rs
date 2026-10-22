@@ -167,12 +167,18 @@ pub fn agent_face(agent: &AgentView) -> Face {
             colour: theme::RUNNING,
             status: "working".to_owned(),
         },
-        SessionState::Restarting { next_at, .. } => {
+        SessionState::Restarting { next_at, last } => {
             let seconds = next_at
                 .duration_since(SystemTime::now())
                 .map(|left| left.as_secs().max(1))
                 .unwrap_or(1);
-            let status = format!("next run in {seconds}s");
+            // A no-work run backs off further than an ordinary idle. The card says
+            // why in the same line, so the longer wait is never a mystery (W67-12).
+            let status = if matches!(last, SessionEnd::NoWork { .. }) {
+                format!("next run in {seconds}s · no work")
+            } else {
+                format!("next run in {seconds}s")
+            };
             Face {
                 symbol: '◐',
                 word: status.clone(),
@@ -384,6 +390,156 @@ pub fn run_result_is_refusal(agent: &AgentView) -> bool {
     )
 }
 
+/// The one word a compact board card shows for the newest run's failure.
+///
+/// An outage must be visible without opening the agent: the newest failed run
+/// replaces the last-work word with `✗ HTTP 500` (or `✗ model unreachable`).
+/// Refused and warned runs keep their last-work word; the strip and the panel
+/// still carry their mark (W67-3).
+pub fn last_work_word(agent: &AgentView) -> Option<String> {
+    if let Some(word) = newest_failure_word(agent) {
+        return Some(word);
+    }
+    let mut best: Option<String> = None;
+    for line in agent.last_work.iter().rev() {
+        if let Some(rest) = line.strip_prefix("pull request #") {
+            // The number is the fact a person needs; the label is what gives way
+            // when a compact line is tight. `PR #100` stays `#100`, never `PR#10`.
+            best = Some(format!("#{}", leading_number(rest)));
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("issue #") {
+            best = Some(format!("#{}", leading_number(rest)));
+        } else if let Some(rest) = line.strip_prefix("comment on #") {
+            best.get_or_insert_with(|| format!("#{}", leading_number(rest)));
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            let branch = rest.split_whitespace().next().unwrap_or(rest);
+            best.get_or_insert_with(|| branch.chars().take(7).collect());
+        }
+    }
+    best
+}
+
+fn leading_number(text: &str) -> String {
+    text.chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+}
+
+/// Whether the compact card's word is a newest-run failure, so it is drawn red.
+pub fn last_work_is_failure(agent: &AgentView) -> bool {
+    newest_failure_word(agent).is_some()
+}
+
+/// `✗ HTTP 500` / `✗ model unreachable` for the newest failed run. `None` when the
+/// newest run did not fail.
+pub fn newest_failure_word(agent: &AgentView) -> Option<String> {
+    if agent.leftover.is_some() {
+        return Some("⚠ leftover".to_owned());
+    }
+    match agent.recent.last() {
+        Some(SessionEnd::Failed { reason }) => Some(format!("✗ {}", short_failure(reason))),
+        Some(SessionEnd::TimedOut) => Some("◷ timeout".to_owned()),
+        _ => None,
+    }
+}
+
+/// The shortest failure word that still carries an HTTP status, for the one
+/// three-row card form whose bottom border must also hold the state word:
+/// `✗ HTTP 500`. Other failures reuse [`newest_failure_word`] (`✗ net`,
+/// `◷ timeout`, `⚠ leftover`).
+pub fn tight_failure_word(agent: &AgentView) -> Option<String> {
+    if let Some(SessionEnd::Failed { reason }) = agent.recent.last()
+        && let Some(code) = http_status_in(reason)
+    {
+        return Some(format!("✗ HTTP {code}"));
+    }
+    newest_failure_word(agent)
+}
+
+/// The full failure word for a board card: `✗ HTTP 500 from the model` or
+/// `✗ model unreachable`. The list form uses [`newest_failure_word`]'s shorter
+/// spelling because a line has room for one work word, not a sentence (W67-3).
+pub fn card_word(agent: &AgentView) -> Option<String> {
+    if agent.leftover.is_some() {
+        return Some("⚠ leftover process".to_owned());
+    }
+    if let Some(SessionEnd::Failed { reason }) = agent.recent.last() {
+        return Some(format!("✗ {}", failure_words(reason)));
+    }
+    last_work_word(agent)
+}
+
+fn short_failure(reason: &str) -> String {
+    if let Some(code) = http_status_in(reason) {
+        return code.to_string();
+    }
+    if reason
+        .to_ascii_lowercase()
+        .contains("cannot reach the model")
+    {
+        return "net".to_owned();
+    }
+    "failed".to_owned()
+}
+
+/// One whole-word failure line for a card: keep the HTTP status first (the fact a
+/// person needs to tell a provider problem from a bad model name), then the
+/// shortest honest phrase for the transport cases.
+pub fn failure_words(reason: &str) -> String {
+    if let Some(code) = http_status_in(reason) {
+        return format!("HTTP {code} from the model");
+    }
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("cannot reach the model") {
+        if let Some(errno) = errno_in(reason) {
+            return format!("model unreachable (errno {errno})");
+        }
+        return "model unreachable".to_owned();
+    }
+    if lower.contains("no answer within") {
+        return "model timed out".to_owned();
+    }
+    if lower.contains("bad_key") || lower.contains("refused the api key") {
+        return "the API key was refused".to_owned();
+    }
+    if lower.contains("model_not_found") {
+        return "the model name was not found".to_owned();
+    }
+    first_clause(reason)
+}
+
+fn http_status_in(text: &str) -> Option<u16> {
+    for marker in ["HTTP ", "HTTP/1.1 ", "HTTP/1.0 ", "status "] {
+        if let Some(rest) = text.split(marker).nth(1) {
+            let digits: String = rest
+                .chars()
+                .skip_while(|ch| !ch.is_ascii_digit())
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect();
+            if let Ok(code) = digits.parse::<u16>()
+                && (400..=599).contains(&code)
+            {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn errno_in(text: &str) -> Option<String> {
+    let at = text.find("errno ")? + "errno ".len();
+    let digits: String = text[at..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
 /// Whether a word is one the product must not show. Used by the render tests.
 pub const BANNED: [&str; 9] = [
     "session",
@@ -426,6 +582,7 @@ mod tests {
             last_error: None,
             last_result: None,
             last_failure: None,
+            leftover: None,
             current_tool: None,
             current_tool_seconds: 0,
             last_work: Vec::new(),
