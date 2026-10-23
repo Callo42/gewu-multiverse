@@ -155,7 +155,7 @@ a single-column connector is placed after the label so it never crosses the word
 After an upgrade, the first open shows one screen: the version this installation was,
 the version this is, what was found (settings, agents, instructions and runs), what is
 reused or ignored, one line from this release's notes naming what changed, and the
-release page address for this exact build (`…/releases/tag/v0.1.35`). If the first-run warnings changed since this installation last
+release page address for this exact build (`…/releases/tag/v0.1.36`). If the first-run warnings changed since this installation last
 agreed to them, the screen says so and the next screen shows them again; after they are
 agreed the program returns to the board, never into the first-run model and picker
 flow. The next open goes straight to the board. The installer records the old version before it replaces the binary, and a
