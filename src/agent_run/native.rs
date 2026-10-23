@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use crate::model;
 use crate::run::NativePlan;
 use crate::transcript::{Record, Transcript};
 
-use super::{RunEnd, RunEvidence, RunLog, Shell};
+use super::{RunEnd, RunEnding, RunEvidence, RunLog, Shell};
 
 /// The run's private native directory under the confined run temp.
 struct NativeFiles {
@@ -36,7 +36,80 @@ struct NativeFiles {
     program: PathBuf,
     install_root: PathBuf,
     skills: Vec<PathBuf>,
-    mcp: Option<PathBuf>,
+    mcp_state: Option<PathBuf>,
+    mcp_socket: Option<PathBuf>,
+}
+
+/// A supervisor-owned MCP server outside the native Landlock writable roots.
+struct McpServer {
+    child: Child,
+    socket: PathBuf,
+    state: PathBuf,
+}
+
+impl McpServer {
+    fn start(
+        plan: &crate::run::RunPlan,
+        shell: &Shell,
+        temp: &Path,
+        native_root: &Path,
+        exe: &Path,
+    ) -> Result<Option<Self>, String> {
+        if crate::run::read_forgejo_context(&shell.run_dir).is_none()
+            || credentials::forgejo_agent_token(&plan.credentials, &plan.agent).is_err()
+        {
+            return Ok(None);
+        }
+        let state = temp.join("mcp-state");
+        std::fs::create_dir_all(&state)
+            .map_err(|error| format!("the MCP state directory cannot be created: {error}"))?;
+        let _ = crate::mode::set_mode(&state, crate::mode::PRIVATE_DIR_MODE);
+        let socket = native_root.join("mcp.sock");
+        let _ = std::fs::remove_file(&socket);
+        let child = Command::new(exe)
+            .arg("--mcp-forgejo-serve")
+            .arg(&socket)
+            .arg(&state)
+            .arg(&shell.run_dir)
+            .arg(&plan.credentials)
+            .arg(&plan.agent)
+            .arg(&plan.workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("the Forgejo MCP server cannot start: {error}"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if socket.exists() {
+                return Ok(Some(Self {
+                    child,
+                    socket,
+                    state,
+                }));
+            }
+            if !crate::run::process_alive(child.id()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        Err("the Forgejo MCP server did not become ready".to_owned())
+    }
+
+    fn state(&self) -> &Path {
+        &self.state
+    }
+}
+
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket);
+    }
 }
 
 /// One tool call still open in the native event stream.
@@ -57,6 +130,7 @@ struct NativeState {
     failed_call: Option<String>,
     refused_write: Option<String>,
     wrote: bool,
+    tool_ok: bool,
     checked_empty: bool,
 }
 
@@ -101,7 +175,7 @@ pub(super) fn run(
         );
     };
 
-    let files = match prepare_files(plan, native, program, protocol, shell, temp) {
+    let mut files = match prepare_files(plan, native, program, protocol, shell, temp) {
         Ok(files) => files,
         Err(reason) => return RunEnd::failed(reason),
     };
@@ -111,7 +185,20 @@ pub(super) fn run(
         native.version,
         files.program.display()
     ));
+    let mcp_server = match McpServer::start(plan, shell, temp, &files.root, &files.key_helper) {
+        Ok(server) => server,
+        Err(reason) => return RunEnd::failed(reason),
+    };
+    if let Some(server) = mcp_server.as_ref() {
+        files.mcp_state = Some(server.state().to_path_buf());
+        files.mcp_socket = Some(server.socket.clone());
+        log.line(&format!("mcp bridge: {}", server.socket.display()));
+    } else {
+        log.line("mcp bridge: off — no Forgejo context or own token");
+    }
+    let _mcp_server = mcp_server;
 
+    let workspace_before = workspace_fingerprint(&plan.workspace);
     let (argv, envs, config_note) = match build_launch(plan, native, program, protocol, &files) {
         Ok(launch) => launch,
         Err(reason) => return RunEnd::failed(reason),
@@ -315,6 +402,9 @@ pub(super) fn run(
         state.wrote = true;
     }
     apply_ledger(&files, transcript, &mut state);
+    if workspace_fingerprint(&plan.workspace) != workspace_before {
+        state.wrote = true;
+    }
 
     let exit = status.expect("the child exited");
     if let Some(call) = state.open.values().next().cloned() {
@@ -340,7 +430,7 @@ pub(super) fn run(
     if !exit.success() {
         return RunEnd::failed(reason);
     }
-    if !state.terminal && state.final_text.is_none() && state.error.is_none() {
+    if !state.terminal {
         return RunEnd::failed(
             "the native program exited without a completion event; the run is not a success"
                 .to_owned(),
@@ -350,7 +440,6 @@ pub(super) fn run(
         return RunEnd::failed(error);
     }
 
-    let instruction_text = String::from_utf8_lossy(instruction);
     let summary = state
         .final_text
         .as_deref()
@@ -363,12 +452,63 @@ pub(super) fn run(
         checked_empty: state.checked_empty,
         ..RunEvidence::default()
     };
-    let ending = super::ending_for_instruction(&instruction_text, &summary, &evidence);
+    let ending = if evidence.refused_write().is_some() {
+        RunEnding::Refused
+    } else if evidence.failed_call().is_some() {
+        RunEnding::Warned
+    } else if evidence.checked_empty && !evidence.wrote {
+        RunEnding::NoWork
+    } else if state.wrote || state.tool_ok {
+        RunEnding::Succeeded
+    } else {
+        RunEnding::Warned
+    };
+    let reason = if summary.trim().is_empty() && matches!(ending, RunEnding::Warned) {
+        Some(
+            "the native program finished without a tool result; the result is not verified"
+                .to_owned(),
+        )
+    } else {
+        (!summary.trim().is_empty()).then_some(summary.clone())
+    };
     RunEnd {
         exit_code: 0,
-        reason: (!summary.trim().is_empty()).then_some(summary),
+        reason,
         ending,
     }
+}
+
+/// A cheap before/after witness of actual workspace changes. It covers files the
+/// native program itself created, edited or committed; arbitrary shell success with
+/// no filesystem effect is not counted as a write.
+fn workspace_fingerprint(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
+    fn walk(root: &Path, path: &Path, out: &mut std::collections::BTreeMap<PathBuf, (u64, u64)>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                walk(root, &path, out);
+            } else if kind.is_file() {
+                let Ok(meta) = entry.metadata() else { continue };
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as u64)
+                    .unwrap_or(0);
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                out.insert(relative, (meta.len(), modified));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
 }
 
 /// Prepare all private native files for one harness.
@@ -410,7 +550,6 @@ fn prepare_files(
         }
     }
     skills.sort();
-    let mcp = prepare_mcp(plan, native, shell, &root)?;
     Ok(NativeFiles {
         root,
         home,
@@ -421,7 +560,8 @@ fn prepare_files(
         program: native.program.clone(),
         install_root: native.install_root.clone(),
         skills,
-        mcp,
+        mcp_state: None,
+        mcp_socket: None,
     })
 }
 
@@ -430,43 +570,6 @@ fn plan_key(plan: &crate::run::RunPlan) -> Result<String, String> {
     credentials::model_key(&plan.credentials, &plan.agent)
         .map(|secret| secret.expose().to_owned())
         .map_err(|error| error.to_string())
-}
-
-/// Copy the minimal Forgejo context the MCP server needs, if the agent has one.
-fn prepare_mcp(
-    plan: &crate::run::RunPlan,
-    _native: &NativePlan,
-    shell: &Shell,
-    native_root: &Path,
-) -> Result<Option<PathBuf>, String> {
-    let Some(context) = crate::run::read_forgejo_context(&shell.run_dir) else {
-        return Ok(None);
-    };
-    let Some(token) = credentials::forgejo_agent_token_optional(&plan.credentials, &plan.agent)
-        .map_err(|error| error.to_string())?
-    else {
-        return Ok(None);
-    };
-    let dir = native_root.join("mcp");
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("{} cannot be created: {error}", dir.display()))?;
-    let _ = crate::mode::set_mode(&dir, crate::mode::PRIVATE_DIR_MODE);
-    let text = serde_json::to_string_pretty(&context)
-        .map_err(|error| format!("the Forgejo context cannot be written: {error}"))?;
-    crate::mode::write_private(dir.join("forgejo.json"), text.as_bytes())
-        .map_err(|error| format!("the Forgejo context cannot be written: {error}"))?;
-    crate::mode::write_private(dir.join("token"), token.expose().as_bytes())
-        .map_err(|error| format!("the Forgejo token file cannot be written: {error}"))?;
-    crate::mode::write_private(dir.join("agent"), plan.agent.as_bytes())
-        .map_err(|error| format!("the Forgejo agent file cannot be written: {error}"))?;
-    crate::mode::write_private(
-        dir.join("workspace"),
-        plan.workspace.display().to_string().as_bytes(),
-    )
-    .map_err(|error| format!("the Forgejo workspace file cannot be written: {error}"))?;
-    crate::mode::write_private(dir.join("writes"), b"0")
-        .map_err(|error| format!("the Forgejo write counter cannot be written: {error}"))?;
-    Ok(Some(dir))
 }
 
 /// Build the program command, its extra environment and a short config description.
@@ -481,11 +584,14 @@ fn build_launch(
 ) -> Result<Launch, String> {
     let mut args: Vec<String> = Vec::new();
     let mut envs: Vec<(String, String)> = Vec::new();
-    let mcp = files.mcp.as_ref().map(|dir| {
+    let mcp = files.mcp_socket.as_ref().map(|socket| {
         let exe = files.key_helper.display().to_string();
         (
             exe,
-            vec!["--mcp-forgejo".to_owned(), dir.display().to_string()],
+            vec![
+                "--mcp-forgejo-connect".to_owned(),
+                socket.display().to_string(),
+            ],
         )
     });
     let model = native.model.clone();
@@ -531,9 +637,14 @@ fn build_launch(
                 "--model".to_owned(),
                 model,
             ]);
+            let skills_dir = dir.join("skills");
             for skill in &files.skills {
+                let Some(name) = skill.file_name() else {
+                    continue;
+                };
+                copy_tree(skill, &skills_dir.join(name))?;
                 args.push("--skill".to_owned());
-                args.push(skill.display().to_string());
+                args.push(skills_dir.join(name).display().to_string());
             }
         }
         Program::Codex => {
@@ -1057,12 +1168,13 @@ fn opencode_event(
             }
         }
         Some("step_finish") => {
-            if let Some(reason) = value
+            let reason = value
                 .get("part")
                 .and_then(|part| part.get("reason"))
                 .and_then(Value::as_str)
-                && reason == "stop"
-            {
+                .unwrap_or("");
+            log.line(&format!("opencode step_finish reason={reason}"));
+            if matches!(reason, "stop" | "end-turn" | "complete") {
                 state.terminal = true;
             }
         }
@@ -1167,6 +1279,9 @@ fn finish_call(
     let duration = call.started.elapsed().as_millis() as u64;
     log.tool_finished();
     let failed = signal.is_some() || exit != 0;
+    if !failed && !is_write_tool(&call.tool) {
+        state.tool_ok = true;
+    }
     if failed {
         let cause = if output.trim().is_empty() {
             format!("the native tool exited with code {exit}")
@@ -1210,7 +1325,7 @@ fn is_write_tool(tool: &str) -> bool {
 
 /// Read the MCP server's per-run ledger and record its facts.
 fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut NativeState) {
-    let Some(dir) = files.mcp.as_ref() else {
+    let Some(dir) = files.mcp_state.as_ref() else {
         return;
     };
     let Ok(text) = std::fs::read_to_string(dir.join("calls.jsonl")) else {
@@ -1244,8 +1359,8 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
                 .trim_start()
                 .starts_with("no open issue is assigned")
         {
-            state.failed_call = state.failed_call.take();
-            // A successful empty assigned read, with no write, is the no-work fact.
+            // A successful empty assigned read is a no-work fact; it never erases
+            // an earlier failed read or write.
             state.checked_empty = true;
         }
         if !ok && crate::forgejo_tools::is_write_tool(tool) {

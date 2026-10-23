@@ -55,6 +55,26 @@ pub enum Invocation {
         /// The run-private context directory.
         context: PathBuf,
     },
+    /// The supervisor-owned MCP server. Started by a run supervisor.
+    McpForgejoServe {
+        /// The run-private socket.
+        socket: PathBuf,
+        /// The protected supervisor state directory.
+        state: PathBuf,
+        /// The run directory.
+        run: PathBuf,
+        /// The credentials file.
+        credentials: PathBuf,
+        /// The agent.
+        agent: String,
+        /// The agent workspace.
+        workspace: PathBuf,
+    },
+    /// The thin MCP relay a native CLI starts.
+    McpForgejoConnect {
+        /// The run-private socket.
+        socket: PathBuf,
+    },
     /// Install one official native program into the product's data directory.
     InstallHarness {
         /// Program id.
@@ -144,6 +164,23 @@ where
             "--mcp-forgejo" => {
                 return Ok(Invocation::McpForgejo {
                     context: value_after(&mut args, "--mcp-forgejo")?,
+                });
+            }
+            "--mcp-forgejo-connect" => {
+                return Ok(Invocation::McpForgejoConnect {
+                    socket: value_after(&mut args, "--mcp-forgejo-connect")?,
+                });
+            }
+            "--mcp-forgejo-serve" => {
+                return Ok(Invocation::McpForgejoServe {
+                    socket: value_after(&mut args, "--mcp-forgejo-serve")?,
+                    state: value_after(&mut args, "--mcp-forgejo-serve")?,
+                    run: value_after(&mut args, "--mcp-forgejo-serve")?,
+                    credentials: value_after(&mut args, "--mcp-forgejo-serve")?,
+                    agent: value_after(&mut args, "--mcp-forgejo-serve")?
+                        .to_string_lossy()
+                        .into_owned(),
+                    workspace: value_after(&mut args, "--mcp-forgejo-serve")?,
                 });
             }
             "--install-harness" => {

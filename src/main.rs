@@ -103,6 +103,20 @@ fn main() -> ExitCode {
         Invocation::McpForgejo { context } => {
             ExitCode::from(mcp_forgejo::serve(&context).clamp(0, 255) as u8)
         }
+        Invocation::McpForgejoConnect { socket } => {
+            ExitCode::from(mcp_forgejo::connect(&socket).clamp(0, 255) as u8)
+        }
+        Invocation::McpForgejoServe {
+            socket,
+            state,
+            run,
+            credentials,
+            agent,
+            workspace,
+        } => ExitCode::from(
+            mcp_forgejo::serve_supervised(&socket, &state, &run, &credentials, &agent, &workspace)
+                .clamp(0, 255) as u8,
+        ),
         Invocation::InstallHarness { program } => {
             let Some(program) = gewu_multiverse::harness::Program::parse(&program) else {
                 eprintln!("gewu-multiverse: there is no program named `{program}`");

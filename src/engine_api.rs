@@ -150,6 +150,8 @@ pub struct RunProgramView {
     pub version: String,
     /// Connection protocol label.
     pub protocol: String,
+    /// Public provider address, without credentials.
+    pub base_url: String,
     /// Model id.
     pub model: String,
     /// Codex sandbox mode (`native` or `full-access`), when relevant.

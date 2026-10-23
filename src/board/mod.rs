@@ -541,6 +541,9 @@ impl Board {
                 };
             }
             _ => match plain(key) {
+                Some('t') if self.model_agent.is_some() => {
+                    self.set_notice("Start uses and reports this agent's own connection");
+                }
                 Some('t') => {
                     if !self.endpoint_fields_filled() {
                         self.set_notice("API address and model needed, then t");
@@ -844,8 +847,17 @@ impl Board {
                     self.screen = Screen::Program;
                 }
                 Some('m') => {
-                    self.model_agent = Some(self.agent_name.clone());
+                    let builtin = self
+                        .view
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == self.agent_name)
+                        .is_some_and(|agent| agent.program == "builtin");
+                    self.model_agent = (!builtin).then(|| self.agent_name.clone());
                     self.model_origin = ModelOrigin::Board;
+                    if builtin {
+                        self.set_notice("built-in agents share the default connection");
+                    }
                     self.set_model_from_view();
                     self.screen = Screen::Model;
                 }
@@ -961,19 +973,21 @@ impl Board {
                     }
                 }
                 Some('f') if self.selected_program() == Program::Codex => {
+                    let current = self
+                        .view
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == self.agent_name)
+                        .and_then(|agent| agent.codex_sandbox.clone())
+                        .unwrap_or_else(|| "native".to_owned());
                     if !self.codex_optin_confirmed {
                         self.codex_optin_confirmed = true;
-                        self.set_notice(
-                            "Codex's own sandbox will be removed; only the product Landlock boundary remains. Press f again to allow it for this agent's next run.",
-                        );
+                        self.set_notice(if current == "full-access" {
+                            "Codex's own sandbox will be restored; the product Landlock boundary remains. Press f again to return this agent's next run to its native sandbox."
+                        } else {
+                            "Codex's own sandbox will be removed; only the product Landlock boundary remains. Press f again to allow it for this agent's next run."
+                        });
                     } else {
-                        let current = self
-                            .view
-                            .agents
-                            .iter()
-                            .find(|agent| agent.name == self.agent_name)
-                            .and_then(|agent| agent.codex_sandbox.clone())
-                            .unwrap_or_else(|| "native".to_owned());
                         let mode = if current == "full-access" {
                             "native"
                         } else {

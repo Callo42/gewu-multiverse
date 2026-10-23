@@ -1703,14 +1703,11 @@ impl Inner {
             .and_then(Program::parse)
             .unwrap_or(Program::Builtin);
         let endpoint = self.settings.endpoint.clone();
-        // A native default needs a connection to snapshot. A caller that creates
-        // agents before the first-run connection is complete gets the built-in
-        // behavior instead of an unusable native agent with no provider.
-        let program = if program.is_native() && !endpoint.configured() {
-            Program::Builtin
-        } else {
-            program
-        };
+        let key = credentials::model_key(&self.credentials, name).ok();
+        let explicit_key = credentials::agent_model_key(&self.credentials, name)
+            .ok()
+            .flatten()
+            .is_some();
         let Some(agent) = self.settings.agent_mut(name) else {
             return;
         };
@@ -1725,6 +1722,16 @@ impl Inner {
         if program == Program::Codex {
             agent.codex_sandbox = "native".to_owned();
         }
+        if program.is_native()
+            && !explicit_key
+            && let Some(key) = key
+            && credentials::record_secret(&self.credentials, Some("model_keys"), name, key.expose())
+                .is_err()
+        {
+            // A key that cannot be snapshotted leaves the agent visibly blocked by the
+            // ordinary missing-key path; it is never silently taken from a changing
+            // global default later.
+        }
     }
 
     /// The immutable program facts of the newest run, when there is one.
@@ -1737,6 +1744,7 @@ impl Inner {
                 label: program.label().to_owned(),
                 version: native.version,
                 protocol: native.protocol,
+                base_url: native.base_url,
                 model: native.model,
                 codex_sandbox: (!native.codex_sandbox.is_empty()).then_some(native.codex_sandbox),
             });
@@ -1747,6 +1755,7 @@ impl Inner {
             label: Program::Builtin.label().to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             protocol: Protocol::ChatCompletions.id().to_owned(),
+            base_url: plan.endpoint,
             model: plan.model,
             codex_sandbox: None,
         })
@@ -1766,8 +1775,12 @@ impl Inner {
             label: program.label().to_owned(),
             version: harness::installed(&self.options.data_root, program)
                 .map(|installed| installed.version)
-                .unwrap_or_else(|| program.pinned_version().to_owned()),
+                .unwrap_or_else(|| "not installed".to_owned()),
             protocol: protocol.id().to_owned(),
+            base_url: self
+                .connection_for(saved)
+                .map(|(_, base, _)| base)
+                .unwrap_or_default(),
             model,
             codex_sandbox: (program == Program::Codex).then(|| {
                 if saved.codex_sandbox == "full-access" {
@@ -2231,6 +2244,11 @@ impl EngineApi for Engine {
                     return Err(format!("there is no agent named `{name}`"));
                 };
                 let endpoint = inner.settings.endpoint.clone();
+                let explicit_key = credentials::agent_model_key(&inner.credentials, &name)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let inherited_key = credentials::model_key(&inner.credentials, &name).ok();
                 let Some(saved) = inner.settings.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
@@ -2269,6 +2287,17 @@ impl EngineApi for Engine {
                     saved.codex_sandbox.clear();
                 } else if saved.codex_sandbox.is_empty() {
                     saved.codex_sandbox = "native".to_owned();
+                }
+                if program.is_native()
+                    && !explicit_key
+                    && let Some(key) = inherited_key.as_ref()
+                {
+                    let _ = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.expose(),
+                    );
                 }
                 inner.save_settings()?;
                 inner.agents[index].last_error = None;

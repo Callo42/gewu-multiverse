@@ -2442,7 +2442,10 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
 fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let title = match board.model_agent.as_deref() {
         Some(name) => format!("{name}'s model"),
-        None => "Your model".to_owned(),
+        None => match board.model_origin {
+            crate::board::ModelOrigin::Board => "Shared model".to_owned(),
+            crate::board::ModelOrigin::FirstRun => "Your model".to_owned(),
+        },
     };
     draw_outer(buf, area, &title);
     let inner = inner(area);
@@ -2546,7 +2549,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let actions = if board.model_editing {
         "⏎ next field   ctrl-u clear   ↑↓ field   esc cancel"
     } else if board.model_agent.is_some() {
-        "e edit   ↑↓ field   t test   ⏎ save   ctrl-u clear   esc back"
+        "e edit   ↑↓ field   ⏎ save   ctrl-u clear   esc back   Start is the test"
     } else {
         "e edit   ↑↓ field   t test   ⏎ next   ctrl-u clear   esc back"
     };
@@ -3552,23 +3555,45 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
         .iter()
         .find(|agent| agent.name == board.agent_name)
     {
+        let describe = |view: &crate::engine_api::RunProgramView| {
+            let host = view
+                .base_url
+                .split("://")
+                .nth(1)
+                .unwrap_or(&view.base_url)
+                .trim_end_matches('/');
+            let sandbox = view
+                .codex_sandbox
+                .as_deref()
+                .map(|mode| format!(" sandbox={mode}"))
+                .unwrap_or_default();
+            format!(
+                "{} {} · {} · {} @ {}{}",
+                view.label, view.version, view.protocol, view.model, host, sandbox
+            )
+        };
         let active = agent
             .active_program
             .as_ref()
-            .map(|view| format!("{} {}", view.label, view.version))
+            .map(describe)
             .unwrap_or_else(|| "no run yet".to_owned());
         let next = agent
             .next_program
             .as_ref()
-            .map(|view| format!("{} {}", view.label, view.version))
+            .map(describe)
             .unwrap_or_else(|| "not chosen".to_owned());
+        let active_word = if matches!(agent.session, SessionState::Running { .. }) {
+            "active"
+        } else {
+            "latest"
+        };
         text_util::put(
             buf,
             inner,
             inner.x + 1,
             y,
             &text_util::ellipsize_words(
-                &format!("active: {active}   next: {next}"),
+                &format!("{active_word}: {active}   next: {next}"),
                 inner.width.saturating_sub(2) as usize,
             ),
             theme::fg(theme::MUTED),
