@@ -1695,7 +1695,7 @@ impl Inner {
     /// installation is Pi (set by `Settings::load`); an existing file without a
     /// default leaves the built-in engine. A native default snapshots the current
     /// connection once.
-    fn assign_new_agent_program(&mut self, name: &str) {
+    fn assign_new_agent_program(&mut self, name: &str) -> Result<(), String> {
         let program = self
             .settings
             .default_harness
@@ -1709,7 +1709,7 @@ impl Inner {
             .flatten()
             .is_some();
         let Some(agent) = self.settings.agent_mut(name) else {
-            return;
+            return Ok(());
         };
         agent.set_harness(program);
         if program.is_native() && agent.provider.is_none() && endpoint.configured() {
@@ -1725,13 +1725,20 @@ impl Inner {
         if program.is_native()
             && !explicit_key
             && let Some(key) = key
-            && credentials::record_secret(&self.credentials, Some("model_keys"), name, key.expose())
-                .is_err()
         {
-            // A key that cannot be snapshotted leaves the agent visibly blocked by the
-            // ordinary missing-key path; it is never silently taken from a changing
-            // global default later.
+            credentials::record_secret(
+                &self.credentials,
+                Some("model_keys"),
+                name,
+                key.expose(),
+            )
+            .map_err(|error| {
+                format!(
+                    "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
+                )
+            })?;
         }
+        Ok(())
     }
 
     /// The immutable program facts of the newest run, when there is one.
@@ -2457,7 +2464,7 @@ impl EngineApi for Engine {
                     let name = format!("agent-{number}");
                     if inner.settings.agent(&name).is_none() {
                         inner.settings.add_agent(&name, Desired::Stopped)?;
-                        inner.assign_new_agent_program(&name);
+                        inner.assign_new_agent_program(&name)?;
                         ensure_agent_paths(&inner.options.layout, &name)?;
                         let runtime = AgentRuntime::load(&inner, &name);
                         inner.agents.push(runtime);
@@ -2475,7 +2482,7 @@ impl EngineApi for Engine {
             Command::AddAgent => {
                 let name = inner.settings.allocate_agent_name()?;
                 inner.settings.add_agent(&name, Desired::Stopped)?;
-                inner.assign_new_agent_program(&name);
+                inner.assign_new_agent_program(&name)?;
                 ensure_agent_paths(&inner.options.layout, &name)?;
                 let runtime = AgentRuntime::load(&inner, &name);
                 inner.agents.push(runtime);

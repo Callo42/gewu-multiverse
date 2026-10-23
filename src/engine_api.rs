@@ -364,7 +364,7 @@ pub enum Command {
         model: String,
         key: Option<String>,
     },
-    /// Set the explicit Codex D106 sandbox choice for one agent.
+    /// Set the explicit Codex compatibility sandbox choice for one agent.
     SetAgentCodexSandbox {
         name: String,
         mode: String,

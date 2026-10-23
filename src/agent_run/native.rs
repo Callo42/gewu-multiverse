@@ -52,7 +52,7 @@ impl McpServer {
         plan: &crate::run::RunPlan,
         shell: &Shell,
         temp: &Path,
-        native_root: &Path,
+        _native_root: &Path,
         exe: &Path,
     ) -> Result<Option<Self>, String> {
         if crate::run::read_forgejo_context(&shell.run_dir).is_none()
@@ -64,7 +64,7 @@ impl McpServer {
         std::fs::create_dir_all(&state)
             .map_err(|error| format!("the MCP state directory cannot be created: {error}"))?;
         let _ = crate::mode::set_mode(&state, crate::mode::PRIVATE_DIR_MODE);
-        let socket = native_root.join("mcp.sock");
+        let socket = state.join("mcp.sock");
         let _ = std::fs::remove_file(&socket);
         let child = Command::new(exe)
             .arg("--mcp-forgejo-serve")
@@ -205,6 +205,10 @@ pub(super) fn run(
     };
     log.line(&format!("native configuration: {config_note}"));
 
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return RunEnd::failed(format!("this program cannot be found: {error}")),
+    };
     let spec = files.root.join("confined-program.json");
     if let Err(error) = write_json(
         &spec,
@@ -219,6 +223,7 @@ pub(super) fn run(
                     .and_then(|exe| exe.parent().map(|parent| parent.display().to_string()))
                     .unwrap_or_default(),
                 shell.askpass.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
+                files.mcp_socket.as_ref().and_then(|path| path.parent()).map(|path| path.display().to_string()).unwrap_or_default(),
             ],
             "write": [files.root.display().to_string()],
         }),
@@ -226,10 +231,6 @@ pub(super) fn run(
         return RunEnd::failed(format!("the native launch plan cannot be written: {error}"));
     }
 
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => return RunEnd::failed(format!("this program cannot be found: {error}")),
-    };
     let mut command = Command::new(&exe);
     command
         .arg("--confined-program")
@@ -430,6 +431,11 @@ pub(super) fn run(
     if !exit.success() {
         return RunEnd::failed(reason);
     }
+    if program == Program::Opencode && state.final_text.is_some() {
+        // The official 2.1.4 final assistant message arrives as a `text` event;
+        // retain it as the completion fact even when it follows the last tool.
+        state.terminal = true;
+    }
     if !state.terminal {
         return RunEnd::failed(
             "the native program exited without a completion event; the run is not a success"
@@ -452,16 +458,13 @@ pub(super) fn run(
         checked_empty: state.checked_empty,
         ..RunEvidence::default()
     };
-    let ending = if evidence.refused_write().is_some() {
-        RunEnding::Refused
-    } else if evidence.failed_call().is_some() {
-        RunEnding::Warned
-    } else if evidence.checked_empty && !evidence.wrote {
-        RunEnding::NoWork
-    } else if state.wrote || state.tool_ok {
-        RunEnding::Succeeded
-    } else {
-        RunEnding::Warned
+    let instruction = String::from_utf8_lossy(instruction);
+    let base = crate::agent_run::ending_for_instruction(&instruction, &summary, &evidence);
+    let wants_write = instruction_wants_write(&instruction, &plan.steps);
+    let ending = match base {
+        RunEnding::Succeeded if wants_write && !state.wrote => RunEnding::Warned,
+        RunEnding::Succeeded if !wants_write && !state.tool_ok => RunEnding::Warned,
+        other => other,
     };
     let reason = if summary.trim().is_empty() && matches!(ending, RunEnding::Warned) {
         Some(
@@ -476,6 +479,34 @@ pub(super) fn run(
         reason,
         ending,
     }
+}
+
+/// Whether the instruction asks for a change, not only a report. This is a
+/// bounded prose check: the tool/work witness below still decides whether the
+/// change happened, and a read-only request may complete from a successful tool.
+fn instruction_wants_write(instruction: &str, steps: &[String]) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    const WRITE_WORDS: [&str; 18] = [
+        "pull request",
+        "comment",
+        "push",
+        "commit",
+        "write",
+        "edit",
+        "create",
+        "update",
+        "fix",
+        "implement",
+        "modify",
+        "delete",
+        "remove",
+        "add ",
+        "open a pr",
+        "review and change",
+        "apply",
+        "make the change",
+    ];
+    WRITE_WORDS.iter().any(|word| lower.contains(word)) || !steps.is_empty()
 }
 
 /// A cheap before/after witness of actual workspace changes. It covers files the
@@ -723,7 +754,9 @@ fn build_launch(
             crate::mode::write_private(dir.join("overlay.yml"), overlay.as_bytes()).map_err(
                 |error| format!("the DeepSeek Harness configuration cannot be written: {error}"),
             )?;
-            let dotenv = format!("GEWU_NATIVE_KEY={}\n", plan_key(plan)?);
+            let key = std::fs::read_to_string(&files.key)
+                .map_err(|error| format!("the captured run key cannot be read: {error}"))?;
+            let dotenv = format!("GEWU_NATIVE_KEY={}\n", key.trim_end());
             crate::mode::write_private(dir.join(".env"), dotenv.as_bytes()).map_err(|error| {
                 format!("the DeepSeek Harness key file cannot be written: {error}")
             })?;
@@ -1153,6 +1186,9 @@ fn opencode_event(
                 .and_then(Value::as_str)
             {
                 state.final_text = Some(text.to_owned());
+                // The official 2.1.4 final text event is the completion fact for a
+                // final assistant message; a text inside an open tool is not.
+                state.terminal = true;
                 let _ = transcript.append(&Record::native_text(text));
             }
         }

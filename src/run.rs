@@ -197,7 +197,7 @@ pub struct NativePlan {
     /// Model id.
     pub model: String,
     /// `native` for the program's own sandbox, `full-access` for the explicit
-    /// Codex D106 choice inside the product Landlock.
+    /// Codex compatibility choice inside the product Landlock.
     #[serde(default)]
     pub codex_sandbox: String,
 }
@@ -1299,7 +1299,11 @@ pub fn settle_run(
     reason: Option<String>,
     grace: std::time::Duration,
 ) -> Result<bool, String> {
-    let reaped = reap_process_group(pgid, run_dir, grace).map_err(categorize_cleanup)?;
+    let mut reaped = reap_process_group(pgid, run_dir, grace).map_err(categorize_cleanup)?;
+    // A native helper may have called setsid and therefore not be in the leader's
+    // group. Its inherited capability is the ownership proof; enumerate and close
+    // every such group before the identities are removed.
+    reaped |= reap_capability_groups(run_dir, grace).map_err(categorize_cleanup)?;
     ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
     // `reap_process_group` only returns Ok when no unverified member survives, and
     // it writes its own run_stopped ending when it had to signal a group.
@@ -2186,6 +2190,30 @@ fn categorize_cleanup(reason: String) -> String {
     }
 }
 
+/// Close every live group that still holds this run's inherited capability.
+///
+/// The capability is kernel-owned and cannot be copied into the run by name. A
+/// group is accepted only after `capability_group` has verified the descriptor
+/// (dev/ino/token) of a live member; `reap_process_group` then applies the same
+/// pidfd/boot/start ownership checks as the leader path.
+fn reap_capability_groups(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
+    let mut seen = Vec::new();
+    let mut reaped = false;
+    for _ in 0..32 {
+        let Some(group) = capability_group(run_dir)? else {
+            return Ok(reaped);
+        };
+        if seen.contains(&group) {
+            return Err(format!(
+                "live leftover: capability-holding group {group} survived reaping"
+            ));
+        }
+        seen.push(group);
+        reaped |= reap_process_group(group, run_dir, grace)?;
+    }
+    Err("live leftover: too many capability-holding groups survived reaping".to_owned())
+}
+
 fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
     // A permissions failure is a recovery failure, not "no records": it must
     // reach the card and block a replacement run (review-3).
@@ -2268,7 +2296,8 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
         clear_process_records(run_dir);
         return Ok(false);
     };
-    let reaped = reap_process_group(pgid, run_dir, grace)?;
+    let mut reaped = reap_process_group(pgid, run_dir, grace)?;
+    reaped |= reap_capability_groups(run_dir, grace)?;
     if !reaped && unverified_group(pgid)? {
         // A live group whose ownership cannot be established is not touched, but
         // it is not hidden either: the open reports it, the card names it and

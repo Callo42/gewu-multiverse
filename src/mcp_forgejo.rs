@@ -124,6 +124,7 @@ pub fn serve_supervised(
     let _ = crate::mode::set_mode(&socket, 0o600);
     for connection in listener.incoming() {
         let Ok(stream) = connection else { continue };
+        let _ = crate::mode::write_private(state_dir.join("connected"), b"1");
         let Ok(input) = stream.try_clone() else {
             continue;
         };
@@ -298,13 +299,13 @@ fn call_tool(
     let record = json!({
         "ts": crate::time::rfc3339(crate::time::now_unix_ms()),
         "tool": name,
-        "repository": facts.repository,
+        "repository": facts.repository.as_deref().map(|text| redactor.redact(text)),
         "number": facts.number,
         "detail": redactor.redact(&facts.detail),
         "ok": ok,
         "outcome": outcome,
-        "action": action,
-        "url": url,
+        "action": action.map(|text| redactor.redact(text)),
+        "url": url.as_deref().map(|text| redactor.redact(text)),
         "write": write,
     });
     let mut file = std::fs::OpenOptions::new()

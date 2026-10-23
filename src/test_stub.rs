@@ -132,10 +132,16 @@ enum Script {
 struct ScriptState {
     script: Script,
     next: usize,
+    title_reply: Option<StubReply>,
 }
 
 impl ScriptState {
-    fn choose(&mut self, method: &str, path: &str) -> StubReply {
+    fn choose(&mut self, method: &str, path: &str, body: &str) -> StubReply {
+        if let Some(reply) = self.title_reply.as_ref()
+            && body.contains("Reply with only the title")
+        {
+            return reply.clone();
+        }
         match &self.script {
             Script::Sequential(replies) => {
                 if replies.is_empty() {
@@ -164,15 +170,21 @@ impl ScriptState {
 impl Stub {
     /// Start a stub that answers the given replies, in order; the last one repeats.
     pub fn start(replies: Vec<StubReply>) -> Self {
-        Self::launch(Script::Sequential(replies))
+        Self::launch(Script::Sequential(replies), None)
     }
 
     /// Start a stub that answers by method and path prefix.
     pub fn start_routed(routes: Vec<Route>) -> Self {
-        Self::launch(Script::Routed(routes))
+        Self::launch(Script::Routed(routes), None)
     }
 
-    fn launch(script: Script) -> Self {
+    /// Start a sequential stub that always answers a session-title request with
+    /// `title`, without consuming a scripted reply.
+    pub fn start_with_title(replies: Vec<StubReply>, title: StubReply) -> Self {
+        Self::launch(Script::Sequential(replies), Some(title))
+    }
+
+    fn launch(script: Script, title_reply: Option<StubReply>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("the stub can bind a local port");
         let addr = listener.local_addr().expect("the stub knows its port");
         listener
@@ -180,7 +192,11 @@ impl Stub {
             .expect("the stub can poll its listener");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let state = Arc::new(Mutex::new(ScriptState { script, next: 0 }));
+        let state = Arc::new(Mutex::new(ScriptState {
+            script,
+            next: 0,
+            title_reply,
+        }));
         let handle = {
             let requests = Arc::clone(&requests);
             let stop = Arc::clone(&stop);
@@ -290,7 +306,7 @@ fn handle_connection(
     let reply = state
         .lock()
         .expect("the script is not poisoned")
-        .choose(&method, &path);
+        .choose(&method, &path, &body);
     requests
         .lock()
         .expect("the request list is not poisoned")

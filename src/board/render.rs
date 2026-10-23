@@ -3568,8 +3568,8 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
                 .map(|mode| format!(" sandbox={mode}"))
                 .unwrap_or_default();
             format!(
-                "{} {} · {} · {} @ {}{}",
-                view.label, view.version, view.protocol, view.model, host, sandbox
+                "{} {} ·{} · {} · {} @ {}",
+                view.label, view.version, sandbox, view.protocol, view.model, host
             )
         };
         let active = agent
@@ -3587,15 +3587,21 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
         } else {
             "latest"
         };
+        let width = inner.width.saturating_sub(2) as usize;
         text_util::put(
             buf,
             inner,
             inner.x + 1,
             y,
-            &text_util::ellipsize_words(
-                &format!("{active_word}: {active}   next: {next}"),
-                inner.width.saturating_sub(2) as usize,
-            ),
+            &text_util::ellipsize_words(&format!("{active_word}: {active}"), width),
+            theme::fg(theme::MUTED),
+        );
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y + 1,
+            &text_util::ellipsize_words(&format!("next: {next}"), width),
             theme::fg(theme::MUTED),
         );
     }
@@ -4102,6 +4108,72 @@ mod tests {
             let face = status::forgejo_face(&state);
             assert!(!face.word.is_empty());
             assert!(matches!(face.symbol, '●' | '◐' | '○'));
+        }
+    }
+}
+
+#[cfg(test)]
+mod program_view_tests {
+    use super::*;
+    use crate::board::FakeEngine;
+    use crate::engine_api::{Command, EngineApi, RunProgramView};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn a_full_access_active_run_stays_visible_beside_a_native_next_at_narrow_widths() {
+        for width in [72_u16, 80] {
+            let mut engine = FakeEngine::new();
+            engine.send(Command::AcknowledgeTerms).expect("terms");
+            engine
+                .send(Command::SetEndpoint {
+                    url: "https://model.example/v1/chat/completions".to_owned(),
+                    model: "demo-model".to_owned(),
+                    key: Some("demo-key".to_owned()),
+                })
+                .expect("endpoint");
+            engine
+                .send(Command::CreateAgents { count: 1 })
+                .expect("agents");
+            let mut board = Board::new(engine);
+            board.screen = Screen::Program;
+            board.agent_name = "agent-1".to_owned();
+            board.view.agents[0].active_program = Some(RunProgramView {
+                program: "codex".to_owned(),
+                label: "Codex".to_owned(),
+                version: "0.164.0".to_owned(),
+                protocol: "responses".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                model: "active-model".to_owned(),
+                codex_sandbox: Some("full-access".to_owned()),
+            });
+            board.view.agents[0].next_program = Some(RunProgramView {
+                program: "codex".to_owned(),
+                label: "Codex".to_owned(),
+                version: "0.164.0".to_owned(),
+                protocol: "responses".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                model: "next-model".to_owned(),
+                codex_sandbox: Some("native".to_owned()),
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("terminal");
+            terminal.draw(|frame| board.draw(frame)).expect("draw");
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..24 {
+                for x in 0..width {
+                    text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+                }
+                text.push('\n');
+            }
+            assert!(
+                text.contains("sandbox=full-access"),
+                "the active full-access fact was lost at {width} columns: {text}"
+            );
+            assert!(
+                text.contains("sandbox=native") && text.contains("next:"),
+                "the next native sandbox was lost at {width} columns: {text}"
+            );
         }
     }
 }

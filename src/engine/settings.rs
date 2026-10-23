@@ -169,7 +169,7 @@ pub struct AgentSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<AgentProvider>,
     /// The Codex sandbox choice: empty/`native` is normal; `full-access` is the
-    /// explicit D106 opt-in that runs Codex without its own sandbox inside the
+    /// explicit compatibility opt-in that runs Codex without its own sandbox inside the
     /// product's enforced Landlock.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codex_sandbox: String,

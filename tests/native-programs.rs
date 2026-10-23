@@ -918,16 +918,17 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
         let board = engine.board();
         matches!(board.forgejo.state, ForgejoState::Running) && board.forgejo.repositories >= 1
     });
-    let model = Stub::start(vec![
+    let model = Stub::start_with_title(
+        vec![
+            sse_tool(
+                "shell",
+                "shell",
+                serde_json::json!({"command": "printf 'native opencode demo\\n' > native-opencode.txt"}),
+            ),
+            sse_final("OpenCode wrote the file with its own shell tool."),
+        ],
         sse_final("Session title"),
-        sse_tool(
-            "shell",
-            "shell",
-            serde_json::json!({"command": "printf 'native opencode demo\\n' > native-opencode.txt"}),
-        ),
-        sse_final("OpenCode wrote the file with its own shell tool."),
-        sse_final("OpenCode wrote the file with its own shell tool."),
-    ]);
+    );
     engine
         .send(Command::SetEndpoint {
             url: model.url(),
