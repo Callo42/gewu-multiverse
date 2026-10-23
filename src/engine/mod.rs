@@ -5281,6 +5281,30 @@ mod tests {
         )
     }
 
+    /// Whether the whole observable completion of a real-child spawn is visible.
+    ///
+    /// The runtime contract writes the durable typed ending **before** it discards
+    /// the verified identity handles. A test that stops at the ending can therefore
+    /// observe the intentional intermediate state. Wait for every fact the final
+    /// assertions require: the typed start, the ending, no pid/group records, no
+    /// recorded group and no live group member.
+    fn real_child_completion_visible(run_dir: &Path, pid: u32) -> bool {
+        let typed_start = crate::transcript::read(run_dir)
+            .map(|file| {
+                file.records.iter().any(|record| matches!(
+                    record,
+                    crate::transcript::Record::RunStarted { pid: started, .. } if *started == pid
+                ))
+            })
+            .unwrap_or(false);
+        typed_start
+            && crate::transcript::terminal_record(run_dir).is_some()
+            && !run_dir.join(crate::engine::session::PID_FILE).exists()
+            && !run_dir.join(crate::run::PGID_FILE).exists()
+            && crate::run::recorded_group(run_dir).is_none()
+            && !process_group_has_members(pid)
+    }
+
     fn assert_real_child_settled(run_dir: &Path, pid: u32) {
         assert!(
             crate::transcript::read(run_dir)
@@ -5334,7 +5358,7 @@ mod tests {
             .expect("Stop");
         let _ = release.send(());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
             tick(&mut engine, &clock, Duration::ZERO);
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -5368,7 +5392,7 @@ mod tests {
         engine.shutdown(Duration::from_millis(200));
         let _ = release.send(());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_real_child_settled(&run_dir, pid);
@@ -5402,7 +5426,7 @@ mod tests {
         }
         let _ = release.send(());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
             tick(&mut engine, &clock, Duration::ZERO);
             std::thread::sleep(Duration::from_millis(10));
         }
