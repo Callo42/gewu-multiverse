@@ -88,6 +88,11 @@ pub struct ToolReply {
     pub action: Option<&'static str>,
     /// The web URL of what a successful write changed.
     pub url: Option<String>,
+    /// The clone branch a pull-request write actually used, when the tool read one.
+    ///
+    /// This is the per-request fact the Runs note pairs with the request number; it
+    /// is never inferred from a later push record.
+    pub branch: Option<String>,
 }
 
 /// What a call asked for, read before it runs so the transcript can name it.
@@ -386,6 +391,7 @@ impl ForgejoTools {
                 number: None,
                 action: None,
                 url: None,
+                branch: None,
             });
         }
         let (text, cut) = bounded(&lines.join("\n"), MAX_TOOL_OUTPUT);
@@ -399,6 +405,7 @@ impl ForgejoTools {
             number: None,
             action: None,
             url: None,
+            branch: None,
         })
     }
 
@@ -478,6 +485,7 @@ impl ForgejoTools {
             number: Some(number),
             action: None,
             url: None,
+            branch: None,
         })
     }
 
@@ -512,6 +520,7 @@ impl ForgejoTools {
             number: Some(number),
             action: Some("commented"),
             url: Some(url),
+            branch: None,
         })
     }
 
@@ -552,6 +561,7 @@ impl ForgejoTools {
                 number: None,
                 action: None,
                 url: None,
+                branch: None,
             });
         }
         let (text, cut) = bounded(&lines.join("\n"), MAX_TOOL_OUTPUT);
@@ -565,6 +575,7 @@ impl ForgejoTools {
             number: None,
             action: None,
             url: None,
+            branch: None,
         })
     }
 
@@ -638,6 +649,7 @@ impl ForgejoTools {
                     number: Some(pull.number),
                     action: Some("opened"),
                     url: Some(url),
+                    branch: Some(branch.clone()),
                 })
             }
             // A race after the lookup: the conflict reply names the pair but not its
@@ -764,6 +776,7 @@ impl ForgejoTools {
                     number: Some(updated.number),
                     action: Some("updated"),
                     url: Some(url),
+                    branch: Some(branch.clone()),
                 })
             }
             Err(error) => Err(self.error_sentence(error)),

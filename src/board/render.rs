@@ -11,7 +11,8 @@ use crate::board::text as text_util;
 use crate::board::theme;
 use crate::board::{Board, Screen};
 use crate::engine_api::{
-    AgentView, Desired, EndpointTest, ForgejoState, ForgejoView, Provisioning, SessionState,
+    AgentView, Desired, EndpointTest, ForgejoState, ForgejoView, Provisioning, SessionEnd,
+    SessionState,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -581,17 +582,44 @@ fn card_bottom_text(agent: &AgentView, card_h: u16) -> String {
         let word = status::card_word(agent);
         if card_h == 3 {
             // A three-row card has no body row for the state word, so the bottom
-            // border carries both, tightly. A failed run's word comes first and is
-            // the shortest one that still names the HTTP status: a whole-word cut
-            // then keeps the status, the fact that must not disappear (F-14).
+            // border carries both, tightly. A cleanup word is the shortest thing the
+            // card can say and does not repeat the plain `stopped` state. A failed
+            // run's word comes first and is the shortest one that still names the
+            // HTTP status: a whole-word cut then keeps the status, the fact that must
+            // not disappear (F-14).
+            if let Some(leftover) = agent.leftover.as_deref() {
+                // A three-row card's whole inner border holds the full category;
+                // only the two-column list needs the compact word.
+                return status::leftover_words(leftover).to_owned();
+            }
             match status::tight_failure_word(agent) {
                 Some(word) => format!("{word} · {}", board_state(&face)),
                 None => match word {
-                    Some(word) => format!("{} · {word}", board_state(&face)),
-                    None => board_state(&face).to_owned(),
+                    Some(word) => {
+                        let state = board_state(&face);
+                        if state.contains("no work") {
+                            // `next 20s·no work` plus the last-work word: the compact
+                            // separator keeps both inside the tight three-row label.
+                            format!("{} {word}", state.replace(" · no work", "·no work"))
+                        } else {
+                            format!("{state} · {word}")
+                        }
+                    }
+                    None => board_state(&face),
                 },
             }
         } else {
+            // A five-row card's border has the card's whole inner width; a verbose
+            // failure phrase would lose `from the model` there. The short word keeps
+            // the HTTP status and the Agent screen keeps the full phrase.
+            let word = if matches!(
+                agent.recent.last(),
+                Some(SessionEnd::Failed { .. } | SessionEnd::TimedOut)
+            ) {
+                status::tight_failure_word(agent)
+            } else {
+                word
+            };
             word.unwrap_or_else(|| board_state(&face))
         }
     }
@@ -635,7 +663,13 @@ fn draw_compact_card(
     } else {
         agent.name.clone()
     };
-    let tail = format!("{title} · {}", board_state(&face));
+    let tail = if agent.leftover.is_some() {
+        // The bottom border's cleanup word already names the state; repeating it on
+        // the top border would spend the narrow line on the same sentence twice.
+        title.clone()
+    } else {
+        format!("{title} · {}", board_state(&face))
+    };
     let max_top = (junction_x.saturating_sub(rect.x + 3)) as usize;
     border_label_parts(
         buf,
@@ -678,6 +712,27 @@ fn draw_compact_card(
     );
 }
 
+/// The bottom label for this card, using the compact cleanup word when the full
+/// category cannot fit on this card's border. This keeps `live`, `unowned` and
+/// `unverified` distinct instead of cutting them all to `cleanup…`.
+fn card_bottom_text_fitted(agent: &AgentView, card_h: u16, max_width: usize) -> String {
+    let full = card_bottom_text(agent, card_h);
+    // The tight three-row label uses the room as written; the padded label reserves
+    // four cells for its cap, spaces and cap.
+    let capacity = if card_h == 3 {
+        max_width
+    } else {
+        max_width.saturating_sub(4)
+    };
+    if let Some(leftover) = agent.leftover.as_deref()
+        && text_util::width(&full) > capacity
+    {
+        return status::leftover_short(leftover).to_owned();
+    }
+    full
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_card(
     buf: &mut Buffer,
     rect: Rect,
@@ -686,6 +741,7 @@ fn draw_card(
     junction: bool,
     junction_x: u16,
     label_room: usize,
+    detailed: bool,
 ) {
     let face = status::agent_face(agent);
     let bg = if selected {
@@ -789,26 +845,38 @@ fn draw_card(
             interior,
             interior.x + 1,
             state_row,
-            &text_util::ellipsize(&face.status, interior.width.saturating_sub(1) as usize),
+            &text_util::ellipsize(
+                &board_state(&face),
+                interior.width.saturating_sub(1) as usize,
+            ),
             theme::card(face.colour, selected),
         );
     }
     if rect.height >= 5 {
-        let line = status::run_result_line(agent).or_else(|| status::activity(agent));
+        // A roomy card carries the newest activity and its age in its own body row,
+        // as the board docs promise; the last-work (or failure) word stays on the
+        // bottom border. A card that is not roomy keeps the run's own result line.
+        let width = interior.width.saturating_sub(1) as usize;
+        let (line, colour) = if detailed {
+            match status::activity_in(agent, width) {
+                Some(line) => (Some(line), theme::MUTED),
+                None => (status::run_result_line(agent), status::result_colour(agent)),
+            }
+        } else if let Some(activity) = status::activity_in(agent, width) {
+            // At 80x24 the card is five rows but not `detailed`; the newest activity
+            // still owns its allocated body row. The result summary remains in the
+            // Agent screen rather than suppressing the activity here (C1).
+            (Some(activity), theme::MUTED)
+        } else {
+            (status::run_result_line(agent), status::result_colour(agent))
+        };
         if let Some(line) = line {
-            let colour = if status::run_result_is_refusal(agent) {
-                theme::RED
-            } else if status::run_result_is_warning(agent) {
-                theme::AMBER
-            } else {
-                theme::MUTED
-            };
             text_util::put(
                 buf,
                 interior,
                 interior.x + 1,
                 rect.y + 3,
-                &text_util::ellipsize_words(&line, interior.width.saturating_sub(1) as usize),
+                &text_util::ellipsize_words(&line, width),
                 theme::card(colour, selected),
             );
         }
@@ -827,7 +895,7 @@ fn draw_card(
             rect,
             rect.x + 1,
             bottom,
-            &card_bottom_text(agent, rect.height),
+            &card_bottom_text_fitted(agent, rect.height, label_room),
             label_style,
             label_room,
         );
@@ -837,7 +905,7 @@ fn draw_card(
             rect,
             rect.x + 1,
             bottom,
-            &card_bottom_text(agent, rect.height),
+            &card_bottom_text_fitted(agent, rect.height, label_room + 4),
             label_style,
             label_room + 4,
         );
@@ -865,6 +933,9 @@ struct GridGeometry {
     bus_ys: Vec<u16>,
     spine_x: u16,
     trunk_x: u16,
+    /// The supported roomy picture (100×30 and above): a tall card carries the
+    /// newest activity row before the last-work word.
+    detailed: bool,
     block_top: u16,
     /// The agent box's outer rectangle in the list form.
     list: Option<Rect>,
@@ -1060,7 +1131,15 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         // The list form: one wired box of one-line entries. One column is used
         // whenever every agent and its facts fit; a second (or third) only when
         // the rows do not. At the floor the box spans the inner width so each
-        // line still carries the whole login and a last-work word.
+        // line still carries the whole login and a last-work word. A mixed board
+        // uses the dense identity form: agent-N names abbreviate to N under an
+        // explicit N=agent-N rule and each login stays inline, so the two
+        // columns can use the full inner width without a gap or a login map.
+        let dense_identity = board
+            .view
+            .agents
+            .iter()
+            .any(|agent| agent.login != format!("gewu-{}", agent.name));
         let max_cols = if compact { 2 } else { 3 };
         let list_w = if compact {
             inner.width
@@ -1070,7 +1149,11 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         let mut chosen: Option<usize> = None;
         for cols in 1..=max_cols.min(agent_count) {
             let rows_total = agent_count.div_ceil(cols);
-            let col_w = list_text_width(list_w, cols);
+            let col_w = if dense_identity {
+                list_w.saturating_sub(2) / cols as u16
+            } else {
+                list_text_width(list_w, cols)
+            };
             if col_w < 26 {
                 continue;
             }
@@ -1085,7 +1168,13 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             // columns and scroll with the selection, as the board always did.
             (1..=max_cols.min(agent_count))
                 .rev()
-                .find(|cols| list_text_width(list_w, *cols) >= 26)
+                .find(|cols| {
+                    if dense_identity {
+                        list_w.saturating_sub(2) / *cols as u16 >= 26
+                    } else {
+                        list_text_width(list_w, *cols) >= 26
+                    }
+                })
                 .unwrap_or(1)
         });
         let rows_total = agent_count.div_ceil(cols);
@@ -1096,7 +1185,11 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         let block_top = inner.y + content_h.saturating_sub(block) / 2;
         let list_x = inner.x + inner.width.saturating_sub(list_w) / 2;
         let list = Rect::new(list_x, block_top + forgejo_h + trunk_gap, list_w, list_h);
-        let col_w = list_text_width(list_w, cols);
+        let col_w = if dense_identity {
+            list_w.saturating_sub(2) / cols as u16
+        } else {
+            list_text_width(list_w, cols)
+        };
         let text_x = list.x + 1;
         let selected_row = board.selection / cols.max(1);
         let mut scroll_row = board.scroll_row;
@@ -1121,7 +1214,7 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             visible_rows: visible,
             card_h: 1,
             card_w: col_w,
-            gap: 1,
+            gap: if dense_identity { 0 } else { 1 },
             forgejo_h,
             footer_rows,
             row_tops,
@@ -1133,6 +1226,7 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             list_col_w: col_w,
             list_x: text_x,
             grid_start: list_x,
+            detailed: roomy,
         }
     } else {
         let rows = agent_count.div_ceil(columns).max(1);
@@ -1174,6 +1268,7 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             bus_ys,
             spine_x,
             trunk_x,
+            detailed: roomy,
             block_top,
             list: None,
             list_col_w: 0,
@@ -1205,6 +1300,15 @@ fn card_junction_for(x: u16, width: u16, card_h: u16, board: &Board) -> u16 {
         // padding; every other label has a space on each side.
         let after = if card_h == 3 { 3 } else { 5 };
         junction = junction.max(x + text_util::width(&label) as u16 + after);
+        if card_h <= 2 {
+            // A two-row card puts the name and state on the top border. A waiting
+            // state is longer than the bottom label, so the junction must clear both
+            // labels; otherwise the wait word is ellipsized on a card with room to
+            // spare (F3/F8).
+            let face = status::agent_face(agent);
+            let top = format!("{} {} · {}", face.symbol, agent.name, board_state(&face));
+            junction = junction.max(x + text_util::width(&top) as u16 + 5);
+        }
     }
     junction.clamp(x + 2, x + width.saturating_sub(2))
 }
@@ -1322,7 +1426,13 @@ fn draw_wrapped_row_spine(
 ///
 /// The name is never cut; the login is kept when it fits whole, and the state takes
 /// the rest of the column. The selected line keeps the `▸` and the tint (B1/B2).
-fn draw_list_line(buf: &mut Buffer, rect: Rect, agent: &AgentView, selected: bool) {
+fn draw_list_line(
+    buf: &mut Buffer,
+    rect: Rect,
+    agent: &AgentView,
+    selected: bool,
+    cleanup_codes: bool,
+) {
     let face = status::agent_face(agent);
     let bg = if selected {
         theme::CARD_SELECTED
@@ -1342,8 +1452,53 @@ fn draw_list_line(buf: &mut Buffer, rect: Rect, agent: &AgentView, selected: boo
         agent.login.clone()
     };
     let count = status::run_count(agent);
-    let word = status::last_work_word(agent);
-    let build = |selected_mark: bool, run: RunWord, no_space: bool, with_state: bool| {
+    let mut word = if cleanup_codes && agent.leftover.is_some() {
+        let code = agent
+            .leftover
+            .as_deref()
+            .map(status::leftover_code)
+            .unwrap_or("");
+        match status::last_work_identity(agent) {
+            Some(identity) if !code.is_empty() => Some(format!("{identity} {code}")),
+            Some(identity) => Some(identity),
+            None if !code.is_empty() => Some(code.to_owned()),
+            None => None,
+        }
+    } else {
+        status::list_word(agent)
+    };
+    // The product's generated login is exactly `gewu-<name>`. On the tightest line
+    // the box legend can name that rule instead of repeating the prefix; a
+    // persisted non-standard login stays on its own line and never uses that rule.
+    let login_derivable = agent.login == format!("gewu-{}", agent.name);
+    // A list line uses the same short state words as a card border, and keeps the
+    // no-work fact (`next 20s·no work`) inside the tightest two-column width.
+    let mut state = if agent.leftover.is_some() {
+        // The list word already names the cleanup state; appending the face word
+        // would repeat it (`⚠ live leftover live leftover`).
+        String::new()
+    } else {
+        board_state(&face).replace(" · no work", "·no work")
+    };
+    if !login_derivable
+        && !cleanup_codes
+        && matches!(
+            agent.recent.last(),
+            Some(SessionEnd::Failed { .. } | SessionEnd::TimedOut)
+        )
+        && let (Some(identity), Some(failure)) = (status::last_work_identity(agent), word.as_ref())
+    {
+        // A persisted login leaves just enough room to keep both the last-work
+        // identity and the failure cause; the mark and legend carry `stopped`.
+        word = Some(format!("{identity} {failure}"));
+        state.clear();
+    }
+    let build = |selected_mark: bool,
+                 run: RunWord,
+                 no_space: bool,
+                 with_login: bool,
+                 with_word: bool,
+                 with_state: bool| {
         let mut line = String::new();
         if selected_mark {
             line.push('▸');
@@ -1353,8 +1508,10 @@ fn draw_list_line(buf: &mut Buffer, rect: Rect, agent: &AgentView, selected: boo
             line.push(' ');
         }
         line.push_str(&agent.name);
-        line.push(' ');
-        line.push_str(&login);
+        if with_login {
+            line.push(' ');
+            line.push_str(&login);
+        }
         line.push(' ');
         let run_text = match run {
             RunWord::Full => count.clone(),
@@ -1362,27 +1519,71 @@ fn draw_list_line(buf: &mut Buffer, rect: Rect, agent: &AgentView, selected: boo
             RunWord::Bare => agent.runs_total.to_string(),
         };
         line.push_str(&run_text);
-        if let Some(word) = &word {
+        if with_word && let Some(word) = &word {
             line.push(' ');
             line.push_str(word);
         }
-        if with_state {
+        if with_state && !state.is_empty() {
             line.push(' ');
-            line.push_str(&face.status);
+            line.push_str(&state);
         }
         line
     };
-    let mut line = build(selected, RunWord::Full, false, true);
-    for (run, no_space) in [
-        (RunWord::Full, false),
-        (RunWord::Compact, false),
-        (RunWord::Bare, false),
-        (RunWord::Bare, true),
-    ] {
+    let mut line = build(selected, RunWord::Full, false, true, true, true);
+    // Tighten in two stages. First the run label is shortened; then the historical
+    // last-work word and the current wait word compete for the last cells. A waiting
+    // state wins there (it is what the agent is doing now); a finished state keeps
+    // the last-work word (the mark and the box legend still name its state). The
+    // login is the last whole fact given up, and only the two-column floor needs it.
+    let live_word = !state.is_empty() && state != "stopped";
+    let waiting = live_word;
+    let mut stages = vec![
+        (RunWord::Full, false, true, true, true),
+        (RunWord::Compact, false, true, true, true),
+        (RunWord::Bare, false, true, true, true),
+    ];
+    if !login_derivable {
+        // A persisted long login may not fit with every other fact. Give up the
+        // inline copy before giving up the wait/failure or last-work word; the exact
+        // login is named in the list box's top-border identity legend.
+        stages.push((RunWord::Bare, false, false, true, true));
+    }
+    if waiting {
+        stages.push((RunWord::Bare, false, true, false, true));
+        // The wait word and the last-work word both outrank the login: keep both,
+        // with the name and count, before giving up the login to a plain line.
+        stages.push((RunWord::Bare, false, false, true, true));
+        stages.push((RunWord::Bare, false, true, true, false));
+    } else {
+        stages.push((RunWord::Bare, false, true, true, false));
+        stages.push((RunWord::Bare, false, false, true, true));
+        stages.push((RunWord::Bare, false, true, false, true));
+    }
+    stages.push((RunWord::Bare, false, false, true, false));
+    stages.push((RunWord::Bare, false, false, false, true));
+    for (run, no_space, with_login, with_word, with_state) in stages {
         if text_util::width(&line) <= max {
             break;
         }
-        line = build(selected, run, no_space, false);
+        line = build(selected, run, no_space, with_login, with_word, with_state);
+    }
+    if text_util::width(&line) > max
+        && let Some(leftover) = agent.leftover.as_deref()
+    {
+        // The full cleanup word did not fit even without the login. The short word
+        // still distinguishes a live process from uncertainty; the Agent screen and
+        // the footer carry the full one.
+        let short = format!(
+            "{}{} {} {} {}",
+            if selected { "▸" } else { "" },
+            face.symbol,
+            agent.name,
+            agent.runs_total,
+            status::leftover_short(leftover)
+        );
+        if text_util::width(&short) <= max {
+            line = short;
+        }
     }
     if text_util::width(&line) > max {
         line = text_util::ellipsize_words(&line, max);
@@ -1415,6 +1616,7 @@ fn draw_agent_list(
     geometry: &GridGeometry,
     forgejo_rect: Rect,
     wire_style: Style,
+    selection_x: u16,
 ) -> BoardLayout {
     let list = geometry.list.expect("the list form has a box");
     for y in forgejo_rect.bottom()..list.y {
@@ -1422,28 +1624,27 @@ fn draw_agent_list(
     }
     text_util::fill(buf, list, Style::new().fg(theme::FG).bg(theme::CARD));
     draw_plain_box(buf, list, Style::new().fg(theme::WIRE).bg(theme::CARD));
-    // The densest form keeps the state as a mark on each line; the box's bottom
-    // border names the three marks once, so the state is still a word on screen.
-    {
-        border_label(
-            buf,
-            list,
-            list.x + 2,
-            list.bottom() - 1,
-            "● working  ◐ waiting  ○ stopped · N runs",
-            theme::fg(theme::MUTED),
-            list.width.saturating_sub(6) as usize,
-        );
-    }
-    // The trunk arrives at the middle of the box's top border as one `┴`.
-    put_arms(
-        buf,
-        buf.area,
-        geometry.trunk_x,
-        list.y,
-        L | R | U,
-        wire_style,
-    );
+
+    let mixed = board
+        .view
+        .agents
+        .iter()
+        .any(|agent| agent.login != format!("gewu-{}", agent.name));
+    let abbreviated_names = board
+        .view
+        .agents
+        .iter()
+        .any(|agent| dense_agent_number(&agent.name).is_some());
+    let cleanup = board
+        .view
+        .agents
+        .iter()
+        .any(|agent| agent.leftover.is_some());
+    let has_failure = board
+        .view
+        .agents
+        .iter()
+        .any(|agent| status::list_word(agent).is_some_and(|word| word.starts_with('✗')));
 
     let agent_count = board.view.agents.len();
     let mut layout = BoardLayout {
@@ -1471,14 +1672,121 @@ fn draw_agent_list(
                 1,
             );
             let selected = !board.forgejo_selected && agent_index == board.selection;
-            draw_list_line(buf, rect, agent, selected);
+            if mixed {
+                draw_dense_list_line(buf, rect, agent, selection_x, selected);
+            } else {
+                draw_list_line(buf, rect, agent, selected, false);
+            }
             layout.listed.push(CardSlot {
                 agent: agent_index,
                 rect,
             });
         }
     }
+
+    let legend = if !mixed {
+        "● working  ◐ waiting  ○ stopped · login=gewu-<name> · run N"
+    } else if cleanup {
+        if has_failure {
+            "N=agent-N · ●w◐w○s · u=unverified o=unowned l=live · ✗=failed"
+        } else {
+            "N=agent-N · ●w◐w○s · u=unverified o=unowned l=live · run"
+        }
+    } else if has_failure {
+        "N=agent-N · ●work ◐waiting ○stopped · ✗=failed"
+    } else {
+        "N=agent-N · ●work ◐waiting ○stopped · run"
+    };
+    let legend = if abbreviated_names {
+        legend.to_owned()
+    } else {
+        legend.replacen("N=agent-N · ", "", 1)
+    };
+    border_label(
+        buf,
+        list,
+        list.x + 2,
+        list.bottom() - 1,
+        &legend,
+        theme::fg(theme::MUTED),
+        list.width.saturating_sub(6) as usize,
+    );
+    // The trunk arrives at the middle of the box's top border as one `┴`.
+    put_arms(
+        buf,
+        buf.area,
+        geometry.trunk_x,
+        list.y,
+        L | R | U,
+        wire_style,
+    );
     layout
+}
+
+fn dense_agent_number(name: &str) -> Option<&str> {
+    name.strip_prefix("agent-")
+        .filter(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Draw a dense mixed-board row. `agent-N` abbreviates to `N` under the
+/// explicit frame rule `N=agent-N`; every other name is printed verbatim. The
+/// actual login remains inline, so no login map or token is needed and a third,
+/// fourth or later recorded identity cannot lose its association. Facts are
+/// packed without padding when the column is tight; no required fact is dropped.
+fn draw_dense_list_line(
+    buf: &mut Buffer,
+    rect: Rect,
+    agent: &AgentView,
+    selection_x: u16,
+    selected: bool,
+) {
+    let face = status::agent_face(agent);
+    let prefix = dense_agent_number(&agent.name).unwrap_or(&agent.name);
+    let head = format!("{}{}:{}", face.symbol, prefix, agent.login);
+    let mut tail = agent.runs_total.to_string();
+    if let Some(last) = status::last_work_identity(agent) {
+        tail.push_str(&last);
+    }
+    let failure = status::list_word(agent)
+        .filter(|word| word.starts_with('✗'))
+        .is_some();
+    if failure {
+        tail.push('✗');
+    }
+    if let Some(code) = agent.leftover.as_deref().map(status::leftover_letter) {
+        tail.push_str(code);
+    }
+    let spaced = format!("{head} {tail}");
+    let line = if text_util::width(&spaced) <= rect.width as usize {
+        spaced
+    } else {
+        format!("{head}{tail}")
+    };
+    text_util::put(
+        buf,
+        rect,
+        rect.x,
+        rect.y,
+        &line,
+        if selected {
+            theme::card_bold(theme::SELECT, true)
+        } else {
+            theme::card(theme::FG, false)
+        },
+    );
+    if selected {
+        // The row has no spare cell for the usual `▸` at the floor; put the
+        // selection mark on the outer border, not through an agent fact.
+        let mark = Rect::new(selection_x, rect.y, 1, 1);
+        text_util::put(
+            buf,
+            mark,
+            selection_x,
+            rect.y,
+            "▸",
+            theme::card_bold(theme::SELECT, true),
+        );
+    }
 }
 
 fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
@@ -1523,7 +1831,7 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
 
     let wire_style = theme::fg(theme::WIRE);
     let layout = if geometry.form == BoardForm::List {
-        draw_agent_list(board, buf, &geometry, forgejo_rect, wire_style)
+        draw_agent_list(board, buf, &geometry, forgejo_rect, wire_style, area.x)
     } else {
         if geometry.columns > 1
             && let Some(first_bus) = geometry.bus_ys.first()
@@ -1637,7 +1945,10 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                         junction.saturating_sub(rect.x + 5) as usize
                     }
                 } else if rect.height == 3 {
-                    rect.width.saturating_sub(4) as usize
+                    // A three-row card's bottom border has no junction on a
+                    // multi-column grid: use its whole inner width, so the wait
+                    // word and the short last-work word both fit.
+                    rect.width.saturating_sub(2) as usize
                 } else if rect.height <= 2 {
                     rect.width.saturating_sub(8) as usize
                 } else {
@@ -1646,7 +1957,16 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                 if rect.height <= 2 {
                     draw_compact_card(buf, rect, agent, selected, true, junction, label_room);
                 } else {
-                    draw_card(buf, rect, agent, selected, true, junction, label_room);
+                    draw_card(
+                        buf,
+                        rect,
+                        agent,
+                        selected,
+                        true,
+                        junction,
+                        label_room,
+                        geometry.detailed,
+                    );
                 }
                 layout.cards.push(CardSlot {
                     agent: agent_index,
@@ -2547,16 +2867,26 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     // current: `status::activity` adds `last:` and an age when the run is over.
     let activity = status::activity(&agent);
     let failure_mark = status::failure_mark(&agent);
-    let failure = agent
-        .last_failure
-        .as_ref()
-        .map(|failure| format!("{failure_mark} {}", status::tool_failure(failure)))
-        .or_else(|| {
-            agent
-                .last_error
-                .as_ref()
-                .map(|error| format!("✗ {}", status::failure_words(error)))
-        });
+    let failure = if let Some(leftover) = agent.leftover.as_deref() {
+        // A cleanup the engine could not finish has its own three state names; the
+        // raw engine sentence (and the previous run's failure) is not shown as if it
+        // were this run's tool result.
+        Some(format!(
+            "{failure_mark} {}",
+            status::leftover_words(leftover)
+        ))
+    } else {
+        agent
+            .last_failure
+            .as_ref()
+            .map(|failure| format!("{failure_mark} {}", status::tool_failure(failure)))
+            .or_else(|| {
+                agent
+                    .last_error
+                    .as_ref()
+                    .map(|error| format!("✗ {}", status::failure_words(error)))
+            })
+    };
     let result = status::run_result_line(&agent);
     let result_colour = if status::run_result_is_refusal(&agent) {
         theme::RED

@@ -65,6 +65,12 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// The delay after a session that succeeded or ran at least this long.
 pub const RESTART_DELAY: Duration = Duration::from_secs(5);
 
+/// The documented wait after a successful run that found no work.
+///
+/// A no-work run is a success, not a quick failure: it resets the failure streak
+/// and waits the fixed, documented 20 s rather than entering the doubling back-off.
+pub const NO_WORK_DELAY: Duration = Duration::from_secs(20);
+
 /// A session shorter than this is a quick failure.
 pub const LONG_SESSION: Duration = Duration::from_secs(60);
 
@@ -379,9 +385,12 @@ fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> O
         instructions,
         runs,
         ignored_config: layout.config_file().is_file(),
+        // The screen names this build's own release notes, not the list of every
+        // release: the person wants the exact version they just opened.
         release_url: format!(
-            "https://github.com/{}/releases",
-            bundled_forgejo::REPOSITORY
+            "https://github.com/{}/releases/tag/v{}",
+            bundled_forgejo::REPOSITORY,
+            env!("CARGO_PKG_VERSION")
         ),
         whats_new: WHATS_NEW.to_owned(),
         warnings_changed: settings.terms_version < TERMS_VERSION,
@@ -666,11 +675,11 @@ impl Inner {
         // from starting a replacement beside a real old process.
         for (name, target, reason) in inner.leftovers.clone() {
             if let Some(index) = inner.agent_index(&name) {
+                inner.agents[index].session = SessionState::Blocked {
+                    reason: reason.clone(),
+                };
                 inner.agents[index].leftover = Some(reason);
                 inner.agents[index].leftover_targets.push(target);
-                inner.agents[index].session = SessionState::Blocked {
-                    reason: "an earlier run's cleanup is incomplete".to_owned(),
-                };
                 inner.agents[index].next_at = None;
             }
         }
@@ -966,6 +975,29 @@ fn end_from_outcome(summary: &run::RunSummary) -> Option<SessionEnd> {
     }
 }
 
+/// The durable outcome and reason for one run the engine saw end.
+///
+/// The engine's own ending is used only when the supervisor did not write one: the
+/// transcript keeps the run's own record when it exists. A stop or timeout that the
+/// engine caused gets a sentence that says so rather than an empty reason.
+fn outcome_for_end(end: &SessionEnd) -> (run::RunOutcome, Option<String>) {
+    match end {
+        SessionEnd::Succeeded => (run::RunOutcome::Succeeded, None),
+        SessionEnd::Refused { reason } => (run::RunOutcome::Refused, Some(reason.clone())),
+        SessionEnd::NoWork { reason } => (run::RunOutcome::NoWork, Some(reason.clone())),
+        SessionEnd::Warned { reason } => (run::RunOutcome::Warned, Some(reason.clone())),
+        SessionEnd::Failed { reason } => (run::RunOutcome::Failed, Some(reason.clone())),
+        SessionEnd::TimedOut => (
+            run::RunOutcome::TimedOut,
+            Some("the run reached its time limit and was stopped".to_owned()),
+        ),
+        SessionEnd::Stopped => (
+            run::RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+        ),
+    }
+}
+
 fn instruction_facts(
     path: &Path,
 ) -> (
@@ -1199,16 +1231,13 @@ impl Inner {
         if let Some((end, started, run_dir, pid)) = ended {
             self.observe_confinement_refusal(&run_dir);
             // A supervisor killed from outside can leave the shell it started in
-            // the run's process group. Reap the group at this boundary, before the
-            // next run is allowed to start; a process that survives is reported on
-            // the card instead of being hidden (F-02/F-03).
-            let leftover = run::reap_process_group(pid, &run_dir, self.options.stop_grace);
-            if leftover.is_ok() {
-                // The run and its group are over: no later reopen may act on the
-                // stale records (including the shell record written at spawn).
-                run::clear_process_records(&run_dir);
-            }
-            self.agents[index].leftover = leftover.err();
+            // the run's process group. The boundary settles the run in this order:
+            // stop or find the group gone, write (or keep) a durable ending, and
+            // only then remove the identity handles. An error at either step keeps
+            // the handles and is reported on the card; Start retries it (F-02).
+            let (outcome, reason) = outcome_for_end(&end);
+            let settled = run::settle_run(&run_dir, pid, outcome, reason, self.options.stop_grace);
+            self.agents[index].leftover = settled.err();
             if self.agents[index].leftover.is_some() {
                 self.agents[index].leftover_targets = vec![RecoveryTarget::Run(run_dir.clone())];
             } else {
@@ -1224,12 +1253,15 @@ impl Inner {
             self.agents[index].activity_refresh_at = None;
             let state_root = self.options.layout.state_root().to_path_buf();
             let agent = &mut self.agents[index];
-            finish_session(agent, end, now, started, &state_root);
+            finish_session(agent, end, now, started, &state_root, Some(&run_dir));
             if agent.leftover.is_some() {
                 // A surviving old process outranks the normal restart: block the
                 // agent (and say why) until Start retries the cleanup.
                 agent.session = SessionState::Blocked {
-                    reason: "an earlier run's cleanup is incomplete".to_owned(),
+                    reason: agent
+                        .leftover
+                        .clone()
+                        .unwrap_or_else(|| "cleanup unverified".to_owned()),
                 };
                 agent.next_at = None;
             }
@@ -1302,7 +1334,10 @@ impl Inner {
         if agent.leftover.is_some() {
             // Never start a replacement beside a process the last cleanup could
             // not stop; the card says why and Start retries the cleanup.
-            return Some("an earlier run's cleanup is incomplete".to_owned());
+            return agent
+                .leftover
+                .clone()
+                .or_else(|| Some("cleanup unverified".to_owned()));
         }
         if !self.settings.endpoint.configured() || !self.credential_key_present() {
             return Some("needs a model".to_owned());
@@ -1651,6 +1686,7 @@ fn finish_session(
     now: Instant,
     started: Instant,
     state_root: &Path,
+    attempt_dir: Option<&Path>,
 ) {
     if agent.desired == Desired::Stopped {
         end = SessionEnd::Stopped;
@@ -1673,19 +1709,24 @@ fn finish_session(
     };
     agent.current_tool = None;
     agent.current_tool_since = None;
-    if let Some(dir) = agent.newest_run.clone() {
-        if let Some(action) = run::forgejo_actions(&dir).pop() {
+    // The attempt that just ended owns the failure/activity rows. A prepare or
+    // spawn failure has a run directory of its own but never became `newest_run`;
+    // reading the previous newest run here showed its old tool failure beside the
+    // current start failure and re-stamped its activity as "now". The previous
+    // last-work block is still rebuilt from all runs below.
+    if let Some(dir) = attempt_dir {
+        if let Some(action) = run::forgejo_actions(dir).pop() {
             agent.activity = Some(plain_activity(&action.sentence));
             agent.activity_at = Some(SystemTime::now());
         }
-        agent.last_failure = run::read_failure(&dir);
+        agent.last_failure = run::read_failure(dir);
         let mut runs = run::runs_of_agent(state_root, &agent.name);
         runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         agent.last_work = run::latest_work(&runs);
         agent.last_work_result = run::latest_work_result(&runs);
-        agent.last_result_is_work = run::run_did_work(&dir);
+        agent.last_result_is_work = run::run_did_work(dir);
         agent.no_assigned_work = run::says_no_assigned_work(
-            &dir,
+            dir,
             &agent
                 .login
                 .clone()
@@ -1710,7 +1751,14 @@ fn finish_session(
         agent.next_at = None;
         return;
     }
-    let delay = if matches!(end, SessionEnd::Succeeded | SessionEnd::Warned { .. })
+    // A no-work run succeeded at what it was asked to do: it resets the quick-failure
+    // streak and takes the documented 20 s watch interval. Only an actual quick
+    // failure grows the back-off, and a successful work run keeps the existing
+    // good-run interval.
+    let delay = if matches!(end, SessionEnd::NoWork { .. }) {
+        agent.quick_failures = 0;
+        NO_WORK_DELAY
+    } else if matches!(end, SessionEnd::Succeeded | SessionEnd::Warned { .. })
         || ran >= LONG_SESSION
     {
         agent.quick_failures = 0;
@@ -1954,7 +2002,7 @@ impl EngineApi for Engine {
                     }
                     if let Some(reason) = failed {
                         inner.agents[index].leftover = Some(reason.clone());
-                        let sentence = format!("an earlier run's cleanup is incomplete: {reason}");
+                        let sentence = format!("cleanup unfinished: {reason}");
                         inner.note(sentence.clone());
                         return Err(sentence);
                     }
@@ -2125,6 +2173,11 @@ impl EngineApi for Engine {
         // engine lock is not held here, so that work can finish. Pids that appear
         // during the wait are signalled as soon as they are visible.
         let mut signalled: Vec<u32> = Vec::new();
+        // Runs whose supervisor has ended are settled after the wait: their group is
+        // stopped, a durable ending is written (unless the run wrote one) and only
+        // then are the identity handles removed. A run that cannot be settled keeps
+        // its handles, so the next open reports the failure and Start retries.
+        let mut settled_runs: Vec<(PathBuf, u32)> = Vec::new();
         loop {
             let mut appeared: Vec<u32> = Vec::new();
             let mut alive = false;
@@ -2133,6 +2186,7 @@ impl EngineApi for Engine {
                 for agent in &mut inner.agents {
                     if let Some(run) = agent.running.as_mut() {
                         if run.handle.try_status().is_some() {
+                            settled_runs.push((run.run_dir.clone(), run.handle.pid()));
                             if let Some(run_id) = run_id_in(&run.run_dir) {
                                 crate::confinement::remove_run_temp(run.handle.pid(), run_id);
                             }
@@ -2184,6 +2238,7 @@ impl EngineApi for Engine {
             for agent in &mut inner.agents {
                 if let Some(mut run) = agent.running.take() {
                     stop_running_session(&mut run.handle, Duration::from_millis(500));
+                    settled_runs.push((run.run_dir.clone(), run.handle.pid()));
                 }
                 if let Some(pid) = agent.starting_pid.take() {
                     signal_group(pid, nix::sys::signal::Signal::SIGKILL);
@@ -2211,6 +2266,18 @@ impl EngineApi for Engine {
             inner.forgejo.start_requested = false;
             inner.forgejo.start_inflight = false;
             inner.forgejo.provisioned = false;
+        }
+        // Settle every run whose supervisor this shutdown ended, outside the lock.
+        // The run gets a durable ending before its handles go; if either step fails
+        // the handles stay for the next open, which reports and retries them.
+        for (run_dir, pid) in settled_runs {
+            let _ = run::settle_run(
+                &run_dir,
+                pid,
+                run::RunOutcome::Stopped,
+                Some("the run was stopped when the program closed".to_owned()),
+                Duration::from_millis(500),
+            );
         }
         // A token helper may have been between "recorded as in flight" and "spawn"
         // when the force phase ran. The job that started it checks the stop flag
@@ -3006,6 +3073,7 @@ fn session_job(
                 now,
                 started,
                 &state_root,
+                Some(&request.run_dir),
             );
             return;
         }
@@ -3025,9 +3093,22 @@ fn session_job(
     let now = clock.now();
     let mut guard = lock_inner(&inner);
     let Some(index) = guard.agent_index(&request.agent) else {
+        // The agent was removed while its spawn was in flight. This job still owns
+        // the child it created: stop it, then settle the run so its durable ending
+        // and its identity handles are put in the correct order. If settlement
+        // fails, the handles stay for the next open, which scans every agent
+        // directory on disk, not only the current settings.
         drop(guard);
         if let Ok(mut handle) = spawned {
+            let pid = handle.pid();
             stop_running_session(&mut handle, Duration::from_secs(1));
+            let _ = run::settle_run(
+                &request.run_dir,
+                pid,
+                run::RunOutcome::Stopped,
+                Some("the run was called off when its agent was removed".to_owned()),
+                Duration::from_secs(1),
+            );
         }
         return;
     };
@@ -3038,11 +3119,37 @@ fn session_job(
     if called_off {
         guard.agents[index].starting = false;
         guard.agents[index].starting_pid = None;
+        let stopping = guard.stopping;
         drop(guard);
         if let Ok(mut handle) = spawned {
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
+            let pid = handle.pid();
             stop_running_session(&mut handle, Duration::from_secs(1));
+            let reason = if stopping {
+                "the run was stopped when the program closed"
+            } else {
+                "the run was stopped before it became current"
+            };
+            match run::settle_run(
+                &request.run_dir,
+                pid,
+                run::RunOutcome::Stopped,
+                Some(reason.to_owned()),
+                Duration::from_secs(1),
+            ) {
+                Ok(_) => {}
+                Err(reason) => {
+                    let mut guard = lock_inner(&inner);
+                    if let Some(index) = guard.agent_index(&request.agent) {
+                        guard.agents[index].leftover = Some(reason.clone());
+                        guard.agents[index].leftover_targets =
+                            vec![RecoveryTarget::Run(request.run_dir.clone())];
+                        guard.agents[index].session = SessionState::Blocked { reason };
+                        guard.agents[index].next_at = None;
+                    }
+                }
+            }
         }
         return;
     }
@@ -3063,6 +3170,17 @@ fn session_job(
             });
             guard.agents[index].newest_run = Some(request.run_dir.clone());
             guard.agents[index].activity_refresh_at = None;
+            // A new run is not the previous one: its failure, its tool and its
+            // activity are read from this run's own records. Keeping the old rows
+            // here made a previous refusal look like the current run's result
+            // (F7); the last-work block is deliberately kept until new work comes.
+            guard.agents[index].last_failure = None;
+            guard.agents[index].last_error = None;
+            guard.agents[index].activity = None;
+            guard.agents[index].activity_at = None;
+            guard.agents[index].current_tool = None;
+            guard.agents[index].current_tool_since = None;
+            guard.agents[index].no_assigned_work = false;
             guard.agents[index].session = SessionState::Running {
                 number: guard.agents[index].session_number,
                 since: SystemTime::now(),
@@ -3086,6 +3204,7 @@ fn session_job(
                 now,
                 started,
                 &state_root,
+                Some(&request.run_dir),
             );
         }
     }
@@ -3603,7 +3722,14 @@ mod tests {
         assert_eq!(upgrade.instructions, 2);
         assert_eq!(upgrade.runs, 1);
         assert!(upgrade.ignored_config, "the old config.toml was not named");
-        assert!(upgrade.release_url.contains("/releases"));
+        assert_eq!(
+            upgrade.release_url,
+            format!(
+                "https://github.com/{}/releases/tag/v{}",
+                bundled_forgejo::REPOSITORY,
+                env!("CARGO_PKG_VERSION")
+            )
+        );
         // The file now says this build, at open.
         assert_eq!(
             last_seen::read(&root).as_deref(),
@@ -4005,9 +4131,19 @@ mod tests {
         );
         let mut board = Board::new(engine);
         // A fresh root gets the one upgrade screen; continue to the board.
-        board.on_key(ratatui::crossterm::event::KeyEvent::from(
-            ratatui::crossterm::event::KeyCode::Enter,
-        ));
+        for _ in 0..2 {
+            if board.screen() == crate::board::Screen::Agent {
+                break;
+            }
+            board.on_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Enter,
+            ));
+        }
+        assert_eq!(
+            board.screen(),
+            crate::board::Screen::Agent,
+            "the Agent screen did not open"
+        );
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("a terminal");
         terminal
@@ -4064,6 +4200,337 @@ mod tests {
         wait_started(&fake, 2);
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
+    }
+
+    fn seed_a_warned_previous_run(root: &Path) {
+        let old = root
+            .join("state")
+            .join("agent-1")
+            .join("run-1700000000000-0007");
+        fs::create_dir_all(&old).expect("the old run directory");
+        let mut transcript = crate::transcript::Transcript::open(&old).expect("transcript");
+        transcript
+            .append(&crate::transcript::Record::forgejo_result(
+                1,
+                1,
+                "forgejo_comment",
+                Some("team/workspace"),
+                Some(7),
+                "ok",
+                Some("http://127.0.0.1:3000/team/workspace/issues/7#c"),
+                Some("commented"),
+            ))
+            .expect("the old comment");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-1700000000000-0007",
+                run::RunOutcome::Warned,
+                Some(0),
+                1_000,
+                Some("the old warning".to_owned()),
+            ))
+            .expect("the old ending");
+        fs::write(
+            old.join(crate::run::FAILURE_FILE),
+            b"write refused: HTTP 403 old refusal",
+        )
+        .expect("the old failure row");
+    }
+
+    fn assert_start_failure_provenance(root: &Path, fail_prepare: bool) {
+        let settings = write_ready(root, &[("agent-1", Desired::Stopped)]);
+        seed_a_warned_previous_run(root);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        let before = engine.board().agents[0].clone();
+        let old_failure = before.last_failure.clone();
+        let old_activity = before.activity.clone();
+        let old_activity_at = before.activity_at;
+        assert_eq!(
+            old_failure.as_deref(),
+            Some("write refused: HTTP 403 old refusal")
+        );
+        let reason = if fail_prepare {
+            fake.fail_prepare("the repository could not be cloned before the session: fixture");
+            "the repository could not be cloned before the session: fixture"
+        } else {
+            fake.fail_spawn("the session process could not be started: fixture");
+            "the session process could not be started: fixture"
+        };
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Start");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            tick(&mut engine, &clock, Duration::ZERO);
+            let shown = engine.board().agents[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("fixture"));
+            if shown {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the current start failure never appeared: {:?}",
+                engine.board().agents[0]
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = engine.board().agents[0].clone();
+        assert_eq!(
+            after.last_failure, None,
+            "the previous run's failure survived the new start failure"
+        );
+        assert!(
+            after
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains(reason)),
+            "the current start failure was not shown: {:?}",
+            after.last_error
+        );
+        assert_eq!(
+            after.activity, old_activity,
+            "the previous activity was replaced by a failure attempt"
+        );
+        assert_eq!(
+            after.activity_at, old_activity_at,
+            "the previous activity was stamped as a new activity"
+        );
+        assert!(
+            after
+                .last_work
+                .iter()
+                .any(|line| line.contains("comment on #7")),
+            "the previous last work was lost: {:?}",
+            after.last_work
+        );
+        // The Agent screen's cause row is the current failure, not the old refusal.
+        let mut board = crate::board::Board::new(engine);
+        for _ in 0..2 {
+            if board.screen() == crate::board::Screen::Agent {
+                break;
+            }
+            board.on_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Enter,
+            ));
+        }
+        assert_eq!(
+            board.screen(),
+            crate::board::Screen::Agent,
+            "the Agent screen did not open"
+        );
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a terminal");
+        terminal
+            .draw(|frame| board.draw(frame))
+            .expect("the frame draws");
+        let mut frame = String::new();
+        let area = terminal.backend().buffer().area;
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                frame.push_str(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((x, y))
+                        .expect("a cell")
+                        .symbol(),
+                );
+            }
+            frame.push('\n');
+        }
+        assert!(
+            frame.contains("fixture"),
+            "the current start failure is not on the Agent screen:\n{frame}"
+        );
+        assert!(
+            !frame.contains("old refusal"),
+            "the previous failure is presented as the current one:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn a_prepare_failure_after_a_warned_run_is_the_current_cause() {
+        let root = scratch_root("engine-prepare-provenance");
+        assert_start_failure_provenance(&root, true);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_spawn_failure_after_a_warned_run_is_the_current_cause() {
+        let root = scratch_root("engine-spawn-provenance");
+        assert_start_failure_provenance(&root, false);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_run_does_not_show_the_previous_runs_failure() {
+        let root = scratch_root("engine-stale-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let old = root
+            .join("state")
+            .join("agent-1")
+            .join("run-1700000000000-0001");
+        fs::create_dir_all(&old).expect("the old run directory");
+        fs::write(old.join("last-failure"), b"write refused: HTTP 403 stale")
+            .expect("the old failure row");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        assert_eq!(
+            engine.board().agents[0].last_failure.as_deref(),
+            Some("write refused: HTTP 403 stale"),
+            "the old row is not set up"
+        );
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Start");
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        assert!(
+            engine.board().agents[0].last_failure.is_none(),
+            "the previous run's failure is still presented beside the new run"
+        );
+        assert!(
+            matches!(
+                engine.board().agents[0].session,
+                SessionState::Running { .. }
+            ),
+            "the new run is not the current state"
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_normal_stop_records_its_ending_before_the_handles_and_reopens_clean() {
+        let root = scratch_root("engine-normal-stop-reopen");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(
+            &root,
+            settings.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&fake),
+        );
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the first run's directory");
+        fs::create_dir_all(&run_dir).expect("the run directory");
+        // The identity handles a real spawner writes. They must be gone only after
+        // the ending is durable.
+        fs::write(run_dir.join(crate::engine::session::PID_FILE), "424242").expect("pid");
+        fs::write(run_dir.join(crate::run::PGID_FILE), "424242").expect("pgid");
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let terminal = crate::transcript::terminal_record(&run_dir)
+            .expect("a normal stop must leave a durable terminal record");
+        assert!(
+            format!("{terminal:?}").contains("stopped"),
+            "the ending is not stopped: {terminal:?}"
+        );
+        assert!(
+            !run_dir.join(crate::engine::session::PID_FILE).exists()
+                && !run_dir.join(crate::run::PGID_FILE).exists(),
+            "the identity handles were not cleared after the ending"
+        );
+        drop(engine);
+        // The next open finds a finished run, not uncertainty, and Start can make a
+        // replacement rather than being blocked forever.
+        let mut reopened = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        assert!(
+            reopened.board().agents[0].leftover.is_none(),
+            "a cleanly stopped run was reported as an unverifiable leftover"
+        );
+        reopened
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Start after a clean stop");
+        tick(&mut reopened, &clock, Duration::ZERO);
+        wait_started(&fake, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_no_work_success_resets_the_failures_and_waits_twenty() {
+        let root = scratch_root("engine-no-work");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        // Two quick failures put the streak at two and the wait at 20 s.
+        fake.finish_current(1);
+        tick(&mut engine, &clock, Duration::ZERO);
+        tick(&mut engine, &clock, Duration::from_secs(10));
+        wait_started(&fake, 2);
+        fake.finish_current(1);
+        tick(&mut engine, &clock, Duration::ZERO);
+        tick(&mut engine, &clock, Duration::from_secs(20));
+        wait_started(&fake, 3);
+        // The third run succeeded and found no work: the documented 20 s interval,
+        // not the 40 s the failure streak would now ask for.
+        let run_dir = fake.last_run_dir().expect("the new run's directory");
+        fs::create_dir_all(&run_dir).expect("the run directory");
+        let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("transcript");
+        transcript
+            .append(&crate::transcript::Record::run_finished(
+                "run-no-work",
+                run::RunOutcome::NoWork,
+                Some(0),
+                500,
+                Some("There are no open issues assigned to me.".to_owned()),
+            ))
+            .expect("the no-work ending");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert!(
+            matches!(
+                &engine.board().agents[0].session,
+                SessionState::Restarting {
+                    last: SessionEnd::NoWork { .. },
+                    ..
+                }
+            ),
+            "the no-work success was not kept: {:?}",
+            engine.board().agents[0].session
+        );
+        tick(&mut engine, &clock, Duration::from_secs(19));
+        assert_eq!(
+            fake.counts().1,
+            3,
+            "a run started before the documented 20 s no-work wait"
+        );
+        tick(&mut engine, &clock, Duration::from_secs(1));
+        wait_started(&fake, 4);
+        // The streak reset on the no-work success: the next actual quick failure
+        // waits the first 10 s, not 40 s.
+        fake.finish_current(1);
+        tick(&mut engine, &clock, Duration::ZERO);
+        tick(&mut engine, &clock, Duration::from_secs(9));
+        assert_eq!(
+            fake.counts().1,
+            4,
+            "a quick failure after a no-work success used a stale streak"
+        );
+        tick(&mut engine, &clock, Duration::from_secs(1));
+        wait_started(&fake, 5);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4581,6 +5048,461 @@ mod tests {
     }
 
     #[test]
+    fn a_persisted_nonstandard_login_reaches_the_floor_board() {
+        for count in [4, 7, 12] {
+            let root = scratch_root(&format!("engine-recorded-login-{count}"));
+            let names: Vec<String> = (1..=count)
+                .map(|number| format!("agent-{number}"))
+                .collect();
+            let agents: Vec<(&str, Desired)> = names
+                .iter()
+                .map(|name| (name.as_str(), Desired::Stopped))
+                .collect();
+            let settings = write_ready(&root, &agents);
+            let layout = Layout::rooted_at(root.clone()).expect("layout");
+            credentials::record_agent_identity(
+                &layout.credentials_file(),
+                "agent-2",
+                Some(&credentials::Secret::new("synthetic-agent-token")),
+                "alice",
+                "alice@example.invalid",
+                "managed",
+                None,
+            )
+            .expect("recorded identity");
+            credentials::record_agent_identity_rights(
+                &layout.credentials_file(),
+                "agent-2",
+                crate::identity::TOOL_RIGHTS_VERSION,
+            )
+            .expect("recorded rights");
+            assert_eq!(
+                credentials::recorded_login(&layout.credentials_file(), "agent-2")
+                    .expect("read login"),
+                Some("alice".to_owned())
+            );
+            let clock = Arc::new(FakeClock::new());
+            let fake = Arc::new(FakeSpawner::new());
+            let mut options = test_options(&root);
+            options.forgejo_ready = false;
+            let mut engine =
+                open_for_test(options, clock, fake, settings).expect("the test engine opens");
+            assert_eq!(
+                engine.board().agents[1].login,
+                "alice",
+                "the persisted login did not reach AgentRuntime"
+            );
+            let mut board = crate::board::Board::new(engine);
+            for _ in 0..2 {
+                if board.screen() == crate::board::Screen::Home {
+                    break;
+                }
+                board.on_key(ratatui::crossterm::event::KeyEvent::from(
+                    ratatui::crossterm::event::KeyCode::Enter,
+                ));
+            }
+            assert_eq!(board.screen(), crate::board::Screen::Home);
+            let backend = ratatui::backend::TestBackend::new(72, 18);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| board.draw(frame))
+                .expect("the floor draws");
+            let area = terminal.backend().buffer().area;
+            let mut frame = String::new();
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    frame.push_str(
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, y))
+                            .expect("cell")
+                            .symbol(),
+                    );
+                }
+                frame.push('\n');
+            }
+            let row = board
+                .layout()
+                .listed
+                .iter()
+                .find(|slot| slot.agent == 1)
+                .map(|slot| slot.rect)
+                .expect("the persisted login's row");
+            let mut own = String::new();
+            for x in row.x..row.right() {
+                own.push_str(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((x, row.y))
+                        .expect("cell")
+                        .symbol(),
+                );
+            }
+            assert!(
+                own.contains("2:alice") && frame.contains("N=agent-N"),
+                "{count}: the persisted login was not mapped to its row: {own:?}\n{frame}"
+            );
+            assert!(
+                !frame.contains("login=gewu-<name>"),
+                "{count}: a generated-login legend claimed the persisted login"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A test spawner that creates a real child, writes the real pid/group records
+    /// and a typed `RunStarted`, reports the pid, then waits for the test before
+    /// returning. It uses the production `SessionSpawner` boundary, so the engine's
+    /// called-off/removal/shutdown code sees a run that actually started.
+    struct RealChildSpawner {
+        report: std::sync::Mutex<Option<std::sync::mpsc::Sender<u32>>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    struct RealChild {
+        child: std::process::Child,
+        pid: u32,
+        exited: Option<std::process::ExitStatus>,
+    }
+
+    impl crate::engine::session::RunningSession for RealChild {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+        fn try_status(&mut self) -> Option<std::process::ExitStatus> {
+            if self.exited.is_none() {
+                self.exited = self.child.try_wait().ok().flatten();
+            }
+            self.exited
+        }
+        fn signal(&mut self, force: bool) {
+            let signal = if force {
+                nix::sys::signal::Signal::SIGKILL
+            } else {
+                nix::sys::signal::Signal::SIGTERM
+            };
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(self.pid as i32), signal);
+        }
+    }
+
+    impl Drop for RealChild {
+        fn drop(&mut self) {
+            if self.exited.is_none() {
+                self.signal(true);
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    impl crate::engine::session::SessionSpawner for RealChildSpawner {
+        fn prepare(
+            &self,
+            request: &crate::engine::session::SessionRequest,
+        ) -> Result<crate::engine::session::PreparedSession, String> {
+            crate::engine::session::ensure_run_dir(&request.run_dir)?;
+            Ok(crate::engine::session::PreparedSession {
+                run_dir: request.run_dir.clone(),
+                workspace: request.workspace.clone(),
+            })
+        }
+        fn spawn_with(
+            &self,
+            prepared: &crate::engine::session::PreparedSession,
+            on_spawn: &mut dyn FnMut(u32),
+        ) -> Result<Box<dyn crate::engine::session::RunningSession>, String> {
+            use std::os::unix::process::CommandExt;
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| format!("the real child cannot start: {error}"))?;
+            let pid = child.id();
+            crate::mode::write_private(
+                prepared.run_dir.join(crate::engine::session::PID_FILE),
+                pid.to_string().as_bytes(),
+            )
+            .map_err(|error| format!("the pid cannot be written: {error}"))?;
+            crate::mode::write_private(
+                prepared.run_dir.join(crate::run::PGID_FILE),
+                pid.to_string().as_bytes(),
+            )
+            .map_err(|error| format!("the group cannot be written: {error}"))?;
+            let mut transcript = crate::transcript::Transcript::open(&prepared.run_dir)
+                .map_err(|error| format!("the transcript cannot open: {error}"))?;
+            transcript
+                .append(&crate::transcript::Record::run_started(
+                    prepared
+                        .run_dir
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("run"),
+                    "agent-1",
+                    pid,
+                    &prepared.workspace.display().to_string(),
+                ))
+                .map_err(|error| format!("the start record cannot be written: {error}"))?;
+            on_spawn(pid);
+            if let Some(report) = self.report.lock().expect("report").take() {
+                let _ = report.send(pid);
+            }
+            if let Some(release) = self.release.lock().expect("release").take() {
+                let _ = release.recv_timeout(Duration::from_secs(5));
+            }
+            Ok(Box::new(RealChild {
+                child,
+                pid,
+                exited: None,
+            }))
+        }
+    }
+
+    fn real_child_spawner() -> (
+        Arc<RealChildSpawner>,
+        std::sync::mpsc::Receiver<u32>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(RealChildSpawner {
+                report: std::sync::Mutex::new(Some(report_tx)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+            report_rx,
+            release_tx,
+        )
+    }
+
+    fn assert_real_child_settled(run_dir: &Path, pid: u32) {
+        assert!(
+            crate::transcript::read(run_dir)
+                .map(|file| file.records.iter().any(|record| matches!(
+                    record,
+                    crate::transcript::Record::RunStarted { pid: started, .. } if *started == pid
+                )))
+                .unwrap_or(false),
+            "the cancelled spawn had no durable typed RunStarted"
+        );
+        assert!(
+            crate::transcript::terminal_record(run_dir).is_some(),
+            "the cancelled spawn had no durable ending"
+        );
+        assert!(
+            !run_dir.join(crate::engine::session::PID_FILE).exists()
+                && !run_dir.join(crate::run::PGID_FILE).exists(),
+            "the cancelled spawn kept its identity handles"
+        );
+        let members = crate::run::recorded_group(run_dir);
+        assert!(members.is_none(), "the handles remained: {members:?}");
+        assert!(
+            std::fs::read_dir("/proc").is_ok(),
+            "the process table is unreadable"
+        );
+    }
+
+    #[test]
+    fn a_real_child_cancelled_during_spawn_has_a_durable_start_and_settles() {
+        let root = scratch_root("engine-real-child-stop-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let (spawner, report, release) = real_child_spawner();
+        let mut engine = open_for_test(
+            test_options(&root),
+            Arc::clone(&clock) as SharedClock,
+            spawner,
+            settings,
+        )
+        .expect("engine opens");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = report
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the real child reached its spawn boundary");
+        let run_dir = newest_run_for_test(&root, "agent-1");
+        assert_real_child_started(&run_dir, pid);
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Stop");
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_real_child_settled(&run_dir, pid);
+        assert!(
+            !process_group_has_members(pid),
+            "the cancelled real child's group survived"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_real_child_shutdown_during_spawn_has_a_durable_start_and_settles() {
+        let root = scratch_root("engine-real-child-shutdown-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let (spawner, report, release) = real_child_spawner();
+        let mut engine = open_for_test(
+            test_options(&root),
+            Arc::clone(&clock) as SharedClock,
+            spawner,
+            settings,
+        )
+        .expect("engine opens");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = report
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the real child reached its spawn boundary");
+        let run_dir = newest_run_for_test(&root, "agent-1");
+        assert_real_child_started(&run_dir, pid);
+        engine.shutdown(Duration::from_millis(200));
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_real_child_settled(&run_dir, pid);
+        assert!(!process_group_has_members(pid));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_real_child_removed_during_spawn_has_a_durable_start_and_settles() {
+        let root = scratch_root("engine-real-child-removed-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let (spawner, report, release) = real_child_spawner();
+        let mut engine = open_for_test(
+            test_options(&root),
+            Arc::clone(&clock) as SharedClock,
+            spawner,
+            settings,
+        )
+        .expect("engine opens");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = report
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the real child reached its spawn boundary");
+        let run_dir = newest_run_for_test(&root, "agent-1");
+        assert_real_child_started(&run_dir, pid);
+        {
+            let mut inner = lock_inner(&engine.inner);
+            assert!(inner.settings.remove_agent("agent-1"));
+            inner.agents.clear();
+        }
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_real_child_settled(&run_dir, pid);
+        assert!(!process_group_has_members(pid));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn newest_run_for_test(root: &Path, agent: &str) -> PathBuf {
+        let mut runs = crate::run::runs_of_agent(&root.join("state"), agent);
+        runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        runs.pop().expect("a run directory").dir
+    }
+
+    fn assert_real_child_started(run_dir: &Path, pid: u32) {
+        assert!(
+            crate::transcript::read(run_dir)
+                .map(|file| file.records.iter().any(|record| matches!(
+                    record,
+                    crate::transcript::Record::RunStarted { pid: started, .. } if *started == pid
+                )))
+                .unwrap_or(false),
+            "the real spawn had no durable typed RunStarted"
+        );
+        assert!(
+            run_dir.join(crate::engine::session::PID_FILE).is_file()
+                && run_dir.join(crate::run::PGID_FILE).is_file(),
+            "the real spawn had no identity handles"
+        );
+    }
+
+    fn process_group_has_members(pgid: u32) -> bool {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|text| text.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // The group is the third field after the parenthesised command.
+            let Some(rest) = stat.rsplit(')').next() else {
+                continue;
+            };
+            if rest.split_whitespace().nth(2) == Some(pgid.to_string().as_str()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn a_removal_during_spawn_settles_the_child_it_already_created() {
+        let root = scratch_root("engine-remove-session-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (pid_rx, release) = fake.block_next_spawn();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session reached its child");
+        assert!(fake.is_live(pid));
+        // The removal job changes settings before the in-flight spawn returns.
+        {
+            let mut inner = lock_inner(&engine.inner);
+            assert!(inner.settings.remove_agent("agent-1"));
+            assert!(inner.agent_index("agent-1").is_some());
+            inner.agents.clear();
+            inner.settings.next_agent = 2;
+        }
+        let _ = release.send(());
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::transcript::terminal_record(&run_dir).is_some(),
+            "a removed agent's spawned child left no durable ending"
+        );
+        assert!(
+            !run_dir.join(crate::engine::session::PID_FILE).exists()
+                && !run_dir.join(crate::run::PGID_FILE).exists(),
+            "a removed agent's spawned child left identity handles"
+        );
+        assert!(!fake.is_live(pid), "the removed agent's child survived");
+        assert!(
+            engine.board().agents.is_empty(),
+            "the removed agent came back"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn shutdown_returns_while_a_session_spawn_is_blocked_and_keeps_no_child() {
         let root = scratch_root("engine-quit-session-spawn");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
@@ -4633,6 +5555,64 @@ mod tests {
         );
         let board = engine.board();
         assert!(matches!(board.agents[0].session, SessionState::Idle));
+        let run_dir = fake.last_run_dir().expect("the spawned run directory");
+        assert!(
+            crate::transcript::terminal_record(&run_dir).is_some(),
+            "shutdown during spawn left no durable ending"
+        );
+        assert!(
+            !run_dir.join(crate::engine::session::PID_FILE).exists()
+                && !run_dir.join(crate::run::PGID_FILE).exists(),
+            "shutdown during spawn left identity handles"
+        );
+    }
+
+    #[test]
+    fn a_stop_during_a_spawn_settles_the_child_and_reopens_clean() {
+        let root = scratch_root("engine-stop-session-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (pid_rx, release) = fake.block_next_spawn();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session reached its child");
+        assert!(fake.is_live(pid));
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop");
+        let _ = release.send(());
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::transcript::terminal_record(&run_dir).is_some(),
+            "a stop during spawn left no durable ending"
+        );
+        assert!(
+            !run_dir.join(crate::engine::session::PID_FILE).exists()
+                && !run_dir.join(crate::run::PGID_FILE).exists(),
+            "a stop during spawn left identity handles"
+        );
+        assert!(!fake.is_live(pid), "the called-off child survived");
+        drop(engine);
+        let settings = Settings::load(&settings::path_in(&root)).expect("settings");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut reopened = open_test_engine(&root, settings, clock, fake);
+        assert!(
+            reopened.board().agents[0].leftover.is_none(),
+            "a settled stop during spawn blocked the reopen: {:?}",
+            reopened.board().agents[0].leftover
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

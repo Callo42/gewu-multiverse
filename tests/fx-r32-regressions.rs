@@ -259,7 +259,7 @@ fn the_work_block_types_a_pull_request_and_a_comment() {
         ))
         .expect("call");
     transcript
-        .append(&Record::forgejo_result(
+        .append(&Record::forgejo_result_with_branch(
             1,
             2,
             "forgejo_open_pull_request",
@@ -268,6 +268,7 @@ fn the_work_block_types_a_pull_request_and_a_comment() {
             "ok",
             Some("http://127.0.0.1:3000/team/website/pulls/5"),
             Some("opened"),
+            Some("fix/x"),
         ))
         .expect("open");
     transcript

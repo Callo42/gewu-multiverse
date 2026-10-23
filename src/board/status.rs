@@ -19,17 +19,18 @@ pub struct Face {
     pub status: String,
 }
 
-/// Remove the engine's technical words from anything that may reach the screen.
+/// Remove the engine's technical words from text the product itself wrote.
 ///
 /// The engine contract is allowed to say `endpoint`, `token`, `session` and the rest;
-/// the person is not. This is the translation point for an engine free-text reason or
-/// an activity string, so no such word can leak through a notice or a reason.
+/// the person is not. This is the translation point for an engine-authored notice or
+/// state reason. It is deliberately **not** applied to a run's own final summary: the
+/// model's words are kept verbatim apart from the existing credential masking, so a
+/// sentence containing an ordinary word like "missing" is never rewritten (F3).
 pub fn plain(text: &str) -> String {
     text.replace("endpoint", "model")
         .replace("provisioning", "setting up")
         .replace("token", "login")
         .replace("session", "run")
-        .replace("missing", "not set up")
         .replace("blocked", "stopped")
         .replace('`', "")
 }
@@ -50,7 +51,15 @@ pub fn tool_failure(text: &str) -> String {
 /// and it must not carry an engine word onto the screen.
 pub fn blocked_words(reason: &str) -> &'static str {
     let reason = reason.to_ascii_lowercase();
-    if reason.contains("instruction") {
+    // The three cleanup states keep their own words, so an unfinished stop never
+    // reads as a generic `needs help` or as a live process when it is only unproven.
+    if reason.trim_start().starts_with("cleanup unverified:") {
+        "cleanup unverified"
+    } else if reason.trim_start().starts_with("unverified leftover:") {
+        "unverified leftover"
+    } else if reason.trim_start().starts_with("live leftover:") {
+        "live leftover"
+    } else if reason.contains("instruction") {
         "needs an instruction"
     } else if reason.contains("model") || reason.contains("endpoint") || reason.contains("key") {
         "needs a model"
@@ -64,8 +73,12 @@ pub fn blocked_words(reason: &str) -> &'static str {
 }
 
 /// The newest activity, in the words the card uses.
+///
+/// Only the product's own activity prefix is rewritten (`opened PR #4` becomes the
+/// same sentence at every size); the repository or branch text that follows it is
+/// kept as the record wrote it. This is not the engine-word map: an activity is a
+/// fact about the run, not engine prose.
 pub fn activity_words(activity: &str) -> String {
-    let activity = plain(activity);
     if let Some(rest) = activity.strip_prefix("commented #") {
         return format!("commented on #{rest}");
     }
@@ -81,7 +94,7 @@ pub fn activity_words(activity: &str) -> String {
     if let Some(rest) = activity.strip_prefix("updated #") {
         return format!("updated pull request #{rest}");
     }
-    activity
+    activity.to_owned()
 }
 
 /// The Forgejo box's face.
@@ -250,7 +263,116 @@ pub fn activity(agent: &AgentView) -> Option<String> {
     }
 }
 
+/// The shortest activity words for a card row while keeping the action and number.
+fn compact_activity_words(activity: &str) -> String {
+    if let Some(rest) = activity.strip_prefix("opened pull request ") {
+        return format!("opened {rest}");
+    }
+    if let Some(rest) = activity.strip_prefix("updated pull request ") {
+        return format!("updated {rest}");
+    }
+    if let Some(rest) = activity.strip_prefix("commented on ") {
+        return format!("comment {rest}");
+    }
+    activity.to_owned()
+}
+
+/// The newest activity and its age, fitted to a roomy card's body row.
+///
+/// The full documented form (`last: … · 2m ago`) is used when the card has room. A
+/// narrower card (the 120×40 and 200×60 twelve-agent grids) takes the compact action
+/// words, and only the action is cut when even that is too wide: the age suffix is
+/// reserved first, so a truthful age is never ellipsized away from its action.
+pub fn activity_in(agent: &AgentView, width: usize) -> Option<String> {
+    let full = activity(agent)?;
+    if super::text::width(&full) <= width {
+        return Some(full);
+    }
+    if matches!(agent.session, SessionState::Running { .. }) {
+        // A running tool row is `shell · 3s`; there is no separate age suffix.
+        return Some(super::text::ellipsize_words(&full, width));
+    }
+    let words = agent
+        .activity
+        .as_deref()
+        .map(activity_words)
+        .map(|activity| compact_activity_words(&activity))?;
+    let suffix = match agent.activity_at {
+        Some(at) => {
+            let age = SystemTime::now()
+                .duration_since(at)
+                .map(age_words_short)
+                .unwrap_or_else(|_| "now".to_owned());
+            format!(" · {age}")
+        }
+        None => String::new(),
+    };
+    Some(fit_activity(&words, &suffix, width))
+}
+
+/// Fit an activity action while reserving the age suffix at the end.
+///
+/// The candidates give up only words, never the action's number or the age: first
+/// the full `last: …` form, then the shorter `last …` label, then the unlabelled
+/// action, then just its verb and number. A final ellipsis may shorten the action,
+/// but the suffix width is always subtracted first. The resulting line is always
+/// within `width` cells and, whenever the suffix itself fits, still carries the age.
+fn fit_activity(words: &str, suffix: &str, width: usize) -> String {
+    let tight = tight_activity_words(words);
+    let number = words
+        .split_whitespace()
+        .find(|word| word.starts_with('#'))
+        .unwrap_or("");
+    let candidates = [
+        format!("last: {words}{suffix}"),
+        format!("last {words}{suffix}"),
+        format!("{words}{suffix}"),
+        format!("{tight}{suffix}"),
+        if number.is_empty() {
+            format!("{words}{suffix}")
+        } else {
+            format!("{number}{suffix}")
+        },
+    ];
+    for candidate in candidates {
+        if super::text::width(&candidate) <= width {
+            return candidate;
+        }
+    }
+    let room = width.saturating_sub(super::text::width(suffix));
+    if room == 0 {
+        return super::text::ellipsize(suffix.trim_start(), width);
+    }
+    let action = super::text::ellipsize_words(&format!("last: {words}"), room);
+    format!("{action}{suffix}")
+}
+
+/// The verb and numeric identity of an activity, without the longer object words.
+fn tight_activity_words(words: &str) -> String {
+    let mut parts = words.split_whitespace();
+    let Some(verb) = parts.next() else {
+        return String::new();
+    };
+    match parts.find(|word| word.starts_with('#')) {
+        Some(number) => format!("{verb} {number}"),
+        None => verb.to_owned(),
+    }
+}
+
 /// An age in the card's few words.
+fn age_words_short(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 10 {
+        "now".to_owned()
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / 3600)
+    }
+}
+
 fn age_words(age: std::time::Duration) -> String {
     let seconds = age.as_secs();
     if seconds < 10 {
@@ -264,16 +386,20 @@ fn age_words(age: std::time::Duration) -> String {
     }
 }
 
-/// The first clause of an error, as a card line: no raw body, no second sentence.
+/// The first clause of a run's own sentence, as a card line.
+///
+/// The words are kept verbatim (apart from the credential masking the run already
+/// did) and only the tail after the first sentence is dropped. The engine-word map is
+/// not applied here: a model that wrote "the missing file" keeps those exact words
+/// (F3).
 pub fn first_clause(text: &str) -> String {
-    let plain = plain(text);
-    let mut cut = plain.len();
+    let mut cut = text.len();
     for needle in [" — ", ". ", "; ", "\n"] {
-        if let Some(at) = plain.find(needle) {
+        if let Some(at) = text.find(needle) {
             cut = cut.min(at);
         }
     }
-    let clause = plain[..cut].trim().trim_end_matches('.');
+    let clause = text[..cut].trim().trim_end_matches('.');
     if clause.chars().count() <= 90 {
         return clause.to_owned();
     }
@@ -314,16 +440,81 @@ pub fn session_symbol(end: &SessionEnd) -> (char, Color) {
 /// may stand beside the newest run's `✗ shell: …`; the newest mark and its row are
 /// what the failed call gets (correction 5, N2).
 pub fn failure_mark(agent: &AgentView) -> char {
-    if agent
-        .last_failure
-        .as_deref()
-        .is_some_and(|failure| failure.trim_start().starts_with("write refused:"))
+    if agent.leftover.is_some() {
+        // A cleanup that could not be proven is not the run's own `✗`; the card
+        // names it separately so an old failed mark is never borrowed for it.
+        '⚠'
+    } else if matches!(agent.recent.last(), Some(SessionEnd::Refused { .. }))
+        && agent
+            .last_failure
+            .as_deref()
+            .is_some_and(|failure| failure.trim_start().starts_with("write refused:"))
     {
         '⊘'
     } else if matches!(agent.recent.last(), Some(SessionEnd::Failed { .. })) {
         '✗'
     } else {
         '⚠'
+    }
+}
+
+/// The category the recovery boundary wrote in the reason.
+///
+/// Only the exact category prefix decides the state. A phrase such as "cannot be
+/// verified" can occur in all three reasons; ordinary substrings must never relabel
+/// record uncertainty as a proven live leftover.
+fn leftover_category(reason: &str) -> u8 {
+    let reason = reason.trim_start();
+    if reason.starts_with("live leftover:") {
+        0
+    } else if reason.starts_with("unverified leftover:") {
+        1
+    } else {
+        2
+    }
+}
+
+/// The card's word for a cleanup the engine could not finish.
+///
+/// Three states are kept apart: a known-live process that resisted stopping is
+/// `live leftover`; a live process whose ownership could not be proven is
+/// `unverified leftover`; a run that left no ownership record is `cleanup
+/// unverified`. None of them is a plain `stopped` or the run's own failure mark.
+pub fn leftover_words(leftover: &str) -> &'static str {
+    match leftover_category(leftover) {
+        0 => "⚠ live leftover",
+        1 => "⚠ unverified leftover",
+        _ => "⚠ cleanup unverified",
+    }
+}
+
+/// The one-letter cleanup category used on a mixed compact line; the list legend
+/// expands `u`/`o`/`l`.
+pub fn leftover_letter(leftover: &str) -> &'static str {
+    match leftover_category(leftover) {
+        0 => "l",
+        1 => "o",
+        _ => "u",
+    }
+}
+
+/// A two-cell cleanup category for the floor list when a persisted login takes the
+/// remaining room. The list legend expands it to the full short word.
+pub fn leftover_code(leftover: &str) -> &'static str {
+    match leftover_category(leftover) {
+        0 => "⚠l",
+        1 => "⚠o",
+        _ => "⚠u",
+    }
+}
+
+/// The shortest form of [`leftover_words`] that keeps the three states apart on a
+/// tight card border.
+pub fn leftover_short(leftover: &str) -> &'static str {
+    match leftover_category(leftover) {
+        0 => "⚠ live",
+        1 => "⚠ unowned",
+        _ => "⚠ unverified",
     }
 }
 
@@ -372,6 +563,17 @@ pub fn run_result_line(agent: &AgentView) -> Option<String> {
             result.unwrap_or_else(|| first_clause(reason))
         )),
         _ => None,
+    }
+}
+
+/// The colour of a run's own result or activity row.
+pub fn result_colour(agent: &AgentView) -> Color {
+    if run_result_is_refusal(agent) {
+        theme::RED
+    } else if run_result_is_warning(agent) {
+        theme::AMBER
+    } else {
+        theme::MUTED
     }
 }
 
@@ -431,11 +633,31 @@ pub fn last_work_is_failure(agent: &AgentView) -> bool {
     newest_failure_word(agent).is_some()
 }
 
+/// The last-work identity (`#4`, `#3` or a short branch) without letting a later
+/// failure replace it. The compact floor uses this beside a cleanup code.
+pub fn last_work_identity(agent: &AgentView) -> Option<String> {
+    let mut best: Option<String> = None;
+    for line in agent.last_work.iter().rev() {
+        if let Some(rest) = line.strip_prefix("pull request #") {
+            return Some(format!("#{}", leading_number(rest)));
+        }
+        if let Some(rest) = line.strip_prefix("issue #") {
+            best = Some(format!("#{}", leading_number(rest)));
+        } else if let Some(rest) = line.strip_prefix("comment on #") {
+            best.get_or_insert_with(|| format!("#{}", leading_number(rest)));
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            let branch = rest.split_whitespace().next().unwrap_or(rest);
+            best.get_or_insert_with(|| branch.chars().take(7).collect());
+        }
+    }
+    best
+}
+
 /// `✗ HTTP 500` / `✗ model unreachable` for the newest failed run. `None` when the
 /// newest run did not fail.
 pub fn newest_failure_word(agent: &AgentView) -> Option<String> {
-    if agent.leftover.is_some() {
-        return Some("⚠ leftover".to_owned());
+    if let Some(leftover) = agent.leftover.as_deref() {
+        return Some(leftover_words(leftover).to_owned());
     }
     match agent.recent.last() {
         Some(SessionEnd::Failed { reason }) => Some(format!("✗ {}", short_failure(reason))),
@@ -449,6 +671,9 @@ pub fn newest_failure_word(agent: &AgentView) -> Option<String> {
 /// `✗ HTTP 500`. Other failures reuse [`newest_failure_word`] (`✗ net`,
 /// `◷ timeout`, `⚠ leftover`).
 pub fn tight_failure_word(agent: &AgentView) -> Option<String> {
+    if let Some(leftover) = agent.leftover.as_deref() {
+        return Some(leftover_short(leftover).to_owned());
+    }
     if let Some(SessionEnd::Failed { reason }) = agent.recent.last()
         && let Some(code) = http_status_in(reason)
     {
@@ -457,12 +682,29 @@ pub fn tight_failure_word(agent: &AgentView) -> Option<String> {
     newest_failure_word(agent)
 }
 
+/// The one word a two-column list line can hold.
+///
+/// It is the compact cleanup state, the short failure word, or the last-work word.
+/// The name, count and this word stay on a line whose login may have to give way;
+/// the Agent screen and footer keep the longer form.
+pub fn list_word(agent: &AgentView) -> Option<String> {
+    if let Some(leftover) = agent.leftover.as_deref() {
+        // The compact line keeps the distinction (`live` versus `unverified`); the
+        // Agent screen and footer carry the full state sentence.
+        return Some(leftover_short(leftover).to_owned());
+    }
+    if let Some(SessionEnd::Failed { reason }) = agent.recent.last() {
+        return Some(format!("✗ {}", short_failure(reason)));
+    }
+    last_work_word(agent)
+}
+
 /// The full failure word for a board card: `✗ HTTP 500 from the model` or
 /// `✗ model unreachable`. The list form uses [`newest_failure_word`]'s shorter
 /// spelling because a line has room for one work word, not a sentence (W67-3).
 pub fn card_word(agent: &AgentView) -> Option<String> {
-    if agent.leftover.is_some() {
-        return Some("⚠ leftover process".to_owned());
+    if let Some(leftover) = agent.leftover.as_deref() {
+        return Some(leftover_words(leftover).to_owned());
     }
     if let Some(SessionEnd::Failed { reason }) = agent.recent.last() {
         return Some(format!("✗ {}", failure_words(reason)));
@@ -506,7 +748,9 @@ pub fn failure_words(reason: &str) -> String {
     if lower.contains("model_not_found") {
         return "the model name was not found".to_owned();
     }
-    first_clause(reason)
+    // This branch is engine prose (a provider/transport sentence), not the agent's
+    // own final summary, so the engine-word map still applies.
+    plain(&first_clause(reason))
 }
 
 fn http_status_in(text: &str) -> Option<u16> {
@@ -696,16 +940,84 @@ mod tests {
     }
 
     #[test]
-    fn activities_are_written_out_and_free_text_is_cleaned() {
+    fn activities_are_written_out_and_engine_prose_is_cleaned() {
         assert_eq!(activity_words("commented #12"), "commented on #12");
         assert_eq!(activity_words("opened PR #4"), "opened pull request #4");
         assert_eq!(activity_words("commented on #12"), "commented on #12");
         assert_eq!(activity_words("opened #4"), "opened pull request #4");
         assert_eq!(activity_words("updated #4"), "updated pull request #4");
-        assert!(!plain("this session token endpoint is missing and blocked").contains("session"));
+        assert!(!plain("this session token endpoint is blocked").contains("session"));
         assert_eq!(
             plain("`agent-4` is connected as `gewu-agent-4`"),
             "agent-4 is connected as gewu-agent-4"
+        );
+    }
+
+    #[test]
+    fn activity_in_keeps_the_age_after_cutting_the_action() {
+        let mut agent = agent(SessionState::Idle, Desired::Stopped);
+        agent.activity = Some("opened pull request #20".to_owned());
+        agent.activity_at = Some(SystemTime::now() - Duration::from_secs(7200));
+        agent.last_result = None;
+        agent.last_work_result = None;
+        for width in [18, 24, 28, 36, 60] {
+            let line = activity_in(&agent, width).expect("an activity line");
+            assert!(
+                super::super::text::width(&line) <= width,
+                "width {width}: the line overflows: {line:?}"
+            );
+            assert!(
+                line.contains("2h"),
+                "width {width}: the age was cut from the activity: {line:?}"
+            );
+            if width >= 24 {
+                assert!(
+                    line.contains("#20"),
+                    "width {width}: the action identity was lost: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_categories_use_their_own_prefix_not_a_shared_phrase() {
+        // Every one of these contains "cannot be verified"; only the exact prefix
+        // may decide the state.
+        let cleanup = "cleanup unverified: the run's ending cannot be verified: permission denied";
+        let unowned = "unverified leftover: a live process group cannot be verified as this run's";
+        let live = "live leftover: a run process (pid 4) could not be stopped";
+        assert_eq!(leftover_words(cleanup), "⚠ cleanup unverified");
+        assert_eq!(leftover_short(cleanup), "⚠ unverified");
+        assert_eq!(blocked_words(cleanup), "cleanup unverified");
+        assert_eq!(leftover_words(unowned), "⚠ unverified leftover");
+        assert_eq!(leftover_short(unowned), "⚠ unowned");
+        assert_eq!(blocked_words(unowned), "unverified leftover");
+        assert_eq!(leftover_words(live), "⚠ live leftover");
+        assert_eq!(leftover_short(live), "⚠ live");
+        assert_eq!(blocked_words(live), "live leftover");
+    }
+
+    #[test]
+    fn a_run_summary_keeps_its_words_and_status_labels_are_exact() {
+        // F3: the engine-word/status map is not applied to the model's own sentence.
+        assert_eq!(
+            first_clause("I could not read the missing file."),
+            "I could not read the missing file"
+        );
+        assert_eq!(
+            first_clause("The endpoint session token is missing."),
+            "The endpoint session token is missing"
+        );
+        assert_eq!(blocked_words("cleanup unverified: x"), "cleanup unverified");
+        assert_eq!(blocked_words("live leftover: x"), "live leftover");
+        assert_eq!(
+            blocked_words("unverified leftover: x"),
+            "unverified leftover"
+        );
+        assert_eq!(blocked_words("blocked"), "needs help");
+        assert_eq!(
+            blocked_words("needs an instruction"),
+            "needs an instruction"
         );
     }
 

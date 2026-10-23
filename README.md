@@ -51,7 +51,9 @@ requests are its own. The board shows the whole thing at a glance:
   document's **file** lines (not wrapped display rows), the bounded run marks with
   their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`,
   wrapped whole on two rows at 72 columns), the newest mark's word, the last
-  tool failure and the newest run's reason. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
+  tool failure and the newest run's reason. The run's own final sentence is shown
+  verbatim apart from the credential masking; the product's status vocabulary is never
+  substituted into it. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
   every element of `PIPESTATUS`, so a failed command in a pipeline, a condition or a
   nested `bash -c`/`#!/bin/bash` script that reads the prelude can never hide behind
   a zero-exit wrapper, and
@@ -82,8 +84,9 @@ requests are its own. The board shows the whole thing at a glance:
   cause row says `⊘ write refused: …`, matching the strip. The
   summary line prefers the newest run that did work (`last work: …`); a later no-op's
   reason is labelled `no work: …`. Started agents keep
-  a visible idle between runs (`next run in 5s`); a no-work run's longer back-off says
-  `next run in 20s · no work`. The selected card is marked `▸`, and
+  a visible idle between runs (the Agent screen says `next run in 5s`; a card's shorter
+  form is `next 5s`); a no-work run's longer back-off says `next run in 20s · no work`
+  (`next 20s·no work` on a card). The selected card is marked `▸`, and
   a window from 140 to 160 columns uses its width for the repository names and card
   detail; a wider one centres the same picture in 160.
 
@@ -92,8 +95,9 @@ runs its instruction, and when that run ends it starts another one after a short
 visible idle, until you stop it. Each run's process group and the shell's boot/start
 identity are written down; if the program or a run's supervisor is killed outright, the
 next start checks the live process identity, binds each process to a kernel pidfd, stops
-the group through those handles, and writes its `run_stopped` record before the board
-opens, so a shell cannot keep editing beside the new run. A process the engine still cannot stop is named on the agent's card,
+the group through those handles, and writes the run's durable ending (and a
+`run_stopped` cleanup record when it had to close the run) before the board opens, so a
+shell cannot keep editing beside the new run. A process the engine still cannot stop is named on the agent's card,
 and the agent stays blocked until `Start` retries the cleanup successfully. An agent's
 shell is confined where the computer allows it. **Landlock is the automatic mechanism**:
 it denies the product's roots, and is not chosen when one of them lies inside a tree it
@@ -118,11 +122,21 @@ The warnings are one compact numbered block: five warnings, or six when this com
 cannot confine a run; the footer states the count, and the fact about this computer is
 the first line under item 2.
 The board repeats the negative sentence. One layout rule holds for 1–12 agents at
-72×18, 80×24, 100×30, 120×40 and 200×60: cards never collide, truncate a name or leave
+72×18, 80×24, 100×30, 120×40 and 200×60 (a home past twelve keeps the compact
+two-column list and scrolls with the selection): cards never collide, truncate a name or leave
 a dangling connector; the grid keeps its columns fixed so a wrapped last row cannot
 move under the wire. When the cards cannot keep a whole title and their facts, the
 board takes a compact list: one wired box with a line (or two columns) per agent,
-keeping the name, login, run count, state mark and last-work word on the frame. The
+keeping the name, run count, state mark and the current or last-work word on the
+frame. The login is on the line while it fits; otherwise the box legend
+`login=gewu-<name>` names the exact generated login when that equality holds (the
+Agent screen always shows the whole login); a persisted non-standard login stays
+whole and agent-associated. On a mixed compact board, an exact `agent-N` name
+displays as `N` under the same-frame rule `N=agent-N`, followed by the actual
+`N:<login>`, so a third, fourth or later recorded identity needs no separate map and
+cannot lose its row association. Names that do not equal `agent-N` stay verbatim;
+generated rows keep their inline login or a `*` marker covered by `*=gewu-<name>`
+only when that equality is true. The
 72×18 Forgejo box keeps the address, repository count, agent count and login on three
 rows (the version stays on the top border); the 80×24 box keeps the organisation, the
 repository names that fit and the login on four rows; from 100×30 the box is six rows.
@@ -132,13 +146,14 @@ is too short for it, never overwriting the keys.
 
 The last-work word keeps its number: `pull request #100` is `#100`, never `#10`, and
 `#10000` stays whole — the label is shortened, not the number. A failed run's word
-starts with the HTTP status (`✗ HTTP 500 from the model`) and is cut on whole words, and
+starts with the HTTP status (`✗ HTTP 500` on a card; the Agent screen names the model
+as well) and is cut on whole words, and
 a single-column connector is placed after the label so it never crosses the word.
 
 After an upgrade, the first open shows one screen: the version this installation was,
 the version this is, what was found (settings, agents, instructions and runs), what is
 reused or ignored, one line from this release's notes naming what changed, and the
-release page address. If the first-run warnings changed since this installation last
+release page address for this exact build (`…/releases/tag/v0.1.34`). If the first-run warnings changed since this installation last
 agreed to them, the screen says so and the next screen shows them again; after they are
 agreed the program returns to the board, never into the first-run model and picker
 flow. The next open goes straight to the board. The installer records the old version before it replaces the binary, and a
@@ -201,17 +216,19 @@ and you can change any of them later.
    line, and a valid but untested one says `not tested — t to test`. The saved and the
    edited key are both shown as eight bullets, and a test result disappears on the
    first edit.
-3. **Choose how many agents.** `←` / `→` changes the number from 1 to 12. Press `⏎` to
-   create them. The board shows `downloading n%`, `setting up`, `starting`, then
-   `● running` while your Forgejo is prepared.
+3. **Choose how many agents.** The first setup offers 1 to 12: `←` / `→` changes the
+   number. Press `⏎` to create them. Later, `+` adds one agent at a time and an
+   installation can grow to 20 in all; `−` removes the selected one. The board shows
+   `downloading n%`, `setting up`, `starting`, then `● running` while your Forgejo is
+   prepared.
 4. **Write each agent's instruction.** Pick a card with `←` / `→` and press `⏎`, then
    `e`. Your own editor opens `instruction.md`; write what the agent should do and
    save. Press `s` to start it. Press `s` again to stop it. **Assign an issue in
    Forgejo first:** an agent works only on the issues assigned to its own Forgejo
    account, so an unassigned issue produces a run with nothing to do.
 
-After the first setup, `+` adds a new agent and `−` removes the selected one (it asks
-once). A removed agent's number and Forgejo account are never reused: `+` after
+After the first setup, `+` adds one new agent (the settings' twenty is the most an
+installation can hold) and `−` removes the selected one (it asks once). A removed agent's number and Forgejo account are never reused: `+` after
 removing `agent-2` makes `agent-3`, with its own new account, while the removed account
 stays deactivated with its history. The last agent cannot be removed and the screen says
 why. `m` opens the model settings, `f` opens the Forgejo page, `?` lists every key, and
@@ -260,19 +277,22 @@ A relative folder is taken from the folder you started the program in.
 ## Stopping, quitting, and opening again
 
 - `s` stops the selected agent. Its current run is asked to stop, and then made to stop
-  if it does not; nothing new starts.
+  if it does not; the run's ending is written to its record before the process handles
+  are removed, and nothing new starts.
 - `q` quits. If an agent is running, the board first names the agents that will stop —
   `quit stops agent-2 and agent-3, and Forgejo; they start again on reopen — q again
   quits`; press `q` again. An agent that is only
   started and waiting for an instruction is not named, because it is not running. It
   stops every started agent and the Forgejo, and prints one line (`stopped 1 agent`, not
   `1 agents`).
-  Closing the terminal window does the same.
+  Closing the terminal window does the same. A run ended by quitting is settled like a
+  stopped one: its durable ending is written before its process handles are removed.
 - Opening the program again starts the Forgejo, and starts the agents you had left
   started, with the same instructions.
 - If the program was killed outright, the next start finds the Forgejo and any run
-  process groups it left behind, stops them, writes each run's `run_stopped` record, and
-  only then opens. A group is believed only through live identity: the shell's recorded
+  process groups it left behind, stops them, writes the durable ending for each run it
+  has to close (with `run-stopped.json` where it reaps a group or supplies a missing
+  ending), and only then opens. A group is believed only through live identity: the shell's recorded
   boot id and start time checked against the live process, or the inherited anonymous
   capability, or the actual supervisor executable with its exact run invocation.
   A run-directory path in some other process's argv does not own the group;

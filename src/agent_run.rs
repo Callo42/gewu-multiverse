@@ -172,6 +172,10 @@ pub struct RunEvidence {
     failed_call: Option<String>,
     /// The cause row for the newest hidden failure, when one was recorded.
     cause: Option<String>,
+    /// Whether that hidden cause is a refused write (the `⊘` row) rather than a
+    /// warned command (the `⚠` row). A read that fails inside a zero-exit wrapper
+    /// must never borrow the write mark (F2).
+    cause_refused: bool,
     /// The assigned-issues list was read successfully and was empty.
     checked_empty: bool,
     /// At least one write tool or write shell command succeeded.
@@ -208,6 +212,12 @@ impl RunEvidence {
     /// The card's cause row for a failure hidden behind a zero-exit wrapper.
     pub fn cause(&self) -> Option<&str> {
         self.cause.as_deref()
+    }
+
+    /// Whether the newest hidden cause is a refused write, so only that case gets
+    /// `⊘ write refused:` on the card.
+    pub fn cause_is_refused(&self) -> bool {
+        self.cause_refused
     }
 
     /// A Forgejo tool ended. A refused **write** is a refusal; a failed read is a
@@ -328,6 +338,7 @@ impl RunEvidence {
                 self.failed_call = Some(raw_cause.clone());
             }
             self.cause = Some(raw_cause);
+            self.cause_refused = false;
             return true;
         }
         // The shell exited 0, but the shell itself reports every simple command it
@@ -337,12 +348,28 @@ impl RunEvidence {
         // a command substitution without reading words in the output (correction 5).
         if !failing.is_empty() {
             let status = failing.last().map(|segment| segment.status).unwrap_or(1);
-            // The failed segment's own error line is the cause. When it printed no
-            // error, the exit status is the cause: a later successful segment's
-            // stdout is never passed off as the reason (correction 5). When several
-            // commands failed, a failed write's own line wins (N5).
+            // The failed segment's own error line is the cause. A successful write
+            // earlier in the command must not turn a later failed read into a write
+            // refusal just because a read operand happens to be a write target
+            // (`mv f g; cat f`). Only when the failed segment has no diagnostic of
+            // its own may a write's own line be used below.
+            let failed_segment_line = failing
+                .last()
+                .and_then(|segment| segment_error_line(&segment.command, &outcome.excerpt));
+            // The same diagnostic appearing as both the failed segment's own line
+            // and the "write target" line is the read's line (`mv f g; cat f`): the
+            // target happened to be a write operand, but the failed operation is the
+            // read. A different shell/write diagnostic is a hidden write.
+            let collision = match (&failed_segment_line, &write_line) {
+                (Some(read), Some(write)) => same_diagnostic(read, write),
+                _ => false,
+            };
             let segment_cause = if failed_write {
                 failing_write_cause(&failing, status, &outcome.excerpt)
+            } else if collision {
+                failed_segment_line
+                    .clone()
+                    .unwrap_or_else(|| write_line.clone().unwrap_or_default())
             } else if let Some(line) = write_line.clone() {
                 line
             } else {
@@ -354,16 +381,21 @@ impl RunEvidence {
             if failed_write {
                 self.refused_write = Some(format!("a shell write was refused: {segment_cause}"));
                 self.cause = Some(segment_cause);
-            } else if writes && write_line.is_some() {
-                // A read failed beside a write whose own diagnostic is in the
-                // output: the write is the refused act and its line is the cause.
+                self.cause_refused = true;
+            } else if writes && write_line.is_some() && !collision {
+                // A hidden write whose own diagnostic sits in the output, while the
+                // shell paired the failure with some other command: the write is the
+                // refused act. A failed read that printed its own line is never
+                // promoted as a write refusal.
                 self.refused_write = Some(format!("a shell write was refused: {segment_cause}"));
                 self.cause = Some(segment_cause);
+                self.cause_refused = true;
             } else {
                 if self.failed_call.is_none() {
                     self.failed_call = Some(segment_cause.clone());
                 }
                 self.cause = Some(segment_cause);
+                self.cause_refused = false;
             }
             return true;
         }
@@ -379,8 +411,12 @@ impl RunEvidence {
         {
             if writes {
                 self.refused_write = Some(format!("a shell write was refused: {cause}"));
+                self.cause_refused = true;
             } else if self.failed_call.is_none() {
                 self.failed_call = Some(cause.clone());
+                self.cause_refused = false;
+            } else {
+                self.cause_refused = false;
             }
             self.cause = Some(cause);
             return true;
@@ -398,8 +434,12 @@ impl RunEvidence {
             let cause = shell_diagnostic_clause(line);
             if writes || recorded_write_named(outcome, line) {
                 self.refused_write = Some(format!("a shell write was refused: {cause}"));
-            } else if self.failed_call.is_none() {
-                self.failed_call = Some(cause.clone());
+                self.cause_refused = true;
+            } else {
+                if self.failed_call.is_none() {
+                    self.failed_call = Some(cause.clone());
+                }
+                self.cause_refused = false;
             }
             self.cause = Some(cause);
             return true;
@@ -413,6 +453,7 @@ impl RunEvidence {
         if let Some(cause) = hidden_write_cause(command, &outcome.excerpt) {
             self.refused_write = Some(format!("a shell write was refused: {cause}"));
             self.cause = Some(cause);
+            self.cause_refused = true;
             return true;
         }
         // The wrapper exited 0. A curl without `-f` may still have been answered with
@@ -421,6 +462,7 @@ impl RunEvidence {
         if writes && curl_without_fail(command) && output_refused(&outcome.excerpt) {
             self.refused_write = Some(format!("a shell write was refused: {cause}"));
             self.cause = Some(cause);
+            self.cause_refused = true;
             return true;
         }
         // `/bin/sh`-only fallback: a compound command can keep a failed write's exit
@@ -433,6 +475,7 @@ impl RunEvidence {
         {
             self.refused_write = Some(format!("a shell write failed: {cause}"));
             self.cause = Some(cause);
+            self.cause_refused = true;
             return true;
         }
         if writes && !wrapper_failed && failing.is_empty() {
@@ -477,8 +520,42 @@ fn failing_write_cause(
         if let Some(line) = segment_error_line(&segment.command, output) {
             return line;
         }
+        if stderr_hidden(&segment.command) {
+            return exit_status_cause(status, output);
+        }
     }
     failing_cause(status, output)
+}
+
+/// Whether a segment sends its own standard error away from the captured output.
+///
+/// When it does, no later line can be that command's diagnostic: the stdout of a
+/// later successful segment (a probe's `DENIED` line, say) must not be passed off as
+/// the failed command's cause. The status is then the honest cause.
+fn stderr_hidden(command: &str) -> bool {
+    let compact: String = command.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact.contains("2>/dev/null")
+        || compact.contains("2>>/dev/null")
+        || compact.contains("&>/dev/null")
+        || compact.contains("&>>/dev/null")
+    {
+        return true;
+    }
+    // `>/dev/null 2>&1` duplicates stderr onto stdout after stdout was discarded.
+    match (compact.find(">/dev/null"), compact.rfind("2>&1")) {
+        (Some(null), Some(dup)) => null < dup,
+        _ => false,
+    }
+}
+
+/// The cause when a command could not have printed a diagnostic: its status, and
+/// whether the tool's captured output was otherwise empty.
+fn exit_status_cause(status: i32, output: &str) -> String {
+    if output.trim().is_empty() {
+        format!("exit {status}: no output")
+    } else {
+        format!("exit {status}: no error line")
+    }
 }
 
 /// The cause of a paired failed call that is not a write.
@@ -487,12 +564,26 @@ fn failing_write_cause(
 /// No such file or directory`), including a diagnostic whose text is not in the
 /// error-word list; only when the output carries no line of that command does the
 /// status wording remain (review correction 7, NB1).
+/// Whether two diagnostic lines describe the same failure, allowing for a bounded
+/// cut in either version.
+fn same_diagnostic(left: &str, right: &str) -> bool {
+    let left = first_clause(left, 160);
+    let right = first_clause(right, 160);
+    left == right || left.contains(&right) || right.contains(&left)
+}
+
 fn failing_segment_cause(
     segment: &transcript::CommandSegment,
     status: i32,
     output: &str,
 ) -> String {
-    segment_error_line(&segment.command, output).unwrap_or_else(|| failing_cause(status, output))
+    if let Some(line) = segment_error_line(&segment.command, output) {
+        return line;
+    }
+    if stderr_hidden(&segment.command) {
+        return exit_status_cause(status, output);
+    }
+    failing_cause(status, output)
 }
 
 /// The error line a failed command itself printed, when the output can be tied to
@@ -1428,10 +1519,17 @@ impl RunLog {
     /// A failed command hidden inside a zero-exit compound, or a `curl` without
     /// `-f` answered with a 4xx/5xx. The process succeeded but the work did not:
     /// the card gets the same cause row, with `⚠` rather than `✗` (correction 4).
-    fn tool_warning(&mut self, tool: &str, detail: &str) {
+    /// A failure hidden inside a zero-exit compound, or a `curl` without `-f`
+    /// answered with a 4xx/5xx. Only a write failure wears `write refused:` on the
+    /// card; a failed read keeps its tool's line and the `⚠` mark (F2).
+    fn tool_warning(&mut self, tool: &str, detail: &str, refused_write: bool) {
         let clause = first_clause(detail, 120);
         let line = format!("{tool}: {clause}");
-        let card = format!("write refused: {clause}");
+        let card = if refused_write {
+            format!("write refused: {clause}")
+        } else {
+            line.clone()
+        };
         let _ = crate::mode::write_private(
             self.dir.join(crate::run::FAILURE_FILE),
             self.secret.redact(&card).as_bytes(),
@@ -1905,7 +2003,11 @@ pub fn execute(run_dir: &Path) -> RunEnd {
     // The process's own exit is recorded before it exits, so a transcript read back
     // knows the run got this far even when the run failed.
     let _ = transcript.append(&Record::child_exit(Some(end.exit_code), None));
-    let _ = transcript.append(&Record::run_finished(
+    // The ending is durable before this process exits: the engine and the next open
+    // read it as the proof that the run finished, and only then remove the run's
+    // process handles. A write that fails is said in the log; the engine sees the
+    // process end, finds no terminal record and writes (or reports) one itself.
+    if let Err(error) = transcript.append_durable(&Record::run_finished(
         &plan.run_id,
         if !end.is_success() {
             RunOutcome::Failed
@@ -1920,7 +2022,11 @@ pub fn execute(run_dir: &Path) -> RunEnd {
         Some(end.exit_code),
         started.elapsed().as_millis() as u64,
         end.reason.clone(),
-    ));
+    )) {
+        log.line(&format!(
+            "the run's ending cannot be recorded durably: {error}"
+        ));
+    }
     // The reason was just written as its own line; do not repeat it here, so a
     // failure sentence appears in the log exactly once.
     match &end.reason {
@@ -2549,15 +2655,18 @@ fn run_model_tool(
     // speaks the same `⊘` as the strip (U6/F-02).
     let hidden_refusal = evidence.note_shell(&command, &outcome);
     let failed = outcome.signal.is_some() || outcome.exit_code != Some(0);
-    if hidden_refusal || (failed && shell_writes(&command) && evidence.refused_write().is_some()) {
+    let failed_write_row = failed && shell_writes(&command) && evidence.refused_write().is_some();
+    if hidden_refusal || failed_write_row {
         // The evidence carries the failed segment's own cause: its error line, or
-        // its exit status when it printed none (correction 5).
+        // its exit status when it printed none (correction 5). Only a refused write
+        // gets the `⊘` row; a warned read gets the ordinary `shell:` row (F2).
         let cause = evidence
             .cause()
             .map(str::to_owned)
             .or_else(|| evidence.refused_cause().map(str::to_owned))
             .unwrap_or_else(|| summarise_output(&outcome.excerpt));
-        log.tool_warning(model::SHELL_TOOL, &cause);
+        let refused_row = evidence.cause_is_refused() || failed_write_row;
+        log.tool_warning(model::SHELL_TOOL, &cause, refused_row);
     }
     if let Err(error) = transcript.append(&Record::tool_result_with_segments(
         Some(turn),
@@ -2703,7 +2812,7 @@ fn run_forgejo_tool(
     };
     match &outcome {
         Ok(reply) => {
-            if let Err(error) = transcript.append(&Record::forgejo_result(
+            if let Err(error) = transcript.append(&Record::forgejo_result_with_branch(
                 turn,
                 index,
                 &call.function.name,
@@ -2712,6 +2821,7 @@ fn run_forgejo_tool(
                 "ok",
                 reply.url.as_deref(),
                 reply.action,
+                reply.branch.as_deref(),
             )) {
                 return Err(RunEnd::failed(format!(
                     "the transcript cannot be written: {error}"
