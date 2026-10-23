@@ -286,16 +286,28 @@ fn call_tool(
     let raw_arguments = arguments.to_string();
     let facts = forgejo_tools::call_facts(name, &raw_arguments);
     let write = forgejo_tools::is_write_tool(name);
+    let reserved = tools.writes().saturating_add(1);
+    if write {
+        if reserved > crate::forgejo_tools::WRITE_BOUND {
+            return Ok(tool_error(format!(
+                "the per-run Forgejo write bound of {} is reached; this run can still read Forgejo, but no further comment or pull request will be written",
+                crate::forgejo_tools::WRITE_BOUND
+            )));
+        }
+        // Reserve before the request can have any effect. A crash or a malformed
+        // 2xx therefore overcounts at worst; it can never reset or undercount.
+        write_counter(counter, reserved)
+            .map_err(|error| format!("the protected write counter cannot be saved: {error}"))?;
+    }
     let result = tools.execute(name, &raw_arguments);
+    if write {
+        tools.set_writes(reserved);
+    }
     let (ok, text, action, url) = match &result {
         Ok(reply) => (true, reply.text.clone(), reply.action, reply.url.clone()),
         Err(error) => (false, error.clone(), None, None),
     };
     let outcome = redactor.redact(&text);
-    if write && ok {
-        write_counter(counter, tools.writes())
-            .map_err(|error| format!("the protected write counter cannot be saved: {error}"))?;
-    }
     let record = json!({
         "ts": crate::time::rfc3339(crate::time::now_unix_ms()),
         "tool": name,

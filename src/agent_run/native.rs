@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -112,6 +113,218 @@ impl Drop for McpServer {
     }
 }
 
+/// A run-private native helper. Dropping it closes the helper before records.
+struct HelperProcess {
+    child: Child,
+}
+
+impl Drop for HelperProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn base64(input: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Start a run-private OpenCode server, create a session at the selected
+/// workspace so its MCP context is initialized, and wait for the supervisor's
+/// six-tool bridge to be connected. The server and client share config/auth.
+fn start_opencode_server(
+    files: &NativeFiles,
+    plan: &crate::run::RunPlan,
+    exe: &Path,
+    shell: &Shell,
+) -> Result<Option<(HelperProcess, String, String)>, String> {
+    let Some(socket_parent) = files.mcp_state.as_ref() else {
+        return Ok(None);
+    };
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| format!("OpenCode's private port cannot be chosen: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("OpenCode's private port cannot be read: {error}"))?
+        .port();
+    drop(listener);
+    let url = format!("http://127.0.0.1:{port}");
+    let password = format!("gewu-{}-{}", plan.run_id, std::process::id());
+    let spec = files.root.join("opencode-server.json");
+    write_json(
+        &spec,
+        &json!({
+            "workspace": plan.workspace.display().to_string(),
+            "program": files.program.display().to_string(),
+            "args": ["serve", "--hostname", "127.0.0.1", "--port", port.to_string()],
+            "read": [files.install_root.display().to_string(), exe.display().to_string(), files.mcp_socket.as_ref().and_then(|p| p.parent()).map(|p| p.display().to_string()).unwrap_or_default(), shell.askpass.as_ref().map(|p| p.display().to_string()).unwrap_or_default()],
+            "write": [files.root.display().to_string()],
+        }),
+    )?;
+    let mut command = Command::new(exe);
+    command
+        .arg("--confined-program")
+        .arg(&spec)
+        .current_dir(&plan.workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.env_clear();
+    for (key, value) in crate::confinement::safe_environment(std::env::vars_os()) {
+        command.env(key, value);
+    }
+    command
+        .env("HOME", &files.home)
+        .env("TMPDIR", &files.tmp)
+        .env("XDG_CONFIG_HOME", files.root.join("opencode"))
+        .env("XDG_STATE_HOME", files.config.join("state"))
+        .env("XDG_CACHE_HOME", files.config.join("cache"))
+        .env("XDG_RUNTIME_DIR", files.config.join("run"))
+        .env("OPENCODE_PASSWORD", &password);
+    if let Some(askpass) = shell.askpass.as_ref() {
+        command
+            .env("GIT_ASKPASS", exe)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env(crate::workspace::ASKPASS_CREDENTIALS, askpass)
+            .env(crate::workspace::ASKPASS_AGENT, &plan.agent);
+        if let Some(login) = shell.login.as_ref() {
+            command.env(crate::workspace::ASKPASS_LOGIN, login);
+        }
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("OpenCode's private server cannot start: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}")
+                .parse()
+                .expect("loopback address"),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            ready = true;
+            break;
+        }
+        if !crate::run::process_alive(child.id()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("OpenCode's private server did not open its loopback port".to_owned());
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    let auth = format!(
+        "Basic {}",
+        base64(format!("opencode:{password}").as_bytes())
+    );
+    let http = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let body = json!({"title": "warm", "location": {"directory": plan.workspace}});
+    let response = http
+        .post(format!("{url}/api/session"))
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/json")
+        .send(serde_json::to_vec(&body).expect("the warm session body"));
+    match response {
+        Ok(reply) if reply.status().is_success() => {}
+        Ok(reply) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "OpenCode's private session could not be created (HTTP {})",
+                reply.status()
+            ));
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "OpenCode's private session could not be created: {error}"
+            ));
+        }
+    }
+    let socket = files.mcp_socket.as_ref().ok_or_else(|| {
+        "OpenCode's MCP socket is missing from the private launch files".to_owned()
+    })?;
+    let body = json!({"config": {
+        "type": "local",
+        "command": [files.key_helper.display().to_string(), "--mcp-forgejo-connect".to_owned(), socket.display().to_string()],
+        "codemode": true,
+        "timeout": {"startup": 20000, "catalog": 20000, "execution": 120000}
+    }});
+    let added = http
+        .put(format!("{url}/api/experimental/mcp/gewu_forgejo"))
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/json")
+        .send(serde_json::to_vec(&body).expect("the MCP config body"));
+    match added {
+        Ok(reply) if reply.status().is_success() => {}
+        Ok(reply) => {
+            let status = reply.status();
+            let list = http
+                .get(format!("{url}/api/mcp"))
+                .header("Authorization", &auth)
+                .call()
+                .ok()
+                .and_then(|response| response.into_body().read_to_string().ok())
+                .unwrap_or_default();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "OpenCode's Forgejo MCP server could not be added (HTTP {status}; MCP list: {list})"
+            ));
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "OpenCode's Forgejo MCP server could not be added: {error}"
+            ));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if socket_parent.join("connected").is_file() {
+            std::thread::sleep(Duration::from_millis(300));
+            return Ok(Some((HelperProcess { child }, url, password)));
+        }
+        if !crate::run::process_alive(child.id()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("OpenCode's private server did not initialize its MCP bridge".to_owned())
+}
+
 /// One tool call still open in the native event stream.
 #[derive(Debug, Clone)]
 struct OpenCall {
@@ -199,16 +412,45 @@ pub(super) fn run(
     let _mcp_server = mcp_server;
 
     let workspace_before = workspace_fingerprint(&plan.workspace);
-    let (argv, envs, config_note) = match build_launch(plan, native, program, protocol, &files) {
+    let (mut argv, envs, config_note) = match build_launch(plan, native, program, protocol, &files)
+    {
         Ok(launch) => launch,
         Err(reason) => return RunEnd::failed(reason),
     };
     log.line(&format!("native configuration: {config_note}"));
 
+    let mut opencode_server = None;
+    let mut opencode_password = None;
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => return RunEnd::failed(format!("this program cannot be found: {error}")),
     };
+    if program == Program::Opencode {
+        match start_opencode_server(&files, plan, &exe, shell) {
+            Ok(Some((server, url, password))) => {
+                let mut adjusted = vec![
+                    argv[0].clone(),
+                    "run".to_owned(),
+                    "--server".to_owned(),
+                    url,
+                ];
+                adjusted.extend(
+                    argv.iter()
+                        .skip(2)
+                        .filter(|arg| *arg != "--standalone")
+                        .cloned(),
+                );
+                argv = adjusted;
+                opencode_server = Some(server);
+                opencode_password = Some(password);
+                log.line("OpenCode: workspace session and MCP bridge ready");
+            }
+            Ok(None) => {}
+            Err(reason) => return RunEnd::failed(reason),
+        }
+    }
+    let _opencode_server = opencode_server;
+
     let spec = files.root.join("confined-program.json");
     if let Err(error) = write_json(
         &spec,
@@ -256,6 +498,9 @@ pub(super) fn run(
         .env("GEWU_WORKSPACE", &plan.workspace);
     for (key, value) in envs {
         command.env(key, value);
+    }
+    if let Some(password) = opencode_password.as_deref() {
+        command.env("OPENCODE_PASSWORD", password);
     }
     // The agent's own Forgejo token reaches git through the existing askpass route.
     if let Some(askpass) = shell.askpass.as_ref() {

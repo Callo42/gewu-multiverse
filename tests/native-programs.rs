@@ -918,14 +918,44 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
         let board = engine.board();
         matches!(board.forgejo.state, ForgejoState::Running) && board.forgejo.repositories >= 1
     });
+    let url = engine.board().forgejo.url.clone();
+    let admin = credentials::forgejo_admin_token(&layout.credentials_file())
+        .expect("the credentials file reads")
+        .expect("the administrator token is recorded");
+    let admin_client = ForgejoClient::new(&url, admin, DEFAULT_TIMEOUT).expect("admin client");
+    let issue = admin_client
+        .create_issue(
+            "team",
+            "workspace",
+            "Native OpenCode proof",
+            "Read this, push a branch and open a pull request.",
+        )
+        .expect("the issue is opened");
+    eprintln!("live: opened team/workspace#{} at {url}", issue.number);
     let model = Stub::start_with_title(
         vec![
             sse_tool(
                 "shell",
                 "shell",
-                serde_json::json!({"command": "printf 'native opencode demo\\n' > native-opencode.txt"}),
+                serde_json::json!({"command": "cd workspace && git checkout -b native-opencode-mcp && printf 'opencode mcp\\n' > native-opencode.txt && git add native-opencode.txt && git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 commit -m 'native opencode mcp' -q && git push -u origin native-opencode-mcp && echo push_ok"}),
             ),
-            sse_final("OpenCode wrote the file with its own shell tool."),
+            sse_tool(
+                "read",
+                "execute",
+                serde_json::json!({"code": format!("const r = await tools.gewu_forgejo.forgejo_read_issue_or_pull({{repository: \"team/workspace\", number: {}}}); return r;", issue.number)}),
+            ),
+            sse_tool(
+                "open",
+                "execute",
+                serde_json::json!({"code": "const r = await tools.gewu_forgejo.forgejo_open_pull_request({repository: \"team/workspace\", title: \"Native OpenCode MCP\"}); return r;"}),
+            ),
+            sse_tool(
+                "comment",
+                "execute",
+                serde_json::json!({"code": format!("const r = await tools.gewu_forgejo.forgejo_comment({{repository: \"team/workspace\", number: {}, body: \"OpenCode MCP worked\"}}); return r;", issue.number)}),
+            ),
+            sse_final("OpenCode read the issue and opened its own pull request with a comment."),
+            sse_final("OpenCode read the issue and opened its own pull request with a comment."),
         ],
         sse_final("Session title"),
     );
@@ -996,10 +1026,10 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
         .agent("agent-1")
         .expect("agent layout")
         .workspace()
-        .join("native-opencode.txt");
+        .join("workspace/native-opencode.txt");
     assert_eq!(
         fs::read_to_string(&proof).expect("the native OpenCode write"),
-        "native opencode demo\n"
+        "opencode mcp\n"
     );
     engine
         .send(Command::Stop {

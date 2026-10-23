@@ -161,6 +161,11 @@ impl ForgejoTools {
         self.writes.get()
     }
 
+    /// Keep the internal count at or above the supervisor's reserved count.
+    pub fn set_writes(&self, writes: u32) {
+        self.writes.set(writes);
+    }
+
     /// Count a write the instance accepted, whether or not its reply parsed.
     ///
     /// This is deliberately not "the call returned `Ok`": a 2xx whose body is not the
