@@ -434,6 +434,25 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_file_without_a_default_keeps_the_builtin_engine() {
+        let root = crate::test_support::scratch_root("settings-legacy");
+        let path = path_in(&root);
+        let settings = Settings::default();
+        settings.save(&path).expect("saved");
+        let read = Settings::load(&path).expect("read");
+        assert!(read.default_harness.is_none());
+        assert!(read.agents.is_empty());
+        let mut upgraded = read;
+        upgraded
+            .add_agent("scribe", Desired::Stopped)
+            .expect("agent");
+        assert_eq!(
+            upgraded.agent("scribe").expect("present").harness(),
+            Program::Builtin
+        );
+    }
+
+    #[test]
     fn a_saved_agent_program_and_compatible_connection_round_trip() {
         let root = crate::test_support::scratch_root("settings-program");
         let path = path_in(&root);

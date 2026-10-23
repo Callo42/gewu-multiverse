@@ -884,6 +884,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_restarted_bridge_starts_from_the_persisted_write_count() {
+        let tools = ForgejoTools::new_with_writes(
+            crate::run::RunForgejo {
+                url: "http://127.0.0.1:1".to_owned(),
+                login: "gewu-agent-1".to_owned(),
+                repositories: Vec::new(),
+            },
+            "/tmp/workspace",
+            "agent-1",
+            Secret::new("dummy"),
+            7,
+        );
+        assert_eq!(tools.writes(), 7);
+    }
+
+    #[test]
     fn a_sentence_has_no_newline_and_is_bounded() {
         let text = sentence(format!("first line\nsecond line {}", "x".repeat(1000)));
         assert!(!text.contains('\n'));

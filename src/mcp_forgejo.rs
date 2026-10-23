@@ -175,3 +175,22 @@ fn write_error(stdout: &mut impl Write, id: Value, code: i64, message: &str) {
     let _ = writeln!(stdout, "{response}");
     let _ = stdout.flush();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bridge_lists_exactly_the_six_existing_tools() {
+        let tools = tool_list();
+        assert_eq!(tools.len(), 6);
+        for name in crate::forgejo_tools::TOOL_NAMES {
+            assert!(
+                tools.iter().any(|tool| tool["name"] == name),
+                "missing {name}"
+            );
+        }
+        let text = instructions();
+        assert!(text.contains("bound of 8 writes"));
+    }
+}
