@@ -228,9 +228,25 @@ top border carries the state symbol, name and state; the bottom border carries t
 login, `run N` and the last-work (or newest-failure) word. When four or more would need
 a scroll, the same place becomes the compact list: one wired box with a line per
 agent, in one column while the line keeps the mark, name, login, run count and word,
-otherwise in two columns. The box's bottom border names the three state marks. Every
-agent of the twelve the picker offers is then on the screen at once. A home past twelve
-(the settings' twenty) keeps two columns and scrolls with the selection.
+otherwise in two columns. A two-column waiting line keeps the name, run count, wait
+word and short last-work word. When even that cannot repeat the login, the box's
+`login=gewu-<name>` legend gives the exact generated login for those lines, but only
+when every shown login really is generated. A persisted non-standard login is always
+whole and agent-associated. On a mixed board the compact floor can use a denser
+identity line: an agent whose name is exactly `agent-N` displays as `N` under the
+same-frame rule `N=agent-N`, and its actual login follows inline (`N:<login>`), so
+there is no separate login token or map and any number of shown identities keeps its
+exact association. Names that do not equal `agent-N` stay verbatim. The rule is only a
+display abbreviation for the actual equality; it is not a naming cap, stored rename or
+permission to guess. Generated rows keep their full `gewu-<name>` inline where it fits;
+a row that needs the space carries `*`, and the bottom legend then applies
+`*=gewu-<name>`. The generated rule is never shown when that equality is false. A
+cleanup row keeps the last-work number and `u`/`o`/`l`, expanded by the legend to
+`unverified`/`unowned`/`live`. The run total is `run N` when the line
+has room and the bare number with the box's `run N` legend when it does not. The box's bottom border names
+the three state marks. Every agent of the twelve the picker offers is then on the
+screen at once. A home past twelve (the settings' twenty) keeps two columns and scrolls
+with the selection.
 
 At 80×24 the cards are three to five rows in up to three columns; the login row also
 carries the total `run N` on the right. A three-row card keeps the state word beside
@@ -239,14 +255,25 @@ the last-work word on the bottom border, in a tight label with no side padding, 
 and puts only the last-work (or failure) word on the border. From 100×30
 a board card is taller: state symbol and name, the login and `run N`, the state word,
 the newest activity (`last: … · 2m ago` after a run ends) and the last-work or
-newest-failure word. From 140 columns the picture grows with the window: the Forgejo
+newest-failure word. At 80×24 one or four agents also get a five-row card; its
+activity row shows the newest activity/time even when a normal result summary also
+exists, and the summary stays on the Agent screen. A roomy card in the twelve-agent grid has less width, so the
+activity shortens to the action, its number and `2m` while the bottom border keeps the
+short last-work word. If the row is still tight, only the action is cut; the age is
+reserved and stays with it. A cleanup the engine could not finish is `⚠ live leftover`, `⚠
+unverified leftover` or `⚠ cleanup unverified`, never the plain `stopped` state. On a
+two-column floor line the compact `⚠ live` / `⚠ unowned` / `⚠ unverified` keeps the
+three distinctions; the Agent screen and footer carry the full sentence. Even the
+six narrow cards of the wide twelve-agent grid use one of those short words rather
+than cutting the three categories to the same `cleanup…`. From 140 columns the picture grows with the window: the Forgejo
 box widens (so every repository name fits) and cards widen; above 160 the whole picture
 is centred in 160 columns, as above.
 
 The one word for the newest work keeps its number: `pull request #100` is `#100`, never
 `#10`, and `#10000` stays whole. When the newest run failed, the word starts with the
-HTTP status (`✗ HTTP 500 from the model`, or `✗ 500` on a one-line list line) and is cut
-on whole words, so the status is never the part that disappears. On a single-column
+HTTP status (`✗ HTTP 500` on a card, `✗ 500` on a one-line list line; the Agent screen
+names the model too) and is cut on whole words, so the status is never the part that
+disappears. On a single-column
 board the wire junction is placed after the label; a connector is never drawn through
 the word.
 
@@ -257,7 +284,8 @@ the run records, not a session counter: it does not reset when an agent starts a
 or the program reopens. `⏎` on a card opens the Agent screen, which carries the last
 work block (`work` + up to three typed rows: `issue #4`,
 `pull request #5 from fix/x`, `comment on #1`, or `branch fix/x` when the run pushed
-without opening a request or commenting), a tool in flight (`shell · 12s`), a
+without opening a request or commenting; an older request record with no branch result
+keeps `pull request #5` and claims no branch), a tool in flight (`shell · 12s`), a
 failed tool call (`⚠ shell: …`, or `✗` when the run itself failed), the newest run's
 reason and the instruction. A tool's failure row is the tool's own line (the run's
 key is already redacted), so a file name in a refusal is not translated into a
@@ -367,7 +395,7 @@ legend, the newest mark's one-word label, and the run count on the right. The se
 |---|---|
 | running, with activity | `working` and `commented on #12` / `opened pull request #4` |
 | running, no activity | `working` |
-| between runs | `next run in 8s` |
+| between runs | `next run in 8s` (a card: `next 8s`) |
 | needs an instruction | `needs an instruction` |
 | needs a model | `needs a model` |
 | Forgejo not running, or its repositories not back yet | `waiting for Forgejo` |
@@ -564,9 +592,12 @@ dropping the consequence. Drawing writes only the reserved rows. A second `q` se
 ## Words
 
 The engine states are mapped to the words above in one place, `src/board/status.rs`.
-No screen uses the words `session`, `provisioning`, `token`, `endpoint`, `missing`,
-`blocked`, `process group`, `loopback` or `2xx`; a render test scans every frame for
-them. A notice is cleaned through the same map and loses its backticks.
+No screen invents the words `session`, `provisioning`, `token`, `endpoint`, `missing`,
+`blocked`, `process group`, `loopback` or `2xx` in the product's own text; a render test
+scans every engine-authored frame for them. A notice is cleaned through the same map
+and loses its backticks. A run's own final summary is not engine text: it is shown
+verbatim apart from the existing credential masking, so a word inside it is never
+replaced by a status label.
 
 The same test scans every frame at every supported size for this vocabulary, and
 another checks that every card and every wire is whole and connected.

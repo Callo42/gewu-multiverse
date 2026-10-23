@@ -466,7 +466,9 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
         return Vec::new();
     };
     let mut read: Option<(String, u64)> = None;
-    let mut pulls: Vec<u64> = Vec::new();
+    // Each request keeps the branch its own tool result read, so several pushes and
+    // pull requests in one run do not borrow the first (or newest) push's branch.
+    let mut pulls: Vec<(u64, Option<String>)> = Vec::new();
     let mut comments: Vec<u64> = Vec::new();
     for record in &file.records {
         match record {
@@ -481,11 +483,15 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
             Record::ForgejoResult {
                 action: Some(action),
                 number: Some(number),
+                branch,
                 ..
             } => match action.as_str() {
                 "opened" | "updated" => {
-                    pulls.retain(|seen| seen != number);
-                    pulls.push(*number);
+                    pulls.retain(|(seen, _)| seen != number);
+                    pulls.push((
+                        *number,
+                        branch.clone().filter(|branch| !branch.trim().is_empty()),
+                    ));
                 }
                 "commented" => {
                     comments.retain(|seen| seen != number);
@@ -506,12 +512,19 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     }
     let mut lines = Vec::new();
     if let Some((_repository, number)) = read
-        && !pulls.contains(&number)
+        && !pulls.iter().any(|(seen, _)| *seen == number)
     {
         lines.push(format!("issue #{number}"));
     }
-    if let Some(number) = pulls.last() {
-        match branch.as_deref().filter(|branch| !branch.trim().is_empty()) {
+    if let Some((number, pull_branch)) = pulls.last() {
+        // The request's own result is the only witness for its branch. An older
+        // record that did not carry one makes no branch claim: pairing it with the
+        // run's single push witness is exactly the wrong-branch bug for a multi-PR
+        // run, so there is no fallback to guess.
+        let shown = pull_branch
+            .as_deref()
+            .filter(|branch| !branch.trim().is_empty());
+        match shown {
             Some(branch) => lines.push(format!("pull request #{number} from {branch}")),
             None => lines.push(format!("pull request #{number}")),
         }
@@ -755,7 +768,7 @@ mod tests {
         assert!(work_summary(&idle).is_empty(), "a read is not work");
 
         // A work run: it read issue #1, opened pull request #5 from fix/api-link and
-        // commented on #1. The branch comes from the run's own push witness.
+        // commented on #1. The branch comes from that request's own tool result.
         let mut transcript = transcript::Transcript::open(&work).expect("transcript");
         transcript
             .append(&Record::forgejo_call(
@@ -768,7 +781,7 @@ mod tests {
             ))
             .expect("read issue");
         transcript
-            .append(&Record::forgejo_result(
+            .append(&Record::forgejo_result_with_branch(
                 1,
                 2,
                 crate::forgejo_tools::OPEN_PULL_REQUEST,
@@ -777,6 +790,7 @@ mod tests {
                 "ok",
                 Some("http://127.0.0.1:3000/team/website/pulls/5"),
                 Some("opened"),
+                Some("fix/api-link"),
             ))
             .expect("open");
         transcript
@@ -828,6 +842,114 @@ mod tests {
             },
         ];
         assert_eq!(latest_work(&runs), lines, "the latest work block was lost");
+    }
+
+    #[test]
+    fn each_pull_request_keeps_the_branch_its_own_result_named() {
+        let root = scratch_root("work-pr-branches");
+        let run = root.join("run-1700000000004-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        let mut transcript = transcript::Transcript::open(&run).expect("transcript");
+        transcript
+            .append(&Record::forgejo_result_with_branch(
+                1,
+                1,
+                crate::forgejo_tools::OPEN_PULL_REQUEST,
+                Some("team/website"),
+                Some(3),
+                "ok",
+                Some("http://127.0.0.1:3000/team/website/pulls/3"),
+                Some("opened"),
+                Some("fix/readme-receive"),
+            ))
+            .expect("the first request");
+        transcript
+            .append(&Record::forgejo_result_with_branch(
+                1,
+                2,
+                crate::forgejo_tools::OPEN_PULL_REQUEST,
+                Some("team/website"),
+                Some(4),
+                "ok",
+                Some("http://127.0.0.1:3000/team/website/pulls/4"),
+                Some("opened"),
+                Some("fix/readme-separate"),
+            ))
+            .expect("the second request");
+        // The run's push witness is a different, earlier push. The branch must come
+        // from request #4's own result, never this file (the reported F4).
+        write_push_witness_at(
+            &run,
+            "fix/readme-receive",
+            "refs/remotes/origin/fix/readme-receive",
+            Some("team/website"),
+            Some("main"),
+        )
+        .expect("the witness");
+        assert_eq!(
+            work_summary(&run),
+            vec!["pull request #4 from fix/readme-separate".to_owned()]
+        );
+
+        // An older record without a branch result omits an unknown branch, and makes
+        // no branch claim when neither fact exists.
+        let legacy = root.join("run-1700000000004-0002");
+        fs::create_dir_all(&legacy).expect("a legacy run");
+        let mut transcript = transcript::Transcript::open(&legacy).expect("transcript");
+        transcript
+            .append(&Record::forgejo_result(
+                1,
+                1,
+                crate::forgejo_tools::OPEN_PULL_REQUEST,
+                Some("team/website"),
+                Some(5),
+                "ok",
+                Some("http://127.0.0.1:3000/team/website/pulls/5"),
+                Some("opened"),
+            ))
+            .expect("the legacy request");
+        assert_eq!(
+            work_summary(&legacy),
+            vec!["pull request #5".to_owned()],
+            "a record with no branch made one up"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_legacy_multi_pull_request_record_does_not_borrow_the_push_witness() {
+        let root = scratch_root("work-pr-legacy");
+        let run = root.join("run-1700000000004-0003");
+        fs::create_dir_all(&run).expect("a run directory");
+        let mut transcript = transcript::Transcript::open(&run).expect("transcript");
+        for number in [3, 4] {
+            transcript
+                .append(&Record::forgejo_result(
+                    1,
+                    number as u32,
+                    crate::forgejo_tools::OPEN_PULL_REQUEST,
+                    Some("team/website"),
+                    Some(number),
+                    "ok",
+                    Some("http://127.0.0.1:3000/team/website/pulls/x"),
+                    Some("opened"),
+                ))
+                .expect("the legacy request");
+        }
+        write_push_witness_at(
+            &run,
+            "fix/first-push",
+            "refs/remotes/origin/fix/first-push",
+            Some("team/website"),
+            Some("main"),
+        )
+        .expect("the witness");
+        assert_eq!(
+            work_summary(&run),
+            vec!["pull request #4".to_owned()],
+            "a legacy multi-PR record borrowed the single push witness"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -903,9 +1025,12 @@ pub struct RunStopped {
     pub reason: String,
 }
 
-/// Write the `run_stopped` record and the run's terminal record, before the
-/// program opens. A run that was killed before it could write its own ending gets
-/// one ending decided by the program that saw it (F-02/F-03).
+/// Write the `run_stopped` record and the run's terminal record.
+///
+/// Both are written before the caller may remove the run's identity handles, and
+/// either failure is returned rather than swallowed. The terminal ending is written
+/// last and committed to disk, so a later open that finds it also has the marker;
+/// an interrupted pair is retried from the still-present handles.
 pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
     let record = RunStopped {
         ts: crate::time::rfc3339(now_unix_ms()),
@@ -915,14 +1040,60 @@ pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) 
     };
     let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
     crate::mode::write_private(run_dir.join(STOPPED_FILE), text.as_bytes())?;
-    let _ = transcript::record_outcome_if_missing(
+    transcript::record_outcome_if_missing(
         run_dir,
         run_id,
         RunOutcome::Stopped,
         Some(reason.to_owned()),
         0,
-    );
-    Ok(())
+    )
+    .map(|_| ())
+}
+
+/// The run id a run directory's name carries.
+fn run_id_of(run_dir: &Path) -> Result<&str, String> {
+    run_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| "the run directory has no run id".to_owned())
+}
+
+/// Record a run's ending durably unless its own supervisor already wrote one.
+///
+/// This is the ordering boundary: call it only after the run's group has been shown
+/// to have no live member, and before [`clear_process_records`]. A failure leaves
+/// every handle in place so a later Start can retry instead of trusting an absent
+/// record.
+pub fn ensure_terminal_record(
+    run_dir: &Path,
+    outcome: RunOutcome,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let run_id = run_id_of(run_dir)?;
+    transcript::record_outcome_if_missing(run_dir, run_id, outcome, reason, 0)
+        .map(|_| ())
+        .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
+}
+
+/// Settle one finished run at the engine's boundary.
+///
+/// First the recorded group is stopped (or found already gone); then, and only
+/// then, the run's ending is written durably; only after both have succeeded are the
+/// identity handles removed. Any error keeps the handles and reaches the card, so
+/// `Start` retries rather than running beside an unproven leftover.
+pub fn settle_run(
+    run_dir: &Path,
+    pgid: u32,
+    outcome: RunOutcome,
+    reason: Option<String>,
+    grace: std::time::Duration,
+) -> Result<bool, String> {
+    let reaped = reap_process_group(pgid, run_dir, grace).map_err(categorize_cleanup)?;
+    ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
+    // `reap_process_group` only returns Ok when no unverified member survives, and
+    // it writes its own run_stopped ending when it had to signal a group.
+    clear_process_records(run_dir);
+    Ok(reaped)
 }
 
 fn read_number(run_dir: &Path, name: &str) -> Option<u32> {
@@ -1152,7 +1323,11 @@ fn pid_holds_capability(pid: u32, capability: &Capability) -> Result<bool, Strin
                 ));
             }
             Ok(_) => return Ok(false),
-            Err(_) => return Ok(false),
+            Err(stat) => {
+                return Err(format!(
+                    "process {pid}'s state cannot be read while checking the run's capability: {stat}"
+                ));
+            }
         },
     };
     for fd in fds.flatten() {
@@ -1402,12 +1577,41 @@ fn process_records_readable(run_dir: &Path) -> Result<(), String> {
 
 /// The group of a live holder of the run's anonymous capability. This finds the
 /// pre-record window and lost-record cases without any named object.
+/// Whether an inaccessible same-user process could hold the run's capability.
+///
+/// The capability is inherited only through the run's own process tree, so a
+/// process running as another user cannot have it. A same-user process whose
+/// descriptor table cannot be read is the one case that must stay uncertain.
+fn same_user_could_hold(pid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // `/proc/self` is a magic link whose metadata is not this process's directory
+    // owner in every namespace view; the status file's Uid line is explicit.
+    let ours = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("Uid:")
+                    .and_then(|rest| rest.split_whitespace().nth(1))
+                    .and_then(|uid| uid.parse::<u32>().ok())
+            })
+        });
+    let theirs = fs::metadata(format!("/proc/{pid}")).map(|metadata| metadata.uid());
+    matches!((ours, theirs), (Some(ours), Ok(theirs)) if ours == theirs)
+}
+
+/// Find a live group that holds the run's capability, or name the uncertainty.
+///
+/// A readable holder wins. If none is readable and any same-user process could not
+/// be inspected, this returns an error rather than `None`: an ordinary supervisor
+/// outcome is not proof that an original-group member is gone.
 fn capability_group(run_dir: &Path) -> Result<Option<u32>, String> {
     let Some(capability) = read_capability(run_dir) else {
         return Ok(None);
     };
-    let entries = fs::read_dir("/proc")
-        .map_err(|error| format!("the process table cannot be read: {error}"))?;
+    let entries = fs::read_dir("/proc").map_err(|error| {
+        format!("cleanup unverified: the process table cannot be read: {error}")
+    })?;
+    let mut uncertain: Option<String> = None;
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -1428,14 +1632,22 @@ fn capability_group(run_dir: &Path) -> Result<Option<u32>, String> {
                 }
             }
             Ok(false) => {}
-            // An inaccessible unrelated process must not hide a readable holder
-            // later in the scan. If no holder can be verified, the durable
-            // capability record below still blocks replacement on this boot;
-            // skipping an inspection is never proof the run has no processes.
-            Err(_) => {}
+            Err(reason) => {
+                // An inaccessible process of another user cannot hold this
+                // user's inherited memfd. A same-user one must not be skipped:
+                // it could be the run's surviving child.
+                if same_user_could_hold(pid) {
+                    uncertain = Some(reason);
+                }
+            }
         }
     }
-    Ok(None)
+    match uncertain {
+        Some(reason) => Err(format!(
+            "cleanup unverified: {reason}; a same-user process could still hold the run's capability"
+        )),
+        None => Ok(None),
+    }
 }
 
 /// Observe the run's group, binding each candidate to a pidfd before its live
@@ -1476,7 +1688,9 @@ fn observe_run_group(
             Ok(pidfd) => pidfd,
             Err(error) => {
                 if error.raw_os_error() != Some(nix::errno::Errno::ESRCH as i32) {
-                    blocked = Some(format!("pid {pid} has no kernel process handle: {error}"));
+                    blocked = Some(format!(
+                        "unverified leftover: a live process has no kernel process handle, so it cannot be verified: {error}"
+                    ));
                 }
                 continue;
             }
@@ -1485,7 +1699,9 @@ fn observe_run_group(
             Ok(Some((live_group, identity))) if live_group == pgid => identity,
             Ok(_) => continue,
             Err(error) => {
-                blocked = Some(format!("pid {pid}'s identity cannot be read: {error}"));
+                blocked = Some(format!(
+                    "unverified leftover: a live process's identity cannot be verified: {error}"
+                ));
                 continue;
             }
         };
@@ -1545,7 +1761,7 @@ fn signal_targets(targets: &[ReapTarget], signal: nix::sys::signal::Signal) -> R
             Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => {}
             Err(error) => {
                 return Err(format!(
-                    "a process from the run (pid {}) cannot be signalled: {error}",
+                    "live leftover: a run process (pid {}) cannot be signalled: {error}",
                     target.pid
                 ));
             }
@@ -1631,6 +1847,26 @@ fn unverified_group(pgid: u32) -> Result<bool, String> {
 /// `Ok(true)` means a group was found and stopped; `Ok(false)` means there was
 /// nothing left. `Err` is one plain sentence for the card when a process survives.
 pub fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
+    reap_leftover_run_inner(run_dir, grace).map_err(categorize_cleanup)
+}
+
+/// Give every cleanup failure one of the three honest categories.
+///
+/// A reason that already says `live leftover:` or `unverified leftover:` keeps
+/// that category. Everything else is `cleanup unverified:`: a missing/read/ending
+/// error is uncertainty, never a claim that a live process was seen.
+fn categorize_cleanup(reason: String) -> String {
+    if reason.starts_with("live leftover:")
+        || reason.starts_with("unverified leftover:")
+        || reason.starts_with("cleanup unverified:")
+    {
+        reason
+    } else {
+        format!("cleanup unverified: {reason}")
+    }
+}
+
+fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
     // A permissions failure is a recovery failure, not "no records": it must
     // reach the card and block a replacement run (review-3).
     process_records_readable(run_dir)?;
@@ -1656,9 +1892,30 @@ pub fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<b
     };
     let has_capability = run_dir.join(SHELL_CAPABILITY_FILE).is_file();
     let Some(pgid) = pgid else {
-        if transcript::terminal_record(run_dir).is_some() {
-            clear_process_records(run_dir);
-            return Ok(false);
+        match transcript::terminal_record_checked(run_dir) {
+            Ok(Some(_)) => {
+                // A supervisor's outcome is not cleanup proof. A capability record
+                // means some process inherited the run's anonymous handle; if no
+                // live holder was verified (and the scan did not report an
+                // inaccessible same-user process), the record still cannot be
+                // discarded on the strength of the ending alone. A record from
+                // before this boot cannot have a live process, so that bounded
+                // case is closed.
+                if has_capability && !run_predates_boot(run_dir) {
+                    return Err(
+                        "cleanup unverified: the run has an ending but its capability record has no verified holder"
+                            .to_owned(),
+                    );
+                }
+                clear_process_records(run_dir);
+                return Ok(false);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cleanup unverified: the run's ending cannot be read, so cleanup cannot be verified: {error}"
+                ));
+            }
         }
         // No process record, identity or verified holder. A capability record is
         // durable evidence that spawn may have happened, so it is start evidence
@@ -1680,13 +1937,12 @@ pub fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<b
             }
             if has_capability {
                 return Err(
-                    "the run's capability record exists but no live holder can be verified; cleanup is uncertain"
+                    "cleanup unverified: a capability record remains but no live holder can be verified; cleanup is uncertain"
                         .to_owned(),
                 );
             }
             return Err(
-                "the run started but its process records are lost; cleanup cannot be verified"
-                    .to_owned(),
+                "cleanup unverified: the run started but its process records are lost; cleanup cannot be verified".to_owned(),
             );
         }
         clear_process_records(run_dir);
@@ -1698,21 +1954,31 @@ pub fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<b
         // it is not hidden either: the open reports it, the card names it and
         // Start refuses a replacement until it is resolved.
         return Err(format!(
-            "a live process group (pgid {pgid}) cannot be verified as this run's; it was left untouched"
+            "unverified leftover: a live process group (pgid {pgid}) cannot be verified as this run's; it was not signalled"
         ));
     }
-    if !reaped && !unverified_group(pgid)? && transcript::terminal_record(run_dir).is_none() {
-        // The recorded numbers survived but nothing is alive: the supervisor died
-        // before it could close the run. Give it the ending the reopen is owed
-        // (F-02).
-        if let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) {
-            write_run_stopped(
-                run_dir,
-                run_id,
-                pgid,
-                "the run from an earlier start ended without a closing record",
-            )
-            .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+    if !reaped && !unverified_group(pgid)? {
+        match transcript::terminal_record_checked(run_dir) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                // The recorded numbers survived but nothing is alive: the supervisor
+                // died before it could close the run. Give it the ending the reopen
+                // is owed, durably, before its handles are removed (F-02).
+                if let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) {
+                    write_run_stopped(
+                        run_dir,
+                        run_id,
+                        pgid,
+                        "the run from an earlier start ended without a closing record",
+                    )
+                    .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "the run's ending cannot be read, so cleanup cannot be verified: {error}"
+                ));
+            }
         }
     }
     clear_process_records(run_dir);
@@ -1741,7 +2007,7 @@ pub fn reap_process_group(
     if targets.is_empty() {
         if unverified_group(pgid)? {
             return Err(format!(
-                "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+                "unverified leftover: a live process group (pgid {pgid}) cannot be verified as this run's; it was not signalled"
             ));
         }
         return Ok(false);
@@ -1756,7 +2022,7 @@ pub fn reap_process_group(
         if targets.is_empty() {
             if unverified_group(pgid)? {
                 return Err(format!(
-                    "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+                    "unverified leftover: a live process group (pgid {pgid}) cannot be verified as this run's; it was not signalled"
                 ));
             }
             write_run_stopped(
@@ -1779,7 +2045,7 @@ pub fn reap_process_group(
     if targets.is_empty() {
         if unverified_group(pgid)? {
             return Err(format!(
-                "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+                "unverified leftover: a live process group (pgid {pgid}) cannot be verified as this run's; it was not signalled"
             ));
         }
         write_run_stopped(
@@ -1801,7 +2067,7 @@ pub fn reap_process_group(
         if targets.is_empty() {
             if unverified_group(pgid)? {
                 return Err(format!(
-                    "a live process group (pgid {pgid}) has a surviving member that cannot be verified; it was not signalled"
+                    "unverified leftover: a live process group (pgid {pgid}) cannot be verified as this run's; it was not signalled"
                 ));
             }
             write_run_stopped(
@@ -1816,7 +2082,7 @@ pub fn reap_process_group(
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Err(format!(
-        "a process from run {run_id} (pid {}) could not be stopped",
+        "live leftover: a run process (pid {}) could not be stopped",
         targets.first().map(|target| target.pid).unwrap_or(pgid)
     ))
 }

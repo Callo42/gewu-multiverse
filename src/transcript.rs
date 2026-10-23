@@ -306,6 +306,12 @@ pub enum Record {
         /// `commented`, `opened` or `updated` for a successful write.
         #[serde(default)]
         action: Option<String>,
+        /// The clone branch a pull-request write used, when the tool read one.
+        ///
+        /// It is recorded from that request's own tool result, so several requests
+        /// in one run each keep their own branch. An older record has none.
+        #[serde(default)]
+        branch: Option<String>,
     },
     /// The run is over. Written by the process that supervised the run, once, last.
     RunFinished {
@@ -550,7 +556,29 @@ impl Record {
             outcome: outcome.to_owned(),
             url: url.map(str::to_owned),
             action: action.map(str::to_owned),
+            branch: None,
         }
+    }
+
+    /// One Forgejo result that also names the branch a pull-request write used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forgejo_result_with_branch(
+        turn: u32,
+        index: u32,
+        tool: &str,
+        repository: Option<&str>,
+        number: Option<u64>,
+        outcome: &str,
+        url: Option<&str>,
+        action: Option<&str>,
+        branch: Option<&str>,
+    ) -> Self {
+        let mut record =
+            Record::forgejo_result(turn, index, tool, repository, number, outcome, url, action);
+        if let Record::ForgejoResult { branch: slot, .. } = &mut record {
+            *slot = branch.map(str::to_owned);
+        }
+        record
     }
 
     /// The terminal record of a run.
@@ -653,6 +681,17 @@ impl Transcript {
         self.file.write_all(b"\n")?;
         self.file.flush()
     }
+
+    /// Append one record and wait until its bytes are on disk.
+    ///
+    /// A terminal record is the proof a later open reads before it removes the
+    /// run's identity handles. Losing an ordinary record is bounded by the
+    /// partial-line rule, but losing the ending would make a finished run look
+    /// uncertain, so this one write asks the filesystem to commit it.
+    pub fn append_durable(&mut self, record: &Record) -> io::Result<()> {
+        self.append(record)?;
+        self.file.sync_data()
+    }
 }
 
 /// A transcript read back from disk.
@@ -748,26 +787,30 @@ pub fn terminal_record(run_dir: &Path) -> Option<Record> {
 /// A run that was killed before it could write its own ending gets one written for it,
 /// so every run has exactly one ending decided by something that saw it. A run that
 /// wrote its own ending keeps it: this never overwrites the process's own record.
+///
+/// The record is written durably because the caller may remove the run's identity
+/// handles immediately afterwards; a caller that sees an error here must keep them.
+/// An unreadable transcript is an error, never "no ending": writing a second ending
+/// over a record that exists but cannot be read would hide a real cleanup failure.
 pub fn record_outcome_if_missing(
     run_dir: &Path,
     run_id: &str,
     outcome: RunOutcome,
     reason: Option<String>,
     duration_ms: u64,
-) -> (RunOutcome, Option<String>, u64) {
-    let existing = terminal_record(run_dir);
+) -> io::Result<(RunOutcome, Option<String>, u64)> {
+    let existing = terminal_record_checked(run_dir)?;
     if existing.is_none() {
-        if let Ok(mut transcript) = Transcript::open(run_dir) {
-            let _ = transcript.append(&Record::run_finished(
-                run_id,
-                outcome,
-                None,
-                duration_ms,
-                reason.clone(),
-            ));
-        }
+        let mut transcript = Transcript::open(run_dir)?;
+        transcript.append_durable(&Record::run_finished(
+            run_id,
+            outcome,
+            None,
+            duration_ms,
+            reason.clone(),
+        ))?;
     }
-    match existing {
+    Ok(match existing {
         Some(Record::RunFinished {
             outcome,
             reason,
@@ -779,7 +822,7 @@ pub fn record_outcome_if_missing(
             duration_ms,
         ),
         _ => (outcome, reason, duration_ms),
-    }
+    })
 }
 
 /// The timestamp of the run's opening record, when it is there.

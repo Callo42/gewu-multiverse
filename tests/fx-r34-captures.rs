@@ -264,7 +264,10 @@ fn capture_the_model_form_warnings_upgrade_and_quit_warning() {
         instructions: 3,
         runs: 19,
         ignored_config: false,
-        release_url: "https://github.com/Callo42/gewu-multiverse/releases".to_owned(),
+        release_url: format!(
+            "https://github.com/Callo42/gewu-multiverse/releases/tag/v{}",
+            env!("CARGO_PKG_VERSION")
+        ),
         whats_new:
             "run marks say exactly what happened, and a started agent's runs never outlive it"
                 .to_owned(),

@@ -10,7 +10,6 @@
 //! `shutdown` can always see every child the engine started.
 
 use std::collections::HashMap;
-use std::fs;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -270,8 +269,12 @@ impl SessionSpawner for RealSpawner {
                     }
                     let _ = ready_tx.send(Ok(pid));
                     let status = child.wait();
-                    let _ = fs::remove_file(run_dir.join(PID_FILE));
-                    let _ = fs::remove_file(run_dir.join(PGID_FILE));
+                    // The pid/group records are identity handles, not transient
+                    // bookkeeping. They stay until the engine has written a durable
+                    // ending and verified cleanup (`run::settle_run`), or until a
+                    // later open does the same. Removing them here lost the only
+                    // recovery handle of a run whose supervisor wrote no shell
+                    // record, even though its ending had not been recorded yet.
                     let _ = status_tx.send(status);
                 }
                 Err(error) => {
@@ -363,6 +366,7 @@ struct FakeInner {
     last_run_dir: Option<PathBuf>,
     last_repositories: Vec<SessionRepository>,
     prepare_failure: Option<String>,
+    spawn_failure: Option<String>,
     block_next_spawn: Option<(std::sync::mpsc::Sender<u32>, std::sync::mpsc::Receiver<()>)>,
 }
 
@@ -428,6 +432,14 @@ impl FakeSpawner {
             .lock()
             .expect("the fake is not poisoned")
             .prepare_failure = Some(reason.to_owned());
+    }
+
+    /// Make the next spawn fail before a child exists.
+    pub fn fail_spawn(&self, reason: &str) {
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .spawn_failure = Some(reason.to_owned());
     }
 
     /// Make the next spawn report its pid and then wait for a release before it
@@ -520,6 +532,9 @@ impl SessionSpawner for FakeSpawner {
     ) -> Result<Box<dyn RunningSession>, String> {
         let (pid, block) = {
             let mut inner = self.inner.lock().expect("the fake is not poisoned");
+            if let Some(reason) = inner.spawn_failure.take() {
+                return Err(reason);
+            }
             inner.next_pid += 1;
             let pid = 40_000 + inner.next_pid;
             inner.live.push(pid);

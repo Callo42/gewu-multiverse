@@ -240,12 +240,22 @@ process and receives one final `run_stopped` record instead of a permanent false
 An empty selected target list never means "group empty": if any live member remains
 unverified, the cleanup is visibly blocked and its evidence kept. No process environment
 is read. A zombie is not counted as live, so a killed shell does not hold the recovery
-open. The engine writes `run-stopped.json` and a
-`run_stopped` terminal record into the run directory before it opens. If a process
-survives the reap, the sentence is kept and drawn on the agent's card; the agent is
-marked blocked and the engine does not start a replacement run beside it. `Start`
-retries the cleanup: if the old process is gone and the record can be written, the
-leftover is cleared and the run may start; if not, the same reason is reported.
+open. At every run boundary and every reopen the order is fixed: stop or find the
+group gone, ensure a durable `run_stopped` ending, and only then remove the run's
+identity handles. A run that writes its own ending has no cleanup marker; when
+recovery itself had to reap a left-over group or close a run that wrote none, it also
+writes `run-stopped.json` with that ending. A failure at either write keeps the handles and is
+reported, so a later `Start` retries instead of trusting an absent record. The same
+ordering settles a normal `s` stop or a run ended by `q`; an interrupted program leaves
+either handles that the next open can still verify or an ending it can trust. If a
+process survives the reap, the sentence is kept and drawn on the agent's card; a known
+live process is `live leftover`, a live process whose ownership is unproven is
+`unverified leftover`, and a run that left no ownership record (or whose record/ending
+cannot be read) is `cleanup unverified`. The list form's compact words are `⚠ live`,
+`⚠ unowned` and `⚠ unverified`, in the same order. The agent is marked blocked and the engine does not start a replacement
+run beside it. `Start` retries the cleanup: if the old process is gone and the record
+can be written, the leftover is cleared and the run may start; if not, the same reason
+is reported.
 A run agent also asks the kernel for `PR_SET_PDEATHSIG`, so a product killed with
 `SIGKILL` ends its supervisor; the shell it started stays in the group and is reaped by
 the next open. At each run boundary the engine reaps the finished run's group before the
@@ -256,7 +266,9 @@ fresh Forgejo, so two servers never share one data directory.
 `q`, the terminal closing (`SIGHUP`) and the window manager ending the program
 (`SIGTERM`) all take the same path: stop every session and Forgejo, leave the alternate
 screen, and print one line when an agent was started (it resumes when the program is
-opened again).
+opened again). A run ended by that path is settled like any other: its group is found
+gone, its durable ending is written unless it has one, and only then are its identity
+handles removed.
 
 A quit while the Forgejo is still starting is handled too: the start job records the
 child's pid immediately after spawning it, `shutdown` signals that pid as well as the
@@ -384,6 +396,8 @@ When a run ends, for **any** reason — success, a non-zero exit, a timeout, a c
 and the agent is still started, the next one is scheduled:
 
 - succeeded, or ran at least 60 s: **5 s**, and the quick-failure streak resets;
+- a successful run that found no work: the documented **20 s** watch interval, and the
+  quick-failure streak resets too (a no-work success is not a failure);
 - otherwise: **10 s**, doubling with each consecutive quick failure, capped at
   **5 min** (10, 20, 40, 80, 160, 300, 300 …).
 
@@ -395,12 +409,15 @@ that overruns the session timeout is stopped the same way and recorded as `Timed
 open; it is what the card's `run N` shows and it never resets on Start or reopen
 (W31-5, F5). `recent` is the newest ten endings, reconstructed from the run records on
 open and updated as runs end. `activity` is the newest Forgejo action of the newest run, read from
-that run's transcript; after the run ends it is drawn as `last: … · 2m ago`. The run
+that run's transcript; after the run ends it is drawn as `last: … · 2m ago`, shortened
+to the compact action and `2m` only where a roomy card is narrow. The run
 writes `current-tool` while a tool call is in flight (so the card can say `shell · 12s`)
 and `last-failure` when one fails (so the card carries the failed command's cause in
 its row: `⚠ <tool>: <first clause>` for a warned run, `✗` for a failed one; the log
 keeps `✗`). `last_work` is the issue, pull request, branch and comment
-the newest run named, read from its transcript and push witness.
+the newest run named, read from its transcript. A pull request's branch comes from
+that request's own tool result; a branch-only run uses the push witness. A legacy
+request with no recorded branch keeps its number and makes no branch claim.
 
 A clean exit is not automatically `✓`. The mark reads the shell's raw record: it is
 `✓` only when every status the shell reported — each trap record's `$?` and every
@@ -533,7 +550,9 @@ description, not on the consent screen. The model test distinguishes its own suf
 and empty-key checks (nothing sent) from a provider refusal (status and the provider's
 own message, kept whole and wrapped to the form's rows at 80 columns); a 404 on a
 `/chat/completions` path names the `/v1` form first. The
-engine's reasons, notices, activities and model-test lines are written in the same
-plain words the board uses, so no technical word reaches a screen from either side.
-`src/board/status.rs` is the one cleaner for free text and also removes the backticks
-the engine writes around names.
+engine's reasons, notices and model-test lines are written in the same plain words the
+board uses. `src/board/status.rs` is the one cleaner for engine-authored text and also
+removes the backticks the engine writes around names. It is deliberately not applied to
+a run's own final summary: the model's words are shown verbatim apart from the existing
+credential masking, so an ordinary word such as `missing` inside a sentence is never
+turned into a status label.
