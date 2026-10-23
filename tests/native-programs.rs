@@ -72,6 +72,10 @@ fn wait_engine(
 }
 
 fn install_pi_fixture(data_root: &Path) {
+    if let Ok(source) = std::env::var("GEWU_PI_INSTALL") {
+        install_product_root(data_root, Program::Pi, Path::new(&source));
+        return;
+    }
     let source =
         std::env::var("GEWU_PI_BINARY").unwrap_or_else(|_| panic!("GEWU_PI_BINARY is not set"));
     let source = PathBuf::from(source);
@@ -142,6 +146,29 @@ fn install_fixture(data_root: &Path, program: Program, source: &Path, entrypoint
     let executable = root.join(entrypoint);
     let _ = std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755));
     assert!(harness::installed(data_root, program).is_some());
+}
+
+fn install_product_root(data_root: &Path, program: Program, source: &Path) {
+    let target = data_root
+        .join("harnesses")
+        .join(program.id())
+        .join(program.pinned_version());
+    if !target.join("install.json").is_file() {
+        let record =
+            std::fs::read(source.join("install.json")).expect("the product install record");
+        hardlink_tree(source, &target).expect("the product-installed tree");
+        // `hardlink_tree` may hardlink the source record to the target; writing the
+        // saved bytes (not copying onto the same inode) keeps the source intact.
+        gewu_multiverse::mode::write_private(target.join("install.json"), &record)
+            .expect("the product install record");
+    }
+    assert!(
+        harness::installed(data_root, program).is_some(),
+        "{} is not a product-installed root ({} -> {})",
+        program.label(),
+        source.display(),
+        target.display()
+    );
 }
 
 fn sse_codex_tool(name: &str, namespace: &str, arguments: serde_json::Value) -> StubReply {
@@ -257,7 +284,9 @@ fn native_pi_reads_an_issue_pushes_a_branch_and_opens_a_pull_request() {
     let layout = Layout::rooted_at(root.0.join("config")).expect("an absolute layout");
     let data_root = root.0.join("data");
     install_pi_fixture(&data_root);
-    let product = PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse"));
+    let product = std::env::var("GEWU_PRODUCT_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse")));
     let mut options = EngineOptions::new(layout.clone(), &data_root).expect("options");
     options.product_binary = product;
     options.auto_start_forgejo = false;
@@ -480,13 +509,21 @@ fn native_codex_reads_an_issue_pushes_and_opens_a_pull_request() {
         bundled_forgejo::SHA256
     );
     let source = PathBuf::from(
-        std::env::var("GEWU_CODEX_ROOT").unwrap_or_else(|_| panic!("GEWU_CODEX_ROOT is not set")),
+        std::env::var("GEWU_CODEX_INSTALL")
+            .or_else(|_| std::env::var("GEWU_CODEX_ROOT"))
+            .unwrap_or_else(|_| panic!("GEWU_CODEX_INSTALL or GEWU_CODEX_ROOT is not set")),
     );
     let root = Scratch::new("codex-live");
     let layout = Layout::rooted_at(root.0.join("config")).expect("an absolute layout");
     let data_root = root.0.join("data");
-    install_fixture(&data_root, Program::Codex, &source, "bin/codex");
-    let product = PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse"));
+    if source.join("install.json").is_file() {
+        install_product_root(&data_root, Program::Codex, &source);
+    } else {
+        install_fixture(&data_root, Program::Codex, &source, "bin/codex");
+    }
+    let product = std::env::var("GEWU_PRODUCT_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse")));
     let mut options = EngineOptions::new(layout.clone(), &data_root).expect("options");
     options.product_binary = product;
     options.auto_start_forgejo = false;
@@ -672,14 +709,18 @@ fn native_dsh_reads_an_issue_pushes_and_opens_a_pull_request() {
         bundled_forgejo::SHA256
     );
     let source = PathBuf::from(
-        std::env::var("GEWU_DSH_ROOT").unwrap_or_else(|_| panic!("GEWU_DSH_ROOT is not set")),
+        std::env::var("GEWU_DSH_INSTALL")
+            .or_else(|_| std::env::var("GEWU_DSH_ROOT"))
+            .unwrap_or_else(|_| panic!("GEWU_DSH_INSTALL or GEWU_DSH_ROOT is not set")),
     );
     let root = Scratch::new("dsh-live");
     let layout = Layout::rooted_at(root.0.join("config")).expect("an absolute layout");
     let data_root = root.0.join("data");
     install_fixture(&data_root, Program::Dsh, &source, "node_modules/.bin/dsh");
     let mut options = EngineOptions::new(layout.clone(), &data_root).expect("options");
-    options.product_binary = PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse"));
+    options.product_binary = std::env::var("GEWU_PRODUCT_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse")));
     options.auto_start_forgejo = false;
     options.ready_timeout = Duration::from_secs(180);
     options.stop_grace = Duration::from_secs(5);
@@ -846,20 +887,27 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
         bundled_forgejo::SHA256
     );
     let source = PathBuf::from(
-        std::env::var("GEWU_OPENCODE_ROOT")
-            .unwrap_or_else(|_| panic!("GEWU_OPENCODE_ROOT is not set")),
+        std::env::var("GEWU_OPENCODE_INSTALL")
+            .or_else(|_| std::env::var("GEWU_OPENCODE_ROOT"))
+            .unwrap_or_else(|_| panic!("GEWU_OPENCODE_INSTALL or GEWU_OPENCODE_ROOT is not set")),
     );
     let root = Scratch::new("opencode-live");
     let layout = Layout::rooted_at(root.0.join("config")).expect("an absolute layout");
     let data_root = root.0.join("data");
-    install_fixture(
-        &data_root,
-        Program::Opencode,
-        &source,
-        "node_modules/@opencode/cli-linux-x64/bin/opencode",
-    );
+    if source.join("install.json").is_file() {
+        install_product_root(&data_root, Program::Opencode, &source);
+    } else {
+        install_fixture(
+            &data_root,
+            Program::Opencode,
+            &source,
+            "node_modules/@opencode/cli-linux-x64/bin/opencode",
+        );
+    }
     let mut options = EngineOptions::new(layout.clone(), &data_root).expect("options");
-    options.product_binary = PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse"));
+    options.product_binary = std::env::var("GEWU_PRODUCT_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_BIN_EXE_gewu-multiverse")));
     options.auto_start_forgejo = false;
     options.ready_timeout = Duration::from_secs(180);
     options.stop_grace = Duration::from_secs(5);
@@ -871,16 +919,13 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
         matches!(board.forgejo.state, ForgejoState::Running) && board.forgejo.repositories >= 1
     });
     let model = Stub::start(vec![
+        sse_final("Session title"),
         sse_tool(
             "shell",
             "shell",
             serde_json::json!({"command": "printf 'native opencode r12\\n' > native-opencode.txt"}),
         ),
-        sse_tool(
-            "shell",
-            "shell",
-            serde_json::json!({"command": "printf 'native opencode r12\\n' > native-opencode.txt"}),
-        ),
+        sse_final("OpenCode wrote the file with its own shell tool."),
         sse_final("OpenCode wrote the file with its own shell tool."),
     ]);
     engine
