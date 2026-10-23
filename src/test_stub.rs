@@ -24,6 +24,8 @@ pub struct StubReply {
     pub status: u16,
     /// The body to answer with.
     pub body: String,
+    /// The `Content-Type` to send; `None` is JSON.
+    pub content_type: Option<String>,
     /// A `Retry-After` to send, when one should be sent.
     pub retry_after_secs: Option<u64>,
     /// How long to wait before answering, so a timeout can be exercised.
@@ -36,6 +38,18 @@ impl StubReply {
         Self {
             status: 200,
             body: body.into(),
+            content_type: None,
+            retry_after_secs: None,
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// A `200` whose body is a server-sent event stream.
+    pub fn sse(body: impl Into<String>) -> Self {
+        Self {
+            status: 200,
+            body: body.into(),
+            content_type: Some("text/event-stream".to_owned()),
             retry_after_secs: None,
             delay: Duration::ZERO,
         }
@@ -46,6 +60,7 @@ impl StubReply {
         Self {
             status,
             body: body.into(),
+            content_type: None,
             retry_after_secs: None,
             delay: Duration::ZERO,
         }

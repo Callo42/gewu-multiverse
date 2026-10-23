@@ -35,6 +35,7 @@ use gewu_multiverse::cli::{Cli, Invocation, help_text, parse_args};
 use gewu_multiverse::confinement;
 use gewu_multiverse::editor;
 use gewu_multiverse::engine::{self, EngineOptions};
+use gewu_multiverse::mcp_forgejo;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::workspace;
 use nix::fcntl::OFlag;
@@ -96,6 +97,69 @@ fn main() -> ExitCode {
         Invocation::LandlockProbe { root } => {
             ExitCode::from(confinement::run_landlock_probe(&root).clamp(0, 255) as u8)
         }
+        Invocation::ConfinedProgram { spec } => {
+            ExitCode::from(confinement::run_confined_program(&spec).clamp(0, 255) as u8)
+        }
+        Invocation::McpForgejo { context } => {
+            ExitCode::from(mcp_forgejo::serve(&context).clamp(0, 255) as u8)
+        }
+        Invocation::InstallHarness { program } => {
+            let Some(program) = gewu_multiverse::harness::Program::parse(&program) else {
+                eprintln!("gewu-multiverse: there is no program named `{program}`");
+                return ExitCode::FAILURE;
+            };
+            if !program.is_native() {
+                eprintln!("gewu-multiverse: the built-in engine needs no install");
+                return ExitCode::FAILURE;
+            }
+            let data_root = match bundled_forgejo::data_root() {
+                Ok(root) => root,
+                Err(error) => {
+                    eprintln!("gewu-multiverse: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut last = None;
+            match gewu_multiverse::harness::install(&data_root, program, |percent| {
+                if percent != last {
+                    last = percent;
+                    match percent {
+                        Some(percent) => eprintln!(
+                            "gewu-multiverse: installing {} — {percent}%",
+                            program.label()
+                        ),
+                        None => eprintln!("gewu-multiverse: installing {}…", program.label()),
+                    }
+                }
+            }) {
+                Ok(installed) => {
+                    println!(
+                        "gewu-multiverse: {} {} is ready at {}",
+                        program.label(),
+                        installed.version,
+                        installed.executable.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!(
+                        "gewu-multiverse: {} could not be installed: {error}",
+                        program.label()
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Invocation::PrintNativeKey { key } => match std::fs::read_to_string(&key) {
+            Ok(text) => {
+                println!("{}", text.trim());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("gewu-multiverse: the run's key cannot be read: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Invocation::InstallForgejo => match install_forgejo() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

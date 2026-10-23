@@ -866,6 +866,121 @@ pub(crate) struct NamespacePlan<'a> {
     pub(crate) exe: Option<&'a Path>,
 }
 
+/// The private launch spec the native supervisor writes for the confined-program
+/// helper. It holds no secret: paths and argv only.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfinedProgramSpec {
+    workspace: PathBuf,
+    program: PathBuf,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    read: Vec<PathBuf>,
+    #[serde(default)]
+    write: Vec<PathBuf>,
+}
+
+/// The `--confined-program` entry: apply the product Landlock ruleset to this
+/// process, then exec the native CLI. Returns only on failure.
+pub fn run_confined_program(spec_path: &Path) -> i32 {
+    let text = match std::fs::read_to_string(spec_path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("gewu-multiverse: the native launch plan cannot be read: {error}");
+            return 126;
+        }
+    };
+    let spec: ConfinedProgramSpec = match serde_json::from_str(&text) {
+        Ok(spec) => spec,
+        Err(error) => {
+            eprintln!("gewu-multiverse: the native launch plan is not valid: {error}");
+            return 126;
+        }
+    };
+    let workspace = match resolved_layout(&spec.workspace) {
+        Some(workspace) => workspace,
+        None => {
+            eprintln!("gewu-multiverse: the native workspace cannot be resolved");
+            return 126;
+        }
+    };
+    if let Err(error) = std::env::set_current_dir(&workspace) {
+        eprintln!(
+            "gewu-multiverse: the native program cannot enter {}: {error}",
+            workspace.display()
+        );
+        return 126;
+    }
+    match exec_landlock_program(&workspace, &spec) {
+        Ok(never) => match never {},
+        Err(error) => {
+            eprintln!("gewu-multiverse: the native program could not start: {error}");
+            126
+        }
+    }
+}
+
+/// Landlock for an arbitrary native program: the same HardRequirement ruleset as
+/// the shell, plus the program's own read-only install directory and any private
+/// config roots the supervisor named.
+fn exec_landlock_program(
+    workspace: &Path,
+    spec: &ConfinedProgramSpec,
+) -> io::Result<std::convert::Infallible> {
+    let (abi, all) = landlock_accesses().ok_or_else(|| {
+        io::Error::other("runs are not confined on this computer — Landlock is not available")
+    })?;
+    let read = AccessFs::from_read(abi);
+    let ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(all)
+        .and_then(|ruleset| ruleset.create())
+        .map_err(|error| {
+            io::Error::other(format!("the Landlock ruleset cannot be made: {error}"))
+        })?;
+    let mut rules = Vec::new();
+    for path in landlock_read_trees() {
+        if path.exists() {
+            rules.extend(landlock::path_beneath_rules([path], read));
+        }
+    }
+    for path in &spec.read {
+        if path.exists() {
+            rules.extend(landlock::path_beneath_rules([path], read));
+        }
+    }
+    let mut writable = vec![workspace.to_path_buf(), PathBuf::from("/dev")];
+    writable.extend(LANDLOCK_WRITE_TREES.iter().skip(1).map(PathBuf::from));
+    if let Some(temp) = std::env::var_os("TMPDIR") {
+        writable.push(PathBuf::from(temp));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        writable.push(PathBuf::from(home));
+    }
+    writable.extend(spec.write.iter().cloned());
+    for path in writable {
+        if path.exists() {
+            rules.extend(landlock::path_beneath_rules([path], all));
+        }
+    }
+    let status = ruleset
+        .add_rules(rules)
+        .and_then(|ruleset| ruleset.restrict_self())
+        .map_err(|error| {
+            io::Error::other(format!("the Landlock rules cannot be applied: {error}"))
+        })?;
+    if status.ruleset != RulesetStatus::FullyEnforced {
+        return Err(io::Error::other(format!(
+            "runs are not confined on this computer — the Landlock ruleset was not fully enforced ({:?})",
+            status.ruleset
+        )));
+    }
+    let mut command = std::process::Command::new(&spec.program);
+    command.args(&spec.args);
+    Err(command.exec())
+}
+
 /// The `--confined-shell` entry: apply the method named in the environment, then
 /// become `shell -c <command>`. Returns only on failure, as a process exit code.
 pub fn run_confined_shell() -> i32 {

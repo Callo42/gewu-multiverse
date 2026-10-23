@@ -5,7 +5,11 @@
 #   curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
 #
 #   sh install.sh v0.1.0            # a specific release tag instead of the latest
+#   sh install.sh --harness pi,codex
+#   GEWU_HARNESSES=pi,opencode sh install.sh
 #   INSTALL_DIR=$HOME/bin sh install.sh
+#
+# The default program is Pi. --harness none installs only the built-in engine.
 #
 # Honest limits: today the releases are x86_64 Linux only, and the binary needs a
 # recent glibc (2.39, Ubuntu 24.04-era). Everything else: build from source —
@@ -13,9 +17,35 @@
 set -eu
 
 repo=Callo42/gewu-multiverse
-tag=${1:-}
+tag=
+harnesses=${GEWU_HARNESSES:-pi}
 dir=${INSTALL_DIR:-$HOME/.local/bin}
 floor=2.39
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --harness)
+            [ "$#" -ge 2 ] || die "--harness needs a comma-separated list"
+            harnesses=$2
+            shift 2
+            ;;
+        --harness=*)
+            harnesses=${1#--harness=}
+            shift
+            ;;
+        --)
+            shift
+            [ "$#" -ge 1 ] && tag=$1
+            break
+            ;;
+        --*)
+            die "unknown option $1"
+            ;;
+        *)
+            tag=$1
+            shift
+            ;;
+    esac
+done
 
 say() { printf '%s\n' "$*" >&2; }
 die() { say "install.sh: $*"; exit 1; }
@@ -92,6 +122,23 @@ if "$dir/gewu-multiverse" --install-forgejo >/dev/null; then
     say "Forgejo 17.0.0 is ready"
 else
     say "the Forgejo download did not finish — the product is installed; its first start will try again"
+fi
+
+if [ -n "$harnesses" ] && [ "$harnesses" != "none" ]; then
+    old_ifs=$IFS
+    IFS=,
+    for program in $harnesses; do
+        IFS=$old_ifs
+        [ -n "$program" ] || continue
+        say "installing the $program agent program (official package, verified)"
+        if "$dir/gewu-multiverse" --install-harness "$program"; then
+            say "the $program agent program is ready"
+        else
+            say "the $program agent program was not installed — the product is installed; choose Install on its Program screen to retry"
+        fi
+        IFS=,
+    done
+    IFS=$old_ifs
 fi
 
 # The closing line must be a command that resolves. When the directory is not on

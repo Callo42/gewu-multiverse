@@ -135,12 +135,24 @@ impl ForgejoTools {
         agent: impl Into<String>,
         token: Secret,
     ) -> Self {
+        Self::new_with_writes(config, workspace, agent, token, 0)
+    }
+
+    /// Build the tools with the writes already made by an earlier MCP server of the
+    /// same run, so restarting the bridge cannot reset the eight-write bound.
+    pub fn new_with_writes(
+        config: RunForgejo,
+        workspace: impl Into<PathBuf>,
+        agent: impl Into<String>,
+        token: Secret,
+        writes: u32,
+    ) -> Self {
         Self {
             config,
             workspace: workspace.into(),
             agent: agent.into(),
             token,
-            writes: Cell::new(0),
+            writes: Cell::new(writes),
         }
     }
 

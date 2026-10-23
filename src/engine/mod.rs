@@ -18,7 +18,7 @@ pub mod last_seen;
 pub mod session;
 pub mod settings;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -33,9 +33,10 @@ use crate::bundled_forgejo::{self, PreparedInstance, RunningForgejo};
 use crate::credentials::{self, CredentialsFile, Secret};
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, Provisioning, SessionEnd, SessionState, UpgradeView,
+    ForgejoView, ProgramView, Provisioning, RunProgramView, SessionEnd, SessionState, UpgradeView,
 };
 use crate::forgejo::{DEFAULT_TIMEOUT, ForgejoClient, ForgejoError, Repository};
+use crate::harness::{self, Program, Protocol};
 use crate::identity;
 use crate::mode::{SECRET_FILE_MODE, set_mode};
 use crate::paths::Layout;
@@ -49,7 +50,8 @@ use self::clock::{RealClock, SharedClock};
 #[cfg(test)]
 use self::session::FakeSpawner;
 use self::session::{
-    PreparedSession, RealSpawner, RunningSession, SessionRepository, SessionRequest, SessionSpawner,
+    NativeRequest, PreparedSession, RealSpawner, RunningSession, SessionRepository, SessionRequest,
+    SessionSpawner,
 };
 use self::settings::{AgentSettings, MAX_AGENTS, Settings};
 
@@ -565,6 +567,14 @@ struct Inner {
     sequence: u64,
     stopping: bool,
     generation: u64,
+    /// Install progress/errors for the Program screen.
+    program_states: HashMap<String, ProgramState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProgramState {
+    installing: Option<Option<u8>>,
+    error: Option<String>,
 }
 
 impl Inner {
@@ -663,6 +673,7 @@ impl Inner {
             sequence: 0,
             stopping: false,
             generation: 0,
+            program_states: HashMap::new(),
         };
         // A number this installation has ever used is never reused, even when the
         // agent is gone from the settings. The names on disk are the floor for an
@@ -1342,8 +1353,8 @@ impl Inner {
                 .clone()
                 .or_else(|| Some("cleanup unverified".to_owned()));
         }
-        if !self.settings.endpoint.configured() || !self.credential_key_present() {
-            return Some("needs a model".to_owned());
+        if let Some(reason) = self.program_block(agent) {
+            return Some(reason);
         }
         if agent.instruction_chars == 0 {
             return Some("needs an instruction".to_owned());
@@ -1527,6 +1538,24 @@ impl Inner {
             }
         }
         let agent = &self.agents[index];
+        let saved_agent = self.settings.agent(&agent_name).cloned()?;
+        let program = saved_agent.harness();
+        let (protocol, base_url, model) = self.connection_for(&saved_agent)?;
+        let native = if program.is_native() {
+            let installed = harness::installed(&self.options.data_root, program)?;
+            Some(NativeRequest {
+                harness: program.id().to_owned(),
+                version: installed.version,
+                program: installed.executable,
+                install_root: installed.root,
+                protocol: protocol.id().to_owned(),
+                base_url: base_url.clone(),
+                model: model.clone(),
+                codex_sandbox: saved_agent.codex_sandbox.clone(),
+            })
+        } else {
+            None
+        };
         self.sequence = self.sequence.saturating_add(1);
         let run_id = run::new_run_id(self.sequence);
         let run_dir = paths.run_dir(&run_id);
@@ -1553,8 +1582,12 @@ impl Inner {
             workspace,
             instruction: paths.instruction().to_path_buf(),
             skills_dir: paths.skills_dir().to_path_buf(),
-            endpoint: self.settings.endpoint.url.clone(),
-            model: self.settings.endpoint.model.clone(),
+            endpoint: if native.is_none() {
+                self.settings.endpoint.chat_url()
+            } else {
+                base_url.clone()
+            },
+            model: model.clone(),
             max_turns: self.settings.endpoint.turns(),
             timeout_secs: self.options.session_timeout.as_secs(),
             credentials: self.credentials.clone(),
@@ -1564,6 +1597,185 @@ impl Inner {
             repositories,
             confinement,
             hide,
+            native,
+        })
+    }
+
+    /// The selected connection for one agent: its explicit provider for a native
+    /// program, or the shared endpoint for the legacy built-in engine.
+    fn connection_for(
+        &self,
+        agent: &settings::AgentSettings,
+    ) -> Option<(Protocol, String, String)> {
+        if agent.harness().is_native() {
+            let provider = agent.provider()?;
+            if !provider.configured() {
+                return None;
+            }
+            Some((
+                provider.protocol(),
+                provider.base_url.trim_end_matches('/').to_owned(),
+                provider.model.clone(),
+            ))
+        } else {
+            if !self.settings.endpoint.configured() {
+                return None;
+            }
+            Some((
+                self.settings.endpoint.protocol(),
+                self.settings.endpoint.base_url(),
+                self.settings.endpoint.model.clone(),
+            ))
+        }
+    }
+
+    /// Why one agent's selected program/connection cannot start, if it cannot.
+    fn program_block(&self, agent: &AgentRuntime) -> Option<String> {
+        let saved = self.settings.agent(&agent.name)?;
+        let program = saved.harness();
+        if program == Program::Builtin {
+            if !self.settings.endpoint.configured() {
+                return Some("needs a model".to_owned());
+            }
+            if credentials::model_key(&self.credentials, &agent.name).is_err() {
+                return Some("needs a model key".to_owned());
+            }
+            return None;
+        }
+        let Some(installed) = harness::installed(&self.options.data_root, program) else {
+            return Some(format!("{} is not installed", program.label()));
+        };
+        let Some((protocol, _base, model)) = self.connection_for(saved) else {
+            return Some("choose this agent's connection and model".to_owned());
+        };
+        if model.trim().is_empty() {
+            return Some("choose this agent's model".to_owned());
+        }
+        if let Some(error) = harness::compatibility_error(program, protocol) {
+            return Some(error);
+        }
+        if credentials::model_key(&self.credentials, &agent.name).is_err() {
+            return Some("needs a model key".to_owned());
+        }
+        if program == Program::Dsh {
+            if let Some(prerequisite) = program.prerequisite_missing() {
+                return Some(prerequisite.to_owned());
+            }
+        }
+        if installed.program != program {
+            return Some("the installed program is for another program".to_owned());
+        }
+        None
+    }
+
+    /// The installed-state cards for the Program screen.
+    fn program_views(&self) -> Vec<ProgramView> {
+        harness::NATIVE_PROGRAMS
+            .into_iter()
+            .map(|program| {
+                let installed = harness::installed(&self.options.data_root, program);
+                let state = self.program_states.get(program.id());
+                ProgramView {
+                    id: program.id().to_owned(),
+                    label: program.label().to_owned(),
+                    version: program.pinned_version().to_owned(),
+                    installed_version: installed.as_ref().map(|item| item.version.clone()),
+                    installed: installed.is_some(),
+                    license: program.license().to_owned(),
+                    download_mb: program.download_mb(),
+                    prerequisite: program.prerequisite().map(str::to_owned),
+                    installing: state.and_then(|state| state.installing),
+                    error: state.and_then(|state| state.error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Give a newly created agent the installation's default program. A fresh
+    /// installation is Pi (set by `Settings::load`); an existing file without a
+    /// default leaves the built-in engine. A native default snapshots the current
+    /// connection once.
+    fn assign_new_agent_program(&mut self, name: &str) {
+        let program = self
+            .settings
+            .default_harness
+            .as_deref()
+            .and_then(Program::parse)
+            .unwrap_or(Program::Builtin);
+        let endpoint = self.settings.endpoint.clone();
+        // A native default needs a connection to snapshot. A caller that creates
+        // agents before the first-run connection is complete gets the built-in
+        // behavior instead of an unusable native agent with no provider.
+        let program = if program.is_native() && !endpoint.configured() {
+            Program::Builtin
+        } else {
+            program
+        };
+        let Some(agent) = self.settings.agent_mut(name) else {
+            return;
+        };
+        agent.set_harness(program);
+        if program.is_native() && agent.provider.is_none() && endpoint.configured() {
+            agent.provider = Some(settings::AgentProvider {
+                base_url: endpoint.base_url(),
+                protocol: endpoint.protocol().id().to_owned(),
+                model: endpoint.model.clone(),
+            });
+        }
+        if program == Program::Codex {
+            agent.codex_sandbox = "native".to_owned();
+        }
+    }
+
+    /// The immutable program facts of the newest run, when there is one.
+    fn active_program(&self, agent: &AgentRuntime) -> Option<RunProgramView> {
+        let dir = agent.newest_run.as_deref()?;
+        if let Ok(Some(native)) = crate::run::NativePlan::read(dir) {
+            let program = Program::parse(&native.harness).unwrap_or(Program::Builtin);
+            return Some(RunProgramView {
+                program: native.harness.clone(),
+                label: program.label().to_owned(),
+                version: native.version,
+                protocol: native.protocol,
+                model: native.model,
+                codex_sandbox: (!native.codex_sandbox.is_empty()).then_some(native.codex_sandbox),
+            });
+        }
+        let plan = run::RunPlan::read(dir).ok()?;
+        Some(RunProgramView {
+            program: "builtin".to_owned(),
+            label: Program::Builtin.label().to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol: Protocol::ChatCompletions.id().to_owned(),
+            model: plan.model,
+            codex_sandbox: None,
+        })
+    }
+
+    /// The saved facts the next run of one agent will use.
+    fn next_program(&self, agent: &AgentRuntime) -> Option<RunProgramView> {
+        let saved = self.settings.agent(&agent.name)?;
+        let program = saved.harness();
+        let (protocol, _, model) = self.connection_for(saved).unwrap_or((
+            Protocol::ChatCompletions,
+            String::new(),
+            String::new(),
+        ));
+        Some(RunProgramView {
+            program: program.id().to_owned(),
+            label: program.label().to_owned(),
+            version: harness::installed(&self.options.data_root, program)
+                .map(|installed| installed.version)
+                .unwrap_or_else(|| program.pinned_version().to_owned()),
+            protocol: protocol.id().to_owned(),
+            model,
+            codex_sandbox: (program == Program::Codex).then(|| {
+                if saved.codex_sandbox == "full-access" {
+                    "full-access".to_owned()
+                } else {
+                    "native".to_owned()
+                }
+            }),
         })
     }
 }
@@ -1789,10 +2001,13 @@ impl EngineApi for Engine {
         let endpoint = EndpointView {
             configured: inner.settings.endpoint.configured(),
             url: inner.settings.endpoint.url.clone(),
+            base_url: inner.settings.endpoint.base_url(),
+            protocol: inner.settings.endpoint.protocol().id().to_owned(),
             model: inner.settings.endpoint.model.clone(),
             key_present: inner.credential_key_present(),
             test: inner.endpoint_test.clone(),
         };
+        let programs = inner.program_views();
         // An upgrade whose warnings changed shows them once more before the board;
         // a same-version open keeps the acknowledgement (F-06).
         let terms_acknowledged = inner.settings.terms_acknowledged
@@ -1857,6 +2072,61 @@ impl EngineApi for Engine {
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
                 last_result_is_work: agent.last_result_is_work,
+                program: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| saved.harness().id().to_owned())
+                    .unwrap_or_else(|| "builtin".to_owned()),
+                program_label: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| saved.harness().label().to_owned())
+                    .unwrap_or_else(|| Program::Builtin.label().to_owned()),
+                program_installed: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| saved.harness())
+                    .filter(|program| program.is_native())
+                    .map(|program| harness::installed(&inner.options.data_root, program).is_some())
+                    .unwrap_or(true),
+                program_version: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| harness::installed(&inner.options.data_root, saved.harness()))
+                    .map(|installed| installed.version),
+                protocol: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(protocol, _, _)| protocol.id().to_owned())
+                    .unwrap_or_else(|| inner.settings.endpoint.protocol().id().to_owned()),
+                base_url: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(_, base, _)| base)
+                    .unwrap_or_else(|| inner.settings.endpoint.base_url()),
+                model: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(_, _, model)| model)
+                    .unwrap_or_else(|| inner.settings.endpoint.model.clone()),
+                key_present: credentials::model_key(&inner.credentials, &agent.name).is_ok(),
+                program_error: inner.program_block(agent),
+                active_program: inner.active_program(agent),
+                next_program: inner.next_program(agent),
+                codex_sandbox: inner
+                    .settings
+                    .agent(&agent.name)
+                    .filter(|saved| saved.harness() == Program::Codex)
+                    .map(|saved| {
+                        if saved.codex_sandbox == "full-access" {
+                            "full-access".to_owned()
+                        } else {
+                            "native".to_owned()
+                        }
+                    }),
             })
             .collect();
         BoardView {
@@ -1874,6 +2144,7 @@ impl EngineApi for Engine {
             forgejo,
             agents,
             endpoint,
+            programs,
             notice,
             admin_password,
             confined: inner.options.confinement.confined(),
@@ -1916,6 +2187,224 @@ impl EngineApi for Engine {
                 inner.note("your model is saved");
                 Ok(())
             }
+            Command::SetConnection {
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let model = model.trim().to_owned();
+                let Some(protocol) = Protocol::parse(&protocol) else {
+                    return Err("that connection type is not one this product knows".to_owned());
+                };
+                if base.is_empty() || model.is_empty() {
+                    return Err("the API address and model are both needed".to_owned());
+                }
+                if protocol != Protocol::ChatCompletions {
+                    return Err(
+                        "the built-in engine needs a Chat Completions connection".to_owned()
+                    );
+                }
+                inner.settings.endpoint.url.clear();
+                inner.settings.endpoint.base_url = base;
+                inner.settings.endpoint.protocol = protocol.id().to_owned();
+                inner.settings.endpoint.model = model;
+                if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+                    credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
+                        .map_err(|error| format!("the model key could not be kept: {error}"))?;
+                }
+                inner.save_settings()?;
+                inner.endpoint_test = EndpointTest::NotRun;
+                inner.note("the default connection is saved");
+                Ok(())
+            }
+            Command::SetAgentProgram {
+                name,
+                program,
+                protocol,
+            } => {
+                let Some(program) = Program::parse(&program) else {
+                    return Err("that program is not one this product knows".to_owned());
+                };
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let endpoint = inner.settings.endpoint.clone();
+                let Some(saved) = inner.settings.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let requested = protocol.as_deref().and_then(Protocol::parse);
+                if let Some(requested) = requested
+                    && let Some(error) = harness::compatibility_error(program, requested)
+                {
+                    return Err(error);
+                }
+                saved.set_harness(program);
+                if program.is_native() {
+                    if saved.provider.is_none() {
+                        if !endpoint.configured() {
+                            return Err("set the default connection first, then choose this agent's program".to_owned());
+                        }
+                        saved.provider = Some(settings::AgentProvider {
+                            base_url: endpoint.base_url(),
+                            protocol: endpoint.protocol().id().to_owned(),
+                            model: endpoint.model.clone(),
+                        });
+                    }
+                    let chosen = requested
+                        .or_else(|| {
+                            saved
+                                .provider
+                                .as_ref()
+                                .and_then(|provider| Protocol::parse(&provider.protocol))
+                        })
+                        .filter(|protocol| program.supports(*protocol))
+                        .unwrap_or_else(|| program.supported_protocols()[0]);
+                    if let Some(provider) = saved.provider.as_mut() {
+                        provider.protocol = chosen.id().to_owned();
+                    }
+                }
+                if program != Program::Codex {
+                    saved.codex_sandbox.clear();
+                } else if saved.codex_sandbox.is_empty() {
+                    saved.codex_sandbox = "native".to_owned();
+                }
+                inner.save_settings()?;
+                inner.agents[index].last_error = None;
+                inner.note(format!("`{name}` now runs with {}", program.label()));
+                Ok(())
+            }
+            Command::SetAgentModel {
+                name,
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let Some(protocol) = Protocol::parse(&protocol) else {
+                    return Err("that connection type is not one this product knows".to_owned());
+                };
+                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let model = model.trim().to_owned();
+                if base.is_empty() || model.is_empty() {
+                    return Err("the API address and model are both needed".to_owned());
+                }
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let Some(saved) = inner.settings.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                saved.provider = Some(settings::AgentProvider {
+                    base_url: base,
+                    protocol: protocol.id().to_owned(),
+                    model,
+                });
+                if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+                    credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.trim(),
+                    )
+                    .map_err(|error| format!("the model key could not be kept: {error}"))?;
+                }
+                inner.save_settings()?;
+                inner.agents[index].last_error = None;
+                inner.note(format!("`{name}`'s connection is saved for its next run"));
+                Ok(())
+            }
+            Command::SetAgentCodexSandbox { name, mode } => {
+                let mode = mode.trim();
+                if mode != "native" && mode != "full-access" {
+                    return Err(
+                        "that Codex sandbox choice is not one this product knows".to_owned()
+                    );
+                }
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let Some(saved) = inner.settings.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                if saved.harness() != Program::Codex {
+                    return Err("the sandbox choice applies only to Codex".to_owned());
+                }
+                saved.codex_sandbox = mode.to_owned();
+                inner.save_settings()?;
+                inner.agents[index].last_error = None;
+                inner.note(format!(
+                    "`{name}`'s Codex sandbox choice is saved for its next run"
+                ));
+                Ok(())
+            }
+            Command::InstallProgram { id } => {
+                let Some(program) = Program::parse(&id).filter(|program| program.is_native())
+                else {
+                    return Err("there is no installable program with that name".to_owned());
+                };
+                if inner
+                    .program_states
+                    .get(&id)
+                    .is_some_and(|state| state.installing.is_some())
+                {
+                    inner.note(format!("{} is already installing", program.label()));
+                    return Ok(());
+                }
+                inner
+                    .program_states
+                    .entry(id.clone())
+                    .or_default()
+                    .installing = Some(None);
+                inner.note(format!("installing {}", program.label()));
+                let inner_arc = Arc::clone(&self.inner);
+                let data_root = inner.options.data_root.clone();
+                drop(inner);
+                std::thread::spawn(move || {
+                    let result = harness::install(&data_root, program, |percent| {
+                        if let Ok(mut inner) = inner_arc.lock() {
+                            if let Some(state) = inner.program_states.get_mut(program.id()) {
+                                state.installing = Some(percent);
+                            }
+                        }
+                    });
+                    if let Ok(mut inner) = inner_arc.lock() {
+                        let state = inner
+                            .program_states
+                            .entry(program.id().to_owned())
+                            .or_default();
+                        state.installing = None;
+                        match result {
+                            Ok(installed) => {
+                                state.error = None;
+                                inner.note(format!(
+                                    "{} {} is installed",
+                                    program.label(),
+                                    installed.version
+                                ));
+                            }
+                            Err(error) => {
+                                state.error = Some(crate::forgejo_tools::sentence(error.clone()));
+                                inner.note(format!(
+                                    "{} could not be installed: {error}",
+                                    program.label()
+                                ));
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            }
+            Command::TestAgentModel { name } => {
+                if inner.settings.agent(&name).is_none() {
+                    return Err(format!("there is no agent named `{name}`"));
+                }
+                inner.note(
+                    "the selected model was not tested; Start will use the program's own error",
+                );
+                Ok(())
+            }
             Command::TestEndpoint => {
                 inner.endpoint_test = EndpointTest::Running;
                 let inner_arc = Arc::clone(&self.inner);
@@ -1939,6 +2428,7 @@ impl EngineApi for Engine {
                     let name = format!("agent-{number}");
                     if inner.settings.agent(&name).is_none() {
                         inner.settings.add_agent(&name, Desired::Stopped)?;
+                        inner.assign_new_agent_program(&name);
                         ensure_agent_paths(&inner.options.layout, &name)?;
                         let runtime = AgentRuntime::load(&inner, &name);
                         inner.agents.push(runtime);
@@ -1956,6 +2446,7 @@ impl EngineApi for Engine {
             Command::AddAgent => {
                 let name = inner.settings.allocate_agent_name()?;
                 inner.settings.add_agent(&name, Desired::Stopped)?;
+                inner.assign_new_agent_program(&name);
                 ensure_agent_paths(&inner.options.layout, &name)?;
                 let runtime = AgentRuntime::load(&inner, &name);
                 inner.agents.push(runtime);

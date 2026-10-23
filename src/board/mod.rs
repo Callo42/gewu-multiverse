@@ -14,6 +14,7 @@ mod theme;
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EngineApi, Provisioning, SessionState,
 };
+use crate::harness::{Program, Protocol};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
@@ -38,6 +39,8 @@ pub enum Screen {
     Home,
     /// One agent, opened from its card.
     Agent,
+    /// One agent's agent program.
+    Program,
     /// The one Forgejo.
     Forgejo,
     /// The keys.
@@ -94,6 +97,14 @@ pub struct Board {
     agent_count: usize,
     build_ready_ticks: u8,
     agent_name: String,
+    /// The agent whose model form is open; `None` is the default connection.
+    model_agent: Option<String>,
+    /// The selected row on the Program screen: 0 is built-in, then NATIVE_PROGRAMS.
+    program_index: usize,
+    /// The connection type selected beside the program.
+    program_protocol: Protocol,
+    /// The Codex dangerous-sandbox explanation was shown; a second `f` is opt-in.
+    codex_optin_confirmed: bool,
     confirm_remove: Option<String>,
     confirm_quit: bool,
     notice: Option<String>,
@@ -149,6 +160,10 @@ impl Board {
             agent_count: 3,
             build_ready_ticks: 0,
             agent_name: String::new(),
+            model_agent: None,
+            program_index: 0,
+            program_protocol: Protocol::ChatCompletions,
+            codex_optin_confirmed: false,
             confirm_remove: None,
             confirm_quit: false,
             notice: None,
@@ -264,6 +279,18 @@ impl Board {
     }
 
     fn set_model_from_view(&mut self) {
+        if let Some(name) = self.model_agent.as_deref() {
+            if let Some(agent) = self.view.agents.iter().find(|agent| agent.name == name) {
+                self.model_fields[0] = agent.base_url.clone();
+                self.model_fields[1] = agent.model.clone();
+                self.model_fields[2].clear();
+                self.model_focus = 0;
+                self.model_editing = false;
+                self.model_edited = false;
+                self.model_cursor = self.model_fields[0].chars().count();
+                return;
+            }
+        }
         self.model_fields[0] = self.view.endpoint.url.clone();
         self.model_fields[1] = self.view.endpoint.model.clone();
         self.model_fields[2].clear();
@@ -298,10 +325,33 @@ impl Board {
         } else {
             Some(self.model_fields[2].clone())
         };
-        Command::SetEndpoint {
-            url: self.model_fields[0].trim().to_owned(),
-            model: self.model_fields[1].trim().to_owned(),
-            key,
+        if let Some(name) = self.model_agent.as_ref() {
+            let protocol = self
+                .view
+                .agents
+                .iter()
+                .find(|agent| &agent.name == name)
+                .and_then(|agent| Protocol::parse(&agent.protocol))
+                .unwrap_or(Protocol::ChatCompletions);
+            let base = self.model_fields[0]
+                .trim()
+                .trim_end_matches('/')
+                .trim_end_matches("/chat/completions")
+                .trim_end_matches('/')
+                .to_owned();
+            Command::SetAgentModel {
+                name: name.clone(),
+                base_url: base,
+                protocol: protocol.id().to_owned(),
+                model: self.model_fields[1].trim().to_owned(),
+                key,
+            }
+        } else {
+            Command::SetEndpoint {
+                url: self.model_fields[0].trim().to_owned(),
+                model: self.model_fields[1].trim().to_owned(),
+                key,
+            }
         }
     }
 
@@ -311,6 +361,15 @@ impl Board {
 
     /// Whether a key would be sent: one typed now, or one already stored.
     fn key_available(&self) -> bool {
+        if let Some(name) = self.model_agent.as_deref() {
+            return !self.model_fields[2].trim().is_empty()
+                || self
+                    .view
+                    .agents
+                    .iter()
+                    .find(|agent| agent.name == name)
+                    .is_some_and(|agent| agent.key_present);
+        }
         !self.model_fields[2].trim().is_empty() || self.view.endpoint.key_present
     }
 
@@ -330,6 +389,7 @@ impl Board {
             Screen::Build => self.keys_build(key),
             Screen::Home => self.keys_home(key),
             Screen::Agent => self.keys_agent(key),
+            Screen::Program => self.keys_program(key),
             Screen::Forgejo => self.keys_forgejo(key),
             Screen::Help => self.keys_help(key),
             Screen::Upgrade => self.keys_upgrade(key),
@@ -448,7 +508,7 @@ impl Board {
                 // The same local checks `t` runs, before anything is saved or sent.
                 // An address the product itself rejects is never left behind by a
                 // silent continue (W67-1).
-                if !self.address_names_completions() {
+                if self.model_agent.is_none() && !self.address_names_completions() {
                     self.set_notice("✗ wrong address — it should end in /chat/completions");
                     return;
                 }
@@ -458,18 +518,26 @@ impl Board {
                 }
                 let tested = self.endpoint_tested();
                 self.send(self.endpoint_command());
-                self.screen = match self.model_origin {
-                    ModelOrigin::FirstRun => Screen::Picker,
-                    ModelOrigin::Board => Screen::Home,
-                };
-                if !tested {
-                    self.set_notice("not tested — t to test");
+                if self.model_agent.is_some() {
+                    self.screen = Screen::Agent;
+                } else {
+                    self.screen = match self.model_origin {
+                        ModelOrigin::FirstRun => Screen::Picker,
+                        ModelOrigin::Board => Screen::Home,
+                    };
+                    if !tested {
+                        self.set_notice("not tested — t to test");
+                    }
                 }
             }
             KeyCode::Esc => {
-                self.screen = match self.model_origin {
-                    ModelOrigin::FirstRun => Screen::Terms,
-                    ModelOrigin::Board => Screen::Home,
+                self.screen = if self.model_agent.is_some() {
+                    Screen::Agent
+                } else {
+                    match self.model_origin {
+                        ModelOrigin::FirstRun => Screen::Terms,
+                        ModelOrigin::Board => Screen::Home,
+                    }
                 };
             }
             _ => match plain(key) {
@@ -696,6 +764,7 @@ impl Board {
                 Some('f') => self.screen = Screen::Forgejo,
                 Some('m') => {
                     self.model_origin = ModelOrigin::Board;
+                    self.model_agent = None;
                     self.set_model_from_view();
                     self.screen = Screen::Model;
                 }
@@ -730,6 +799,56 @@ impl Board {
                     let name = self.agent_name.clone();
                     self.toggle_named(&name);
                 }
+                Some('p') => {
+                    let current = self
+                        .view
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == self.agent_name)
+                        .map(|agent| agent.program.as_str())
+                        .unwrap_or("builtin");
+                    self.program_index = if current == "builtin" {
+                        0
+                    } else {
+                        crate::harness::NATIVE_PROGRAMS
+                            .iter()
+                            .position(|program| program.id() == current)
+                            .map(|index| index + 1)
+                            .unwrap_or(0)
+                    };
+                    let chosen = self
+                        .view
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == self.agent_name)
+                        .and_then(|agent| Protocol::parse(&agent.protocol))
+                        .unwrap_or(Protocol::ChatCompletions);
+                    let program = if self.program_index == 0 {
+                        Program::Builtin
+                    } else {
+                        crate::harness::NATIVE_PROGRAMS
+                            .get(self.program_index - 1)
+                            .copied()
+                            .unwrap_or(Program::Builtin)
+                    };
+                    self.program_protocol = if program.supports(chosen) {
+                        chosen
+                    } else {
+                        program
+                            .supported_protocols()
+                            .first()
+                            .copied()
+                            .unwrap_or(Protocol::ChatCompletions)
+                    };
+                    self.codex_optin_confirmed = false;
+                    self.screen = Screen::Program;
+                }
+                Some('m') => {
+                    self.model_agent = Some(self.agent_name.clone());
+                    self.model_origin = ModelOrigin::Board;
+                    self.set_model_from_view();
+                    self.screen = Screen::Model;
+                }
                 Some('e') => match self.engine.instruction_path(&self.agent_name) {
                     Some(path) => {
                         self.handoff = Some(Handoff {
@@ -752,6 +871,123 @@ impl Board {
                 }
                 Some('?') => {
                     self.help_back = Screen::Agent;
+                    self.screen = Screen::Help;
+                }
+                Some('q') => self.request_quit(),
+                _ => {}
+            },
+        }
+    }
+
+    fn selected_program(&self) -> Program {
+        if self.program_index == 0 {
+            Program::Builtin
+        } else {
+            crate::harness::NATIVE_PROGRAMS
+                .get(self.program_index - 1)
+                .copied()
+                .unwrap_or(Program::Builtin)
+        }
+    }
+
+    fn cycle_program_protocol(&mut self, forward: bool) {
+        let program = self.selected_program();
+        let supported = program.supported_protocols();
+        if supported.is_empty() {
+            return;
+        }
+        let current = supported
+            .iter()
+            .position(|protocol| *protocol == self.program_protocol)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % supported.len()
+        } else {
+            (current + supported.len() - 1) % supported.len()
+        };
+        self.program_protocol = supported[next];
+    }
+
+    fn keys_program(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Agent,
+            KeyCode::Up => {
+                self.program_index = (self.program_index + 4) % 5;
+                let supported = self.selected_program().supported_protocols();
+                if !supported.contains(&self.program_protocol) {
+                    self.program_protocol = supported
+                        .first()
+                        .copied()
+                        .unwrap_or(Protocol::ChatCompletions);
+                }
+            }
+            KeyCode::Down => {
+                self.program_index = (self.program_index + 1) % 5;
+                let supported = self.selected_program().supported_protocols();
+                if !supported.contains(&self.program_protocol) {
+                    self.program_protocol = supported
+                        .first()
+                        .copied()
+                        .unwrap_or(Protocol::ChatCompletions);
+                }
+            }
+            KeyCode::Left => self.cycle_program_protocol(false),
+            KeyCode::Right => self.cycle_program_protocol(true),
+            KeyCode::Enter => {
+                let program = self.selected_program();
+                if !program.supports(self.program_protocol) {
+                    self.program_protocol = program
+                        .supported_protocols()
+                        .first()
+                        .copied()
+                        .unwrap_or(Protocol::ChatCompletions);
+                }
+                self.send(Command::SetAgentProgram {
+                    name: self.agent_name.clone(),
+                    program: program.id().to_owned(),
+                    protocol: Some(self.program_protocol.id().to_owned()),
+                });
+                self.screen = Screen::Agent;
+            }
+            _ => match plain(key) {
+                Some('i') => {
+                    let program = self.selected_program();
+                    if program.is_native() {
+                        self.send(Command::InstallProgram {
+                            id: program.id().to_owned(),
+                        });
+                    } else {
+                        self.set_notice("the built-in engine needs no install");
+                    }
+                }
+                Some('f') if self.selected_program() == Program::Codex => {
+                    if !self.codex_optin_confirmed {
+                        self.codex_optin_confirmed = true;
+                        self.set_notice(
+                            "Codex's own sandbox will be removed; only the product Landlock boundary remains. Press f again to allow it for this agent's next run.",
+                        );
+                    } else {
+                        let current = self
+                            .view
+                            .agents
+                            .iter()
+                            .find(|agent| agent.name == self.agent_name)
+                            .and_then(|agent| agent.codex_sandbox.clone())
+                            .unwrap_or_else(|| "native".to_owned());
+                        let mode = if current == "full-access" {
+                            "native"
+                        } else {
+                            "full-access"
+                        };
+                        self.codex_optin_confirmed = false;
+                        self.send(Command::SetAgentCodexSandbox {
+                            name: self.agent_name.clone(),
+                            mode: mode.to_owned(),
+                        });
+                    }
+                }
+                Some('?') => {
+                    self.help_back = Screen::Program;
                     self.screen = Screen::Help;
                 }
                 Some('q') => self.request_quit(),

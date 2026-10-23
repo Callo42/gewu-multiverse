@@ -37,6 +37,29 @@ pub enum Invocation {
         /// The probe root holding the readable control file and the denied secret.
         root: PathBuf,
     },
+    /// Apply the product Landlock boundary then exec a native program. Started by a
+    /// run, never by a person.
+    ConfinedProgram {
+        /// The private launch plan.
+        spec: PathBuf,
+    },
+    /// Print one run's model key for a native program's command-backed credential
+    /// helper. Started by the native program, never by a person.
+    PrintNativeKey {
+        /// The run-private key file.
+        key: PathBuf,
+    },
+    /// Serve one run's six Forgejo tools over stdio MCP. Started by the native
+    /// program, never by a person.
+    McpForgejo {
+        /// The run-private context directory.
+        context: PathBuf,
+    },
+    /// Install one official native program into the product's data directory.
+    InstallHarness {
+        /// Program id.
+        program: String,
+    },
     /// Fetch the pinned Forgejo into the data directory and exit.
     InstallForgejo,
     /// Print the help text.
@@ -108,6 +131,28 @@ where
             }
             // A run starts this mode with no other argument. It is not a person's
             // mode and is not in the help.
+            "--confined-program" => {
+                return Ok(Invocation::ConfinedProgram {
+                    spec: value_after(&mut args, "--confined-program")?,
+                });
+            }
+            "--print-native-key" => {
+                return Ok(Invocation::PrintNativeKey {
+                    key: value_after(&mut args, "--print-native-key")?,
+                });
+            }
+            "--mcp-forgejo" => {
+                return Ok(Invocation::McpForgejo {
+                    context: value_after(&mut args, "--mcp-forgejo")?,
+                });
+            }
+            "--install-harness" => {
+                return Ok(Invocation::InstallHarness {
+                    program: value_after(&mut args, "--install-harness")?
+                        .to_string_lossy()
+                        .into_owned(),
+                });
+            }
             "--confined-shell" => {
                 if args.next().is_some() {
                     return Err("--confined-shell takes no argument".to_owned());
