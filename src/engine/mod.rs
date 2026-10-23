@@ -99,8 +99,11 @@ pub const REPOSITORY_REFRESH: Duration = Duration::from_secs(2);
 pub const TERMS_VERSION: u32 = 2;
 
 /// The one line from this release's notes that the upgrade screen shows.
-pub const WHATS_NEW: &str =
-    "run marks say exactly what happened, and a started agent's runs never outlive it";
+///
+/// It stays inside what the product can observe: marks name the evidence the run
+/// reported, and an ordinary earlier run is stopped with its cleanup checked. It does
+/// not promise perfect shell interpretation or containment of detached processes.
+pub const WHATS_NEW: &str = "run marks name what was observed; an ordinary earlier run is stopped and its cleanup checked before the board reopens";
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.

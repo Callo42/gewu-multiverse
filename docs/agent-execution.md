@@ -125,8 +125,9 @@ use. Their authority is deliberately narrow:
 - `forgejo_update_pull_request` — change the title/body of the agent's own open request
   for that branch.
 
-A comment, an opened request and an update are writes and each counts against a
-**per-run bound of eight writes**. After eight, the write tools refuse with one
+The list is assigned-only; a read or a comment in a cloned team repository is not
+gated by the assignment. A comment, an opened request and an update are writes and each
+counts against a **per-run bound of eight writes**. After eight, the write tools refuse with one
 sentence naming the bound, while reads continue. The tools never merge, close, reopen,
 delete, label, assign, approve a review, or change a repository or a user.
 

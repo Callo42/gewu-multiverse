@@ -659,10 +659,11 @@ fn render_agent(view: &mut BoardView, width: u16, height: u16) -> String {
     text(&draw(&mut board, width, height))
 }
 
-/// The model's own final summary is shown verbatim; ordinary words that happen to
-/// match a status word are not replaced.
+/// The model's own final summary is not rewritten; ordinary words that happen to
+/// match a status word are not replaced. The visible row may still be cut with an
+/// explicit ellipsis, and the transcript keeps the whole sentence.
 #[test]
-fn model_summary_words_are_verbatim_while_status_labels_stay_exact() {
+fn model_summary_words_are_not_rewritten_while_status_labels_stay_exact() {
     let root = scratch("verbatim-summary");
     let run_dir = prepare_scripted(&root, "read the missing file\n");
     let mut view = board_view(&run_dir, "warned", "The endpoint session token is missing.");

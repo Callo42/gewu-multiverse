@@ -48,12 +48,14 @@ requests are its own. The board shows the whole thing at a glance:
   agent starts again or the program reopens. Open it with `⏎` for the Agent screen:
   the last work block (typed, and kept until a later run does new work), the
   instruction's first line, always, and `… (N more lines)` where N counts the
-  document's **file** lines (not wrapped display rows), the bounded run marks with
+  document's **file** lines (not wrapped display rows); where no count row fits, the
+  visible cut itself ends in `…`, the bounded run marks with
   their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`,
   wrapped whole on two rows at 72 columns), the newest mark's word, the last
-  tool failure and the newest run's reason. The run's own final sentence is shown
-  verbatim apart from the credential masking; the product's status vocabulary is never
-  substituted into it. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
+  tool failure and the newest run's reason. The run's own final sentence is not
+  rewritten apart from the credential masking; when it is too long for the visible
+  row it is shortened with an explicit `…`, and `t` opens the transcript that keeps
+  the whole sentence. The product's status vocabulary is never substituted into it. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
   every element of `PIPESTATUS`, so a failed command in a pipeline, a condition or a
   nested `bash -c`/`#!/bin/bash` script that reads the prelude can never hide behind
   a zero-exit wrapper, and
@@ -224,8 +226,9 @@ and you can change any of them later.
 4. **Write each agent's instruction.** Pick a card with `←` / `→` and press `⏎`, then
    `e`. Your own editor opens `instruction.md`; write what the agent should do and
    save. Press `s` to start it. Press `s` again to stop it. **Assign an issue in
-   Forgejo first:** an agent works only on the issues assigned to its own Forgejo
-   account, so an unassigned issue produces a run with nothing to do.
+   Forgejo first:** the assigned-issues list is the starting point. An unassigned
+   issue is not listed, though an agent can still read or comment on an issue in a
+   cloned team repository with its own account.
 
 After the first setup, `+` adds one new agent (the settings' twenty is the most an
 installation can hold) and `−` removes the selected one (it asks once). A removed agent's number and Forgejo account are never reused: `+` after
@@ -247,9 +250,9 @@ why. `m` opens the model settings, `f` opens the Forgejo page, `?` lists every k
 | The Forgejo administrator password | not on disk: `p` on the Forgejo page resets it through Forgejo's administration API and shows the new one |
 
 The Forgejo address is on the board and on the Forgejo page, for example
-`http://127.0.0.1:3000`. The page also says `agents work only on issues assigned to them
-— assign an issue in Forgejo`, and its team link is
-`/org/<organisation>/teams/<team>`. On the Forgejo page (`f`) your login is shown next to
+`http://127.0.0.1:3000`. The page also says `assigned issues are the focus; comments
+in cloned team repos`, and its organisation row says `team — create repositories under
+team`; its team link is `/org/<organisation>/teams/<team>`. On the Forgejo page (`f`) your login is shown next to
 `your login:`, the repositories are listed by name, and the agents' one-line
 permission summary is there with the team page address. The newest repository event is
 on the page and on the board at every supported size; the 80-column board also keeps
@@ -282,9 +285,10 @@ A relative folder is taken from the folder you started the program in.
 - `q` quits. If an agent is running, the board first names the agents that will stop —
   `quit stops agent-2 and agent-3, and Forgejo; they start again on reopen — q again
   quits`; press `q` again. An agent that is only
-  started and waiting for an instruction is not named, because it is not running. It
-  stops every started agent and the Forgejo, and prints one line (`stopped 1 agent`, not
-  `1 agents`).
+  started and blocked on an instruction is not named, because it has no live run. It
+  stops every live run and the Forgejo, then prints one line counting the same live
+  agents the warning named (`stopped 1 agent`, not `1 agents`); the started choices
+  still resume when you reopen.
   Closing the terminal window does the same. A run ended by quitting is settled like a
   stopped one: its durable ending is written before its process handles are removed.
 - Opening the program again starts the Forgejo, and starts the agents you had left

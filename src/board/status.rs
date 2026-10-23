@@ -24,8 +24,10 @@ pub struct Face {
 /// The engine contract is allowed to say `endpoint`, `token`, `session` and the rest;
 /// the person is not. This is the translation point for an engine-authored notice or
 /// state reason. It is deliberately **not** applied to a run's own final summary: the
-/// model's words are kept verbatim apart from the existing credential masking, so a
-/// sentence containing an ordinary word like "missing" is never rewritten (F3).
+/// model's words are kept unchanged apart from the existing credential masking, so a
+/// sentence containing an ordinary word like "missing" is never rewritten. The
+/// visible row may still be shortened with an explicit ellipsis; the full sentence is
+/// in the transcript.
 pub fn plain(text: &str) -> String {
     text.replace("endpoint", "model")
         .replace("provisioning", "setting up")
@@ -43,6 +45,41 @@ pub fn plain(text: &str) -> String {
 /// NB1). The row is a tool's evidence, not engine prose.
 pub fn tool_failure(text: &str) -> String {
     text.to_owned()
+}
+
+/// A tool failure fitted to the one cause row the card can show.
+///
+/// The record keeps the tool's full line. At a narrow card, a long POSIX diagnostic
+/// can otherwise be cut at the first space after the program (`cat:…`) and lose the
+/// actual error. When that would happen, keep a truthful compact form
+/// `<program>: …: <error>`; the path is still in the full record and transcript.
+pub fn fit_tool_failure(text: &str, width: usize) -> String {
+    if super::text::width(text) <= width {
+        return text.to_owned();
+    }
+    let (lead, body) = match text.strip_prefix("write refused: ") {
+        Some(body) => ("write refused: ", body),
+        None => ("", text),
+    };
+    let parts: Vec<&str> = body.split(": ").collect();
+    let start = if parts.len() >= 3 && parts[0] == "shell" && parts[1].starts_with("exit ") {
+        2
+    } else {
+        0
+    };
+    if start >= parts.len() {
+        return text.to_owned();
+    }
+    let diagnostic = parts[start..].join(": ");
+    let Some(compact) = crate::agent_run::compact_diagnostic(&diagnostic) else {
+        return text.to_owned();
+    };
+    let prefix = parts[..start].join(": ");
+    if prefix.is_empty() {
+        format!("{lead}{compact}")
+    } else {
+        format!("{lead}{prefix}: {compact}")
+    }
 }
 
 /// The blocked reason in the words the card uses.
@@ -388,10 +425,11 @@ fn age_words(age: std::time::Duration) -> String {
 
 /// The first clause of a run's own sentence, as a card line.
 ///
-/// The words are kept verbatim (apart from the credential masking the run already
+/// The words are kept unchanged (apart from the credential masking the run already
 /// did) and only the tail after the first sentence is dropped. The engine-word map is
 /// not applied here: a model that wrote "the missing file" keeps those exact words
-/// (F3).
+/// (F3). The display row may shorten the result with an explicit ellipsis; the
+/// transcript keeps the whole sentence.
 pub fn first_clause(text: &str) -> String {
     let mut cut = text.len();
     for needle in [" — ", ". ", "; ", "\n"] {

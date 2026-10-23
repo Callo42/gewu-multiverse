@@ -577,13 +577,31 @@ fn failing_segment_cause(
     status: i32,
     output: &str,
 ) -> String {
+    if matches!(segment_program(&segment.command), Some("[" | "[[" | "test")) {
+        // A failed `[ -f … ]`/`test` condition has no diagnostic of its own; later
+        // stdout (`DENIED …`) must not become its cause. Name the status honestly.
+        return format!("exit {status}: condition returned non-zero");
+    }
     if let Some(line) = segment_error_line(&segment.command, output) {
         return line;
     }
     if stderr_hidden(&segment.command) {
-        return exit_status_cause(status, output);
+        // The command's own stderr was sent to `/dev/null`: no path or errno text was
+        // observed. Name the failed program and its status instead of borrowing an
+        // unrelated stdout line (or an environment line) as a cause.
+        let program = segment_program(&segment.command).unwrap_or("the command");
+        return format!("exit {status}: no error line ({program})");
     }
     failing_cause(status, output)
+}
+
+/// The first program word of a recorded command, for a cause that cannot name a
+/// diagnostic because its stderr was redirected.
+fn segment_program(command: &str) -> Option<&str> {
+    shell_words(command)
+        .into_iter()
+        .find(|word| !word.starts_with('-') && !word.contains('='))
+        .map(|word| word.rsplit('/').next().unwrap_or(word))
 }
 
 /// The error line a failed command itself printed, when the output can be tied to
@@ -606,7 +624,7 @@ fn segment_error_line(command: &str, output: &str) -> Option<String> {
         .rev()
         .find(|line| line.to_ascii_lowercase().starts_with(&prefix))
     {
-        return Some(first_clause(line, 160));
+        return Some(diagnostic_clause(line));
     }
     // A failing program's own `<program>:` line is its diagnostic even when the text
     // is not one of the words `is_error_line` knows (review correction 7, NB1).
@@ -617,7 +635,12 @@ fn segment_error_line(command: &str, output: &str) -> Option<String> {
         .rev()
         .find(|line| line.to_ascii_lowercase().starts_with(&prefix))
     {
-        return Some(first_clause(line, 160));
+        return Some(diagnostic_clause(line));
+    }
+    // With stderr redirected to `/dev/null`, stdout cannot name this command's
+    // diagnostic. A path or status from arbitrary stdout is not its error.
+    if stderr_hidden(command) {
+        return None;
     }
     for argument in words[at + 1..]
         .iter()
@@ -625,7 +648,7 @@ fn segment_error_line(command: &str, output: &str) -> Option<String> {
         .filter(|word| !word.starts_with('-') && !word.contains('='))
     {
         if let Some(line) = lines.iter().rev().find(|line| line.contains(argument)) {
-            return Some(first_clause(line, 160));
+            return Some(diagnostic_clause(line));
         }
     }
     None
@@ -870,23 +893,40 @@ fn segment_writes(segment: &str) -> bool {
         }
     }
 
-    // `-G`/`--get` is case-sensitive: `-g` is `--globoff`, not a method. A curl GET
-    // may carry `--data` and still be a read (review correction 3, non-blocking 3).
-    let get = words.iter().enumerate().any(|(index, word)| {
-        *word == "-G"
-            || lower[index] == "--get"
-            || (lower[index] == "-x" && next_is(index, "get"))
-            || (lower[index] == "--request" && next_is(index, "get"))
-            || lower[index].starts_with("--request=get")
-            || lower[index].ends_with("xget")
-            || (word.starts_with('-') && !word.starts_with("--") && word[1..].contains('G'))
-    });
-    if !get
-        && lower
-            .iter()
-            .any(|word| word.starts_with("--data") || *word == "-d" || word.starts_with("-d@"))
-    {
-        return true;
+    // The request method and body flags are curl's own. Only read them when this
+    // segment actually runs `curl`: `[ -d "$p" ]` has a test operator `-d`, which is
+    // not a request body, and a read-only probe must not become a write because of it.
+    let curl = words.iter().position(|word| is_program(word, "curl"));
+    if let Some(at) = curl {
+        let curl_words = &words[at + 1..];
+        let curl_flags = &lower[at + 1..];
+        let next_is_curl =
+            |index: usize, name: &str| curl_flags.get(index + 1).is_some_and(|word| word == name);
+        // `-G`/`--get` is case-sensitive: `-g` is `--globoff`, not a method. A curl GET
+        // may carry `--data` and still be a read (review correction 3, non-blocking 3).
+        let get =
+            curl_words
+                .iter()
+                .zip(curl_flags)
+                .enumerate()
+                .any(|(index, (word, lower_word))| {
+                    *word == "-G"
+                        || *lower_word == "--get"
+                        || (*lower_word == "-x" && next_is_curl(index, "get"))
+                        || (*lower_word == "--request" && next_is_curl(index, "get"))
+                        || lower_word.starts_with("--request=get")
+                        || lower_word.ends_with("xget")
+                        || (word.starts_with('-')
+                            && !word.starts_with("--")
+                            && word[1..].contains('G'))
+                });
+        if !get
+            && curl_flags
+                .iter()
+                .any(|word| word.starts_with("--data") || *word == "-d" || word.starts_with("-d@"))
+        {
+            return true;
+        }
     }
 
     if git_writes(&lower) {
@@ -1574,7 +1614,7 @@ fn summarise_output(output: &str) -> String {
         if let Some(code) = http_status(line) {
             return format!("the server answered HTTP {code}");
         }
-        return first_clause(line, 160);
+        return diagnostic_clause(line);
     }
     match lines.last() {
         Some(line) => first_clause(line, 160),
@@ -1728,25 +1768,35 @@ fn system_diagnostic(output: &str) -> Option<String> {
 /// (`/bin/bash: …: File name too long`) instead of ending on the path.
 fn diagnostic_clause(line: &str) -> String {
     let clause = first_clause(line, 160);
-    if !clause.ends_with('…') {
+    // Even a line under the general 160-character bound can be wider than a card's
+    // one cause row. A path in the middle then makes the renderer show only `cat:…`.
+    // Collapse it early enough to keep the program and the system's error words.
+    if !clause.ends_with('…') && line.trim().chars().count() <= 70 {
         return clause;
     }
+    compact_diagnostic(line).unwrap_or(clause)
+}
+
+/// The compact `<program>: …: <error>` form of a POSIX diagnostic, when it ends in
+/// one of the operating system's error strings.
+///
+/// The caller decides whether the row is too wide for the full form; this helper
+/// only says whether a truthful compact form exists. It is shared with the card
+/// renderer so a medium path can keep its error clause at a narrow supported size.
+pub(crate) fn compact_diagnostic(line: &str) -> Option<String> {
     let line = line.trim();
     let lower = line.to_ascii_lowercase();
-    let Some(error) = system_error_texts()
+    let error = system_error_texts()
         .iter()
-        .find(|error| lower.ends_with(error.as_str()))
-    else {
-        return clause;
-    };
+        .find(|error| lower.ends_with(error.as_str()))?;
     let tail = &line[line.len() - error.len()..];
     let program = line
         .split_once(": ")
         .map_or("", |(program, _)| program.trim());
     if program.is_empty() || program.len() > 80 {
-        return clause;
+        return None;
     }
-    format!("{program}: …: {tail}")
+    Some(format!("{program}: …: {tail}"))
 }
 
 /// The longest shell or source name the recorder can report.
@@ -6770,6 +6820,97 @@ mod tests {
             ending_with_evidence("", &evidence),
             RunEnding::Warned,
             "a denied read is not the write mark"
+        );
+    }
+
+    #[test]
+    fn a_compound_read_only_probe_is_not_a_write() {
+        // A real compound read-only probe: an `if`/`elif` read test over protected paths,
+        // with `/dev/null` redirections, then `env` and a `sed` filter. The `[ -d ]`
+        // test operator is not curl's `-d` body flag.
+        let home = "/tmp/gewu-fixture";
+        let command = format!(
+            "for p in {home}/.config/gewu-multiverse/credentials.toml \
+             {home}/.local/share/gewu-multiverse {home}/.local/state/gewu-multiverse {home} \
+             /etc/hostname; do \
+             if [ -f \"$p\" ] && cat \"$p\" >/dev/null 2>&1; then echo \"READABLE file $p\"; \
+             elif [ -d \"$p\" ] && find \"$p\" -maxdepth 1 >/dev/null 2>&1; then echo \"READABLE dir $p\"; \
+             else echo \"DENIED $p\"; fi; done; \
+             echo \"--- environment ---\"; env | sort | sed -E 's/(KEY|TOKEN|SECRET|PASSWORD)=.*/\\1=<redacted-by-fixture>/I'"
+        );
+        assert!(
+            !shell_writes(&command),
+            "the compound read-only probe was called a write"
+        );
+        assert!(
+            !shell_writes("elif [ -d \"$p\" ]"),
+            "the test operand became a write"
+        );
+        assert!(shell_writes("curl -s -d '{}' http://127.0.0.1:1/team"));
+    }
+
+    #[test]
+    fn a_denied_compound_read_keeps_a_truthful_cause_without_the_wrapper() {
+        // A real run's own record: the only failing segments are read tests and
+        // `find`; both redirected stderr to `/dev/null`, so no path or errno text was
+        // observed. The output also contains the confinement wrapper in `env`; that
+        // internal variable must never become the cause.
+        let home = "/tmp/gewu-fixture";
+        let command = format!(
+            "for p in {home}/.config/gewu-multiverse/credentials.toml \
+             {home}/.local/share/gewu-multiverse {home}/.local/state/gewu-multiverse {home} \
+             /etc/hostname; do \
+             if [ -f \"$p\" ] && cat \"$p\" >/dev/null 2>&1; then echo \"READABLE file $p\"; \
+             elif [ -d \"$p\" ] && find \"$p\" -maxdepth 1 >/dev/null 2>&1; then echo \"READABLE dir $p\"; \
+             else echo \"DENIED $p\"; fi; done; \
+             echo \"--- environment ---\"; env | sort | sed -E 's/(KEY|TOKEN|SECRET|PASSWORD)=.*/\\1=<redacted-by-fixture>/I'"
+        );
+        let outcome = ToolOutcome {
+            exit_code: Some(0),
+            signal: None,
+            excerpt: "DENIED /tmp/gewu-fixture/.config/gewu-multiverse/credentials.toml | \
+                      DENIED /tmp/gewu-fixture/.local/share/gewu-multiverse | \
+                      DENIED /tmp/gewu-fixture | READABLE file /etc/hostname | \
+                      --- environment --- | \
+                      GEWU_CONFINE_COMMAND=for p in /tmp/gewu-fixture/.config/gewu-multiverse/credentials.toml \
+                      /tmp/gewu-fixture/.local/share/gewu-multiverse /tmp/gewu-fixture/.local/state/gewu-multiverse\n"
+                .to_owned(),
+            segments: vec![
+                transcript::CommandSegment {
+                    command: "[ -f \"$p\" ]".to_owned(),
+                    status: 1,
+                },
+                transcript::CommandSegment {
+                    command: "find \"$p\" -maxdepth 1 > /dev/null 2>&1".to_owned(),
+                    status: 1,
+                },
+                transcript::CommandSegment {
+                    command: "[ -d \"$p\" ]".to_owned(),
+                    status: 1,
+                },
+            ],
+            raw_failures: vec![1, 1, 1],
+            shell_prefixes: vec!["bash".to_owned()],
+        };
+        let mut evidence = RunEvidence::default();
+        assert!(evidence.note_shell(&command, &outcome));
+        assert!(
+            evidence.refused_write().is_none(),
+            "the read-only probe was called a write refusal: {:?}",
+            evidence.refused_write()
+        );
+        assert_eq!(
+            evidence.cause(),
+            Some("exit 1: condition returned non-zero"),
+            "the failed condition must name itself, not the wrapper"
+        );
+        assert_eq!(
+            ending_with_evidence(
+                "Some reads were denied; the environment is in the tool output.",
+                &evidence
+            ),
+            RunEnding::Warned,
+            "the run was not a refused write"
         );
     }
 }

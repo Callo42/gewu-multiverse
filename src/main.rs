@@ -35,7 +35,6 @@ use gewu_multiverse::cli::{Cli, Invocation, help_text, parse_args};
 use gewu_multiverse::confinement;
 use gewu_multiverse::editor;
 use gewu_multiverse::engine::{self, EngineOptions};
-use gewu_multiverse::engine_api::Desired;
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::workspace;
 use nix::fcntl::OFlag;
@@ -240,12 +239,7 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
     let drawn = event_loop(&mut screen, &mut board, Some(&termination));
     // The number of agents whose choice is started *now*, not when the board opened:
     // the person may have started one during this visit.
-    let started = board
-        .view()
-        .agents
-        .iter()
-        .filter(|agent| agent.desired == Desired::Started)
-        .count();
+    let started = board.quit_stopped_count();
     // Stop every session and Forgejo before the terminal comes back.
     board.shutdown();
     // A lost terminal has nothing to restore; asking for the mode back on a dead

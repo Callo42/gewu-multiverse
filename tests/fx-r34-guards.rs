@@ -17,6 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use gewu_multiverse::board::{Board, BoardForm};
@@ -55,6 +56,39 @@ impl EngineApi for Fixed {
         Ok(())
     }
     fn tick(&mut self) {}
+    fn instruction_path(&self, _agent: &str) -> Option<PathBuf> {
+        None
+    }
+    fn session_files(&self, _agent: &str) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+    fn shutdown(&mut self, _grace: Duration) {}
+}
+
+/// An engine whose second started agent becomes running on the next tick, so a
+/// quit confirmation sees a real live-view change without any product timing trick.
+struct ChangingEngine {
+    view: Arc<Mutex<BoardView>>,
+    changed: bool,
+}
+
+impl EngineApi for ChangingEngine {
+    fn board(&mut self) -> BoardView {
+        self.view.lock().expect("the changed view").clone()
+    }
+    fn send(&mut self, _command: BoardCommand) -> Result<(), String> {
+        Ok(())
+    }
+    fn tick(&mut self) {
+        if !self.changed {
+            self.changed = true;
+            let mut view = self.view.lock().expect("the changed view");
+            view.agents[1].session = SessionState::Running {
+                number: 1,
+                since: SystemTime::now(),
+            };
+        }
+    }
     fn instruction_path(&self, _agent: &str) -> Option<PathBuf> {
         None
     }
@@ -493,6 +527,90 @@ fn a_failed_run_keeps_http_status_and_the_connector_never_crosses_it() {
             }
         }
     }
+}
+
+#[test]
+fn the_quit_warning_counts_only_the_live_started_population() {
+    // A started agent blocked on a missing instruction is not a live run. The
+    // warning and the final count name the same population: the running agent, not
+    // the blocked one.
+    let mut board_view = view(2);
+    board_view.agents[0].desired = Desired::Started;
+    board_view.agents[0].session = SessionState::Running {
+        number: 1,
+        since: SystemTime::now(),
+    };
+    board_view.agents[1].desired = Desired::Started;
+    board_view.agents[1].session = SessionState::Blocked {
+        reason: "not started — write an instruction first".to_owned(),
+    };
+    let mut board = Board::new(Fixed(board_view));
+    assert_eq!(board.active_started_count(), 1);
+    board.on_key(KeyEvent::from(KeyCode::Char('q')));
+    assert_eq!(board.quit_stopped_count(), 0);
+    // The final count is captured only at the actual shutdown, from the live view.
+    board.on_key(KeyEvent::from(KeyCode::Char('q')));
+    assert_eq!(board.quit_stopped_count(), 1);
+    let frame = frame_text(&draw(&mut board, 120, 40));
+    let flat = frame
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '│' | '╭' | '╮' | '╰' | '╯' | '─') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("quit stops agent-1 and Forgejo"),
+        "the live agent is not named:\n{frame}"
+    );
+    assert!(
+        !flat.contains("agent-1 and agent-2"),
+        "the waiting agent was counted as live:\n{frame}"
+    );
+}
+
+#[test]
+fn the_quit_warning_follows_a_live_view_change_until_the_second_q() {
+    // The warning is rendered from the live view; the final count is captured only
+    // when the second q actually shuts down. A started second agent that becomes
+    // running while the confirmation is open must appear in both.
+    let mut initial = view(2);
+    initial.agents[0].desired = Desired::Started;
+    initial.agents[0].session = SessionState::Running {
+        number: 1,
+        since: SystemTime::now(),
+    };
+    initial.agents[1].desired = Desired::Started;
+    initial.agents[1].session = SessionState::Blocked {
+        reason: "not started — write an instruction first".to_owned(),
+    };
+    let shared = Arc::new(Mutex::new(initial));
+    let mut board = Board::new(ChangingEngine {
+        view: Arc::clone(&shared),
+        changed: false,
+    });
+    board.on_key(KeyEvent::from(KeyCode::Char('q')));
+    assert_eq!(board.active_started_count(), 1);
+    assert_eq!(board.quit_stopped_count(), 0);
+    board.tick();
+    assert_eq!(board.active_started_count(), 2);
+    let frame = frame_text(&draw(&mut board, 120, 40));
+    assert!(
+        frame.contains("agent-1") && frame.contains("agent-2"),
+        "{frame}"
+    );
+    board.on_key(KeyEvent::from(KeyCode::Char('q')));
+    assert_eq!(
+        board.quit_stopped_count(),
+        2,
+        "the final count did not follow the live view shown by the warning"
+    );
 }
 
 #[test]
