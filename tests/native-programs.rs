@@ -319,7 +319,7 @@ fn native_pi_reads_an_issue_pushes_a_branch_and_opens_a_pull_request() {
         .expect("the issue is opened");
     eprintln!("live: opened team/workspace#{} at {url}", issue.number);
 
-    let branch = "native-pi-r12";
+    let branch = "native-pi-demo";
     let model = Stub::start(vec![
         sse_tool(
             "read",
@@ -332,10 +332,10 @@ fn native_pi_reads_an_issue_pushes_a_branch_and_opens_a_pull_request() {
             serde_json::json!({
                 "command": format!(
                     "cd workspace && git checkout -b {branch} && \
-                     printf 'native pi r12\\n' > native-pi.txt && \
+                     printf 'native pi demo\\n' > native-pi.txt && \
                      git add native-pi.txt && \
                      git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 \
-                         commit -m 'native pi r12' -q && \
+                         commit -m 'native pi demo' -q && \
                      git push -u origin {branch} && echo push_ok"
                 )
             }),
@@ -345,7 +345,7 @@ fn native_pi_reads_an_issue_pushes_a_branch_and_opens_a_pull_request() {
             "mcp__gewu_forgejo__forgejo_open_pull_request",
             serde_json::json!({
                 "repository": "team/workspace",
-                "title": "Native Pi r12",
+                "title": "Native Pi demo",
                 "body": format!("The native Pi agent pushed this for issue #{}.", issue.number)
             }),
         ),
@@ -554,7 +554,7 @@ fn native_codex_reads_an_issue_pushes_and_opens_a_pull_request() {
             "Do the native work.",
         )
         .expect("the issue is opened");
-    let branch = "native-codex-r12";
+    let branch = "native-codex-demo";
     let model = Stub::start(vec![
         sse_codex_tool(
             "forgejo_read_issue_or_pull",
@@ -566,7 +566,7 @@ fn native_codex_reads_an_issue_pushes_and_opens_a_pull_request() {
             "functions",
             serde_json::json!({
                 "cmd": format!(
-                    "cd workspace && git checkout -b {branch} && printf 'native codex r12\\n' > native-codex.txt && git add native-codex.txt && git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 commit -m 'native codex r12' -q && git push -u origin {branch} && echo push_ok"
+                    "cd workspace && git checkout -b {branch} && printf 'native codex demo\\n' > native-codex.txt && git add native-codex.txt && git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 commit -m 'native codex demo' -q && git push -u origin {branch} && echo push_ok"
                 )
             }),
         ),
@@ -575,7 +575,7 @@ fn native_codex_reads_an_issue_pushes_and_opens_a_pull_request() {
             "mcp__gewu_forgejo",
             serde_json::json!({
                 "repository": "team/workspace",
-                "title": "Native Codex r12",
+                "title": "Native Codex demo",
                 "body": format!("The native Codex agent pushed this for issue #{}.", issue.number)
             }),
         ),
@@ -621,7 +621,7 @@ fn native_codex_reads_an_issue_pushes_and_opens_a_pull_request() {
             name: "agent-1".to_owned(),
             mode: "full-access".to_owned(),
         })
-        .expect("the D106 opt-in is saved");
+        .expect("the explicit compatibility opt-in opt-in is saved");
     wait_engine(
         &mut engine,
         "Codex to be selected",
@@ -744,7 +744,7 @@ fn native_dsh_reads_an_issue_pushes_and_opens_a_pull_request() {
             "Do the native work.",
         )
         .expect("issue");
-    let branch = "native-dsh-r12";
+    let branch = "native-dsh-demo";
     let model = Stub::start(vec![
         sse_tool(
             "read",
@@ -756,7 +756,7 @@ fn native_dsh_reads_an_issue_pushes_and_opens_a_pull_request() {
             "bash",
             serde_json::json!({
                 "command": format!(
-                    "cd workspace && git checkout -b {branch} && printf 'native dsh r12\\n' > native-dsh.txt && git add native-dsh.txt && git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 commit -m 'native dsh r12' -q && git push -u origin {branch} && echo push_ok"
+                    "cd workspace && git checkout -b {branch} && printf 'native dsh demo\\n' > native-dsh.txt && git add native-dsh.txt && git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 commit -m 'native dsh demo' -q && git push -u origin {branch} && echo push_ok"
                 ),
                 "description": "push the native DSH branch"
             }),
@@ -766,7 +766,7 @@ fn native_dsh_reads_an_issue_pushes_and_opens_a_pull_request() {
             "mcp__gewu_forgejo__forgejo_open_pull_request",
             serde_json::json!({
                 "repository": "team/workspace",
-                "title": "Native DSH r12",
+                "title": "Native DSH demo",
                 "body": format!("The native DSH agent pushed this for issue #{}.", issue.number)
             }),
         ),
@@ -923,7 +923,7 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
         sse_tool(
             "shell",
             "shell",
-            serde_json::json!({"command": "printf 'native opencode r12\\n' > native-opencode.txt"}),
+            serde_json::json!({"command": "printf 'native opencode demo\\n' > native-opencode.txt"}),
         ),
         sse_final("OpenCode wrote the file with its own shell tool."),
         sse_final("OpenCode wrote the file with its own shell tool."),
@@ -998,7 +998,7 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
         .join("native-opencode.txt");
     assert_eq!(
         fs::read_to_string(&proof).expect("the native OpenCode write"),
-        "native opencode r12\n"
+        "native opencode demo\n"
     );
     engine
         .send(Command::Stop {

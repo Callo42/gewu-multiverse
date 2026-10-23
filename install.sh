@@ -21,6 +21,8 @@ tag=
 harnesses=${GEWU_HARNESSES:-pi}
 dir=${INSTALL_DIR:-$HOME/.local/bin}
 floor=2.39
+say() { printf '%s\n' "$*" >&2; }
+die() { say "install.sh: $*"; exit 1; }
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --harness)
@@ -46,9 +48,6 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
-
-say() { printf '%s\n' "$*" >&2; }
-die() { say "install.sh: $*"; exit 1; }
 
 [ "$(uname -s)" = "Linux" ] || die "only Linux is supported today ($(uname -s) found); build from source: cargo install --git https://github.com/$repo"
 [ "$(uname -m)" = "x86_64" ] || die "only x86_64 is built today ($(uname -m) found); build from source: cargo install --git https://github.com/$repo"
