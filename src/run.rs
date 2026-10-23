@@ -979,6 +979,166 @@ mod tests {
             "no write and no push is not work"
         );
     }
+
+    /// A child process used by the descriptor-exit tests. It holds either the
+    /// inherited memfd capability or a named file descriptor, optionally makes its
+    /// fd table inaccessible, announces readiness and then exits after a short hold.
+    #[test]
+    fn capability_descriptor_helper() {
+        if std::env::var_os("GEWU_RUN_CAPABILITY_HELPER").is_none() {
+            return;
+        }
+        let marker = std::env::var("GEWU_RUN_CAPABILITY_MARKER").expect("marker path");
+        let hold_ms: u64 = std::env::var("GEWU_RUN_CAPABILITY_HOLD_MS")
+            .expect("hold")
+            .parse()
+            .expect("hold number");
+        let file = std::env::var_os("GEWU_RUN_CAPABILITY_FILE")
+            .map(|path| fs::File::open(path).expect("the helper opens its descriptor"));
+        if std::env::var_os("GEWU_RUN_CAPABILITY_NONDUMPABLE").is_some() {
+            let _ = rustix::process::set_dumpable_behavior(
+                rustix::process::DumpableBehavior::NotDumpable,
+            );
+        }
+        fs::write(marker, b"ready").expect("the helper marker");
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+        drop(file);
+    }
+
+    fn spawn_capability_helper(
+        root: &Path,
+        non_dumpable: bool,
+        file: Option<&Path>,
+        hold_ms: u64,
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let marker = root.join("capability-helper-marker");
+        let mut command = Command::new(std::env::current_exe().expect("the test executable"));
+        command
+            .args([
+                "--exact",
+                "run::tests::capability_descriptor_helper",
+                "--nocapture",
+            ])
+            .env("GEWU_RUN_CAPABILITY_HELPER", "1")
+            .env("GEWU_RUN_CAPABILITY_MARKER", &marker)
+            .env("GEWU_RUN_CAPABILITY_HOLD_MS", hold_ms.to_string())
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if non_dumpable {
+            command.env("GEWU_RUN_CAPABILITY_NONDUMPABLE", "1");
+        }
+        if let Some(file) = file {
+            command.env("GEWU_RUN_CAPABILITY_FILE", file);
+        }
+        let child = command.spawn().expect("the capability helper starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.is_file(), "the capability helper never became ready");
+        child
+    }
+
+    fn wait_for_inaccessible_fds(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if fs::read_dir(format!("/proc/{pid}/fd")).is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the helper's fd table never became inaccessible");
+    }
+
+    fn memfd_capability() -> (fs::File, Capability) {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+        let fd = nix::sys::memfd::memfd_create(
+            "gewu-exiting-capability",
+            nix::sys::memfd::MFdFlags::empty(),
+        )
+        .expect("memfd");
+        let mut capability = fs::File::from(fd);
+        let token = [0x6d_u8; 16];
+        capability.write_all(&token).expect("token");
+        capability.seek(SeekFrom::Start(0)).expect("seek");
+        let metadata = capability.metadata().expect("metadata");
+        (
+            capability,
+            Capability {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                token: hex(&token),
+            },
+        )
+    }
+
+    #[test]
+    fn a_dying_descriptor_open_error_is_accepted_as_gone() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("capability-exit-open");
+        let file = root.join("capability");
+        fs::write(&file, [0x5b_u8; 16]).expect("token file");
+        let metadata = fs::metadata(&file).expect("metadata");
+        let capability = Capability {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            token: hex(&[0x5b_u8; 16]),
+        };
+        let mut child = spawn_capability_helper(&root, false, Some(&file), 250);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).expect("deny open");
+        let mut saw_error = false;
+        for entry in fs::read_dir(format!("/proc/{}/fd", child.id())).expect("fd table") {
+            let entry = entry.expect("fd");
+            if fs::metadata(entry.path()).is_ok() && fs::File::open(entry.path()).is_err() {
+                saw_error = true;
+            }
+        }
+        assert!(
+            saw_error,
+            "the fixture did not produce a descriptor open error"
+        );
+        let result = pid_holds_capability(child.id(), &capability);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("restore");
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            !result.expect("the dying open-error holder is uncertain, not a holder"),
+            "an exited open-error holder was reported as still holding the capability"
+        );
+    }
+
+    #[test]
+    fn a_persistently_inaccessible_capability_holder_stays_uncertain() {
+        let root = scratch_root("capability-live-inaccessible");
+        let (_capability_file, capability) = memfd_capability();
+        let mut child = spawn_capability_helper(&root, true, None, 5_000);
+        wait_for_inaccessible_fds(child.id());
+        let started = std::time::Instant::now();
+        let result = pid_holds_capability(child.id(), &capability);
+        let elapsed = started.elapsed();
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+        let error = result.expect_err("a live inaccessible holder must stay uncertain");
+        assert!(
+            error.contains("file descriptors cannot be read"),
+            "the live inaccessible holder error changed: {error}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300)
+                && elapsed < std::time::Duration::from_secs(2),
+            "the bounded recheck was not bounded: {elapsed:?}"
+        );
+    }
 }
 
 /// The file recording one run's process group, beside the pid record.
@@ -1310,33 +1470,86 @@ fn read_capability(run_dir: &Path) -> Option<Capability> {
 
 /// Whether one process holds the run's memfd capability. Permission/fd errors
 /// are visible only for a process already known to be in the run's group.
+///
+/// A process that is exiting can transiently refuse its `/proc/<pid>/fd` reads
+/// after it has already been signalled. Re-observe only that concrete descriptor
+/// error class for a short bounded window. Absence is accepted only with positive
+/// gone/zombie/exited facts; a live, unreadable or unknown process still returns
+/// uncertainty and keeps its records.
 fn pid_holds_capability(pid: u32, capability: &Capability) -> Result<bool, String> {
+    const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
+    const STEP: std::time::Duration = std::time::Duration::from_millis(10);
+    let deadline = std::time::Instant::now() + RECHECK;
+    loop {
+        match pid_holds_capability_once(pid, capability) {
+            Ok(found) => return Ok(found),
+            Err((message, error)) if descriptor_error_may_be_exit(&error) => {
+                // `/proc` absence is not proof of an ending by itself: a live
+                // process can be hidden from procfs. Only a successful zero
+                // signal is a positive "still exists" fact; a dead pid or a
+                // zombie/dead state is a positive ending fact.
+                if !process_alive(pid) {
+                    return Ok(false);
+                }
+                match process_facts(pid) {
+                    Ok(Some((state, _, _))) if process_state_has_ended(state) => return Ok(false),
+                    Ok(Some(_)) | Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(message);
+                        }
+                        std::thread::sleep(STEP);
+                    }
+                    Err(stat) => {
+                        return Err(format!(
+                            "process {pid}'s state cannot be read while checking the run's capability: {stat}"
+                        ));
+                    }
+                }
+            }
+            Err((message, _)) => return Err(message),
+        }
+    }
+}
+
+/// A positive ending fact from `/proc/<pid>/stat`. A stopped/traced process is
+/// still live and unknown for recovery.
+fn process_state_has_ended(state: char) -> bool {
+    matches!(state, 'Z' | 'X' | 'x')
+}
+
+/// The descriptor-read error class a process can produce while it is exiting.
+fn descriptor_error_may_be_exit(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+    ) || error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32)
+}
+
+fn pid_holds_capability_once(
+    pid: u32,
+    capability: &Capability,
+) -> Result<bool, (String, io::Error)> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let fds = match fs::read_dir(format!("/proc/{pid}/fd")) {
         Ok(fds) => fds,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => match process_facts(pid) {
-            Ok(Some((state, _, _))) if state != 'Z' => {
-                return Err(format!(
+        Err(error) => {
+            return Err((
+                format!(
                     "process {pid}'s file descriptors cannot be read while checking the run's capability: {error}"
-                ));
-            }
-            Ok(_) => return Ok(false),
-            Err(stat) => {
-                return Err(format!(
-                    "process {pid}'s state cannot be read while checking the run's capability: {stat}"
-                ));
-            }
-        },
+                ),
+                error,
+            ));
+        }
     };
     for fd in fds.flatten() {
         let target = match fs::metadata(fd.path()) {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(format!(
-                    "process {pid}'s file descriptor cannot be inspected: {error}"
+                return Err((
+                    format!("process {pid}'s file descriptor cannot be inspected: {error}"),
+                    error,
                 ));
             }
         };
@@ -1347,8 +1560,9 @@ fn pid_holds_capability(pid: u32, capability: &Capability) -> Result<bool, Strin
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(format!(
-                    "process {pid}'s capability cannot be opened: {error}"
+                return Err((
+                    format!("process {pid}'s capability cannot be opened: {error}"),
+                    error,
                 ));
             }
         };
