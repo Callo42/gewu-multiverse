@@ -1,6 +1,6 @@
 [package]
 name = "gewu-multiverse"
-version = "0.1.35"
+version = "0.1.36"
 edition = "2024"
 rust-version = "1.85"
 description = "One bundled Forgejo on your machine and the agents you run on it, drawn as a terminal board."
