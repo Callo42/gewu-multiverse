@@ -12,7 +12,7 @@ mod text;
 mod theme;
 
 use crate::engine_api::{
-    AgentView, BoardView, Command, Desired, EndpointTest, EngineApi, Provisioning,
+    AgentView, BoardView, Command, Desired, EndpointTest, EngineApi, Provisioning, SessionState,
 };
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -103,6 +103,9 @@ pub struct Board {
     sent: Vec<Command>,
     handoff: Option<Handoff>,
     quitting: bool,
+    /// The live started agents the quit confirmation named, frozen so the final
+    /// line counts the same population even if shutdown updates the view.
+    quit_stopped: Option<usize>,
     shutdown_sent: bool,
     shutdown_calls: usize,
 }
@@ -155,6 +158,7 @@ impl Board {
             sent: Vec::new(),
             handoff: None,
             quitting: false,
+            quit_stopped: None,
             shutdown_sent: false,
             shutdown_calls: 0,
         };
@@ -611,6 +615,9 @@ impl Board {
                 self.quitting = true;
             } else if matches!(key.code, KeyCode::Esc) || matches!(plain(key), Some('n')) {
                 self.confirm_quit = false;
+                // The person changed their mind; a later quit must freeze a fresh
+                // population, not the one this cancelled confirmation named.
+                self.quit_stopped = None;
             }
             return;
         }
@@ -857,15 +864,8 @@ impl Board {
     }
 
     fn request_quit(&mut self) {
-        let started = self.view.agents.iter().any(|agent| {
-            agent.desired == Desired::Started
-                && matches!(
-                    agent.session,
-                    crate::engine_api::SessionState::Running { .. }
-                        | crate::engine_api::SessionState::Restarting { .. }
-                )
-        });
-        if !started {
+        let live = self.active_started_count();
+        if live == 0 {
             self.leave_without_warning();
             return;
         }
@@ -880,6 +880,7 @@ impl Board {
     }
 
     fn leave_without_warning(&mut self) {
+        self.quit_stopped.get_or_insert(0);
         self.shutdown();
         self.quitting = true;
     }
@@ -891,6 +892,8 @@ impl Board {
         }
         self.shutdown_sent = true;
         self.shutdown_calls += 1;
+        let live = self.active_started_count();
+        self.quit_stopped.get_or_insert(live);
         self.engine.shutdown(Duration::from_secs(2));
     }
 
@@ -924,9 +927,36 @@ impl Board {
         &self.last
     }
 
+    /// The started agents that are running or restarting now.
+    ///
+    /// This is the population the quit warning names and the final line counts: an
+    /// agent waiting between runs, or stopped by a missing instruction, is still
+    /// started, but it has no live run for `quit` to stop. The shutdown path still
+    /// stops every live run and the Forgejo.
+    pub fn active_started(&self) -> impl Iterator<Item = &AgentView> {
+        self.view.agents.iter().filter(|agent| {
+            agent.desired == Desired::Started
+                && matches!(
+                    agent.session,
+                    SessionState::Running { .. } | SessionState::Restarting { .. }
+                )
+        })
+    }
+
+    /// How many started agents have a live run now, so the warning and the final
+    /// line count the same population.
+    pub fn active_started_count(&self) -> usize {
+        self.active_started().count()
+    }
+
     /// Whether the loop should stop.
     pub fn should_quit(&self) -> bool {
         self.quitting
+    }
+
+    /// The live started agents the quit confirmation named, for the final line.
+    pub fn quit_stopped_count(&self) -> usize {
+        self.quit_stopped.unwrap_or(0)
     }
 
     /// How many times shutdown ran.

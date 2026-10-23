@@ -150,14 +150,20 @@ commit made there is authored by the agent because the account really exists and
 key really pushes the commit.
 
 An agent uses the user's own `git`; no `glab` and no other Git host client is needed.
-The work rule is the assignment: the list tool shows only the open issues assigned to
-the agent's own account in its cloned repositories, and a write outside that scope is
-refused by Forgejo. `forgejo_read_issue_or_pull` can open any issue or pull request by
-number in a cloned repository (a read is not a claim on it); the page therefore says
-`agents work only on issues assigned to them`, not that reads are invisible. The page
-and the README say so, and the Agent screen's empty work area says `no issues assigned
-to gewu-agent-1 yet`. Assign an issue to the agent's Forgejo
-account first; an unassigned issue is not silently picked up.
+The work rule starts with the assignment: the list tool shows only the open issues
+assigned to the agent's own account in its cloned repositories. The page therefore says
+`assigned issues are the focus; comments in cloned team repos`, not that every read or
+comment is assignment-scoped. `forgejo_read_issue_or_pull` can open any issue or pull
+request by number in a cloned repository (a read is not a claim on it), and
+`forgejo_comment` may write one comment on any issue or pull request in a cloned team
+repository, even when it is assigned to someone else; the repository boundary is what
+the product tool enforces. The shell runs with the agent's own Forgejo account and is
+not assignment-scoped either. The page and the README say so, and the Agent screen's
+empty work area says `no issues assigned to gewu-agent-1 yet`. Assign an issue to the
+agent's Forgejo account first; an unassigned issue is not listed as work. The page's
+organisation row says `team — create repositories under team`, because Forgejo's
+new-repository form defaults to the owner's personal namespace; the agents see only the
+organisation's repositories.
 The run declares six Forgejo tools beside `shell` only when all three hold: a Forgejo
 context was written for the run, the agent's identity is settled with its own key in
 the credentials file, and at least one repository is cloned into its workspace.

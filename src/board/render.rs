@@ -11,8 +11,7 @@ use crate::board::text as text_util;
 use crate::board::theme;
 use crate::board::{Board, Screen};
 use crate::engine_api::{
-    AgentView, Desired, EndpointTest, ForgejoState, ForgejoView, Provisioning, SessionEnd,
-    SessionState,
+    AgentView, EndpointTest, ForgejoState, ForgejoView, Provisioning, SessionEnd, SessionState,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -956,16 +955,7 @@ fn status_row_needed(board: &Board) -> bool {
 /// The agents the quit warning names: started, and running or restarting.
 fn started_agent_names(board: &Board) -> Vec<&str> {
     board
-        .view
-        .agents
-        .iter()
-        .filter(|agent| {
-            agent.desired == Desired::Started
-                && matches!(
-                    agent.session,
-                    SessionState::Running { .. } | SessionState::Restarting { .. }
-                )
-        })
+        .active_started()
         .map(|agent| agent.name.as_str())
         .collect()
 }
@@ -2879,7 +2869,10 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         agent
             .last_failure
             .as_ref()
-            .map(|failure| format!("{failure_mark} {}", status::tool_failure(failure)))
+            .map(|failure| {
+                let fitted = status::fit_tool_failure(failure, width.saturating_sub(2));
+                format!("{failure_mark} {fitted}")
+            })
             .or_else(|| {
                 agent
                     .last_error
@@ -3257,6 +3250,19 @@ fn draw_instruction(
     );
 }
 
+/// End a clipped instruction row with an explicit ellipsis.
+///
+/// The count of hidden **file** lines is preferred when a row can be spared; at the
+/// one-row floor there is no such row, so the visible cut itself says the text
+/// continues. A row that already ends in an ellipsis is left alone.
+fn continued_instruction(part: &str, width: usize) -> String {
+    if part.ends_with('…') {
+        part.to_owned()
+    } else {
+        text_util::ellipsize(&format!("{part}…"), width)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_instruction_rows(
     buf: &mut Buffer,
@@ -3274,16 +3280,19 @@ fn draw_instruction_rows(
     let total_rows: usize = physical.iter().map(Vec::len).sum();
     if total_rows <= rows {
         let mut row = 0;
+        let mut last = None;
         for line in physical {
             for part in line {
+                let shown = text_util::ellipsize_words(part, width);
                 text_util::put(
                     buf,
                     clip,
                     x,
                     top + row as u16,
-                    &text_util::ellipsize_words(part, width),
+                    &shown,
                     theme::card(theme::FG, true),
                 );
+                last = Some((shown, top + row as u16));
                 row += 1;
             }
         }
@@ -3300,6 +3309,18 @@ fn draw_instruction_rows(
                 &text_util::ellipsize(&format!("… ({hidden} more {noun})"), width),
                 theme::card(theme::MUTED, true),
             );
+        } else if hidden > 0 {
+            // No row is left for the count; the visible cut still says it continues.
+            if let Some((part, y)) = last {
+                text_util::put(
+                    buf,
+                    clip,
+                    x,
+                    y,
+                    &continued_instruction(&part, width),
+                    theme::card(theme::FG, true),
+                );
+            }
         }
         return;
     }
@@ -3311,6 +3332,7 @@ fn draw_instruction_rows(
     }
     let mut drawn = 0;
     let mut fully_shown = 0;
+    let mut last = None;
     for line in physical {
         if drawn >= take {
             break;
@@ -3321,14 +3343,16 @@ fn draw_instruction_rows(
                 complete = false;
                 break;
             }
+            let shown = text_util::ellipsize_words(part, width);
             text_util::put(
                 buf,
                 clip,
                 x,
                 top + drawn as u16,
-                &text_util::ellipsize_words(part, width),
+                &shown,
                 theme::card(theme::FG, true),
             );
+            last = Some((shown, top + drawn as u16));
             drawn += 1;
         }
         if complete {
@@ -3346,6 +3370,20 @@ fn draw_instruction_rows(
             &text_util::ellipsize(&format!("… ({hidden} more {noun})"), width),
             theme::card(theme::MUTED, true),
         );
+    } else if hidden > 0 {
+        // The one-row floor has no row for the count. End the visible instruction
+        // with an explicit cut; the file-line count is still what a spare row would
+        // show, never a count of display rows.
+        if let Some((part, y)) = last {
+            text_util::put(
+                buf,
+                clip,
+                x,
+                y,
+                &continued_instruction(&part, width),
+                theme::card(theme::FG, true),
+            );
+        }
     }
 }
 
@@ -3412,18 +3450,33 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
             }],
         ),
         ("version", vec![view.version.clone()]),
-        ("organisation", vec![view.organisation.clone()]),
+        (
+            "organisation",
+            text_util::wrap(
+                &format!(
+                    "{} — create repositories under {}",
+                    view.organisation, view.organisation
+                ),
+                room,
+            ),
+        ),
         ("repositories", text_util::wrap(&repositories, room)),
         ("your login:", text_util::wrap(&login, room)),
         ("password", text_util::wrap(&password, room)),
         (
             "agents can",
-            vec!["write to team repositories only".to_owned()],
+            text_util::wrap(
+                &format!("write to {} repositories only", view.organisation),
+                room,
+            ),
         ),
         (
             "agents work",
             text_util::wrap(
-                "only on issues assigned to them — assign an issue in Forgejo",
+                &format!(
+                    "assigned issues are the focus; comments in cloned {} repos",
+                    view.organisation
+                ),
                 room,
             ),
         ),

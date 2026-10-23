@@ -1223,7 +1223,11 @@ fn the_forgejo_page_names_repositories_permissions_and_the_team() {
     assert!(frame.contains("write to team repositories only"), "{frame}");
     assert!(frame.contains("/org/team/teams/agents"), "{frame}");
     assert!(
-        frame.contains("only on issues assigned to them — assign an issue in Forgejo"),
+        frame.contains("assigned issues are the focus; comments in cloned team repos"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("team — create repositories under team"),
         "{frame}"
     );
     assert!(frame.contains("kept from an earlier setup"), "{frame}");
@@ -1389,11 +1393,21 @@ fn a_long_one_line_instruction_is_signposted_at_the_floor() {
             flat.contains("Take issue #1"),
             "{width}x{height}: the first line disappeared behind the count:\n{frame}"
         );
-        if !flat.contains("with the link.") && width >= 80 {
+        if !flat.contains("with the link.") {
+            let row = frame
+                .lines()
+                .find(|line| line.contains("Take issue #1"))
+                .unwrap_or_else(|| panic!("{width}x{height}: no instruction row:\n{frame}"));
             assert!(
-                frame.contains("… (") && frame.contains("more line"),
-                "{width}x{height}: the dropped text is not counted:\n{frame}"
+                row.contains('…'),
+                "{width}x{height}: the visible cut has no ellipsis:\n{frame}"
             );
+            if width >= 80 {
+                assert!(
+                    frame.contains("… (") && frame.contains("more line"),
+                    "{width}x{height}: the dropped text is not counted:\n{frame}"
+                );
+            }
         }
         assert_no_text_on_a_rule_row(&buffer, &format!("long-line {width}x{height}"));
     }
@@ -1434,9 +1448,13 @@ fn a_long_one_line_instruction_keeps_its_first_line_when_a_second_row_exists() {
     let mut board = Board::new(long_line_engine(1));
     press(&mut board, KeyCode::Enter);
     let frame = text(&draw(&mut board, 72, 18));
+    let row = frame
+        .lines()
+        .find(|line| line.contains("Take issue #1"))
+        .unwrap_or_else(|| panic!("the one-row floor lost the first line (U4):\n{frame}"));
     assert!(
-        frame.contains("Take issue #1"),
-        "the one-row floor must keep the first line (U4):\n{frame}"
+        row.contains('…'),
+        "the one-row floor cut the instruction without an ellipsis:\n{frame}"
     );
 }
 
@@ -1638,8 +1656,12 @@ fn the_floor_forgejo_page_keeps_every_fact_and_the_assignment_rule() {
     let frame = text(&draw(&mut board, 72, 18));
     let flat = flat(&draw(&mut board, 72, 18));
     assert!(
-        flat.contains("only on issues assigned to them — assign an issue in Forgejo"),
+        flat.contains("assigned issues are the focus; comments in cloned team repos"),
         "the assignment rule is not whole at 72x18:\n{flat}"
+    );
+    assert!(
+        flat.contains("create repositories under team"),
+        "the create-under-team guidance is missing at 72x18:\n{flat}"
     );
     for wanted in [
         "17.0.0",
@@ -1647,7 +1669,8 @@ fn the_floor_forgejo_page_keeps_every_fact_and_the_assignment_rule() {
         "team",
         "team page",
         "/org/team/teams/agents",
-        "only on issues assigned",
+        "assigned issues are the focus",
+        "create repositories under team",
         "your login:",
     ] {
         assert!(

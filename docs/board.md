@@ -322,7 +322,11 @@ levels of symbolic links`, `File name too long` and every other errno text — o
 `cannot create`/`cannot remove`/`cannot open`/`cannot stat`/`cannot access` naming a
 path, or a line in the shell's own diagnostic prefix, lowers the mark to `⊘` when the
 command names a recognised write and to `⚠` otherwise. When a mixed failure prints
-more than one diagnostic, the failed write's own line is the cause row.
+more than one diagnostic, the failed write's own line is the cause row. A long POSIX
+diagnostic is shortened to `<program>: …: <error>` before the card's one-line cut, so
+the program and `Permission denied` survive; the transcript keeps the full line. A
+failed `[ … ]`/`test` condition names its non-zero status instead of borrowing a later
+stdout line.
 The shell's own voice is the third witness. The product launches the shell, so it
 knows the exact `<name>: ` with which bash prefixes its own errors and warnings: the
 outer shell's name and the `$0` of every nested `bash` that reads `BASH_ENV` arrive
@@ -386,7 +390,8 @@ says `no issues assigned to gewu-agent-1 yet`. The instruction's first display r
 own, and the text never shares a row with that rule. `… (N more lines)` counts the
 **file lines** of the document that did not fit, not the wrapped display rows, and the
 noun agrees (`1 more line`). At the 72×18 floor the section keeps the first display
-row; where a second row exists the marker goes on the next row. From 80 columns the
+row; where a second row exists the marker goes on the next row, and at the one-row
+floor the visible cut itself ends in `…` (with no count row to claim). From 80 columns the
 taller panel uses its spare rows: more display rows, and at a tall size the whole
 instruction. The run strip is bounded: at most five marks, then `+N`, with a small
 legend, the newest mark's one-word label, and the run count on the right. The selected card has the cyan border and tinted background.
@@ -476,12 +481,12 @@ the board. A hand-off steps out of the terminal and restores it exactly.
 │                                                      │
 │  address        http://127.0.0.1:3000                │
 │  version        17.0.0                               │
-│  organisation   team                                 │
+│  organisation   team — create repositories under team│
 │  repositories   3                                    │
 │  your login:    owner                                │
 │  password       ••••••••••  p resets it — 10 s, old…│
 │  agents can     write to team repositories only      │
-│  agents work    only on issues assigned to them — … │
+│  agents work    assigned issues are the focus; …     │
 │  team page      http://127.0.0.1:3000/org/team/…    │
 │  agents         gewu-agent-1 · gewu-agent-2          │
 │                                                      │
@@ -493,12 +498,14 @@ the board. A hand-off steps out of the terminal and restores it exactly.
 
 The screen uses the state words above. While Forgejo is not installed, `address` says
 `not set up yet`, not an address. `repositories` lists the organisation's repositories
-by name; `agents can` is the one-line permission summary; `agents work only on issues
-assigned to them — assign an issue in Forgejo` is the work rule (the list tool shows
-only its own assigned issues; a write outside that scope is refused); `team page` is
-`/org/<organisation>/teams/<team>` (never `/orgs/`, which is a 404). At 72×18 the page
-keeps every row, wrapping the two long ones instead of dropping version, organisation
-or the team page. A login kept from an installation made by an earlier
+by name; `organisation` also says `create repositories under team` because the Forgejo
+form defaults to the owner's personal namespace and the agents see only organisation
+repositories; `agents can` is the one-line permission summary; `assigned issues are the
+focus; comments in cloned team repos` is the work rule (the list tool shows only its
+own assigned issues, while a comment on any issue or pull request in a cloned team
+repository is allowed); `team page` is `/org/<organisation>/teams/<team>` (never
+`/orgs/`, which is a 404). At 72×18 the page keeps every row, wrapping the long ones
+instead of dropping version, organisation or the team page. A login kept from an installation made by an earlier
 version says `(kept from an earlier setup)`. Repository changes seen between two
 administration-API polls appear on the page and on the board at every supported size:
 `team/scratch was deleted`, `team/website was created` (inside the box where it is tall
@@ -595,9 +602,10 @@ The engine states are mapped to the words above in one place, `src/board/status.
 No screen invents the words `session`, `provisioning`, `token`, `endpoint`, `missing`,
 `blocked`, `process group`, `loopback` or `2xx` in the product's own text; a render test
 scans every engine-authored frame for them. A notice is cleaned through the same map
-and loses its backticks. A run's own final summary is not engine text: it is shown
-verbatim apart from the existing credential masking, so a word inside it is never
-replaced by a status label.
+and loses its backticks. A run's own final summary is not engine text: it is not
+rewritten apart from the existing credential masking, so a word inside it is never
+replaced by a status label. When the visible row cannot hold it, it ends in an explicit
+`…`; the full sentence is in the transcript (`t`).
 
 The same test scans every frame at every supported size for this vocabulary, and
 another checks that every card and every wire is whole and connected.

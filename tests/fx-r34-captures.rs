@@ -269,7 +269,7 @@ fn capture_the_model_form_warnings_upgrade_and_quit_warning() {
             env!("CARGO_PKG_VERSION")
         ),
         whats_new:
-            "run marks say exactly what happened, and a started agent's runs never outlive it"
+            "run marks name what was observed; an ordinary earlier run is stopped and its cleanup checked before the board reopens"
                 .to_owned(),
         warnings_changed: true,
     });

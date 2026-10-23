@@ -433,7 +433,9 @@ fn capture_the_version_tag_upgrade_screen() {
                 "https://github.com/Callo42/gewu-multiverse/releases/tag/v{}",
                 env!("CARGO_PKG_VERSION")
             ),
-            whats_new: "run marks say exactly what happened".to_owned(),
+            whats_new:
+                "run marks name what was observed; an ordinary earlier run is stopped and its cleanup checked before the board reopens"
+                    .to_owned(),
             warnings_changed: false,
         });
         let mut board = Board::new(Fixed(upgrade));

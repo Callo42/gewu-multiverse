@@ -458,7 +458,10 @@ long`, `Too many levels of symbolic links` and every other errno text — or
 `cannot create`/`cannot remove`/`cannot open`/`cannot stat`/`cannot access` naming a
 path) is a witness, so an unlisted program's failure there is `⚠`. When a mixed
 failure prints more than one diagnostic, the failed write's own line is the cause
-row. The shell's own voice is the third witness. Every shell that reads the prelude
+row. A long POSIX diagnostic is shortened to `<program>: …: <error>` so the error words
+survive a card's one-line cut; the transcript keeps the full line. A failed
+`[ … ]`/`test` condition names its status, never a later stdout line. The shell's own
+voice is the third witness. Every shell that reads the prelude
 reports its `$0` — the outer shell and every nested `bash` that reads `BASH_ENV` —
 and the trap reports `BASH_SOURCE[0]`, the name bash uses for a sourced command or a
 function defined there; bash prefixes its own errors and warnings with that exact
@@ -553,6 +556,7 @@ own message, kept whole and wrapped to the form's rows at 80 columns); a 404 on 
 engine's reasons, notices and model-test lines are written in the same plain words the
 board uses. `src/board/status.rs` is the one cleaner for engine-authored text and also
 removes the backticks the engine writes around names. It is deliberately not applied to
-a run's own final summary: the model's words are shown verbatim apart from the existing
+a run's own final summary: the model's words are not rewritten apart from the existing
 credential masking, so an ordinary word such as `missing` inside a sentence is never
-turned into a status label.
+turned into a status label. A long summary may be shortened on the visible row with an
+explicit `…`; the transcript (`t`) keeps the whole sentence.
