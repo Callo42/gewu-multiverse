@@ -1314,13 +1314,21 @@ pub struct RunHandle {
     inner: Box<dyn RunningSession>,
 }
 
-impl RunHandle {
-    /// Adopt a spawned session into the owner's handle. Crate-private: external
-    /// callers cannot make a handle to signal.
-    pub(crate) fn new(inner: Box<dyn RunningSession>) -> Self {
-        Self { inner }
-    }
+mod handle {
+    use super::{RunHandle, RunningSession};
 
+    pub(super) fn new(inner: Box<dyn RunningSession>) -> RunHandle {
+        RunHandle { inner }
+    }
+}
+
+/// Adopt a spawned session into the owner's handle. This is an owner request, not a
+/// public constructor; the handle's signal method remains private.
+pub(crate) fn adopt_session(inner: Box<dyn RunningSession>) -> RunHandle {
+    handle::new(inner)
+}
+
+impl RunHandle {
     /// The child's pid / process-group id.
     pub fn pid(&self) -> u32 {
         self.inner.pid()
@@ -1350,8 +1358,8 @@ impl EndingSeal {
     }
 }
 
-/// Deserialization only: an old transcript's terminal record has no seal. It cannot
-/// be used to construct a new one outside the owner's storage path.
+/// Storage-only deserialization default. It cannot construct a terminal record
+/// itself; the text guard rejects calls outside the owner/storage modules.
 pub(crate) fn seal_from_storage() -> EndingSeal {
     EndingSeal::new()
 }
@@ -1834,6 +1842,52 @@ pub fn stop_uncertain(
     reason
 }
 
+/// A run directory owned by the owner from the moment it exists. Dropping an armed
+/// guard records a prepared-run ending; disarming it just before spawn hands the run
+/// to the child/handle path.
+pub struct PreparedRun {
+    run_dir: std::path::PathBuf,
+    run_id: String,
+    armed: bool,
+}
+
+impl PreparedRun {
+    /// Create (or reuse) a prepared run directory at 0700.
+    pub fn create(run_dir: &Path, run_id: &str) -> Result<Self, String> {
+        std::fs::create_dir_all(run_dir)
+            .map_err(|error| format!("{} cannot be created: {error}", run_dir.display()))?;
+        crate::mode::set_mode(run_dir, crate::mode::PRIVATE_DIR_MODE)
+            .map_err(|error| format!("{} cannot be restricted: {error}", run_dir.display()))?;
+        Ok(Self {
+            run_dir: run_dir.to_path_buf(),
+            run_id: run_id.to_owned(),
+            armed: true,
+        })
+    }
+
+    /// The directory this guard owns.
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// Hand the run to the child path: no prepared-run ending is written.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreparedRun {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = request_cancel_prepared(
+                &self.run_dir,
+                &self.run_id,
+                "the prepared run was dropped before it was spawned",
+            );
+        }
+    }
+}
+
 /// Cancel a run that exists only as a prepared directory, before any child exists.
 /// This is the startup-cancellation owner path: it writes exactly one stopped
 /// terminal and stop record, or explicit uncertainty, with no process handle.
@@ -1909,9 +1963,9 @@ pub(crate) fn adapter_signal_run_group(pid: u32, force: bool) {
     let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
 }
 
-/// Signal a starting child's group by the pid the job reported. The job owns the
-/// wait and reaps it when it returns.
-pub(crate) fn signal_starting_group(pid: u32, force: bool) {
+/// Request a signal to a starting child's group by the pid the job reported. The
+/// job owns the wait and reaps it when it returns.
+pub(crate) fn request_starting_stop(pid: u32, force: bool, _reason: &str) {
     adapter_signal_run_group(pid, force);
 }
 

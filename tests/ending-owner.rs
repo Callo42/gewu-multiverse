@@ -28,6 +28,8 @@ const ENDING_TOKENS: &[&str] = &[
     "pin_first_ending",
     "ending_uncertainty(",
     "seal_from_storage",
+    "RunHandle::new",
+    "signal_starting_group",
     "recorded_first_ending(",
     "STOPPED_FILE",
     "FIRST_ENDING_FILE",
@@ -168,7 +170,7 @@ fn the_owner_exposes_the_ending_requests() {
         "pub fn recover_ending",
         "pub fn request_natural_finish",
         "pub fn request_failed_finish",
-        "pub(crate) fn signal_starting_group",
+        "pub(crate) fn request_starting_stop",
         "pub(crate) fn adapter_signal_run_group",
     ] {
         assert!(text.contains(token), "the owner lacks `{token}`");

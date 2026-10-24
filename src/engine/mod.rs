@@ -3054,7 +3054,7 @@ impl EngineApi for Engine {
                     }
                 }
                 if let Some(pid) = agent.starting_pid {
-                    run::signal_starting_group(pid, false);
+                    run::request_starting_stop(pid, false, "the starting run was stopped");
                 }
             }
             if let Some(server) = inner.forgejo.child.as_mut() {
@@ -3133,7 +3133,7 @@ impl EngineApi for Engine {
             for pid in run_appeared {
                 if !signalled.contains(&pid) {
                     signalled.push(pid);
-                    run::signal_starting_group(pid, false);
+                    run::request_starting_stop(pid, false, "the starting run was stopped");
                 }
             }
             for pid in appeared {
@@ -3214,7 +3214,7 @@ impl EngineApi for Engine {
                     }
                 }
                 if let Some(pid) = agent.starting_pid.take() {
-                    run::signal_starting_group(pid, true);
+                    run::request_starting_stop(pid, true, "the starting run was forced");
                 }
                 agent.starting = false;
                 agent.session = SessionState::Idle;
@@ -3533,7 +3533,7 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
         // The job checks the desired choice after every wait, stops a child it has
         // already spawned, and clears `starting` itself.
         if let Some(pid) = agent.starting_pid {
-            run::signal_starting_group(pid, false);
+            run::request_starting_stop(pid, false, "the starting run was stopped");
         }
         agent.starting = false;
     }
@@ -4026,12 +4026,7 @@ fn session_job(
     {
         let mut guard = lock_inner(&inner);
         let Some(index) = guard.agent_index(&request.agent) else {
-            drop(guard);
-            let _ = run::request_cancel_prepared(
-                &request.run_dir,
-                &request.run_id,
-                "the run was called off before it became current",
-            );
+            // `prepared` is dropped here; its owner guard records the ending.
             return;
         };
         if guard.stopping
@@ -4039,19 +4034,13 @@ fn session_job(
             || guard.agents[index].desired != Desired::Started
             || !guard.agents[index].starting
         {
-            let reason = if guard.stopping {
-                "the run was stopped when the program closed"
-            } else {
-                "the run was called off before it became current"
-            };
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
-            drop(guard);
-            let _ = run::request_cancel_prepared(&request.run_dir, &request.run_id, reason);
+            // `prepared` is dropped here; its owner guard records the ending.
             return;
         }
     }
-    let prepared = match prepared {
+    let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(reason) => {
             let now = clock.now();
@@ -4063,15 +4052,8 @@ fn session_job(
                 || guard.generation != generation
                 || guard.agents[index].desired != Desired::Started
             {
-                let reason = if guard.stopping {
-                    "the run was stopped when the program closed"
-                } else {
-                    "the run was called off before it became current"
-                };
                 guard.agents[index].starting = false;
                 guard.agents[index].starting_pid = None;
-                drop(guard);
-                let _ = run::request_cancel_prepared(&request.run_dir, &request.run_id, reason);
                 return;
             }
             guard.agents[index].starting = false;
@@ -4090,6 +4072,9 @@ fn session_job(
             return;
         }
     };
+    // The run is about to be spawned: the prepared-run guard must not write a
+    // cancellation ending. The child/handle path owns the ending from here.
+    prepared.guard.disarm();
     // Spawn without the state lock. The spawner reports the pid as soon as the child
     // exists, so a shutdown during a spawner's own wait can signal it. Recording the
     // pid takes the lock only for the short store.
@@ -4112,7 +4097,7 @@ fn session_job(
         // directory on disk, not only the current settings.
         drop(guard);
         if let Ok(handle) = spawned {
-            let mut handle = run::RunHandle::new(handle);
+            let mut handle = run::adopt_session(handle);
             let pid = handle.pid();
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
@@ -4165,7 +4150,7 @@ fn session_job(
         let stopping = guard.stopping;
         drop(guard);
         if let Ok(handle) = spawned {
-            let mut handle = run::RunHandle::new(handle);
+            let mut handle = run::adopt_session(handle);
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
             let pid = handle.pid();
@@ -4234,7 +4219,7 @@ fn session_job(
             guard.agents[index].running = Some(RunningState {
                 run_dir: request.run_dir.clone(),
                 started,
-                handle: run::RunHandle::new(handle),
+                handle: run::adopt_session(handle),
                 stopping: false,
                 stop_deadline: None,
                 stop_requested: false,
@@ -6719,10 +6704,11 @@ mod tests {
             &self,
             request: &crate::engine::session::SessionRequest,
         ) -> Result<crate::engine::session::PreparedSession, String> {
-            crate::engine::session::ensure_run_dir(&request.run_dir)?;
+            let guard = crate::run::PreparedRun::create(&request.run_dir, &request.run_id)?;
             Ok(crate::engine::session::PreparedSession {
                 run_dir: request.run_dir.clone(),
                 workspace: request.workspace.clone(),
+                guard,
             })
         }
         fn spawn_with(
@@ -7067,6 +7053,77 @@ mod tests {
         }
         assert!(run_dir.join(run::STOPPED_FILE).is_file());
         assert!(fake.live().is_empty(), "a child was spawned after shutdown");
+    }
+
+    #[test]
+    fn a_prepare_error_after_the_run_directory_gets_an_ending() {
+        let root = scratch_root("engine-prepare-error-ending");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_prepare_after_dir("the workspace could not be prepared");
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut run_dir = None;
+        while Instant::now() < deadline {
+            run_dir = fake.last_run_dir();
+            if run_dir
+                .as_ref()
+                .is_some_and(|dir| crate::transcript::terminal_record(dir).is_some())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let run_dir = run_dir.expect("prepare created a run directory");
+        let terminal =
+            crate::transcript::terminal_record(&run_dir).expect("a failed prepare left no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        assert!(
+            fake.live().is_empty(),
+            "a child was spawned after the failure"
+        );
+    }
+
+    #[test]
+    fn a_prepare_error_with_the_agent_removed_still_gets_an_ending() {
+        let root = scratch_root("engine-prepare-error-removed");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_prepare_after_dir("the workspace could not be prepared");
+        let (prepared_rx, release) = fake.block_next_prepare();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        prepared_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session prepared its run directory");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents.clear();
+        }
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let terminal = crate::transcript::terminal_record(&run_dir)
+            .expect("a prepare error with the agent removed left no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
     }
 
     #[test]

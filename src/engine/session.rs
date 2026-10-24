@@ -99,12 +99,13 @@ pub struct NativeRequest {
 }
 
 /// A session whose slow work is done and whose plan is on disk.
-#[derive(Debug, Clone)]
 pub struct PreparedSession {
     /// The run's record directory.
     pub run_dir: PathBuf,
     /// The agent's workspace.
     pub workspace: PathBuf,
+    /// Owner guard for the prepared run; disarmed just before spawn.
+    pub guard: crate::run::PreparedRun,
 }
 
 /// The name of the pid file inside a run's record directory.
@@ -163,7 +164,7 @@ impl RealSpawner {
 
 impl SessionSpawner for RealSpawner {
     fn prepare(&self, request: &SessionRequest) -> Result<PreparedSession, String> {
-        ensure_run_dir(&request.run_dir)?;
+        let guard = crate::run::PreparedRun::create(&request.run_dir, &request.run_id)?;
         crate::mode::hold_dir_private_below(&request.state_root, &request.run_dir).map_err(
             |error| {
                 format!(
@@ -263,6 +264,7 @@ impl SessionSpawner for RealSpawner {
         Ok(PreparedSession {
             run_dir: request.run_dir.clone(),
             workspace: request.workspace.clone(),
+            guard,
         })
     }
 
@@ -398,6 +400,7 @@ struct FakeInner {
     last_run_dir: Option<PathBuf>,
     last_repositories: Vec<SessionRepository>,
     prepare_failure: Option<String>,
+    prepare_failure_after_dir: Option<String>,
     spawn_failure: Option<String>,
     block_next_spawn: Option<(std::sync::mpsc::Sender<u32>, std::sync::mpsc::Receiver<()>)>,
     block_next_prepare: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
@@ -467,6 +470,14 @@ impl FakeSpawner {
             .prepare_failure = Some(reason.to_owned());
     }
 
+    /// Make the next `prepare` fail after it created the run directory.
+    pub fn fail_prepare_after_dir(&self, reason: &str) {
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .prepare_failure_after_dir = Some(reason.to_owned());
+    }
+
     /// Make the next spawn fail before a child exists.
     pub fn fail_spawn(&self, reason: &str) {
         self.inner
@@ -527,7 +538,7 @@ impl SessionSpawner for FakeSpawner {
         if let Some(reason) = inner.prepare_failure.take() {
             return Err(reason);
         }
-        ensure_run_dir(&request.run_dir)?;
+        let guard = crate::run::PreparedRun::create(&request.run_dir, &request.run_id)?;
         let plan = RunPlan {
             run_id: request.run_id.clone(),
             agent: request.agent.clone(),
@@ -566,14 +577,22 @@ impl SessionSpawner for FakeSpawner {
         inner.last_prepared = Some(request.agent.clone());
         inner.last_run_dir = Some(request.run_dir.clone());
         inner.last_repositories = request.repositories.clone();
+        let after_dir_failure = inner.prepare_failure_after_dir.take();
         if let Some((started, release)) = inner.block_next_prepare.take() {
             drop(inner);
             let _ = started.send(());
             let _ = release.recv();
+            if let Some(reason) = after_dir_failure {
+                return Err(reason);
+            }
+        } else if let Some(reason) = after_dir_failure {
+            drop(inner);
+            return Err(reason);
         }
         Ok(PreparedSession {
             run_dir: request.run_dir.clone(),
             workspace: request.workspace.clone(),
+            guard,
         })
     }
 
@@ -645,14 +664,6 @@ fn write_pid(run_dir: &Path, pid: u32) -> Result<(), String> {
 fn write_pgid(run_dir: &Path, pgid: u32) -> Result<(), String> {
     crate::mode::write_private(run_dir.join(PGID_FILE), pgid.to_string().as_bytes())
         .map_err(|error| format!("the session's process-group record cannot be written: {error}"))
-}
-
-/// Ensure one run's directory exists at 0700.
-pub(crate) fn ensure_run_dir(run_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(run_dir)
-        .map_err(|error| format!("{} cannot be created: {error}", run_dir.display()))?;
-    crate::mode::set_mode(run_dir, crate::mode::PRIVATE_DIR_MODE)
-        .map_err(|error| format!("{} cannot be restricted: {error}", run_dir.display()))
 }
 
 /// The exit code of a status, when it has one; a signal is reported as 128+signal.
