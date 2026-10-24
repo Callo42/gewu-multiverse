@@ -1257,6 +1257,16 @@ fn launch_budget(timeout_secs: u64) -> LaunchBudget {
     }
 }
 
+/// OpenCode 2.1.4 owns its retry loop and ignores the provider `maxRetries`
+/// option, so its request timeout must fit an observed twelve attempts inside the
+/// session deadline. Three attempts is the other harnesses' configured budget.
+fn opencode_request_ms(timeout_secs: u64) -> u64 {
+    const OBSERVED_ATTEMPTS: u64 = 12;
+    let total_ms = timeout_secs.max(1).saturating_mul(1000);
+    let usable = total_ms.saturating_sub(total_ms / 5);
+    (usable / OBSERVED_ATTEMPTS).clamp(1_000, 45_000)
+}
+
 /// Build the program command, its extra environment and a short config description.
 type Launch = (Vec<String>, Vec<(String, String)>, String);
 
@@ -1470,7 +1480,7 @@ fn build_launch(
                         "options": {
                             "baseURL": native.base_url,
                             "apiKey": format!("{{file:{}}}", files.key.display()),
-                            "timeout": budget.request_ms,
+                            "timeout": opencode_request_ms(plan.timeout_secs),
                             "maxRetries": 2
                         },
                         "models": {
@@ -2472,6 +2482,9 @@ mod launch_budget_tests {
             );
             assert!(budget.request_ms >= 1_000);
             assert!(budget.request_ms <= 120_000);
+            if timeout_secs >= 60 {
+                assert!(opencode_request_ms(timeout_secs) * 12 < timeout_secs * 1000);
+            }
         }
     }
 }
