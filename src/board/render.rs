@@ -3425,6 +3425,20 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Agent program");
     let inner = inner(area);
     let mut y = inner.y + 1;
+    if let Some(unknown) = board.program_unknown.as_ref() {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            &text_util::ellipsize(
+                &format!("saved program `{unknown}` is not one this product knows"),
+                inner.width.saturating_sub(2) as usize,
+            ),
+            theme::fg(theme::RED),
+        );
+        y += 1;
+    }
     for index in 0..5 {
         let program = if index == 0 {
             Program::Builtin
@@ -3434,7 +3448,7 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
                 .copied()
                 .unwrap_or(Program::Builtin)
         };
-        let selected = index == board.program_index;
+        let selected = index == board.program_index && board.program_unknown.is_none();
         let marker = if selected { "▸ " } else { "  " };
         let installed = board
             .view
@@ -4205,5 +4219,39 @@ mod program_view_tests {
                 "the next native sandbox was lost at {width} columns: {text}"
             );
         }
+    }
+    #[test]
+    fn an_unknown_saved_program_is_shown_and_not_preselected() {
+        let mut engine = FakeEngine::new();
+        engine.send(Command::AcknowledgeTerms).expect("terms");
+        engine
+            .send(Command::SetEndpoint {
+                url: "https://model.example/v1/chat/completions".to_owned(),
+                model: "demo-model".to_owned(),
+                key: Some("demo-key".to_owned()),
+            })
+            .expect("endpoint");
+        engine
+            .send(Command::CreateAgents { count: 1 })
+            .expect("agents");
+        let mut board = Board::new(engine);
+        board.screen = Screen::Program;
+        board.agent_name = "agent-1".to_owned();
+        board.view.agents[0].unknown_program = Some("potato".to_owned());
+        board.view.agents[0].program_label = "unknown program `potato`".to_owned();
+        board.program_unknown = Some("potato".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| board.draw(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("potato"), "{text}");
+        assert!(text.contains("not one this product knows"), "{text}");
+        assert!(!text.contains("▸ built-in engine"), "{text}");
     }
 }

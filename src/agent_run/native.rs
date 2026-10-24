@@ -948,8 +948,19 @@ fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
             })
         });
     if read_prefix && !compound_action && !update_pr && !open_pr {
-        let comment_local =
-            tokens.contains(&"code") || tokens.contains(&"file") || tokens.contains(&"source");
+        let path_like = lower.split_whitespace().any(|word| {
+            word.contains('/')
+                || [
+                    ".rs", ".md", ".py", ".js", ".ts", ".go", ".java", ".c", ".h", ".toml",
+                    ".json", ".yaml", ".yml", ".sh",
+                ]
+                .iter()
+                .any(|suffix| word.ends_with(suffix))
+        });
+        let comment_local = tokens.contains(&"code")
+            || tokens.contains(&"file")
+            || tokens.contains(&"source")
+            || path_like;
         let pr_explicit = tokens.contains(&"pr") || lower.contains("pull request");
         let comment_explicit = tokens.contains(&"comment") && !comment_local;
         let forgejo_noun = forgejo || pr_explicit || comment_explicit;
@@ -2292,6 +2303,10 @@ mod native_proof_tests {
         );
         assert_eq!(
             requested_work("Read the code comment in src/main.rs.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the comment in src/main.rs.", &[]),
             RequestedWork::ReadOnly
         );
         assert_eq!(

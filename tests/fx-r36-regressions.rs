@@ -174,6 +174,7 @@ fn board_view(_run_dir: &Path, outcome: &str, reason: &str) -> BoardView {
             last_result_is_work: false,
             program: "builtin".to_owned(),
             program_label: "built-in engine".to_owned(),
+            unknown_program: None,
             program_installed: true,
             program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             protocol: "chat-completions".to_owned(),

@@ -103,6 +103,9 @@ pub struct Board {
     program_index: usize,
     /// The connection type selected beside the program.
     program_protocol: Protocol,
+    /// The saved program value the Program screen must show as an error until
+    /// the person explicitly chooses a known one.
+    program_unknown: Option<String>,
     /// The Codex dangerous-sandbox explanation was shown; a second `f` is opt-in.
     codex_optin_confirmed: bool,
     confirm_remove: Option<String>,
@@ -163,6 +166,7 @@ impl Board {
             model_agent: None,
             program_index: 0,
             program_protocol: Protocol::ChatCompletions,
+            program_unknown: None,
             codex_optin_confirmed: false,
             confirm_remove: None,
             confirm_quit: false,
@@ -810,6 +814,12 @@ impl Board {
                         .find(|agent| agent.name == self.agent_name)
                         .map(|agent| agent.program.as_str())
                         .unwrap_or("builtin");
+                    self.program_unknown = self
+                        .view
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == self.agent_name)
+                        .and_then(|agent| agent.unknown_program.clone());
                     self.program_index = if current == "builtin" {
                         0
                     } else {
@@ -924,6 +934,7 @@ impl Board {
         match key.code {
             KeyCode::Esc => self.screen = Screen::Agent,
             KeyCode::Up => {
+                self.program_unknown = None;
                 self.program_index = (self.program_index + 4) % 5;
                 let supported = self.selected_program().supported_protocols();
                 if !supported.contains(&self.program_protocol) {
@@ -934,6 +945,7 @@ impl Board {
                 }
             }
             KeyCode::Down => {
+                self.program_unknown = None;
                 self.program_index = (self.program_index + 1) % 5;
                 let supported = self.selected_program().supported_protocols();
                 if !supported.contains(&self.program_protocol) {
@@ -946,6 +958,12 @@ impl Board {
             KeyCode::Left => self.cycle_program_protocol(false),
             KeyCode::Right => self.cycle_program_protocol(true),
             KeyCode::Enter => {
+                if let Some(unknown) = self.program_unknown.clone() {
+                    self.set_notice(format!(
+                        "the saved program `{unknown}` is not one this product knows; choose a program first"
+                    ));
+                    return;
+                }
                 let program = self.selected_program();
                 if !program.supports(self.program_protocol) {
                     self.program_protocol = program

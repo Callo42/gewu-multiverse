@@ -2123,6 +2123,10 @@ impl EngineApi for Engine {
                             .unwrap_or_else(|| saved.harness().label().to_owned())
                     })
                     .unwrap_or_else(|| Program::Builtin.label().to_owned()),
+                unknown_program: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| saved.unknown_harness()),
                 program_installed: inner
                     .settings
                     .agent(&agent.name)

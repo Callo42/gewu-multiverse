@@ -226,6 +226,8 @@ pub struct AgentView {
     pub program: String,
     /// The selected program's display name.
     pub program_label: String,
+    /// A saved program value this build does not know, kept for repair.
+    pub unknown_program: Option<String>,
     /// Whether the selected program is installed.
     pub program_installed: bool,
     /// The installed version, when it is.
