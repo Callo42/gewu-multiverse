@@ -51,7 +51,10 @@ durable `.install-journal` records each state. If the process is killed before t
 old root moves, the stage is removed and the old root stays. If it is killed between
 the two renames, the next engine open restores the old root from the backup before
 the first picture. If it is killed after publication, the verified new root stays
-and the owned backup is cleaned. A stage left by the earlier pre-journal installer
+and the owned backup is cleaned. If a cancel/rename failure cannot verify that the old
+root is restored, the error names the uncertainty and the journal plus owned backup
+are kept; removing a foreign destination is always the person's action, never the
+installer's. A stage left by the earlier pre-journal installer
 is recognised only by its exact name and package-file contents; a lone complete
 legacy backup is restored when the version root is missing. Foreign stages,
 backups, symlinked journals and unrecognised locks are preserved.
@@ -66,8 +69,10 @@ foreign lock or a cancelled program install leaves the installed binary in place
 
 DeepSeek Harness 0.2.1-rc.2 is installed from its vendored lockfile with `npm ci`,
 an isolated `HOME`/cache inside the stage, the official npm registry, and no global
-Node/npm, shared cache or user npm setting changed. Node.js 24.9 or newer and npm are
-required and are checked before a stage is made.
+Node/npm, shared cache or user npm setting changed. Node.js 24.9 or newer and npm
+11.16.0 or newer are required and are checked before a stage is made. npm before
+11.16.0 ignores the project `allowScripts` map, so the installer refuses it rather than
+running a denied lifecycle script; the check happens before any stage or download.
 
 The lockfile has five packages with install scripts. This product reviews that exact
 set: `node-pty@1.2.0-beta.15`, `koffi@3.1.1` and
@@ -75,8 +80,10 @@ set: `node-pty@1.2.0-beta.15`, `koffi@3.1.1` and
 helpers are needed; `@google/genai@2.21.0` and `protobufjs@7.6.6` are recorded as
 denied no-ops. Any changed lock with a different script set fails before `npm`
 starts. `allowScripts` is not a blanket switch, and this installer never passes
-`--dangerously-allow-all-scripts`. If npm is configured to skip install scripts, the
-install fails with that reason instead of pretending the program is ready. After
+`--dangerously-allow-all-scripts`. A configured
+`dangerously-allow-all-scripts=true` is refused before npm runs, because it bypasses
+the two explicit denials. If npm is configured to skip install scripts, the install
+fails with that reason instead of pretending the program is ready. After
 `npm ci`, the installer loads `node-pty`'s native module and executes `koffi`'s libc
 `getpid` binding; a `spawn-helper`, where the platform ships one, must be executable.
 A missing or non-executable helper fails truthfully and the old version is kept.

@@ -209,7 +209,7 @@ impl Program {
     pub fn prerequisite(self) -> Option<&'static str> {
         match self {
             Self::Builtin | Self::Pi | Self::Codex | Self::Opencode => None,
-            Self::Dsh => Some("Node.js 24.9+ and npm"),
+            Self::Dsh => Some("Node 24.9+ / npm 11.16+"),
         }
     }
 

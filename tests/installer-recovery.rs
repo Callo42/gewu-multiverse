@@ -168,6 +168,8 @@ fn cancelling_during_the_locked_package_build_kills_npm_and_removes_the_stage() 
     write_executable(
         &sandbox.bin.join("npm"),
         r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '11.17.0
+'; exit 0; fi
 if [ "$1" = "config" ]; then printf 'false
 '; exit 0; fi
 : > "$NPM_STARTED"
@@ -349,6 +351,192 @@ fn a_hard_kill_after_the_old_root_rename_is_recovered_before_use() {
 }
 
 #[test]
+fn cancelling_after_the_old_rename_restores_it_and_removes_the_journal() {
+    let sandbox = Sandbox::new("cancel-after-old");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"old-moved\""))
+                .unwrap_or(false)
+                && !root.exists()
+        },
+        Duration::from_secs(15),
+    );
+    assert!(
+        ready,
+        "the installer reached the pause after the old rename"
+    );
+    signal(&child, "INT");
+    let status = child.wait().expect("the installer ends");
+    assert_eq!(status.code(), Some(130), "{status:?}");
+    assert_eq!(
+        fs::read(root.join("pi/pi")).expect("the restored old binary"),
+        old_binary
+    );
+    assert!(!journal.exists());
+    assert!(stage_dirs(&harness).is_empty());
+    assert!(
+        !fs::read_dir(&harness)
+            .expect("the harness directory")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    );
+}
+
+#[test]
+fn a_failed_restore_keeps_foreign_data_the_old_backup_and_the_journal() {
+    let sandbox = Sandbox::new("failed-restore");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename");
+    let child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"old-moved\""))
+                .unwrap_or(false)
+                && !root.exists()
+        },
+        Duration::from_secs(15),
+    );
+    assert!(
+        ready,
+        "the installer reached the pause after the old rename"
+    );
+
+    // Occupy the destination with data this installer does not own. A truthful
+    // rollback must leave it alone and keep the old backup and journal.
+    fs::create_dir_all(&root).expect("the foreign root");
+    fs::write(root.join("foreign-keep"), b"user data").expect("the foreign data");
+    signal(&child, "INT");
+    let output = child.wait_with_output().expect("the installer ends");
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not be confirmed restored")
+            && stderr.contains("recovery journal")
+            && stderr.contains("owned backup were kept"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read(root.join("foreign-keep")).expect("the foreign data"),
+        b"user data"
+    );
+    assert!(journal.exists(), "the recovery journal was removed");
+    assert!(
+        fs::read_dir(&harness)
+            .expect("the harness directory")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    );
+    assert!(stage_dirs(&harness).is_empty());
+
+    // Once the foreign destination is removed by its owner, the kept journal and
+    // backup restore the old version exactly.
+    fs::remove_dir_all(&root).expect("the test's foreign destination");
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(
+        fs::read(root.join("pi/pi")).expect("the restored old binary"),
+        old_binary
+    );
+    assert!(!journal.exists());
+    assert!(
+        !fs::read_dir(&harness)
+            .expect("the harness directory")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    );
+}
+
+#[test]
+fn a_kill_between_the_old_rename_and_its_journal_write_is_recovered() {
+    let sandbox = Sandbox::new("kill-unjournaled");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename-before-journal");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"staged\""))
+                .unwrap_or(false)
+                && !root.exists()
+                && fs::read_dir(&harness)
+                    .expect("the harness directory")
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the pre-journal pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+    assert!(journal.exists());
+    assert!(!stage_dirs(&harness).is_empty());
+
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(
+        fs::read(root.join("pi/pi")).expect("the restored old binary"),
+        old_binary
+    );
+    assert!(!journal.exists());
+    assert!(stage_dirs(&harness).is_empty());
+    assert!(
+        !fs::read_dir(&harness)
+            .expect("the harness directory")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    );
+}
+
+#[test]
 fn a_legacy_old_root_is_restored_when_the_version_root_is_missing() {
     let sandbox = Sandbox::new("legacy-old");
     let harness = sandbox.harness_dir("pi");
@@ -505,9 +693,13 @@ fn blocked_dsh_scripts_are_diagnosed_and_the_old_install_is_kept() {
     write_executable(
         &sandbox.bin.join("npm"),
         r#"#!/bin/sh
-if [ "$1" = "--version" ]; then printf '11.17.0\n'; exit 0; fi
+if [ "$1" = "--version" ]; then printf '%s\n' "${FAKE_NPM_VERSION:-11.17.0}"; exit 0; fi
 if [ "$1" = "config" ]; then
-  printf '%s\n' "${FAKE_IGNORE_SCRIPTS:-false}"
+  case "$3" in
+    ignore-scripts) printf '%s\n' "${FAKE_IGNORE_SCRIPTS:-false}" ;;
+    dangerously-allow-all-scripts) printf '%s\n' "${FAKE_DANGEROUS:-false}" ;;
+    *) printf 'false\n' ;;
+  esac
   exit 0
 fi
 prefix=
@@ -550,6 +742,65 @@ exit 0
         fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint"),
         old
     );
+}
+
+#[test]
+fn unsupported_npm_and_dangerous_script_config_are_refused_before_effects() {
+    let sandbox = Sandbox::new("dsh-npm-policy");
+    let root = sandbox.install_root("dsh", "0.2.1-rc.2");
+    dsh_old_install(&root, "0.2.0", 0);
+    let old = fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint");
+    let marker = sandbox.root.join("npm-ci-ran");
+    write_executable(
+        &sandbox.bin.join("npm"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '%s
+' "${FAKE_NPM_VERSION:-11.17.0}"; exit 0; fi
+if [ "$1" = "config" ]; then
+  case "$3" in
+    ignore-scripts) printf '%s
+' "${FAKE_IGNORE_SCRIPTS:-false}" ;;
+    dangerously-allow-all-scripts) printf '%s
+' "${FAKE_DANGEROUS:-false}" ;;
+    *) printf 'false
+' ;;
+  esac
+  exit 0
+fi
+: > "$NPM_CI_MARKER"
+exit 0
+"#,
+    );
+    for (version, dangerous, ignore, expected) in [
+        ("11.15.0", "false", "false", "older than 11.16"),
+        ("11.17.0", "true", "false", "dangerously-allow-all-scripts"),
+        ("11.17.0", "false", "true", "skips install scripts"),
+    ] {
+        let _ = fs::remove_file(&marker);
+        let mut command = sandbox.product();
+        command
+            .env("FAKE_NPM_VERSION", version)
+            .env("FAKE_DANGEROUS", dangerous)
+            .env("FAKE_IGNORE_SCRIPTS", ignore)
+            .env("NPM_CI_MARKER", &marker)
+            .args(["--install-harness", "dsh"]);
+        let output = command.output().expect("the product runs");
+        assert!(!output.status.success(), "{version}/{dangerous}/{ignore}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{version}/{dangerous}/{ignore}: {stderr}"
+        );
+        assert!(
+            !marker.exists(),
+            "npm ci ran despite the preflight refusal: {version}/{dangerous}/{ignore}"
+        );
+        assert_eq!(
+            fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint"),
+            old
+        );
+        assert!(stage_dirs(&sandbox.harness_dir("dsh")).is_empty());
+    }
 }
 
 #[test]

@@ -144,6 +144,11 @@ pub fn install(
     if let Some(prerequisite) = program.prerequisite_missing() {
         return Err(prerequisite.to_owned());
     }
+    if program == Program::Dsh {
+        // npm only enforces the project allowScripts map from 11.16.0. Refusing an
+        // older npm here is before any package stage, download or lifecycle script.
+        verify_dsh_npm_policy_support()?;
+    }
     let prior_record_sha256 = if root.exists() {
         if fs::symlink_metadata(&root)
             .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
@@ -548,7 +553,7 @@ fn install_dsh(
     let koffi_version = json_field(&stage.join("node_modules/koffi/package.json"), "version")
         .unwrap_or_else(|| "unknown".to_owned());
     let resources = format!(
-        "npm lock sha256 {lock_sha}; @deepseek-ai/dsh tarball sha256 {} (verified; lock integrity sha512 verified); entrypoint {entrypoint}; node-pty pty.node sha256 {pty_sha}; koffi {koffi_version}; install scripts reviewed: node-pty, koffi and dsh-subprocess-local; no-op scripts denied: @google/genai and protobufjs; no recursive tree digest is claimed",
+        "npm lock sha256 {lock_sha}; @deepseek-ai/dsh tarball sha256 {} (verified; lock integrity sha512 verified); entrypoint {entrypoint}; node-pty pty.node sha256 {pty_sha}; koffi {koffi_version}; npm >=11.16 policy enforced; install scripts reviewed: node-pty, koffi and dsh-subprocess-local; no-op scripts denied: @google/genai and protobufjs; dangerously-allow-all-scripts refused; no recursive tree digest is claimed",
         harness::artefact_sha256(Program::Dsh)
     );
     // The npm home and cache are installer state, not part of the program.
@@ -556,6 +561,89 @@ fn install_dsh(
     let _ = fs::remove_dir_all(&cache);
     let _ = fs::remove_file(&log_path);
     write_record(stage, Program::Dsh, entrypoint, Some(resources))
+}
+
+/// npm 11.16.0 is the first release that enforces the project `allowScripts` map.
+/// Older npm silently runs a denied lifecycle script, so it cannot be used for the
+/// five-package DeepSeek Harness review. This preflight runs before a stage exists.
+fn verify_dsh_npm_policy_support() -> Result<(), String> {
+    let check = std::env::temp_dir().join(format!(".gewu-npm-policy-{}", new_token()));
+    fs::create_dir(&check)
+        .map_err(|error| format!("the npm policy check cannot start: {error}"))?;
+    let _ = crate::mode::set_mode(&check, crate::mode::PRIVATE_DIR_MODE);
+    let home = check.join("home");
+    let cache = check.join("cache");
+    fs::create_dir_all(&home)
+        .map_err(|error| format!("the npm policy check cannot start: {error}"))?;
+    fs::create_dir_all(&cache)
+        .map_err(|error| format!("the npm policy check cannot start: {error}"))?;
+    let _ = crate::mode::set_mode(&home, crate::mode::PRIVATE_DIR_MODE);
+    let _ = crate::mode::set_mode(&cache, crate::mode::PRIVATE_DIR_MODE);
+    let result = (|| {
+        let version = npm_config_output(&["--version"], &home, &cache)?;
+        let parsed = parse_npm_version(&version).ok_or_else(|| {
+            format!(
+                "npm reported an unreadable version ({version}); version 11.16 or newer is needed for DeepSeek Harness because older npm ignores its reviewed install scripts (the old version is unchanged)"
+            )
+        })?;
+        if parsed < (11, 16, 0) {
+            return Err(format!(
+                "npm {version} is older than 11.16 and ignores DeepSeek Harness's reviewed install scripts; update npm to 11.16 or newer and try again (the old version is unchanged)"
+            ));
+        }
+        let ignore = npm_config_output(&["config", "get", "ignore-scripts"], &home, &cache)?;
+        if config_is_true(&ignore) {
+            return Err(
+                "npm skips install scripts; DeepSeek Harness needs the three reviewed install scripts re-enabled (the old version is unchanged)"
+                    .to_owned(),
+            );
+        }
+        let dangerous = npm_config_output(
+            &["config", "get", "dangerously-allow-all-scripts"],
+            &home,
+            &cache,
+        )?;
+        if config_is_true(&dangerous) {
+            return Err(
+                "npm is configured with dangerously-allow-all-scripts, which runs every dependency script; remove that setting from npm config or the environment and try again (the old version is unchanged)"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&check);
+    result
+}
+
+fn parse_npm_version(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.trim().split('-').next().unwrap_or(version);
+    let mut pieces = core.split('.');
+    let major = pieces.next()?.parse().ok()?;
+    let minor = pieces.next()?.parse().ok()?;
+    let patch = pieces.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn config_is_true(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("true")
+}
+
+fn npm_config_output(args: &[&str], home: &Path, cache: &Path) -> Result<String, String> {
+    let output = Command::new("npm")
+        .args(args)
+        .env("HOME", home)
+        .env("npm_config_cache", cache)
+        .env("npm_config_registry", "https://registry.npmjs.org/")
+        .env("npm_config_update_notifier", "false")
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("npm could not be started: {error}"))?;
+    if !output.status.success() {
+        return Err("npm could not read its version or install-script configuration".to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn check_npm_scripts_enabled(stage: &Path, home: &Path, cache: &Path) -> Result<(), String> {
@@ -577,7 +665,7 @@ fn check_npm_scripts_enabled(stage: &Path, home: &Path, cache: &Path) -> Result<
     let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if value == "true" {
         return Err(
-            "npm skips install scripts; DeepSeek Harness needs the scripts reviewed by this installer"
+            "npm skips install scripts; DeepSeek Harness needs the three reviewed install scripts re-enabled (the old version is unchanged)"
                 .to_owned(),
         );
     }
@@ -1008,20 +1096,34 @@ fn publish(
             ));
         }
         sync_dir(directory)?;
+        // The gap before the journal says `old-moved` is test-observable. The
+        // initial `staged` journal already carries the prior record identity.
+        maybe_pause("after-old-rename-before-journal");
     }
     journal.state = JournalState::OldMoved;
     write_journal(&journal_path, &journal)?;
     maybe_pause("after-old-rename");
     if cancel.is_cancelled() {
-        rollback(root, &stage, directory, &journal_path, &journal);
-        return Err(INSTALL_CANCELED.to_owned());
+        return match rollback(root, &stage, directory, &journal_path, &journal, program) {
+            Ok(()) => Err(INSTALL_CANCELED.to_owned()),
+            Err(uncertainty) => Err(format!(
+                "the install was canceled but the previous version could not be confirmed restored: {uncertainty}; the recovery journal {} and owned backup were kept",
+                journal_path.display()
+            )),
+        };
     }
     if let Err(error) = fs::rename(&stage, root) {
-        rollback(root, &stage, directory, &journal_path, &journal);
-        return Err(format!(
-            "{} cannot be put in place ({error}); the old version is unchanged",
-            program.label()
-        ));
+        return match rollback(root, &stage, directory, &journal_path, &journal, program) {
+            Ok(()) => Err(format!(
+                "{} cannot be put in place ({error}); the old version is unchanged",
+                program.label()
+            )),
+            Err(uncertainty) => Err(format!(
+                "{} cannot be put in place ({error}), and the previous version could not be confirmed restored: {uncertainty}; the recovery journal {} and owned backup were kept",
+                program.label(),
+                journal_path.display()
+            )),
+        };
     }
     sync_dir(directory)?;
     journal.state = JournalState::Published;
@@ -1029,11 +1131,17 @@ fn publish(
     let installed = match harness::read_installed_at_root(root, program) {
         Some(installed) => installed,
         None => {
-            rollback(root, &stage, directory, &journal_path, &journal);
-            return Err(format!(
-                "{} was put in place but its program or required helper cannot be read back; the old version is unchanged",
-                program.label()
-            ));
+            return match rollback(root, &stage, directory, &journal_path, &journal, program) {
+                Ok(()) => Err(format!(
+                    "{} was put in place but its program or required helper cannot be read back; the old version is unchanged",
+                    program.label()
+                )),
+                Err(uncertainty) => Err(format!(
+                    "{} was put in place but its program or required helper cannot be read back, and the previous version could not be confirmed restored: {uncertainty}; the recovery journal {} and owned backup were kept",
+                    program.label(),
+                    journal_path.display()
+                )),
+            };
         }
     };
     maybe_pause("after-publish");
@@ -1057,18 +1165,93 @@ fn publish(
     Ok(installed)
 }
 
-fn rollback(root: &Path, stage: &Path, directory: &Path, journal_path: &Path, journal: &Journal) {
+/// Undo an interrupted publication. Success means the old root is back at its
+/// path (or there was no old root and the new tree is only in the owned stage) and
+/// the journal can be removed. Any uncertainty keeps the journal and every owned
+/// backup, and never deletes or overwrites a foreign destination.
+fn rollback(
+    root: &Path,
+    stage: &Path,
+    directory: &Path,
+    journal_path: &Path,
+    journal: &Journal,
+    program: Program,
+) -> Result<(), String> {
+    let mut problems = Vec::new();
     if root.exists() && !stage.exists() && root_owned_by(root, &journal.token) {
-        let _ = fs::rename(root, stage);
-    }
-    if let Some(old_name) = &journal.old {
-        let old_path = directory.join(old_name);
-        if old_path.exists() && !root.exists() {
-            let _ = fs::rename(&old_path, root);
+        if let Err(error) = fs::rename(root, stage) {
+            problems.push(format!(
+                "the new package could not be moved aside ({error})"
+            ));
+        } else {
+            let _ = sync_dir(directory);
         }
+    }
+    let old_path = journal.old.as_ref().map(|name| directory.join(name));
+    if let Some(old_path) = old_path.as_ref()
+        && old_path.exists()
+    {
+        if root.exists() {
+            problems.push(format!(
+                "the version root {} is occupied by something this installer cannot replace",
+                root.display()
+            ));
+        } else if !old_belongs_to_journal(
+            old_path,
+            &journal.token,
+            journal.prior_record_sha256.as_deref(),
+        ) {
+            problems.push(
+                "the backup does not carry this install's owner identity; it was left untouched"
+                    .to_owned(),
+            );
+        } else if let Err(error) = fs::rename(old_path, root) {
+            problems.push(format!(
+                "the previous version could not be restored ({error})"
+            ));
+        } else {
+            let _ = sync_dir(directory);
+        }
+    } else if journal.had_old {
+        problems.push("the previous version backup is missing".to_owned());
+    }
+    if !problems.is_empty() {
+        let _ = sync_dir(directory);
+        return Err(problems.join("; "));
+    }
+    if journal.had_old && (harness::read_installed_at_root(root, program).is_none()) {
+        return Err(
+            "the previous version is present at its root but does not read back as ready; the journal was kept"
+                .to_owned(),
+        );
     }
     let _ = fs::remove_file(journal_path);
     let _ = sync_dir(directory);
+    Ok(())
+}
+
+fn new_root_settled(root: &Path, program: Program, token: &str) -> bool {
+    root_owned_by(root, token) && harness::read_installed_at_root(root, program).is_some()
+}
+
+/// The journal's own prior record hash, or the stage token, proves the backup
+/// belongs to this transaction. Unlike deletion, restoration does not require the
+/// old tree to be "ready": a carried version with a missing helper is still the
+/// user's data and is put back rather than deleted.
+fn old_belongs_to_journal(old: &Path, token: &str, prior_record_sha256: Option<&str>) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(old) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    if stage_owned_by(old, token) {
+        return true;
+    }
+    let Some(expected) = prior_record_sha256 else {
+        return false;
+    };
+    sha256_file(&old.join("install.json")).ok().as_deref() == Some(expected)
 }
 
 fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(), String> {
@@ -1114,9 +1297,8 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                     // written before the first rename (a crash between them).
                     if let Some(old) = old.as_ref()
                         && old.exists()
-                        && owned_old(
+                        && old_belongs_to_journal(
                             old,
-                            program,
                             &journal.token,
                             journal.prior_record_sha256.as_deref(),
                         )
@@ -1137,20 +1319,21 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                 if !root.exists() {
                     if let Some(old) = old.as_ref()
                         && old.exists()
-                        && owned_old(
+                        && old_belongs_to_journal(
                             old,
-                            program,
                             &journal.token,
                             journal.prior_record_sha256.as_deref(),
                         )
                     {
                         fs::rename(old, root).map_err(|error| {
-                            format!("the previous install could not be restored: {error}")
+                            format!(
+                                "the previous install could not be restored; the journal and backup were kept ({error})"
+                            )
                         })?;
                         sync_dir(directory)?;
                     } else {
                         return Err(
-                            "the previous install was moved aside and cannot be verified; the journal was kept"
+                            "the previous install was moved aside and cannot be verified; the journal and any owned backup were kept"
                                 .to_owned(),
                         );
                     }
@@ -1160,40 +1343,82 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                 }
                 if let Some(old) = old.as_ref()
                     && old.exists()
-                    && owned_old(
-                        old,
-                        program,
-                        &journal.token,
-                        journal.prior_record_sha256.as_deref(),
-                    )
                 {
-                    let _ = fs::remove_dir_all(old);
+                    if new_root_settled(root, program, &journal.token) {
+                        if owned_old(
+                            old,
+                            program,
+                            &journal.token,
+                            journal.prior_record_sha256.as_deref(),
+                        ) {
+                            let _ = fs::remove_dir_all(old);
+                            sync_dir(directory)?;
+                        }
+                    } else {
+                        return Err(format!(
+                            "the version root is occupied and the previous version is still at {}; the journal and backup were kept",
+                            old.display()
+                        ));
+                    }
+                }
+                if !root.is_dir() {
+                    return Err(
+                        "the previous version is not present at its root; the journal was kept"
+                            .to_owned(),
+                    );
                 }
             }
             JournalState::Published => {
                 if stage.exists() {
                     remove_owned_stage(&stage, program, &journal.token)?;
                 }
-                if let Some(old) = old.as_ref()
-                    && old.exists()
-                    && owned_old(
-                        old,
-                        program,
-                        &journal.token,
-                        journal.prior_record_sha256.as_deref(),
-                    )
-                {
-                    if !root.exists() {
-                        // The new root was removed after publication; the old version
-                        // is the only usable copy and is restored rather than deleted.
+                if !root.exists() {
+                    if let Some(old) = old.as_ref()
+                        && old.exists()
+                        && old_belongs_to_journal(
+                            old,
+                            &journal.token,
+                            journal.prior_record_sha256.as_deref(),
+                        )
+                    {
                         fs::rename(old, root).map_err(|error| {
-                            format!("the previous install could not be restored: {error}")
+                            format!(
+                                "the previous install could not be restored; the journal and backup were kept ({error})"
+                            )
                         })?;
                         sync_dir(directory)?;
-                    } else {
+                    }
+                    if !root.exists() && old.as_ref().is_some_and(|path| path.exists()) {
+                        return Err(
+                            "the published root and a previous-version backup both remain unsettled; the journal and backup were kept"
+                                .to_owned(),
+                        );
+                    }
+                } else if new_root_settled(root, program, &journal.token) {
+                    if let Some(old) = old.as_ref()
+                        && old.exists()
+                        && owned_old(
+                            old,
+                            program,
+                            &journal.token,
+                            journal.prior_record_sha256.as_deref(),
+                        )
+                    {
                         let _ = fs::remove_dir_all(old);
                         sync_dir(directory)?;
                     }
+                } else if old.as_ref().is_some_and(|path| path.exists()) {
+                    return Err(format!(
+                        "the published version root could not be verified while a previous-version backup remains at {}; the journal and backup were kept",
+                        old.as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default()
+                    ));
+                } else if !root.is_dir() {
+                    return Err(
+                        "the published version root is not a directory; the journal was kept"
+                            .to_owned(),
+                    );
                 }
             }
         }
@@ -1570,6 +1795,18 @@ mod tests {
         );
         assert_eq!(base64(b"f"), "Zg==");
         assert_eq!(base64(b"fo"), "Zm8=");
+    }
+
+    #[test]
+    fn the_npm_policy_floor_and_boolean_config_are_read_strictly() {
+        assert_eq!(parse_npm_version("11.15.0"), Some((11, 15, 0)));
+        assert_eq!(parse_npm_version("11.16.0"), Some((11, 16, 0)));
+        assert_eq!(parse_npm_version("11.17.0-rc.1"), Some((11, 17, 0)));
+        assert_eq!(parse_npm_version("npm 11.17.0"), None);
+        assert!(config_is_true("true"));
+        assert!(config_is_true(" TRUE \n"));
+        assert!(!config_is_true("false"));
+        assert!(!config_is_true(""));
     }
 
     #[test]

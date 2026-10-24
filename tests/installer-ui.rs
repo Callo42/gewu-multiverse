@@ -59,7 +59,7 @@ fn program(
             "dsh" => 753,
             _ => 240,
         },
-        prerequisite: (id == "dsh").then(|| "Node.js 24.9+ and npm".to_owned()),
+        prerequisite: (id == "dsh").then(|| "Node 24.9+ / npm 11.16+".to_owned()),
         installing,
         installing_phase: phase.map(str::to_owned),
         error: error.map(str::to_owned),
@@ -185,7 +185,7 @@ fn an_error_names_the_old_version_and_a_quit_cancels_the_selected_install() {
     press(&mut board, KeyCode::Down);
     let terminal = draw(&mut board, 72, 18);
     let picture = flat(&terminal);
-    assert!(picture.contains("Node.js 24.9+"), "{picture}");
+    assert!(picture.contains("Node 24.9+ / npm 11.16+"), "{picture}");
     assert!(picture.contains("npm"), "{picture}");
 
     // Back to Pi and start its install, then quit once: the warning must say what

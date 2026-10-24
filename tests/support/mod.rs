@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shared harness for the installer integration tests. Every server, HOME and data
 //! root is task-private; no real product home or provider store is used.
 
