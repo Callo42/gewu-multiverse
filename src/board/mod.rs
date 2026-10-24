@@ -965,9 +965,20 @@ impl Board {
                 Some('i') => {
                     let program = self.selected_program();
                     if program.is_native() {
-                        self.send(Command::InstallProgram {
-                            id: program.id().to_owned(),
-                        });
+                        let installing = self
+                            .view
+                            .programs
+                            .iter()
+                            .any(|view| view.id == program.id() && view.installing.is_some());
+                        if installing {
+                            self.send(Command::CancelInstallProgram {
+                                id: program.id().to_owned(),
+                            });
+                        } else {
+                            self.send(Command::InstallProgram {
+                                id: program.id().to_owned(),
+                            });
+                        }
                     } else {
                         self.set_notice("the built-in engine needs no install");
                     }
@@ -1115,7 +1126,8 @@ impl Board {
 
     fn request_quit(&mut self) {
         let live = self.active_started_count();
-        if live == 0 {
+        let installing = self.installing_count();
+        if live == 0 && installing == 0 {
             self.leave_without_warning();
             return;
         }
@@ -1126,7 +1138,26 @@ impl Board {
             self.screen = Screen::Home;
             self.confirm_quit = true;
             self.confirm_remove = None;
+            if installing > 0 {
+                let noun = if installing == 1 {
+                    "install"
+                } else {
+                    "installs"
+                };
+                self.set_notice(format!(
+                    "q again cancels the running {noun}; the previous version is kept"
+                ));
+            }
         }
+    }
+
+    /// How many program installs are still running, for the quit warning.
+    pub fn installing_count(&self) -> usize {
+        self.view
+            .programs
+            .iter()
+            .filter(|program| program.installing.is_some())
+            .count()
     }
 
     fn leave_without_warning(&mut self) {

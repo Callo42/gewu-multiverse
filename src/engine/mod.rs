@@ -312,6 +312,10 @@ fn build(
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
     let (_, leftovers) = recover_stale_sessions(&options.layout, options.stop_grace)?;
     remove_stale_run_temps();
+    // A kill between the installer's two directory renames is restored before the
+    // first picture reads the program cards. A live install owns its directory and
+    // is not touched.
+    let install_recovery = harness::recover_pending(&options.data_root);
     let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
     // The recovery result is part of the first picture: Inner::new must receive it
     // before it loads the agent cards, or a failed cleanup is silently dropped and
@@ -324,6 +328,9 @@ fn build(
         leftovers,
     )?;
     inner.upgrade = upgrade;
+    for note in install_recovery {
+        inner.note(note);
+    }
     last_seen::write(options.layout.root(), env!("CARGO_PKG_VERSION"))?;
     // An installation from the old screens may still hold `config.toml`. The new
     // engine does not read it and does not convert it; it says once, on the first
@@ -571,10 +578,13 @@ struct Inner {
     program_states: HashMap<String, ProgramState>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 struct ProgramState {
     installing: Option<Option<u8>>,
+    phase: Option<harness::InstallPhase>,
     error: Option<String>,
+    cancel: Option<harness::CancelToken>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Inner {
@@ -1685,6 +1695,9 @@ impl Inner {
                     download_mb: program.download_mb(),
                     prerequisite: program.prerequisite().map(str::to_owned),
                     installing: state.and_then(|state| state.installing),
+                    installing_phase: state
+                        .and_then(|state| state.phase)
+                        .map(|phase| phase.label().to_owned()),
                     error: state.and_then(|state| state.error.clone()),
                 }
             })
@@ -2388,29 +2401,32 @@ impl EngineApi for Engine {
                     inner.note(format!("{} is already installing", program.label()));
                     return Ok(());
                 }
-                inner
-                    .program_states
-                    .entry(id.clone())
-                    .or_default()
-                    .installing = Some(None);
+                let cancel = harness::CancelToken::new();
+                let state = inner.program_states.entry(id.clone()).or_default();
+                state.installing = Some(None);
+                state.phase = Some(harness::InstallPhase::Preparing);
+                state.error = None;
+                state.cancel = Some(cancel.clone());
                 inner.note(format!("installing {}", program.label()));
                 let inner_arc = Arc::clone(&self.inner);
                 let data_root = inner.options.data_root.clone();
                 drop(inner);
-                std::thread::spawn(move || {
-                    let result = harness::install(&data_root, program, |percent| {
-                        if let Ok(mut inner) = inner_arc.lock() {
-                            if let Some(state) = inner.program_states.get_mut(program.id()) {
-                                state.installing = Some(percent);
+                let handle = std::thread::spawn(move || {
+                    let result =
+                        harness::install_cancellable(&data_root, program, &cancel, |sample| {
+                            if let Ok(mut inner) = inner_arc.lock()
+                                && let Some(state) = inner.program_states.get_mut(program.id())
+                            {
+                                state.installing = Some(sample.percent);
+                                state.phase = Some(sample.phase);
                             }
-                        }
-                    });
-                    if let Ok(mut inner) = inner_arc.lock() {
-                        let state = inner
-                            .program_states
-                            .entry(program.id().to_owned())
-                            .or_default();
+                        });
+                    if let Ok(mut inner) = inner_arc.lock()
+                        && let Some(state) = inner.program_states.get_mut(program.id())
+                    {
                         state.installing = None;
+                        state.phase = None;
+                        state.cancel = None;
                         match result {
                             Ok(installed) => {
                                 state.error = None;
@@ -2418,6 +2434,13 @@ impl EngineApi for Engine {
                                     "{} {} is installed",
                                     program.label(),
                                     installed.version
+                                ));
+                            }
+                            Err(error) if error == harness::INSTALL_CANCELED => {
+                                state.error = None;
+                                inner.note(format!(
+                                    "installing {} was canceled; the previous version is unchanged",
+                                    program.label()
                                 ));
                             }
                             Err(error) => {
@@ -2430,6 +2453,31 @@ impl EngineApi for Engine {
                         }
                     }
                 });
+                if let Some(state) = lock_inner(&self.inner).program_states.get_mut(&id) {
+                    state.thread = Some(handle);
+                }
+                Ok(())
+            }
+            Command::CancelInstallProgram { id } => {
+                let Some(program) = Program::parse(&id).filter(|program| program.is_native())
+                else {
+                    return Err("there is no installable program with that name".to_owned());
+                };
+                let Some(state) = inner.program_states.get(&id) else {
+                    inner.note(format!("{} is not installing", program.label()));
+                    return Ok(());
+                };
+                if state.installing.is_none() {
+                    inner.note(format!("{} is not installing", program.label()));
+                    return Ok(());
+                }
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+                inner.note(format!(
+                    "canceling the {} install; the previous version stays usable",
+                    program.label()
+                ));
                 Ok(())
             }
             Command::TestAgentModel { name } => {
@@ -2677,6 +2725,11 @@ impl EngineApi for Engine {
             }
             inner.stopping = true;
             inner.generation = inner.generation.saturating_add(1);
+            for state in inner.program_states.values() {
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+            }
             // Ask every group politely. A start or spawn still in flight records its
             // child's pid, and is signalled again as that pid appears below.
             for agent in &mut inner.agents {
@@ -2820,6 +2873,31 @@ impl EngineApi for Engine {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+        // Cancelled installs clean their own stage. Wait inside the caller's grace so
+        // a quit does not leave a download writing behind the board; a stage that
+        // cannot finish is journaled and recovered on the next open.
+        let install_jobs: Vec<std::thread::JoinHandle<()>> = {
+            let mut inner = lock_inner(&self.inner);
+            for state in inner.program_states.values_mut() {
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+            }
+            inner
+                .program_states
+                .values_mut()
+                .filter_map(|state| state.thread.take())
+                .collect()
+        };
+        let install_deadline = Instant::now() + grace.min(Duration::from_secs(2));
+        for handle in install_jobs {
+            while !handle.is_finished() && Instant::now() < install_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
         // A clean exit records the version too, so an installation that is opened and
         // closed many times keeps one current line.
@@ -6326,5 +6404,126 @@ mod tests {
             REPOSITORY_REFRESH <= Duration::from_secs(2),
             "the board can stay stale for {REPOSITORY_REFRESH:?}"
         );
+    }
+
+    struct ResetTestArtifact;
+
+    impl Drop for ResetTestArtifact {
+        fn drop(&mut self) {
+            crate::harness::set_test_artifact(None, None);
+        }
+    }
+
+    #[test]
+    fn shutdown_cancels_a_running_install_and_keeps_the_old_version() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_root("engine-install-shutdown");
+        let install = root.join("data/harnesses/pi/1.4.0");
+        fs::create_dir_all(install.join("pi")).expect("the old install");
+        let old_binary = install.join("pi/pi");
+        fs::write(&old_binary, "#!/bin/sh\necho old-pi\n").expect("the old binary");
+        fs::set_permissions(&old_binary, fs::Permissions::from_mode(0o755))
+            .expect("the old binary mode");
+        fs::write(
+            install.join("install.json"),
+            r#"{"program":"pi","version":"1.3.9","sha256":"fixture","license":"MIT","entrypoint":"pi/pi","resources":null,"installed_at":"2026-10-23T00:00:00.000Z"}"#,
+        )
+        .expect("the old record");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("the loopback address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => {
+                        request.extend_from_slice(&buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let body = vec![3u8; 2 * 1024 * 1024];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            for part in body.chunks(4096) {
+                if stream.write_all(part).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let _reset = ResetTestArtifact;
+        crate::harness::set_test_artifact(
+            Some(&format!("http://{address}/package")),
+            Some(&"0".repeat(64)),
+        );
+
+        let mut engine = open_for_test(
+            test_options(&root),
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            Settings::default(),
+        )
+        .expect("the test engine opens");
+        engine
+            .send(Command::InstallProgram {
+                id: "pi".to_owned(),
+            })
+            .expect("the install starts");
+        let harness_dir = root.join("data/harnesses/pi");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut downloading = false;
+        while Instant::now() < deadline {
+            if let Ok(entries) = fs::read_dir(&harness_dir) {
+                downloading = entries.flatten().any(|entry| {
+                    let stage = entry.path();
+                    stage
+                        .file_name()
+                        .map(|name| name.to_string_lossy().starts_with(".stage-"))
+                        .unwrap_or(false)
+                        && fs::metadata(stage.join("pi.tar.part"))
+                            .map(|metadata| metadata.len() > 0)
+                            .unwrap_or(false)
+                });
+            }
+            if downloading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(downloading, "the install did not reach the download");
+
+        let started = Instant::now();
+        engine.shutdown(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown waited for the whole download"
+        );
+        assert_eq!(
+            fs::read_to_string(&old_binary).expect("the old binary"),
+            "#!/bin/sh\necho old-pi\n"
+        );
+        let stages: Vec<_> = fs::read_dir(&harness_dir)
+            .expect("the harness directory")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".stage-"))
+            .collect();
+        assert!(stages.is_empty(), "a canceled stage survived shutdown");
     }
 }

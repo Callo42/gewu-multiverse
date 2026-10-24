@@ -7,7 +7,7 @@
 
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, Provisioning, SessionEnd, SessionState,
+    ForgejoView, ProgramView, Provisioning, SessionEnd, SessionState,
 };
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
@@ -50,6 +50,8 @@ pub struct FakeEngine {
     instruction_root: PathBuf,
     reveal_sent: bool,
     shutdown_called: bool,
+    /// Scripted program cards, when a test needs an install state on screen.
+    programs: Vec<ProgramView>,
     /// Whether the host can confine a run. The fake is confined by default; the
     /// `unconfined` constructor adds the sixth warning and takes the claim away.
     confined: bool,
@@ -111,8 +113,15 @@ impl FakeEngine {
             instruction_root: root,
             reveal_sent: false,
             shutdown_called: false,
+            programs: Vec::new(),
             confined: true,
         }
+    }
+
+    /// Put scripted program cards on the Program screen. Used by installer UI tests;
+    /// the ordinary demo has no installed native program.
+    pub fn set_programs(&mut self, programs: Vec<ProgramView>) {
+        self.programs = programs;
     }
 
     /// The same fake on a host where runs are not confined: five warnings plus the
@@ -539,7 +548,7 @@ impl EngineApi for FakeEngine {
                 admin_login_kept: false,
             },
             agents,
-            programs: Vec::new(),
+            programs: self.programs.clone(),
             endpoint: EndpointView {
                 configured: !self.endpoint_url.trim().is_empty()
                     && !self.endpoint_model.trim().is_empty(),
@@ -602,7 +611,19 @@ impl EngineApi for FakeEngine {
                 self.notice = Some(format!("{name}'s Codex sandbox is {mode}"));
             }
             Command::InstallProgram { id } => {
+                if let Some(program) = self.programs.iter_mut().find(|program| program.id == id) {
+                    program.installing = Some(None);
+                    program.installing_phase = Some("preparing".to_owned());
+                    program.error = None;
+                }
                 self.notice = Some(format!("installing {id}"));
+            }
+            Command::CancelInstallProgram { id } => {
+                if let Some(program) = self.programs.iter_mut().find(|program| program.id == id) {
+                    program.installing = None;
+                    program.installing_phase = None;
+                }
+                self.notice = Some(format!("canceling the {id} install"));
             }
             Command::TestAgentModel { name } => {
                 self.notice = Some(format!("{name}'s model was not tested"));

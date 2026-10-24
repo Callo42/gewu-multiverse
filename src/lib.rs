@@ -48,6 +48,7 @@ pub mod forgejo;
 pub mod forgejo_tools;
 pub mod harness;
 pub mod identity;
+mod installer;
 pub mod mcp_forgejo;
 pub mod mode;
 pub mod model;
