@@ -1642,6 +1642,9 @@ impl Inner {
     /// Why one agent's selected program/connection cannot start, if it cannot.
     fn program_block(&self, agent: &AgentRuntime) -> Option<String> {
         let saved = self.settings.agent(&agent.name)?;
+        if let Some(unknown) = saved.unknown_harness() {
+            return Some(format!("unknown saved program `{unknown}`"));
+        }
         let program = saved.harness();
         if program == Program::Builtin {
             if !self.settings.endpoint.configured() {
@@ -2113,7 +2116,12 @@ impl EngineApi for Engine {
                 program_label: inner
                     .settings
                     .agent(&agent.name)
-                    .map(|saved| saved.harness().label().to_owned())
+                    .map(|saved| {
+                        saved
+                            .unknown_harness()
+                            .map(|unknown| format!("unknown program `{unknown}`"))
+                            .unwrap_or_else(|| saved.harness().label().to_owned())
+                    })
                     .unwrap_or_else(|| Program::Builtin.label().to_owned()),
                 program_installed: inner
                     .settings
@@ -2627,6 +2635,13 @@ impl EngineApi for Engine {
                     inner.agents[index].leftover_targets.clear();
                     inner.agents[index].session = SessionState::Idle;
                     inner.agents[index].next_at = None;
+                }
+                if let Some(reason) = inner.program_block(&inner.agents[index]) {
+                    inner.agents[index].session = SessionState::Blocked {
+                        reason: reason.clone(),
+                    };
+                    inner.note(format!("not started — {reason}"));
+                    return Ok(());
                 }
                 inner.set_desired(index, Desired::Started);
                 let agent = &mut inner.agents[index];
@@ -6684,5 +6699,66 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".stage-"))
             .collect();
         assert!(stages.is_empty(), "a canceled stage survived shutdown");
+    }
+    #[test]
+    fn below_start_block_reasons_never_report_started() {
+        type Mutation = fn(&mut Settings);
+        let cases: [(&str, Mutation); 4] = [
+            ("neg-provider", |settings| settings.endpoint.url.clear()),
+            ("neg-key", |settings| {
+                settings.agents[0].harness = "builtin".to_owned()
+            }),
+            ("neg-program", |settings| {
+                settings.agents[0].harness = "codex".to_owned()
+            }),
+            ("neg-unknown", |settings| {
+                settings.agents[0].harness = "potato".to_owned()
+            }),
+        ];
+        for (name, mutate) in cases {
+            let root = scratch_root(name);
+            let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+            mutate(&mut settings);
+            settings
+                .save(&settings::path_in(
+                    Layout::rooted_at(root.clone())
+                        .expect("the test layout is absolute")
+                        .root(),
+                ))
+                .expect("settings");
+            let clock = Arc::new(FakeClock::new());
+            let fake = Arc::new(FakeSpawner::new());
+            let mut engine = open_test_engine(&root, settings, clock, fake.clone());
+            if name == "neg-key" {
+                let _ = std::fs::remove_file(
+                    Layout::rooted_at(root.clone())
+                        .expect("layout")
+                        .credentials_file(),
+                );
+            }
+            engine
+                .send(Command::Start {
+                    name: "agent-1".to_owned(),
+                })
+                .expect("Start is accepted");
+            assert_eq!(fake.counts().1, 0, "{name} started a session");
+            let board = engine.board();
+            match &board.agents[0].session {
+                SessionState::Blocked { reason } => assert!(
+                    reason.contains("model")
+                        || reason.contains("installed")
+                        || reason.contains("unknown"),
+                    "{name}: {reason}"
+                ),
+                other => panic!("{name}: expected Blocked, got {other:?}"),
+            }
+            if name == "neg-unknown" {
+                assert!(
+                    board.agents[0].program_label.contains("potato"),
+                    "{}",
+                    board.agents[0].program_label
+                );
+            }
+        }
     }
 }

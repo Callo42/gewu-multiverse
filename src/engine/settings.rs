@@ -216,6 +216,13 @@ impl AgentSettings {
         Program::parse(&self.harness).unwrap_or(Program::Builtin)
     }
 
+    /// The saved program value that this build does not know, if any. An unknown
+    /// value is never silently treated as built-in; it stays saved for repair.
+    pub fn unknown_harness(&self) -> Option<String> {
+        let saved = self.harness.trim();
+        (!saved.is_empty() && Program::parse(saved).is_none()).then(|| saved.to_owned())
+    }
+
     /// Set the selected program; built-in is written as the empty legacy value.
     pub fn set_harness(&mut self, program: Program) {
         self.harness = if program == Program::Builtin {
