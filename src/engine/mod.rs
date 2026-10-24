@@ -3142,17 +3142,27 @@ impl EngineApi for Engine {
             let mut inner = lock_inner(&self.inner);
             for agent in &mut inner.agents {
                 if let Some(mut run) = agent.running.take() {
-                    if run.first_ending.is_none()
-                        && let Err(error) = pin_first_ending(&mut run)
-                    {
-                        first_ending_errors.push(format!(
-                            "`{}`: the shutdown ending cannot be recorded before the forced stop: {error}",
-                            agent.name
-                        ));
+                    let mut uncertain = false;
+                    if run.first_ending.is_none() {
+                        match pin_first_ending(&mut run) {
+                            Ok(_) => {}
+                            Err(error) => {
+                                let run_id = run_id_in(&run.run_dir).unwrap_or("the run");
+                                let reason = mark_ending_uncertain(&run.run_dir, run_id, &error);
+                                first_ending_errors.push(format!("`{}`: {reason}", agent.name));
+                                uncertain = true;
+                            }
+                        }
                     }
                     stop_running_session(&mut run.handle, Duration::from_millis(500));
-                    let first_ending = run.first_ending.or(Some(run::FirstEnding::Stop));
-                    settled_runs.push((run.run_dir.clone(), run.handle.pid(), first_ending));
+                    if !uncertain {
+                        let first_ending = run.first_ending.unwrap_or(run::FirstEnding::Stop);
+                        settled_runs.push((
+                            run.run_dir.clone(),
+                            run.handle.pid(),
+                            Some(first_ending),
+                        ));
+                    }
                 }
                 if let Some(pid) = agent.starting_pid.take() {
                     signal_group(pid, nix::sys::signal::Signal::SIGKILL);
@@ -3505,6 +3515,16 @@ fn pin_first_ending(run: &mut RunningState) -> Result<run::FirstEnding, String> 
     let actual = run::ensure_first_ending(&run.run_dir, run_id, proposed)?;
     run.first_ending = Some(actual);
     Ok(actual)
+}
+
+/// Persist the evidence that a cleanup stop could not establish a valid first
+/// ending. The returned sentence reaches the card; the run's handles stay.
+fn mark_ending_uncertain(run_dir: &Path, run_id: &str, error: &str) -> String {
+    let reason = format!("the run's first ending is uncertain: {error}");
+    match run::record_ending_uncertainty(run_dir, run_id, &reason) {
+        Ok(()) => reason,
+        Err(marker) => format!("{reason}; the uncertainty evidence could not be written: {marker}"),
+    }
 }
 
 fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
@@ -4075,8 +4095,17 @@ fn session_job(
                 run::FirstEnding::Stop
             };
             let first_ending =
-                run::ensure_first_ending(&request.run_dir, &request.run_id, proposed)
-                    .unwrap_or(proposed);
+                match run::ensure_first_ending(&request.run_dir, &request.run_id, proposed) {
+                    Ok(first_ending) => first_ending,
+                    Err(error) => {
+                        // The child still has to be stopped, but without a valid fact
+                        // this is an uncertain ending, not a clean stop. The marker and
+                        // the retained handles block a later clean recovery.
+                        let _ = mark_ending_uncertain(&request.run_dir, &request.run_id, &error);
+                        stop_running_session(&mut handle, Duration::from_secs(1));
+                        return;
+                    }
+                };
             stop_running_session(&mut handle, Duration::from_secs(1));
             let _ = run::settle_run_with_stop(
                 &request.run_dir,
@@ -4109,8 +4138,23 @@ fn session_job(
                 run::FirstEnding::Stop
             };
             let first_ending =
-                run::ensure_first_ending(&request.run_dir, &request.run_id, proposed)
-                    .unwrap_or(proposed);
+                match run::ensure_first_ending(&request.run_dir, &request.run_id, proposed) {
+                    Ok(first_ending) => first_ending,
+                    Err(error) => {
+                        let reason =
+                            mark_ending_uncertain(&request.run_dir, &request.run_id, &error);
+                        stop_running_session(&mut handle, Duration::from_secs(1));
+                        let mut guard = lock_inner(&inner);
+                        if let Some(index) = guard.agent_index(&request.agent) {
+                            guard.agents[index].leftover = Some(reason.clone());
+                            guard.agents[index].leftover_targets =
+                                vec![RecoveryTarget::Run(request.run_dir.clone())];
+                            guard.agents[index].session = SessionState::Blocked { reason };
+                            guard.agents[index].next_at = None;
+                        }
+                        return;
+                    }
+                };
             stop_running_session(&mut handle, Duration::from_secs(1));
             let reason = if stopping {
                 "the run was stopped when the program closed"
@@ -5814,6 +5858,31 @@ mod tests {
     }
 
     #[test]
+    fn a_shutdown_fact_write_failure_records_uncertainty_and_keeps_handles() {
+        let root = scratch_root("engine-shutdown-uncertain");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        // An obstructed fact path makes every fact write fail while the rest of
+        // the run directory remains writable for the uncertainty evidence.
+        fs::create_dir(run_dir.join(run::FIRST_ENDING_FILE)).expect("the obstructed fact");
+        engine.shutdown(Duration::from_millis(200));
+        assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
+        assert!(
+            !run_dir.join(run::STOPPED_FILE).is_file(),
+            "a clean stop was claimed without a fact"
+        );
+        let error = run::reap_leftover_run(&run_dir, Duration::from_millis(20))
+            .expect_err("the uncertain run must not recover cleanly");
+        assert!(error.contains("uncertain"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_shutdown_after_the_childs_ending_keeps_the_first_stops_stopped() {
         let root = scratch_root("engine-stop-then-shutdown");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
@@ -6882,6 +6951,39 @@ mod tests {
             engine.board().agents.is_empty(),
             "the removed agent came back"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_removal_fact_failure_stops_the_child_but_records_uncertainty() {
+        let root = scratch_root("engine-remove-session-fact-fail");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (pid_rx, release) = fake.block_next_spawn();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session reached its child");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        fs::create_dir(run_dir.join(run::FIRST_ENDING_FILE)).expect("the obstructed fact");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            assert!(inner.settings.remove_agent("agent-1"));
+            inner.agents.clear();
+        }
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!fake.is_live(pid), "the removed agent's child survived");
+        assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
+        assert!(!run_dir.join(run::STOPPED_FILE).is_file());
+        let error = run::reap_leftover_run(&run_dir, Duration::from_millis(20))
+            .expect_err("the uncertain run must not recover cleanly");
+        assert!(error.contains("uncertain"), "{error}");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -21,6 +21,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::prelude::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -1238,6 +1239,8 @@ pub const SHELL_CAPABILITY_FILE: &str = "shell.capability";
 pub const STOPPED_FILE: &str = "run-stopped.json";
 /// The write-once first-ending fact, written before any signal it governs.
 pub const FIRST_ENDING_FILE: &str = "first-ending.json";
+/// The evidence that the first-ending fact could not be established or honoured.
+pub const ENDING_UNCERTAIN_FILE: &str = "ending-uncertain.json";
 
 /// The native supervisor's latest failure-model state, beside the run's records.
 ///
@@ -1312,11 +1315,82 @@ struct FirstEndingRecord {
     ending: FirstEnding,
 }
 
+/// The evidence that a run's ending is uncertain: the fact could not be written,
+/// read, matched to this run, or honoured against its records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndingUncertainty {
+    /// When the uncertainty was recorded, in RFC 3339 UTC.
+    ts: String,
+    /// The run the uncertainty belongs to.
+    run_id: String,
+    /// One plain sentence naming the evidence.
+    error: String,
+}
+
+/// Record that this run's ending cannot be decided cleanly.
+///
+/// This is written before a cleanup stop when the first-ending fact cannot be
+/// written, and when a persisted fact contradicts the run's terminal record. A
+/// reader that sees it must report uncertainty and keep the handles, never claim a
+/// clean stop or outcome.
+pub fn record_ending_uncertainty(run_dir: &Path, run_id: &str, error: &str) -> io::Result<()> {
+    let expected = run_id_of_io(run_dir)?;
+    if run_id != expected {
+        return Err(io::Error::other(format!(
+            "the uncertainty names run `{run_id}` but the directory is `{expected}`"
+        )));
+    }
+    let record = EndingUncertainty {
+        ts: crate::time::rfc3339(now_unix_ms()),
+        run_id: run_id.to_owned(),
+        error: error.to_owned(),
+    };
+    let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(ENDING_UNCERTAIN_FILE), text.as_bytes())
+}
+
+/// Read this run's uncertainty evidence, if any. A foreign or malformed record is
+/// itself uncertainty, never "none".
+pub fn ending_uncertainty(run_dir: &Path) -> Result<Option<String>, String> {
+    let expected = run_id_of(run_dir)?;
+    let path = run_dir.join(ENDING_UNCERTAIN_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "the run's ending uncertainty cannot be read: {error}"
+            ));
+        }
+    };
+    let record: EndingUncertainty = serde_json::from_str(&text)
+        .map_err(|error| format!("the run's ending uncertainty is malformed: {error}"))?;
+    if record.run_id != expected {
+        return Err(format!(
+            "the ending uncertainty belongs to run `{}`, not `{expected}`",
+            record.run_id
+        ));
+    }
+    Ok(Some(record.error))
+}
+
+fn run_id_of_io(run_dir: &Path) -> io::Result<&str> {
+    run_dir
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| io::Error::other("the run directory has no run id"))
+}
+
 /// Read the durable first-ending fact, if this run has one.
 ///
 /// A malformed record is an error, never "no fact": guessing would let a later
 /// writer change which ending happened first.
 pub fn recorded_first_ending(run_dir: &Path) -> Result<Option<FirstEnding>, String> {
+    let expected = run_id_of(run_dir)?;
+    if let Some(error) = ending_uncertainty(run_dir)? {
+        return Err(format!("the run's ending is uncertain: {error}"));
+    }
     let path = run_dir.join(FIRST_ENDING_FILE);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -1327,6 +1401,12 @@ pub fn recorded_first_ending(run_dir: &Path) -> Result<Option<FirstEnding>, Stri
     };
     let record: FirstEndingRecord = serde_json::from_str(&text)
         .map_err(|error| format!("the run's first ending is malformed: {error}"))?;
+    if record.run_id != expected {
+        return Err(format!(
+            "the first ending belongs to run `{}`, not `{expected}`; the ending is uncertain",
+            record.run_id
+        ));
+    }
     Ok(Some(record.ending))
 }
 
@@ -1341,7 +1421,22 @@ pub fn ensure_first_ending(
     run_id: &str,
     proposed: FirstEnding,
 ) -> Result<FirstEnding, String> {
-    if let Some(existing) = recorded_first_ending(run_dir)? {
+    let expected = run_id_of(run_dir)?;
+    if run_id != expected {
+        return Err(format!(
+            "the first ending names run `{run_id}` but the directory is `{expected}`; the ending is uncertain"
+        ));
+    }
+    let existing = match recorded_first_ending(run_dir) {
+        Ok(existing) => existing,
+        Err(error) => {
+            if !error.contains("uncertain") {
+                let _ = record_ending_uncertainty(run_dir, run_id, &error);
+            }
+            return Err(error);
+        }
+    };
+    if let Some(existing) = existing {
         return Ok(existing);
     }
     let record = FirstEndingRecord {
@@ -1352,8 +1447,10 @@ pub fn ensure_first_ending(
     let text = serde_json::to_string_pretty(&record)
         .map_err(|error| format!("the run's first ending cannot be encoded: {error}"))?;
     let target = run_dir.join(FIRST_ENDING_FILE);
+    static FIRST_ENDING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let sequence = FIRST_ENDING_SEQ.fetch_add(1, Ordering::Relaxed);
     let stage = run_dir.join(format!(
-        ".first-ending.part-{}-{}",
+        ".first-ending.part-{}-{}-{sequence}",
         std::process::id(),
         now_unix_ms()
     ));
@@ -1371,11 +1468,10 @@ pub fn ensure_first_ending(
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
-        // Make the directory entry durable too. Failure here is not hidden: the
-        // file may exist but a power loss before the sync is not promised.
-        if let Ok(dir) = fs::File::open(run_dir) {
-            dir.sync_all()?;
-        }
+        // Make the directory entry durable too. A directory that cannot be opened
+        // or synced is a failure, not an implied success.
+        let dir = fs::File::open(run_dir)?;
+        dir.sync_all()?;
         Ok(())
     })();
     let _ = fs::remove_file(&stage);
@@ -1391,7 +1487,16 @@ pub fn ensure_first_ending(
 /// last and committed to disk, so a later open that finds it also has the marker;
 /// an interrupted pair is retried from the still-present handles.
 pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
-    match recorded_first_ending(run_dir).map_err(io::Error::other)? {
+    let fact = match recorded_first_ending(run_dir) {
+        Ok(fact) => fact,
+        Err(error) => {
+            if !error.contains("uncertain") {
+                let _ = record_ending_uncertainty(run_dir, run_id, &error);
+            }
+            return Err(io::Error::other(error));
+        }
+    };
+    match fact {
         Some(FirstEnding::Stop) => {
             write_stop_marker(run_dir, run_id, pgid, reason)?;
             write_terminal_replacing(run_dir, run_id, RunOutcome::Stopped, reason)
@@ -1401,9 +1506,9 @@ pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) 
             let terminal =
                 transcript::terminal_record_checked(run_dir).map_err(io::Error::other)?;
             if terminal.is_none() {
-                return Err(io::Error::other(
-                    "the run recorded a terminal ending first, but that ending cannot be read",
-                ));
+                let reason = "the run recorded a terminal ending first, but that ending cannot be read; the ending is uncertain";
+                let _ = record_ending_uncertainty(run_dir, run_id, reason);
+                return Err(io::Error::other(reason));
             }
             Ok(())
         }
@@ -1557,12 +1662,26 @@ pub fn settle_run_with_stop(
     // The durable fact is the only source. If the caller has not persisted one yet,
     // write its proposed fact before the reap can signal the group. A later settle
     // reads the same fact even if the process that proposed it is gone.
-    let first_ending = match recorded_first_ending(run_dir)? {
-        Some(persisted) => persisted,
-        None => ensure_first_ending(run_dir, run_id, first_ending)?,
+    let first_ending = match recorded_first_ending(run_dir) {
+        Ok(Some(persisted)) => persisted,
+        Ok(None) => ensure_first_ending(run_dir, run_id, first_ending)?,
+        Err(error) => {
+            if !error.contains("uncertain") {
+                let _ = record_ending_uncertainty(run_dir, run_id, &error);
+            }
+            return Err(error);
+        }
     };
     let existing = transcript::terminal_record_checked(run_dir)
         .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
+    if stop.is_some() && first_ending == FirstEnding::Terminal && existing.is_none() {
+        // The durable fact says the run ended first, but its terminal record is
+        // missing or unreadable. The two records contradict each other; do not
+        // reclassify the run as stopped. Keep the evidence and the handles.
+        let reason = "the run's first ending is terminal, but its terminal record is missing; the ending is uncertain";
+        let _ = record_ending_uncertainty(run_dir, run_id, reason);
+        return Err(reason.to_owned());
+    }
     if stop.is_some() && first_ending == FirstEnding::Terminal && existing.is_some() {
         // The run ended first. The Stop is only a desired-state change: keep the one
         // ending, write no stop marker, and still verify the group is gone.
@@ -3376,6 +3495,82 @@ mod stop_record_tests {
             recorded_first_ending(&run).expect("read"),
             Some(FirstEnding::Stop)
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_terminal_fact_without_its_terminal_is_uncertain() {
+        let root = scratch("terminal-fact-missing");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Terminal).expect("terminal fact");
+        let error = settle_run_with_stop(
+            &run,
+            4_000_020,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(20),
+            Some("the run was stopped on request".to_owned()),
+            FirstEnding::Terminal,
+        )
+        .expect_err("a terminal fact without its ending must be uncertain");
+        assert!(error.contains("uncertain"), "{error}");
+        assert!(
+            !run.join(STOPPED_FILE).is_file(),
+            "a clean stop was claimed"
+        );
+        assert!(run.join(ENDING_UNCERTAIN_FILE).is_file());
+        match transcript::terminal_record(&run) {
+            None => {}
+            Some(other) => panic!("an ending was invented: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_foreign_first_ending_is_uncertain() {
+        let root = scratch("foreign-first-ending");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let text = serde_json::json!({
+            "ts": "2026-10-24T17:00:00.000Z",
+            "run_id": "run-9999999999999-9999",
+            "ending": "stop"
+        })
+        .to_string();
+        fs::write(run.join(FIRST_ENDING_FILE), text).expect("foreign fact");
+        let error = recorded_first_ending(&run).expect_err("a foreign fact is not this run's");
+        assert!(error.contains("belongs to run"), "{error}");
+        assert!(ending_uncertainty(&run).expect("read").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_uncertainty_record_blocks_clean_recovery() {
+        let root = scratch("uncertainty-blocks");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the child finished before the stop",
+        );
+        let run_id = "run-1700000200000-0001";
+        record_ending_uncertainty(&run, run_id, "the first-ending write failed")
+            .expect("uncertainty record");
+        let error = reap_leftover_run(&run, Duration::from_millis(20))
+            .expect_err("an uncertain ending must not recover cleanly");
+        assert!(
+            error.contains("uncertain") || error.contains("cannot be read"),
+            "{error}"
+        );
+        assert!(
+            !run.join(STOPPED_FILE).is_file(),
+            "a clean stop was claimed"
+        );
+        match terminal(&run) {
+            Record::RunFinished { outcome, .. } => assert_eq!(outcome, "succeeded"),
+            other => panic!("the ending changed: {other:?}"),
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

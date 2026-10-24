@@ -262,6 +262,14 @@ settle, reap or reopen reads that file; it cannot re-sample the fact or hand the
 to a later child ending. Recovery uses it too: a persisted `stop` replaces a child's
 post-stop ending with one `stopped` terminal plus the stop record, while a persisted
 `terminal` keeps the child's ending and writes no stop record.
+
+The fact is trusted only when it names this exact run and agrees with its records. A
+missing/corrupt terminal under a persisted `terminal` fact, a foreign `run_id`, an
+unreadable fact, or a fact that cannot be written before a governed signal is an
+uncertain ending: the product writes `ending-uncertain.json` with the evidence, keeps
+the handles and blocks dependent actions. It never falls back to a clean `stopped` or
+`terminal` outcome. A cleanup stop that must still end a live child records that
+uncertainty before the stop and does not settle the run cleanly.
 The native supervisor writes `native-progress.json` whenever its per-harness outcome
 model changes (waiting, retrying, failed, succeeded), so a cause the harness already
 emitted survives the engine killing the child at its deadline. A failed tool is
