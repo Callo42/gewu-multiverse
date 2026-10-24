@@ -7,7 +7,7 @@
 
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, Provisioning, SessionEnd, SessionState,
+    ForgejoView, ProgramView, Provisioning, SessionEnd, SessionState,
 };
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
@@ -50,6 +50,8 @@ pub struct FakeEngine {
     instruction_root: PathBuf,
     reveal_sent: bool,
     shutdown_called: bool,
+    /// Scripted program cards, when a test needs an install state on screen.
+    programs: Vec<ProgramView>,
     /// Whether the host can confine a run. The fake is confined by default; the
     /// `unconfined` constructor adds the sixth warning and takes the claim away.
     confined: bool,
@@ -111,8 +113,15 @@ impl FakeEngine {
             instruction_root: root,
             reveal_sent: false,
             shutdown_called: false,
+            programs: Vec::new(),
             confined: true,
         }
+    }
+
+    /// Put scripted program cards on the Program screen. Used by installer UI tests;
+    /// the ordinary demo has no installed native program.
+    pub fn set_programs(&mut self, programs: Vec<ProgramView>) {
+        self.programs = programs;
     }
 
     /// The same fake on a host where runs are not confined: five warnings plus the
@@ -494,6 +503,18 @@ impl EngineApi for FakeEngine {
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
                 last_result_is_work: agent.last_result_is_work,
+                program: "builtin".to_owned(),
+                program_label: "built-in engine".to_owned(),
+                program_installed: true,
+                program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                protocol: "chat-completions".to_owned(),
+                base_url: self.endpoint_url.clone(),
+                model: self.endpoint_model.clone(),
+                key_present: self.endpoint_key_present,
+                program_error: None,
+                active_program: None,
+                next_program: None,
+                codex_sandbox: None,
             })
             .collect();
         BoardView {
@@ -527,10 +548,13 @@ impl EngineApi for FakeEngine {
                 admin_login_kept: false,
             },
             agents,
+            programs: self.programs.clone(),
             endpoint: EndpointView {
                 configured: !self.endpoint_url.trim().is_empty()
                     && !self.endpoint_model.trim().is_empty(),
                 url: self.endpoint_url.clone(),
+                base_url: self.endpoint_url.clone(),
+                protocol: "chat-completions".to_owned(),
                 model: self.endpoint_model.clone(),
                 key_present: self.endpoint_key_present,
                 test: self.test.clone(),
@@ -559,6 +583,50 @@ impl EngineApi for FakeEngine {
                 }
                 self.test = EndpointTest::NotRun;
                 self.test_pending = false;
+            }
+            Command::SetConnection {
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let _ = protocol;
+                self.endpoint_url = base_url;
+                self.endpoint_model = model;
+                if let Some(key) = key {
+                    if !key.is_empty() {
+                        self.endpoint_key_present = true;
+                    }
+                }
+                self.test = EndpointTest::NotRun;
+                self.test_pending = false;
+            }
+            Command::SetAgentProgram { name, program, .. } => {
+                self.notice = Some(format!("{name} now runs with {program}"));
+            }
+            Command::SetAgentModel { name, .. } => {
+                self.notice = Some(format!("{name}'s connection is saved"));
+            }
+            Command::SetAgentCodexSandbox { name, mode } => {
+                self.notice = Some(format!("{name}'s Codex sandbox is {mode}"));
+            }
+            Command::InstallProgram { id } => {
+                if let Some(program) = self.programs.iter_mut().find(|program| program.id == id) {
+                    program.installing = Some(None);
+                    program.installing_phase = Some("preparing".to_owned());
+                    program.error = None;
+                }
+                self.notice = Some(format!("installing {id}"));
+            }
+            Command::CancelInstallProgram { id } => {
+                if let Some(program) = self.programs.iter_mut().find(|program| program.id == id) {
+                    program.installing = None;
+                    program.installing_phase = None;
+                }
+                self.notice = Some(format!("canceling the {id} install"));
+            }
+            Command::TestAgentModel { name } => {
+                self.notice = Some(format!("{name}'s model was not tested"));
             }
             Command::TestEndpoint => {
                 self.test = EndpointTest::Running;

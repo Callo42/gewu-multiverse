@@ -34,6 +34,8 @@
 //! [`Secret::redact`] first — with every other secret the credentials file holds — so a
 //! run can be read afterwards without any secret being recoverable.
 
+mod native;
+
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -2151,6 +2153,13 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
         return RunEnd::failed(format!("the transcript cannot be written: {error}"));
     }
 
+    let native_plan = match crate::run::NativePlan::read(run_dir) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return RunEnd::failed(format!("the native program plan cannot be read: {error}"));
+        }
+    };
+
     // The key is read here, before anything runs, so that a declared step's output is
     // redacted too. A run without a key cannot proceed: it would have nothing to think
     // with, and pretending otherwise would only hide the problem.
@@ -2174,23 +2183,48 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
     // transcript. The model key stays what the request's Authorization header uses.
     let secret = secret.with_extra_redactions(credentials::all_secret_values(&plan.credentials));
     log.set_secret(secret.clone());
-    log.line(&format!(
-        "model: {} at {} (bound: {}, {} s)",
-        plan.model,
-        plan.endpoint,
-        words::counted(plan.max_turns as usize, "turn", "turns"),
-        plan.timeout_secs
-    ));
-    // The bound is written into the transcript before the first call, so a run read
-    // afterwards shows what it was held to rather than only how it ended.
-    if let Err(error) = transcript.append(&Record::run_limits(
-        &plan.run_id,
-        plan.max_turns,
-        plan.timeout_secs,
-        &plan.endpoint,
-        &plan.model,
-    )) {
-        return RunEnd::failed(format!("the transcript cannot be written: {error}"));
+    if let Some(native) = native_plan.as_ref() {
+        log.line(&format!(
+            "program: {} {} using {} at {} model {} ({} s)",
+            native.harness,
+            native.version,
+            native.protocol,
+            native.base_url,
+            native.model,
+            plan.timeout_secs
+        ));
+        if let Err(error) = transcript.append(&Record::native_started(
+            &plan.run_id,
+            &plan.agent,
+            &native.harness,
+            &native.version,
+            &native.program.display().to_string(),
+            &native.protocol,
+            &native.base_url,
+            &native.model,
+            (!native.codex_sandbox.is_empty()).then_some(native.codex_sandbox.as_str()),
+        )) {
+            return RunEnd::failed(format!("the transcript cannot be written: {error}"));
+        }
+    } else {
+        log.line(&format!(
+            "model: {} at {} (bound: {}, {} s)",
+            plan.model,
+            plan.endpoint,
+            words::counted(plan.max_turns as usize, "turn", "turns"),
+            plan.timeout_secs
+        ));
+        // The bound is written into the transcript before the first call, so a run read
+        // afterwards shows what it was held to rather than only how it ended.
+        if let Err(error) = transcript.append(&Record::run_limits(
+            &plan.run_id,
+            plan.max_turns,
+            plan.timeout_secs,
+            &plan.endpoint,
+            &plan.model,
+        )) {
+            return RunEnd::failed(format!("the transcript cannot be written: {error}"));
+        }
     }
 
     // The shell is confined before any command runs. If this computer offers no
@@ -2217,6 +2251,19 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
         if let Err(end) = run_declared_step(tool_index, command, plan, &shell, transcript, log) {
             return end;
         }
+    }
+
+    if let Some(native_plan) = native_plan.as_ref() {
+        return native::run(
+            plan,
+            native_plan,
+            &instruction,
+            &secret,
+            tool_index,
+            &shell,
+            transcript,
+            log,
+        );
     }
 
     // The Forgejo tools are declared only when the context file names at least one
@@ -5200,6 +5247,7 @@ mod tests {
         let stub = Stub::start(vec![StubReply {
             status: 200,
             body: completion("too late"),
+            content_type: None,
             retry_after_secs: None,
             delay: Duration::from_secs(30),
         }]);

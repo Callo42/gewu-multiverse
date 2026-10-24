@@ -114,6 +114,52 @@ pub enum SessionState {
     Blocked { reason: String },
 }
 
+/// One native program the product can install, as the Program screen shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramView {
+    /// Stable id (`pi`, `codex`, `dsh`, `opencode`).
+    pub id: String,
+    /// Display name.
+    pub label: String,
+    /// The tested version.
+    pub version: String,
+    /// The actual installed version, when installed.
+    pub installed_version: Option<String>,
+    /// Whether the executable is present.
+    pub installed: bool,
+    /// The official licence.
+    pub license: String,
+    /// Approximate download size in MB.
+    pub download_mb: u32,
+    /// A non-Rust prerequisite sentence, when the program has one.
+    pub prerequisite: Option<String>,
+    /// An install in progress, 0-100 when known.
+    pub installing: Option<Option<u8>>,
+    /// The current install phase word (`downloading`, `installing packages`, …).
+    pub installing_phase: Option<String>,
+    /// The newest install failure, one sentence.
+    pub error: Option<String>,
+}
+
+/// The immutable program facts of one run, for active-versus-next display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunProgramView {
+    /// Program id.
+    pub program: String,
+    /// Program display name.
+    pub label: String,
+    /// Actual native version, or the product version for built-in.
+    pub version: String,
+    /// Connection protocol label.
+    pub protocol: String,
+    /// Public provider address, without credentials.
+    pub base_url: String,
+    /// Model id.
+    pub model: String,
+    /// Codex sandbox mode (`native` or `full-access`), when relevant.
+    pub codex_sandbox: Option<String>,
+}
+
 /// One agent, as its card shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentView {
@@ -176,6 +222,30 @@ pub struct AgentView {
     /// Whether the newest finished run itself did work. False means a later result
     /// is a check run and must not be presented as the agent's whole work.
     pub last_result_is_work: bool,
+    /// The selected program id (`builtin` for the legacy engine).
+    pub program: String,
+    /// The selected program's display name.
+    pub program_label: String,
+    /// Whether the selected program is installed.
+    pub program_installed: bool,
+    /// The installed version, when it is.
+    pub program_version: Option<String>,
+    /// The selected connection protocol word.
+    pub protocol: String,
+    /// The selected API base URL.
+    pub base_url: String,
+    /// The selected model id.
+    pub model: String,
+    /// Whether a key is available for this agent (its own or the shared one).
+    pub key_present: bool,
+    /// Why Start would refuse this agent's program/connection, in one sentence.
+    pub program_error: Option<String>,
+    /// The actual program facts of the newest run, when it has one.
+    pub active_program: Option<RunProgramView>,
+    /// The saved facts the next run will use, when they differ from the active run.
+    pub next_program: Option<RunProgramView>,
+    /// The selected Codex sandbox mode (`native`/`full-access`), when Codex.
+    pub codex_sandbox: Option<String>,
 }
 
 /// What an older installation looked like when this version first opened it.
@@ -218,8 +288,12 @@ pub enum EndpointTest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointView {
     pub configured: bool,
-    /// The completions URL as written.
+    /// The completions URL as written (legacy).
     pub url: String,
+    /// The API base URL for a new connection.
+    pub base_url: String,
+    /// The connection protocol word.
+    pub protocol: String,
     pub model: String,
     pub key_present: bool,
     pub test: EndpointTest,
@@ -237,6 +311,8 @@ pub struct BoardView {
     pub forgejo: ForgejoView,
     pub agents: Vec<AgentView>,
     pub endpoint: EndpointView,
+    /// The native programs and their installed state.
+    pub programs: Vec<ProgramView>,
     /// The outcome of the newest command, one short line, shown once.
     pub notice: Option<String>,
     /// The administrator password, present only in the view right after
@@ -259,11 +335,53 @@ pub struct BoardView {
 pub enum Command {
     /// Record the first-run terms.
     AcknowledgeTerms,
-    /// Set the one model endpoint; `key: None` keeps the stored key.
+    /// Set the default model endpoint; `key: None` keeps the stored key.
     SetEndpoint {
         url: String,
         model: String,
         key: Option<String>,
+    },
+    /// Set the default connection in the new base-URL/protocol shape.
+    SetConnection {
+        base_url: String,
+        protocol: String,
+        model: String,
+        key: Option<String>,
+    },
+    /// Select one agent's program. Native selection snapshots the default
+    /// connection the first time; it never changes another agent.
+    SetAgentProgram {
+        name: String,
+        program: String,
+        /// The selected connection type for the new program, when the person chose
+        /// one. `None` keeps a compatible existing provider protocol or the
+        /// program's default.
+        protocol: Option<String>,
+    },
+    /// Set one agent's explicit connection and key; `key: None` keeps its key.
+    SetAgentModel {
+        name: String,
+        base_url: String,
+        protocol: String,
+        model: String,
+        key: Option<String>,
+    },
+    /// Set the explicit Codex compatibility sandbox choice for one agent.
+    SetAgentCodexSandbox {
+        name: String,
+        mode: String,
+    },
+    /// Install one native program into the product's data directory.
+    InstallProgram {
+        id: String,
+    },
+    /// Stop one in-flight install, keeping the previous usable version.
+    CancelInstallProgram {
+        id: String,
+    },
+    /// Test one agent's selected model with one real request.
+    TestAgentModel {
+        name: String,
     },
     /// Test the endpoint in the background.
     TestEndpoint,

@@ -135,12 +135,24 @@ impl ForgejoTools {
         agent: impl Into<String>,
         token: Secret,
     ) -> Self {
+        Self::new_with_writes(config, workspace, agent, token, 0)
+    }
+
+    /// Build the tools with the writes already made by an earlier MCP server of the
+    /// same run, so restarting the bridge cannot reset the eight-write bound.
+    pub fn new_with_writes(
+        config: RunForgejo,
+        workspace: impl Into<PathBuf>,
+        agent: impl Into<String>,
+        token: Secret,
+        writes: u32,
+    ) -> Self {
         Self {
             config,
             workspace: workspace.into(),
             agent: agent.into(),
             token,
-            writes: Cell::new(0),
+            writes: Cell::new(writes),
         }
     }
 
@@ -870,6 +882,22 @@ pub fn undeclared(name: &str, forgejo_declared: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restarted_bridge_starts_from_the_persisted_write_count() {
+        let tools = ForgejoTools::new_with_writes(
+            crate::run::RunForgejo {
+                url: "http://127.0.0.1:1".to_owned(),
+                login: "gewu-agent-1".to_owned(),
+                repositories: Vec::new(),
+            },
+            "/tmp/workspace",
+            "agent-1",
+            Secret::new("dummy"),
+            7,
+        );
+        assert_eq!(tools.writes(), 7);
+    }
 
     #[test]
     fn a_sentence_has_no_newline_and_is_bounded() {
