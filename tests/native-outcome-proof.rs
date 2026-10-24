@@ -639,7 +639,11 @@ fn wait_for_request(probe: &str, limit: Duration) {
 #[test]
 #[ignore = "live Forgejo + four pinned harnesses: run with GEWU_FORGEJO_BINARY=... GEWU_PRODUCT_BINARY=... GEWU_PROOF_ROOT=..."]
 fn every_harness_cancelled_run_writes_a_stop_record() {
+    let only = std::env::var("GEWU_PROOF_ONLY").ok();
     for harness in ["pi", "codex", "dsh", "opencode"] {
+        if only.as_deref().is_some_and(|only| only != harness) {
+            continue;
+        }
         let (scratch, layout, mut engine, protocol) = open_engine_for(
             &format!("cancel-{harness}"),
             harness,
@@ -689,7 +693,11 @@ fn every_harness_cancelled_run_writes_a_stop_record() {
 #[test]
 #[ignore = "live Forgejo + four pinned harnesses: run with GEWU_FORGEJO_BINARY=... GEWU_PRODUCT_BINARY=... GEWU_PROOF_ROOT=..."]
 fn every_harness_engine_deadline_writes_a_stop_record() {
+    let only = std::env::var("GEWU_PROOF_ONLY").ok();
     for harness in ["pi", "codex", "dsh", "opencode"] {
+        if only.as_deref().is_some_and(|only| only != harness) {
+            continue;
+        }
         let (scratch, layout, mut engine, protocol) = open_engine_for(
             &format!("deadline-{harness}"),
             harness,

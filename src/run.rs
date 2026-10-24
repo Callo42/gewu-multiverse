@@ -1457,23 +1457,34 @@ pub fn settle_run_with_stop(
             .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
         stop_sentence = Some(sentence);
     }
-    let reaped = match reaped {
-        Ok(reaped) => reaped,
-        Err(error) => return Err(categorize_cleanup(error)),
-    };
-    match stop_sentence {
-        Some(sentence) => {
-            reconcile_stop_terminal(run_dir, run_id, outcome, &sentence)
-                .map_err(categorize_cleanup)?;
+    match reaped {
+        Ok(reaped) => {
+            match stop_sentence {
+                Some(sentence) => {
+                    reconcile_stop_terminal(run_dir, run_id, outcome, &sentence)
+                        .map_err(categorize_cleanup)?;
+                }
+                None => {
+                    ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
+                }
+            }
+            // `reap_process_group` only returns Ok when no unverified member survives,
+            // and it writes its own run_stopped ending when it had to signal a group.
+            clear_process_records(run_dir);
+            Ok(reaped)
         }
-        None => {
-            ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
+        Err(error) => {
+            // The stop happened, but its cleanup is unverified. Write the truthful
+            // terminal ending anyway (with that uncertainty in the sentence) while
+            // keeping every handle, so a later Start retries the cleanup and still
+            // finds an outcome and reason.
+            if let Some(sentence) = stop_sentence.as_deref() {
+                reconcile_stop_terminal(run_dir, run_id, outcome, sentence)
+                    .map_err(categorize_cleanup)?;
+            }
+            Err(categorize_cleanup(error))
         }
     }
-    // `reap_process_group` only returns Ok when no unverified member survives, and
-    // it writes its own run_stopped ending when it had to signal a group.
-    clear_process_records(run_dir);
-    Ok(reaped)
 }
 
 fn read_number(run_dir: &Path, name: &str) -> Option<u32> {
@@ -3033,10 +3044,20 @@ mod stop_record_tests {
             marker.contains("could not be verified as stopped"),
             "the stop marker hid the failed reap: {marker}"
         );
-        assert!(
-            transcript::terminal_record(&run).is_none(),
-            "an unverified reap wrote a terminal ending"
-        );
+        match transcript::terminal_record(&run) {
+            Some(Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            }) => {
+                assert_eq!(outcome, "stopped");
+                assert!(
+                    reason.contains("could not be verified as stopped"),
+                    "the terminal ending hid the failed reap: {reason}"
+                );
+            }
+            other => panic!("the unverified stop wrote no truthful ending: {other:?}"),
+        }
         let _ = nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
