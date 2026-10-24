@@ -129,7 +129,7 @@ fn view(count: usize) -> BoardView {
                 last_result_is_work: true,
                 program: "builtin".to_owned(),
                 program_label: "built-in engine".to_owned(),
-            unknown_program: None,
+                unknown_program: None,
                 program_installed: true,
                 program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                 protocol: "chat-completions".to_owned(),
