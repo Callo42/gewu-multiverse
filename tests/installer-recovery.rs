@@ -351,6 +351,202 @@ fn a_hard_kill_after_the_old_root_rename_is_recovered_before_use() {
 }
 
 #[test]
+fn a_staged_foreign_root_keeps_the_journal_and_old_backup() {
+    let sandbox = Sandbox::new("staged-foreign");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename-before-journal");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"staged\""))
+                .unwrap_or(false)
+                && !root.exists()
+                && fs::read_dir(&harness)
+                    .expect("the harness directory")
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the pre-journal pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+
+    // The crash is now in Staged with the old root already moved aside. A foreign
+    // directory arriving at the version root must not erase the journal or backup.
+    fs::create_dir_all(&root).expect("the foreign root");
+    fs::write(root.join("foreign-keep"), b"user data").expect("the foreign data");
+
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(
+        !notes.is_empty(),
+        "an ambiguous staged state was reported as settled"
+    );
+    assert_eq!(
+        fs::read(root.join("foreign-keep")).expect("the foreign data"),
+        b"user data"
+    );
+    assert!(journal.exists(), "the recovery journal was removed");
+    assert!(
+        fs::read_dir(&harness)
+            .expect("the harness directory")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-")),
+        "the old backup was removed"
+    );
+
+    fs::remove_dir_all(&root).expect("the test's foreign destination");
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(
+        fs::read(root.join("pi/pi")).expect("the restored old binary"),
+        old_binary
+    );
+    assert!(!journal.exists());
+}
+
+#[test]
+fn an_old_moved_foreign_root_without_a_backup_keeps_the_journal() {
+    let sandbox = Sandbox::new("old-moved-foreign");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"old-moved\""))
+                .unwrap_or(false)
+                && !root.exists()
+                && fs::read_dir(&harness)
+                    .expect("the harness directory")
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the after-old-rename pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+    let old = fs::read_dir(&harness)
+        .expect("the harness directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".old-"))
+        })
+        .expect("the old backup");
+    fs::rename(&old, harness.join("foreign-backup")).expect("the test moves the old backup");
+    fs::create_dir_all(&root).expect("the foreign root");
+    fs::write(root.join("foreign-keep"), b"user data").expect("the foreign data");
+
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(
+        !notes.is_empty(),
+        "a missing backup was reported as settled"
+    );
+    assert_eq!(
+        fs::read(root.join("foreign-keep")).expect("the foreign data"),
+        b"user data"
+    );
+    assert!(journal.exists(), "the recovery journal was removed");
+    assert!(harness.join("foreign-backup/pi/pi").is_file());
+}
+
+#[test]
+fn a_published_foreign_root_without_a_backup_keeps_the_journal() {
+    let sandbox = Sandbox::new("published-foreign");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-publish");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"published\""))
+                .unwrap_or(false)
+                && root.join("install.json").is_file()
+                && fs::read_dir(&harness)
+                    .expect("the harness directory")
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the after-publish pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+    let old = fs::read_dir(&harness)
+        .expect("the harness directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".old-"))
+        })
+        .expect("the old backup");
+    fs::rename(&old, harness.join("foreign-backup")).expect("the test moves the old backup");
+    fs::remove_dir_all(&root).expect("the test removes the new root");
+    fs::create_dir_all(&root).expect("the foreign root");
+    fs::write(root.join("foreign-keep"), b"user data").expect("the foreign data");
+
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(
+        !notes.is_empty(),
+        "a missing backup was reported as settled"
+    );
+    assert_eq!(
+        fs::read(root.join("foreign-keep")).expect("the foreign data"),
+        b"user data"
+    );
+    assert!(journal.exists(), "the recovery journal was removed");
+    assert!(harness.join("foreign-backup/pi/pi").is_file());
+}
+
+#[test]
 fn cancelling_after_the_old_rename_restores_it_and_removes_the_journal() {
     let sandbox = Sandbox::new("cancel-after-old");
     let root = sandbox.install_root("pi", "1.4.0");

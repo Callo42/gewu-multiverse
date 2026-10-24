@@ -1254,6 +1254,24 @@ fn old_belongs_to_journal(old: &Path, token: &str, prior_record_sha256: Option<&
     sha256_file(&old.join("install.json")).ok().as_deref() == Some(expected)
 }
 
+fn plain_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+        .unwrap_or(false)
+}
+
+fn prior_root_matches(root: &Path, prior_record_sha256: Option<&str>) -> bool {
+    let Some(expected) = prior_record_sha256 else {
+        return false;
+    };
+    plain_dir(root) && sha256_file(&root.join("install.json")).ok().as_deref() == Some(expected)
+}
+
+fn prior_root_settled(root: &Path, program: Program, prior_record_sha256: Option<&str>) -> bool {
+    prior_root_matches(root, prior_record_sha256)
+        && harness::read_installed_at_root(root, program).is_some()
+}
+
 fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(), String> {
     let journal_path = directory.join(JOURNAL_FILE);
     if let Ok(metadata) = fs::symlink_metadata(&journal_path)
@@ -1292,6 +1310,7 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
             .transpose()?;
         match journal.state {
             JournalState::Staged => {
+                let old_present = old.as_ref().is_some_and(|path| path.exists());
                 if !root.exists() {
                     // The old root may have been moved even though the journal was
                     // written before the first rename (a crash between them).
@@ -1302,28 +1321,7 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                             &journal.token,
                             journal.prior_record_sha256.as_deref(),
                         )
-                    {
-                        fs::rename(old, root).map_err(|error| {
-                            format!("the previous install could not be restored: {error}")
-                        })?;
-                        sync_dir(directory)?;
-                    } else if stage.exists() && stage_owned_by(&stage, &journal.token) {
-                        // Nothing to restore; the fresh stage is not published.
-                        remove_owned_stage(&stage, program, &journal.token)?;
-                    }
-                } else if stage.exists() {
-                    remove_owned_stage(&stage, program, &journal.token)?;
-                }
-            }
-            JournalState::OldMoved => {
-                if !root.exists() {
-                    if let Some(old) = old.as_ref()
-                        && old.exists()
-                        && old_belongs_to_journal(
-                            old,
-                            &journal.token,
-                            journal.prior_record_sha256.as_deref(),
-                        )
+                        && plain_dir(old)
                     {
                         fs::rename(old, root).map_err(|error| {
                             format!(
@@ -1331,70 +1329,46 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                             )
                         })?;
                         sync_dir(directory)?;
-                    } else {
-                        return Err(
-                            "the previous install was moved aside and cannot be verified; the journal and any owned backup were kept"
-                                .to_owned(),
-                        );
-                    }
-                }
-                if stage.exists() {
-                    remove_owned_stage(&stage, program, &journal.token)?;
-                }
-                if let Some(old) = old.as_ref()
-                    && old.exists()
-                {
-                    if new_root_settled(root, program, &journal.token) {
-                        if owned_old(
-                            old,
+                        if !prior_root_settled(
+                            root,
                             program,
-                            &journal.token,
                             journal.prior_record_sha256.as_deref(),
                         ) {
-                            let _ = fs::remove_dir_all(old);
-                            sync_dir(directory)?;
+                            return Err(
+                                "the previous install was put back but does not read back as its recorded version; the journal was kept"
+                                    .to_owned(),
+                            );
                         }
-                    } else {
-                        return Err(format!(
-                            "the version root is occupied and the previous version is still at {}; the journal and backup were kept",
-                            old.display()
-                        ));
-                    }
-                }
-                if !root.is_dir() {
-                    return Err(
-                        "the previous version is not present at its root; the journal was kept"
-                            .to_owned(),
-                    );
-                }
-            }
-            JournalState::Published => {
-                if stage.exists() {
-                    remove_owned_stage(&stage, program, &journal.token)?;
-                }
-                if !root.exists() {
-                    if let Some(old) = old.as_ref()
-                        && old.exists()
-                        && old_belongs_to_journal(
-                            old,
-                            &journal.token,
-                            journal.prior_record_sha256.as_deref(),
-                        )
-                    {
-                        fs::rename(old, root).map_err(|error| {
-                            format!(
-                                "the previous install could not be restored; the journal and backup were kept ({error})"
-                            )
-                        })?;
-                        sync_dir(directory)?;
-                    }
-                    if !root.exists() && old.as_ref().is_some_and(|path| path.exists()) {
+                        if stage.exists() {
+                            remove_owned_stage(&stage, program, &journal.token)?;
+                        }
+                    } else if old_present {
                         return Err(
-                            "the published root and a previous-version backup both remain unsettled; the journal and backup were kept"
+                            "the staged old backup is not owned by this transaction; the journal and backup were kept"
                                 .to_owned(),
                         );
+                    } else if journal.had_old {
+                        return Err(
+                            "the staged previous-version backup is missing; the journal was kept"
+                                .to_owned(),
+                        );
+                    } else if stage.exists() {
+                        if stage_owned_by(&stage, &journal.token) {
+                            remove_owned_stage(&stage, program, &journal.token)?;
+                        } else {
+                            return Err(
+                                "the staged package directory is not owned by this transaction; the journal was kept"
+                                    .to_owned(),
+                            );
+                        }
                     }
+                    // No old root and no unpublished stage: a no-old/no-new cancel is
+                    // settled.
                 } else if new_root_settled(root, program, &journal.token) {
+                    // A publication happened despite the journal still saying staged.
+                    if stage.exists() {
+                        remove_owned_stage(&stage, program, &journal.token)?;
+                    }
                     if let Some(old) = old.as_ref()
                         && old.exists()
                         && owned_old(
@@ -1407,16 +1381,173 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                         let _ = fs::remove_dir_all(old);
                         sync_dir(directory)?;
                     }
-                } else if old.as_ref().is_some_and(|path| path.exists()) {
+                } else if old_present {
                     return Err(format!(
-                        "the published version root could not be verified while a previous-version backup remains at {}; the journal and backup were kept",
+                        "the version root is occupied and the previous version is still at {}; the journal and backup were kept",
                         old.as_ref()
                             .map(|path| path.display().to_string())
                             .unwrap_or_default()
                     ));
-                } else if !root.is_dir() {
+                } else if prior_root_matches(root, journal.prior_record_sha256.as_deref()) {
+                    // The transaction never moved the prior root; the stage is an
+                    // unpublished copy. Removing only the owned stage is a true cancel.
+                    if stage.exists() {
+                        remove_owned_stage(&stage, program, &journal.token)?;
+                    }
+                } else {
                     return Err(
-                        "the published version root is not a directory; the journal was kept"
+                        "the staged version root is foreign or ambiguous; the journal was kept"
+                            .to_owned(),
+                    );
+                }
+            }
+            JournalState::OldMoved => {
+                let old_present = old.as_ref().is_some_and(|path| path.exists());
+                if !root.exists() {
+                    if let Some(old) = old.as_ref()
+                        && old.exists()
+                        && old_belongs_to_journal(
+                            old,
+                            &journal.token,
+                            journal.prior_record_sha256.as_deref(),
+                        )
+                        && plain_dir(old)
+                    {
+                        fs::rename(old, root).map_err(|error| {
+                            format!(
+                                "the previous install could not be restored; the journal and backup were kept ({error})"
+                            )
+                        })?;
+                        sync_dir(directory)?;
+                        if !prior_root_settled(
+                            root,
+                            program,
+                            journal.prior_record_sha256.as_deref(),
+                        ) {
+                            return Err(
+                                "the previous install was put back but does not read back as its recorded version; the journal was kept"
+                                    .to_owned(),
+                            );
+                        }
+                    } else if journal.had_old || old_present {
+                        return Err(
+                            "the previous install was moved aside and cannot be verified as owned; the journal and any backup were kept"
+                                .to_owned(),
+                        );
+                    } else if stage.exists() {
+                        if stage_owned_by(&stage, &journal.token) {
+                            remove_owned_stage(&stage, program, &journal.token)?;
+                        } else {
+                            return Err(
+                                "the staged package directory is not owned by this transaction; the journal was kept"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    // A no-old/no-new interrupted publication is a settled cancel.
+                } else if new_root_settled(root, program, &journal.token) {
+                    if stage.exists() {
+                        remove_owned_stage(&stage, program, &journal.token)?;
+                    }
+                    if let Some(old) = old.as_ref()
+                        && old.exists()
+                        && owned_old(
+                            old,
+                            program,
+                            &journal.token,
+                            journal.prior_record_sha256.as_deref(),
+                        )
+                    {
+                        let _ = fs::remove_dir_all(old);
+                        sync_dir(directory)?;
+                    }
+                } else if old_present {
+                    return Err(format!(
+                        "the version root is occupied and the previous version is still at {}; the journal and backup were kept",
+                        old.as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default()
+                    ));
+                } else if prior_root_settled(root, program, journal.prior_record_sha256.as_deref())
+                {
+                    // Rollback already put the verified old tree back at the root.
+                    if stage.exists() {
+                        remove_owned_stage(&stage, program, &journal.token)?;
+                    }
+                } else {
+                    return Err(
+                        "the moved version root is neither the verified old install nor the owned readable new install; the journal was kept"
+                            .to_owned(),
+                    );
+                }
+            }
+            JournalState::Published => {
+                if stage.exists() {
+                    remove_owned_stage(&stage, program, &journal.token)?;
+                }
+                let old_present = old.as_ref().is_some_and(|path| path.exists());
+                if root.exists() {
+                    if new_root_settled(root, program, &journal.token) {
+                        if let Some(old) = old.as_ref()
+                            && old.exists()
+                            && owned_old(
+                                old,
+                                program,
+                                &journal.token,
+                                journal.prior_record_sha256.as_deref(),
+                            )
+                        {
+                            let _ = fs::remove_dir_all(old);
+                            sync_dir(directory)?;
+                        }
+                    } else if old_present {
+                        return Err(format!(
+                            "the published version root could not be verified while a previous-version backup remains at {}; the journal and backup were kept",
+                            old.as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default()
+                        ));
+                    } else if prior_root_settled(
+                        root,
+                        program,
+                        journal.prior_record_sha256.as_deref(),
+                    ) {
+                        // A rollback restored the old tree after publication.
+                    } else {
+                        return Err(
+                            "the published version root is neither the owned readable new install nor the verified old install; the journal was kept"
+                                .to_owned(),
+                        );
+                    }
+                } else if let Some(old) = old.as_ref()
+                    && old.exists()
+                    && old_belongs_to_journal(
+                        old,
+                        &journal.token,
+                        journal.prior_record_sha256.as_deref(),
+                    )
+                    && plain_dir(old)
+                {
+                    fs::rename(old, root).map_err(|error| {
+                        format!(
+                            "the previous install could not be restored; the journal and backup were kept ({error})"
+                        )
+                    })?;
+                    sync_dir(directory)?;
+                    if !prior_root_settled(root, program, journal.prior_record_sha256.as_deref()) {
+                        return Err(
+                            "the previous install was put back but does not read back as its recorded version; the journal was kept"
+                                .to_owned(),
+                        );
+                    }
+                } else if old_present {
+                    return Err(
+                        "the published root is missing and its previous-version backup is not owned; the journal and backup were kept"
+                            .to_owned(),
+                    );
+                } else {
+                    return Err(
+                        "the published root and any previous-version backup are missing; the journal was kept"
                             .to_owned(),
                     );
                 }
