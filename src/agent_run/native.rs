@@ -348,7 +348,12 @@ fn redact_native(secret: &Secret, text: &str) -> String {
 
 fn redact_native_line(secret: &Secret, line: &str, carry: &mut String) -> String {
     let plain = secret.expose();
-    let suffix_prefix = (4..plain.len().min(line.len() + 1)).any(|n| line.ends_with(&plain[..n]));
+    let suffix_prefix = plain
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(plain.len()))
+        .filter(|index| *index >= 4 && *index <= line.len())
+        .any(|index| line.ends_with(&plain[..index]));
     if suffix_prefix {
         // Withhold the whole line until the following fragment can be checked.
         carry.push_str(line);
@@ -366,10 +371,13 @@ fn redact_native_line(secret: &Secret, line: &str, carry: &mut String) -> String
         .chars()
         .rev()
         .collect();
-    let cut = redacted
+    let mut cut = redacted
         .len()
         .saturating_sub(line.len())
         .min(redacted.len());
+    while cut < redacted.len() && !redacted.is_char_boundary(cut) {
+        cut += 1;
+    }
     redacted[cut..].to_owned()
 }
 
@@ -385,6 +393,7 @@ struct NativeState {
     wrote: bool,
     workspace_wrote: bool,
     pr_ok: bool,
+    pr_updated: bool,
     comment_ok: bool,
     forgejo_read_ok: bool,
     pushed: bool,
@@ -803,7 +812,9 @@ enum RequestedWork {
     ReadOnly,
     GenericWrite,
     PullRequest,
+    PullRequestUpdate,
     Comment,
+    UnsupportedForgejoWrite,
     Push,
     ForgejoRead,
     Ambiguous,
@@ -815,25 +826,33 @@ enum RequestedWork {
 /// workspace witness; everything else stays ambiguous and therefore warned.
 fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
     let lower = instruction.trim().to_ascii_lowercase();
-    let change_words = [
-        "change",
-        "refactor",
-        "rename",
-        "rewrite",
-        "implement",
-        "modify",
-        "update",
-        "fix",
-        "create",
-        "delete",
-        "remove",
-        "add ",
-        "write",
-        "edit",
-        "apply",
-    ];
-    let changes = change_words.iter().any(|word| lower.contains(word));
-    let imperative_comment = lower.starts_with("comment")
+    let tokens: Vec<&str> = lower
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let changes = tokens.iter().any(|word| {
+        matches!(
+            *word,
+            "change"
+                | "refactor"
+                | "rename"
+                | "rewrite"
+                | "implement"
+                | "modify"
+                | "update"
+                | "fix"
+                | "create"
+                | "delete"
+                | "remove"
+                | "add"
+                | "write"
+                | "edit"
+                | "apply"
+                | "close"
+                | "reopen"
+        )
+    });
+    let imperative_comment = tokens.first() == Some(&"comment")
         || lower.contains("leave a comment")
         || lower.contains("post a comment")
         || lower.contains("write a comment")
@@ -848,24 +867,44 @@ fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
     ]
     .iter()
     .any(|word| lower.starts_with(word));
-    let forgejo = ["issue", "pull request", "forgejo", "repository"]
+    let forgejo = ["issue", "pull request", "forgejo"]
         .iter()
         .any(|word| lower.contains(word));
+    let update_pr = lower.contains("update the pull request")
+        || lower.contains("update pull request")
+        || lower.contains("update the pr")
+        || lower.contains("update pr");
+    let open_pr = lower.contains("open a pull request")
+        || lower.starts_with("open a pr")
+        || lower.contains("create a pull request")
+        || lower.contains("open the pull request");
+    if lower.contains("close the issue")
+        || lower.contains("close issue")
+        || lower.contains("reopen the issue")
+        || lower.contains("reopen issue")
+    {
+        // The six supplied tools cannot close or reopen an issue. A read, a shell
+        // success or a generic tool acknowledgement cannot satisfy this ask.
+        return RequestedWork::UnsupportedForgejoWrite;
+    }
     if imperative_comment {
         return RequestedWork::Comment;
     }
-    if lower.contains("pull request") || lower.starts_with("open a pr") {
-        return RequestedWork::PullRequest;
-    }
-    if lower.starts_with("push ") || lower == "push" {
-        return RequestedWork::Push;
-    }
-    if read_prefix && !changes {
+    if read_prefix && !changes && !update_pr && !open_pr {
         return if forgejo {
             RequestedWork::ForgejoRead
         } else {
             RequestedWork::ReadOnly
         };
+    }
+    if update_pr {
+        return RequestedWork::PullRequestUpdate;
+    }
+    if open_pr {
+        return RequestedWork::PullRequest;
+    }
+    if tokens.first() == Some(&"push") {
+        return RequestedWork::Push;
     }
     if changes || !steps.is_empty() {
         return RequestedWork::GenericWrite;
@@ -873,7 +912,10 @@ fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
     if forgejo {
         return RequestedWork::ForgejoRead;
     }
-    if lower.contains("read") || lower.contains("inspect") {
+    if tokens
+        .iter()
+        .any(|word| matches!(*word, "read" | "inspect"))
+    {
         return RequestedWork::ReadOnly;
     }
     RequestedWork::Ambiguous
@@ -895,7 +937,9 @@ fn decide_native_ending(
         RunEnding::Succeeded => {
             let matched = match requested {
                 RequestedWork::PullRequest => state.pr_ok && state.pushed,
+                RequestedWork::PullRequestUpdate => state.pr_ok && state.pr_updated,
                 RequestedWork::Comment => state.comment_ok,
+                RequestedWork::UnsupportedForgejoWrite => false,
                 RequestedWork::GenericWrite => state.workspace_wrote || state.pushed,
                 RequestedWork::Push => state.pushed,
                 RequestedWork::ReadOnly => state.tool_ok,
@@ -1816,6 +1860,9 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
                     state.comment_ok = true;
                 } else {
                     state.pr_ok = true;
+                    if tool.ends_with(crate::forgejo_tools::UPDATE_PULL_REQUEST) {
+                        state.pr_updated = true;
+                    }
                 }
             } else if record
                 .get("accepted")
@@ -2080,5 +2127,86 @@ mod native_proof_tests {
             decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &read),
             RunEnding::Warned
         );
+    }
+    #[test]
+    fn c2_issue_update_prefix_and_local_repository_are_not_implicit_writes() {
+        assert_eq!(
+            requested_work("Read the updated issue and summarize it.", &[]),
+            RequestedWork::ForgejoRead
+        );
+        assert_eq!(
+            requested_work("Read the prefix of the issue and report it.", &[]),
+            RequestedWork::ForgejoRead
+        );
+        assert_eq!(
+            requested_work("Read the issue and fix the parser.", &[]),
+            RequestedWork::GenericWrite
+        );
+        assert_eq!(
+            requested_work("Read the local repository README and summarize it.", &[]),
+            RequestedWork::ReadOnly
+        );
+    }
+
+    #[test]
+    fn c2_supported_and_unsupported_actions_need_matching_facts() {
+        let read = NativeState {
+            tool_ok: true,
+            forgejo_read_ok: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            requested_work("Close the issue after checking it.", &[]),
+            RequestedWork::UnsupportedForgejoWrite
+        );
+        assert_eq!(
+            decide_native_ending(
+                RunEnding::Succeeded,
+                RequestedWork::UnsupportedForgejoWrite,
+                &read
+            ),
+            RunEnding::Warned
+        );
+        assert_eq!(
+            requested_work("Update the pull request description.", &[]),
+            RequestedWork::PullRequestUpdate
+        );
+        let updated = NativeState {
+            pr_ok: true,
+            pr_updated: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(
+                RunEnding::Succeeded,
+                RequestedWork::PullRequestUpdate,
+                &updated
+            ),
+            RunEnding::Succeeded
+        );
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &updated),
+            RunEnding::Warned
+        );
+        let opened = NativeState {
+            pr_ok: true,
+            pushed: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &opened),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn c4_multibyte_secret_split_does_not_panic_and_is_redacted() {
+        let secret = Secret::new("clé-runtime-é".to_owned());
+        let mut carry = String::new();
+        let first = redact_native_line(&secret, "prefix clé-runt", &mut carry);
+        let second = redact_native_line(&secret, "ime-é suffix", &mut carry);
+        assert!(first.is_empty());
+        let combined = format!("{first}{second}");
+        assert!(!combined.contains(secret.expose()));
     }
 }

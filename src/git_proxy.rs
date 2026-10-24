@@ -214,23 +214,73 @@ fn fixed_route(raw: &str, repos: &[String], method: &str) -> Option<String> {
     }
 }
 
-fn parse_lengths(lines: &[String]) -> Option<usize> {
-    let mut found = None;
+#[derive(Debug, PartialEq, Eq)]
+enum Framing {
+    Fixed(usize),
+    Chunked,
+}
+
+fn parse_lengths(lines: &[String]) -> Option<Framing> {
+    let mut length = None;
+    let mut chunked = false;
+    let mut transfer_seen = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
+        let value = value.trim();
         if name.eq_ignore_ascii_case("transfer-encoding") {
-            return None;
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            if found.is_some() {
+            if transfer_seen || length.is_some() {
                 return None;
             }
-            found = Some(value.trim().parse::<usize>().ok()?);
+            transfer_seen = true;
+            if !value.eq_ignore_ascii_case("chunked") {
+                return None;
+            }
+            chunked = true;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if length.is_some() || chunked {
+                return None;
+            }
+            length = Some(value.parse::<usize>().ok()?);
         }
     }
-    found
+    if chunked {
+        Some(Framing::Chunked)
+    } else {
+        Some(Framing::Fixed(length.unwrap_or(0)))
+    }
+}
+
+fn decode_chunked(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    loop {
+        let line_end = input[at..].windows(2).position(|w| w == b"\r\n")? + at;
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&input[at..line_end]).ok()?.trim(), 16)
+                .ok()?;
+        at = line_end + 2;
+        if size == 0 {
+            loop {
+                let trailer_end = input[at..].windows(2).position(|w| w == b"\r\n")? + at;
+                if trailer_end == at {
+                    return Some((out, at + 2));
+                }
+                at = trailer_end + 2;
+            }
+        }
+        if input.len() < at + size + 2 {
+            return None;
+        }
+        out.extend_from_slice(&input[at..at + size]);
+        at += size;
+        if &input[at..at + 2] != b"\r\n" {
+            return None;
+        }
+        at += 2;
+    }
 }
 
 fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &str) -> Option<()> {
@@ -263,20 +313,49 @@ fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect();
-    let content_length = parse_lengths(&headers).unwrap_or(0);
-    if method == "POST" && content_length == 0 {
-        return None;
-    }
-    let mut body = head[split..].to_vec();
-    while body.len() < content_length {
-        let mut chunk = [0u8; 8192];
-        let n = client.read(&mut chunk).ok()?;
-        if n == 0 {
-            break;
+    let framing = parse_lengths(&headers)?;
+    let mut received = head[split..].to_vec();
+    let owned_body;
+    let body: &[u8] = match framing {
+        Framing::Fixed(length) => {
+            if method == "POST" && length == 0 {
+                return None;
+            }
+            while received.len() < length {
+                let mut chunk = [0u8; 8192];
+                let n = client.read(&mut chunk).ok()?;
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&chunk[..n]);
+            }
+            if received.len() < length {
+                return None;
+            }
+            &received[..length]
         }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    let body = &body[..content_length.min(body.len())];
+        Framing::Chunked => {
+            if method != "POST" {
+                return None;
+            }
+            loop {
+                if let Some((decoded, _)) = decode_chunked(&received) {
+                    owned_body = decoded;
+                    break;
+                }
+                let mut chunk = [0u8; 8192];
+                let n = client.read(&mut chunk).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                received.extend_from_slice(&chunk[..n]);
+                if received.len() > 128 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            &owned_body
+        }
+    };
     let mut upstream = TcpStream::connect_timeout(
         &format!("{host}:{port}").parse().ok()?,
         Duration::from_secs(10),
@@ -369,6 +448,9 @@ mod boundary_tests {
             ])
             .is_none()
         );
-        assert_eq!(parse_lengths(&["Content-Length: 5".to_owned()]), Some(5));
+        assert!(matches!(
+            parse_lengths(&["Content-Length: 5".to_owned()]),
+            Some(Framing::Fixed(5))
+        ));
     }
 }

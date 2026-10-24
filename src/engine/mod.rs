@@ -6435,6 +6435,12 @@ mod tests {
             .expect("default key");
         let before_one = engine.board().agents[0].program.clone();
         let before_two = engine.board().agents[1].program.clone();
+        let before_provider = engine.inner.lock().expect("inner").settings.agents[0]
+            .provider
+            .clone();
+        let before_other_provider = engine.inner.lock().expect("inner").settings.agents[1]
+            .provider
+            .clone();
         std::fs::set_permissions(
             &credentials,
             std::os::unix::fs::PermissionsExt::from_mode(0o400),
@@ -6455,5 +6461,29 @@ mod tests {
         );
         assert_eq!(engine.board().agents[0].program, before_one);
         assert_eq!(engine.board().agents[1].program, before_two);
+        assert_eq!(
+            engine.inner.lock().expect("inner").settings.agents[0].provider,
+            before_provider
+        );
+        assert_eq!(
+            engine.inner.lock().expect("inner").settings.agents[1].provider,
+            before_other_provider
+        );
+        let saved = Settings::load(&settings::path_in(layout.root())).expect("durable settings");
+        assert_eq!(saved.agents[0].harness(), Program::Builtin);
+        assert_eq!(saved.agents[0].provider, before_provider);
+        assert_eq!(saved.agents[1].provider, before_other_provider);
+        assert!(
+            credentials::agent_model_key(&credentials, "agent-1")
+                .expect("key read")
+                .is_none(),
+            "an explicit agent key appeared after the failed snapshot"
+        );
+        assert_eq!(
+            credentials::model_key(&credentials, "agent-1")
+                .expect("default key")
+                .expose(),
+            "fixture-default-key"
+        );
     }
 }
