@@ -1446,10 +1446,26 @@ fn pi_event(
                 .and_then(Value::as_str)
                 == Some("assistant")
             {
+                if let Some(message) = value.get("message") {
+                    if let Some(error) = message.get("errorMessage").and_then(Value::as_str)
+                        && !error.trim().is_empty()
+                    {
+                        state.error.get_or_insert_with(|| error.to_owned());
+                    }
+                }
                 if let Some(text) = assistant_text(value.get("message")) {
                     state.final_text = Some(text.clone());
                     let _ = transcript.append(&Record::native_text(text));
                 }
+            }
+        }
+        Some("auto_retry_end") => {
+            if value.get("success").and_then(Value::as_bool) == Some(false) {
+                let message = value
+                    .get("finalError")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the native provider failed after its retries");
+                state.error.get_or_insert_with(|| message.to_owned());
             }
         }
         Some("agent_settled") => {

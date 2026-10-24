@@ -1304,6 +1304,14 @@ pub fn settle_run(
     // group. Its inherited capability is the ownership proof; enumerate and close
     // every such group before the identities are removed.
     reaped |= reap_capability_groups(run_dir, grace).map_err(categorize_cleanup)?;
+    if outcome == RunOutcome::Stopped && !run_dir.join(STOPPED_FILE).exists() {
+        let run_id = run_id_of(run_dir).map_err(categorize_cleanup)?;
+        let sentence = reason
+            .clone()
+            .unwrap_or_else(|| "the run was stopped on request".to_owned());
+        write_run_stopped(run_dir, run_id, pgid, &sentence)
+            .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+    }
     ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
     // `reap_process_group` only returns Ok when no unverified member survives, and
     // it writes its own run_stopped ending when it had to signal a group.
