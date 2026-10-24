@@ -38,7 +38,7 @@ use crate::engine_api::{
 use crate::forgejo::{DEFAULT_TIMEOUT, ForgejoClient, ForgejoError, Repository};
 use crate::harness::{self, Program, Protocol};
 use crate::identity;
-use crate::mode::{SECRET_FILE_MODE, set_mode};
+use crate::mode::{PRIVATE_DIR_MODE, SECRET_FILE_MODE, set_mode};
 use crate::paths::Layout;
 use crate::run::process_alive;
 use crate::run::{self, LOG_FILE};
@@ -536,8 +536,6 @@ struct AgentRuntime {
     provision_retry_at: Option<Instant>,
     removal_pending: bool,
     removal_retry_at: Option<Instant>,
-    /// The Forgejo login/tokens were already cancelled but the local removal failed.
-    identity_cancelled: bool,
 }
 
 /// The bundled Forgejo's engine state.
@@ -931,13 +929,25 @@ impl AgentRuntime {
             .is_some_and(|dir| run::says_no_assigned_work(dir, &format!("gewu-{name}")));
         let last_work_result = run::latest_work_result(&runs);
         let last_result_is_work = newest_run.as_deref().is_some_and(run::run_did_work);
+        let removal_reason = removal_marked(&inner.options.layout, name).then(|| {
+            "its Forgejo sign-in and tokens were already cancelled; Remove can be retried"
+                .to_owned()
+        });
+        let provisioning = match &removal_reason {
+            Some(reason) => Provisioning::Failed {
+                reason: reason.clone(),
+            },
+            None => provisioning,
+        };
         Self {
             name: name.to_owned(),
             desired,
             provisioning,
             login,
             email,
-            session: SessionState::Idle,
+            session: removal_reason.map_or(SessionState::Idle, |reason| SessionState::Blocked {
+                reason,
+            }),
             sessions_since_start: 0,
             runs_total: runs.len() as u64,
             session_number: 0,
@@ -973,7 +983,6 @@ impl AgentRuntime {
             provision_retry_at: None,
             removal_pending: false,
             removal_retry_at: None,
-            identity_cancelled: false,
         }
     }
 
@@ -1636,6 +1645,7 @@ impl Inner {
                     let agent = &self.agents[index];
                     (
                         agent.removal_pending
+                            || removal_marked(&self.options.layout, &agent.name)
                             || agent.provisioning == Provisioning::Ready
                             || agent.provision_inflight
                             || agent
@@ -2919,7 +2929,7 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
-                if inner.agents[index].identity_cancelled {
+                if removal_marked(&inner.options.layout, &name) {
                     let reason = "its Forgejo sign-in and tokens were already cancelled; Remove can be retried";
                     inner.agents[index].session = SessionState::Blocked {
                         reason: reason.to_owned(),
@@ -4029,6 +4039,14 @@ fn repository_events(before: &[String], after: &[String]) -> Vec<String> {
 }
 
 fn provision_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
+    if let Ok(mut guard) = inner.lock()
+        && removal_marked(&guard.options.layout, &name)
+    {
+        if let Some(index) = guard.agent_index(&name) {
+            guard.agents[index].provision_inflight = false;
+        }
+        return;
+    }
     let (url, token) = match inner.lock() {
         Ok(inner) => (inner.forgejo.url.clone(), inner.forgejo.admin_token.clone()),
         Err(poisoned) => {
@@ -4315,6 +4333,25 @@ fn removed_note(name: &str) -> String {
 }
 
 fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
+    let marker = match inner.lock() {
+        Ok(inner) => write_removal_marker(&inner, &name),
+        Err(poisoned) => write_removal_marker(&poisoned.into_inner(), &name),
+    };
+    if let Err(reason) = marker {
+        if let Ok(mut inner) = inner.lock() {
+            if let Some(index) = inner.agent_index(&name) {
+                inner.agents[index].removal_pending = false;
+                inner.agents[index].provisioning = Provisioning::Failed {
+                    reason: reason.clone(),
+                };
+                inner.agents[index].session = SessionState::Blocked {
+                    reason: reason.clone(),
+                };
+                inner.note(reason);
+            }
+        }
+        return;
+    }
     let (url, admin_token, credentials, login, token_name) = match inner.lock() {
         Ok(inner) => {
             let Some(index) = inner.agent_index(&name) else {
@@ -4393,6 +4430,7 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                 }) {
                     Ok(()) => {
                         inner.agents.remove(index);
+                        clear_removal_marker(&inner.options.layout, &name);
                         inner.note(removed_note(&name));
                     }
                     Err(error) => {
@@ -4403,7 +4441,6 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                         inner.agents[index].removal_retry_at =
                             Some(Instant::now() + PROVISION_RETRY);
                         inner.agents[index].login = None;
-                        inner.agents[index].identity_cancelled = true;
                         inner.agents[index].provisioning = Provisioning::Failed {
                             reason: reason.clone(),
                         };
@@ -4446,6 +4483,54 @@ fn restore_endpoint_key(
         Err(restore_error) => format!(
             "the connection was not saved; the previous model key could not be restored ({error}); the key restore also failed ({restore_error})"
         ),
+    }
+}
+
+/// The private, durable record that this agent is being removed. It lives beside
+/// the run records, not in settings, because the failure it must survive is a
+/// settings write failure.
+fn removal_marker_path(layout: &Layout, name: &str) -> Option<PathBuf> {
+    layout
+        .agent(name)
+        .ok()
+        .map(|paths| paths.state_dir().join("removal-pending"))
+}
+
+fn removal_marked(layout: &Layout, name: &str) -> bool {
+    removal_marker_path(layout, name).is_some_and(|path| path.exists())
+}
+
+fn write_removal_marker(inner: &Inner, name: &str) -> Result<PathBuf, String> {
+    let paths = inner
+        .options
+        .layout
+        .agent(name)
+        .map_err(|error| format!("the agent's state directory is not available: {error}"))?;
+    fs::create_dir_all(paths.state_dir()).map_err(|error| {
+        format!(
+            "the removal marker directory {} cannot be created: {error}; nothing was cancelled",
+            paths.state_dir().display()
+        )
+    })?;
+    set_mode(paths.state_dir(), PRIVATE_DIR_MODE).map_err(|error| {
+        format!(
+            "the removal marker directory {} cannot be made private: {error}; nothing was cancelled",
+            paths.state_dir().display()
+        )
+    })?;
+    let marker = paths.state_dir().join("removal-pending");
+    crate::mode::write_private(&marker, b"removal pending\n").map_err(|error| {
+        format!(
+            "the removal could not be recorded at {}: {error}; nothing was cancelled",
+            marker.display()
+        )
+    })?;
+    Ok(marker)
+}
+
+fn clear_removal_marker(layout: &Layout, name: &str) {
+    if let Some(marker) = removal_marker_path(layout, name) {
+        let _ = fs::remove_file(marker);
     }
 }
 
@@ -7696,6 +7781,124 @@ mod tests {
     }
 
     #[test]
+    fn f4r_a_marked_agent_is_not_scheduled_for_provisioning() {
+        let root = scratch_root("engine-f4r-provision");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        options.forgejo_ready = false;
+        let engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.forgejo.state = ForgejoState::Running;
+            inner.forgejo.provisioned = true;
+            inner.forgejo.admin_token = Some(Secret::new("admin"));
+            inner.agents[0].provisioning = Provisioning::Failed {
+                reason: "cancelled".to_owned(),
+            };
+            inner.agents[0].removal_pending = false;
+        }
+        write_removal_marker(&lock_inner(&engine.inner), "agent-1").expect("marker");
+        let jobs = lock_inner(&engine.inner).due_jobs(Instant::now());
+        assert!(
+            !jobs
+                .iter()
+                .any(|job| matches!(job, Job::ProvisionAgent(name) if name == "agent-1")),
+            "a marked agent was scheduled for provisioning"
+        );
+    }
+
+    #[test]
+    fn f4r_a_reopen_restores_the_marked_block_and_never_provisions() {
+        let root = scratch_root("engine-f4r-reopen");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let layout = Layout::rooted_at(root.clone()).expect("layout");
+        let state_dir = layout
+            .agent("agent-1")
+            .expect("agent paths")
+            .state_dir()
+            .to_path_buf();
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        crate::mode::write_private(state_dir.join("removal-pending"), b"removal pending\n")
+            .expect("marker");
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        options.forgejo_ready = false;
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_for_test(options, Arc::new(FakeClock::new()), fake.clone(), settings)
+            .expect("the engine opens");
+        {
+            let inner = lock_inner(&engine.inner);
+            assert!(matches!(
+                inner.agents[0].session,
+                SessionState::Blocked { .. }
+            ));
+        }
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.forgejo.state = ForgejoState::Running;
+            inner.forgejo.provisioned = true;
+            inner.forgejo.admin_token = Some(Secret::new("admin"));
+            let jobs = inner.due_jobs(Instant::now());
+            assert!(
+                !jobs
+                    .iter()
+                    .any(|job| matches!(job, Job::ProvisionAgent(name) if name == "agent-1")),
+                "a reopened marked agent was scheduled for provisioning"
+            );
+        }
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Start returns without starting");
+        assert_eq!(fake.counts().1, 0, "a reopened marked agent started");
+    }
+
+    #[test]
+    fn f4r_a_marker_write_failure_cancels_nothing() {
+        let root = scratch_root("engine-f4r-marker-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let state_dir = Layout::rooted_at(root.clone())
+            .expect("layout")
+            .agent("agent-1")
+            .expect("agent paths")
+            .state_dir()
+            .to_path_buf();
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir).expect("clear state dir");
+        }
+        std::fs::write(&state_dir, b"not a directory").expect("blocking file");
+        remove_agent_job(Arc::clone(&engine.inner), "agent-1".to_owned());
+        let inner = lock_inner(&engine.inner);
+        assert_eq!(inner.agents.len(), 1);
+        assert!(
+            inner
+                .notice
+                .as_deref()
+                .is_some_and(|note| note.contains("nothing was cancelled")),
+            "{:?}",
+            inner.notice
+        );
+        assert!(!state_dir.join("removal-pending").exists());
+    }
+
+    #[test]
     fn f4_a_failed_removal_save_blocks_and_a_retry_completes() {
         use std::os::unix::fs::PermissionsExt;
         let root = scratch_root("engine-f4-removal");
@@ -7716,7 +7919,6 @@ mod tests {
         {
             let inner = lock_inner(&engine.inner);
             assert_eq!(inner.agents.len(), 1);
-            assert!(inner.agents[0].identity_cancelled);
             assert!(matches!(
                 inner.agents[0].session,
                 SessionState::Blocked { .. }
