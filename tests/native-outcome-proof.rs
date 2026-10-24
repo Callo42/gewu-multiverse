@@ -789,7 +789,14 @@ fn a_stop_after_the_runs_terminal_record_does_not_replace_it() {
             .send(Command::Stop {
                 name: "agent-1".to_owned(),
             })
-            .expect("stop");
+            .expect("first stop");
+        // The first Stop sampled Terminal; a second Stop must not re-open the
+        // ordering decision after the child's ending.
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("second stop");
         let (same_dir, record) =
             wait_terminal_for(&mut engine, &layout, "agent-1", Duration::from_secs(60));
         assert_eq!(same_dir, run_dir);

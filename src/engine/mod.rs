@@ -462,9 +462,9 @@ struct RunningState {
     stop_deadline: Option<Instant>,
     stop_requested: bool,
     timed_out: bool,
-    /// Whether the run had already written its terminal record when this stop or
-    /// deadline was requested. A later stop must not replace that ending.
-    terminal_before_stop: bool,
+    /// The run's first ending, recorded once when it happens. A later Stop,
+    /// shutdown, settle, reap or reopen never changes it.
+    first_ending: Option<run::FirstEnding>,
 }
 
 /// The facts `poll_agent` hands from the running state to the settle boundary.
@@ -475,7 +475,7 @@ type EndedRun = (
     u32,
     bool,
     Option<run::NativeProgress>,
-    bool,
+    Option<run::FirstEnding>,
 );
 
 /// One agent's engine state, beside its saved settings.
@@ -1262,7 +1262,13 @@ impl Inner {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
                     run.timed_out = true;
                     run.stopping = true;
-                    run.terminal_before_stop = run::terminal_recorded(&run.run_dir).unwrap_or(true);
+                    run.first_ending.get_or_insert_with(|| {
+                        if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
+                            run::FirstEnding::Terminal
+                        } else {
+                            run::FirstEnding::Stop
+                        }
+                    });
                     run.stop_deadline = Some(now + self.options.stop_grace);
                     run.handle.signal(false);
                 }
@@ -1273,11 +1279,12 @@ impl Inner {
             if let Some(status) = run.handle.try_status() {
                 let engine_stopped = desired == Desired::Stopped || run.stop_requested;
                 let timed_out = run.timed_out;
-                let terminal_before_stop = run.terminal_before_stop;
-                // A run that already wrote its ending won the race with a Stop or a
-                // deadline. The engine's own stop is authoritative only when no
-                // terminal record existed when that stop was requested.
-                let stop_wins = (engine_stopped || timed_out) && !terminal_before_stop;
+                let first_ending = run.first_ending;
+                // A run that had already written its ending when the first stop was
+                // requested won the race. The engine's own stop is authoritative
+                // only when the write-once fact says Stop.
+                let stop_wins = (engine_stopped || timed_out)
+                    && !matches!(first_ending, Some(run::FirstEnding::Terminal));
                 let terminal = transcript::terminal_record(&run.run_dir);
                 let progress = if timed_out && stop_wins {
                     run::native_progress(&run.run_dir)
@@ -1340,13 +1347,11 @@ impl Inner {
                     run.handle.pid(),
                     stop_wins,
                     progress,
-                    terminal_before_stop,
+                    first_ending,
                 ));
             }
         }
-        if let Some((mut end, started, run_dir, pid, stop_wins, progress, terminal_before_stop)) =
-            ended
-        {
+        if let Some((mut end, started, run_dir, pid, stop_wins, progress, first_ending)) = ended {
             self.observe_confinement_refusal(&run_dir);
             // A supervisor killed from outside can leave the shell it started in
             // the run's process group. The boundary settles the run in this order:
@@ -1387,7 +1392,7 @@ impl Inner {
                 reason,
                 self.options.stop_grace,
                 stop_reason,
-                terminal_before_stop,
+                first_ending.unwrap_or(run::FirstEnding::Stop),
             );
             self.agents[index].leftover = settled.err();
             if self.agents[index].leftover.is_some() {
@@ -3012,7 +3017,13 @@ impl EngineApi for Engine {
             for agent in &mut inner.agents {
                 if let Some(run) = agent.running.as_mut() {
                     run.stopping = true;
-                    run.terminal_before_stop = run::terminal_recorded(&run.run_dir).unwrap_or(true);
+                    run.first_ending.get_or_insert_with(|| {
+                        if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
+                            run::FirstEnding::Terminal
+                        } else {
+                            run::FirstEnding::Stop
+                        }
+                    });
                     run.handle.signal(false);
                 }
                 if let Some(pid) = agent.starting_pid {
@@ -3038,7 +3049,7 @@ impl EngineApi for Engine {
         // stopped, a durable ending is written (unless the run wrote one) and only
         // then are the identity handles removed. A run that cannot be settled keeps
         // its handles, so the next open reports the failure and Start retries.
-        let mut settled_runs: Vec<(PathBuf, u32, bool)> = Vec::new();
+        let mut settled_runs: Vec<(PathBuf, u32, Option<run::FirstEnding>)> = Vec::new();
         loop {
             let mut appeared: Vec<u32> = Vec::new();
             let mut alive = false;
@@ -3050,7 +3061,7 @@ impl EngineApi for Engine {
                             settled_runs.push((
                                 run.run_dir.clone(),
                                 run.handle.pid(),
-                                run.terminal_before_stop,
+                                run.first_ending,
                             ));
                             if let Some(run_id) = run_id_in(&run.run_dir) {
                                 crate::confinement::remove_run_temp(run.handle.pid(), run_id);
@@ -3103,13 +3114,8 @@ impl EngineApi for Engine {
             for agent in &mut inner.agents {
                 if let Some(mut run) = agent.running.take() {
                     stop_running_session(&mut run.handle, Duration::from_millis(500));
-                    let terminal_before_stop = run.terminal_before_stop
-                        || run::terminal_recorded(&run.run_dir).unwrap_or(true);
-                    settled_runs.push((
-                        run.run_dir.clone(),
-                        run.handle.pid(),
-                        terminal_before_stop,
-                    ));
+                    let first_ending = run.first_ending.or(Some(run::FirstEnding::Stop));
+                    settled_runs.push((run.run_dir.clone(), run.handle.pid(), first_ending));
                 }
                 if let Some(pid) = agent.starting_pid.take() {
                     signal_group(pid, nix::sys::signal::Signal::SIGKILL);
@@ -3141,7 +3147,7 @@ impl EngineApi for Engine {
         // Settle every run whose supervisor this shutdown ended, outside the lock.
         // The run gets a durable ending before its handles go; if either step fails
         // the handles stay for the next open, which reports and retries them.
-        for (run_dir, pid, terminal_before_stop) in settled_runs {
+        for (run_dir, pid, first_ending) in settled_runs {
             let _ = run::settle_run_with_stop(
                 &run_dir,
                 pid,
@@ -3149,7 +3155,7 @@ impl EngineApi for Engine {
                 Some("the run was stopped when the program closed".to_owned()),
                 Duration::from_millis(500),
                 Some("the run was stopped when the program closed".to_owned()),
-                terminal_before_stop,
+                first_ending.unwrap_or(run::FirstEnding::Stop),
             );
         }
         // A token helper may have been between "recorded as in flight" and "spawn"
@@ -3454,7 +3460,13 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) {
     }
     if let Some(run) = agent.running.as_mut() {
         run.stopping = true;
-        run.terminal_before_stop = run::terminal_recorded(&run.run_dir).unwrap_or(true);
+        run.first_ending.get_or_insert_with(|| {
+            if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
+                run::FirstEnding::Terminal
+            } else {
+                run::FirstEnding::Stop
+            }
+        });
         run.stop_requested = true;
         run.stop_deadline = Some(Instant::now() + grace);
         run.handle.signal(false);
@@ -4000,7 +4012,11 @@ fn session_job(
         drop(guard);
         if let Ok(mut handle) = spawned {
             let pid = handle.pid();
-            let terminal_before_stop = run::terminal_recorded(&request.run_dir).unwrap_or(true);
+            let first_ending = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
+                run::FirstEnding::Terminal
+            } else {
+                run::FirstEnding::Stop
+            };
             stop_running_session(&mut handle, Duration::from_secs(1));
             let _ = run::settle_run_with_stop(
                 &request.run_dir,
@@ -4009,7 +4025,7 @@ fn session_job(
                 Some("the run was called off when its agent was removed".to_owned()),
                 Duration::from_secs(1),
                 Some("the run was called off when its agent was removed".to_owned()),
-                terminal_before_stop,
+                first_ending,
             );
         }
         return;
@@ -4027,7 +4043,11 @@ fn session_job(
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
             let pid = handle.pid();
-            let terminal_before_stop = run::terminal_recorded(&request.run_dir).unwrap_or(true);
+            let first_ending = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
+                run::FirstEnding::Terminal
+            } else {
+                run::FirstEnding::Stop
+            };
             stop_running_session(&mut handle, Duration::from_secs(1));
             let reason = if stopping {
                 "the run was stopped when the program closed"
@@ -4041,7 +4061,7 @@ fn session_job(
                 Some(reason.to_owned()),
                 Duration::from_secs(1),
                 Some(reason.to_owned()),
-                terminal_before_stop,
+                first_ending,
             ) {
                 Ok(_) => {}
                 Err(reason) => {
@@ -4072,7 +4092,7 @@ fn session_job(
                 stop_deadline: None,
                 stop_requested: false,
                 timed_out: false,
-                terminal_before_stop: false,
+                first_ending: None,
             });
             guard.agents[index].newest_run = Some(request.run_dir.clone());
             guard.agents[index].activity_refresh_at = None;
@@ -5590,7 +5610,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_that_wins_replaces_the_childs_post_stop_ending_with_one_stopped() {
+    fn a_second_stop_after_the_childs_ending_keeps_the_first_stops_stopped() {
         let root = scratch_root("engine-stop-then-finish");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
         let clock = Arc::new(FakeClock::new());
@@ -5603,9 +5623,16 @@ mod tests {
             .send(Command::Stop {
                 name: "agent-1".to_owned(),
             })
-            .expect("stop");
-        // The child managed to write an ending during the stop grace window.
+            .expect("first stop");
+        // The child managed to write an ending during the first stop's grace.
         write_terminal_record(&run_dir, run::RunOutcome::Succeeded, "a post-signal ending");
+        // A second Stop must not re-sample the ordering fact and hand the run to the
+        // child's post-signal ending.
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("second stop");
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
         let board = engine.board();
@@ -5616,6 +5643,38 @@ mod tests {
             endings.len(),
             1,
             "the run kept two terminal records: {endings:?}"
+        );
+        assert_eq!(endings[0].0, "stopped");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_shutdown_after_the_childs_ending_keeps_the_first_stops_stopped() {
+        let root = scratch_root("engine-stop-then-shutdown");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("first stop");
+        write_terminal_record(
+            &run_dir,
+            run::RunOutcome::Succeeded,
+            "a post-stop ending before shutdown",
+        );
+        engine.shutdown(Duration::from_millis(200));
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        let endings = terminal_outcomes(&run_dir);
+        assert_eq!(
+            endings.len(),
+            1,
+            "shutdown kept two terminal records: {endings:?}"
         );
         assert_eq!(endings[0].0, "stopped");
         let _ = fs::remove_dir_all(&root);

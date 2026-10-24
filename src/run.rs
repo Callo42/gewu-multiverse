@@ -283,6 +283,17 @@ pub fn parse_steps(text: &str) -> Vec<String> {
 }
 
 /// How a run ended.
+/// Which ending happened first for a run: its own terminal record, or the first
+/// engine stop/deadline/shutdown request. It is recorded once, when the first ending
+/// occurs, and is never re-sampled by a later Stop, shutdown, settle or reopen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstEnding {
+    /// The run wrote its own terminal record before any engine stop was requested.
+    Terminal,
+    /// An engine stop, deadline or shutdown was requested while no terminal existed.
+    Stop,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
@@ -1409,26 +1420,23 @@ pub fn settle_run(
             .clone()
             .unwrap_or_else(|| "the run was stopped on request".to_owned())
     });
-    let terminal_before_stop = terminal_recorded(run_dir).unwrap_or(false);
-    settle_run_with_stop(
-        run_dir,
-        pgid,
-        outcome,
-        reason,
-        grace,
-        stop,
-        terminal_before_stop,
-    )
+    let first_ending = if terminal_recorded(run_dir).unwrap_or(true) {
+        FirstEnding::Terminal
+    } else {
+        FirstEnding::Stop
+    };
+    settle_run_with_stop(run_dir, pgid, outcome, reason, grace, stop, first_ending)
 }
 
-/// [`settle_run`] with the engine's own stop reason and whether the run had
-/// already written its terminal record when the stop was requested.
+/// [`settle_run`] with the engine's own stop reason and the write-once first-ending
+/// fact.
 ///
-/// A stop that arrives after the run's own ending changes only the agent's desired
-/// state: the existing terminal record is the run's one outcome and no stop marker
-/// is written. A stop that was requested while the run had no ending wins; if the
-/// child manages to write an ending during the grace window, the stop record
-/// replaces it so the run still has exactly one terminal outcome.
+/// `FirstEnding::Terminal` means the run ended first: the existing terminal record is
+/// its one outcome and no stop marker is written. `FirstEnding::Stop` means the
+/// engine's stop was requested while no terminal existed; if the child managed to
+/// write one during the grace window, the stop record replaces it so the run still
+/// has exactly one terminal outcome. A later Stop, shutdown, settle, reap or reopen
+/// cannot change this fact.
 pub fn settle_run_with_stop(
     run_dir: &Path,
     pgid: u32,
@@ -1436,12 +1444,12 @@ pub fn settle_run_with_stop(
     reason: Option<String>,
     grace: std::time::Duration,
     stop: Option<String>,
-    terminal_before_stop: bool,
+    first_ending: FirstEnding,
 ) -> Result<bool, String> {
     let run_id = run_id_of(run_dir).map_err(categorize_cleanup)?;
     let existing = transcript::terminal_record_checked(run_dir)
         .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
-    if stop.is_some() && terminal_before_stop && existing.is_some() {
+    if stop.is_some() && first_ending == FirstEnding::Terminal && existing.is_some() {
         // The run ended first. The Stop is only a desired-state change: keep the one
         // ending, write no stop marker, and still verify the group is gone.
         let reaped = reap(run_dir, pgid, grace)?;
@@ -2960,7 +2968,7 @@ mod stop_record_tests {
             Some(reason.to_owned()),
             Duration::from_millis(50),
             Some(reason.to_owned()),
-            false,
+            FirstEnding::Stop,
         )
         .expect("the timeout settles");
         assert!(!settled);
@@ -2996,7 +3004,7 @@ mod stop_record_tests {
             Some("the run was stopped on request".to_owned()),
             Duration::from_millis(50),
             Some("the run was stopped on request".to_owned()),
-            true,
+            FirstEnding::Terminal,
         )
         .expect("the stop settles");
         assert!(
@@ -3032,7 +3040,7 @@ mod stop_record_tests {
             Some("the run was stopped on request".to_owned()),
             Duration::from_millis(50),
             Some("the run was stopped on request".to_owned()),
-            false,
+            FirstEnding::Stop,
         )
         .expect("the stop settles");
         let marker = stop_reason(&run);
@@ -3113,7 +3121,7 @@ mod stop_record_tests {
             Some("the run was stopped on request".to_owned()),
             Duration::from_millis(80),
             Some("the run was stopped on request".to_owned()),
-            false,
+            FirstEnding::Stop,
         )
         .expect_err("an unverified group cannot be claimed stopped");
         assert!(

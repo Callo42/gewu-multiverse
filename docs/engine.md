@@ -255,7 +255,9 @@ and the terminal ending waits for a verified reap. A run's own terminal record w
 before a stop wins: the stop changes only the agent's desired state, writes no stop
 marker and adds no second ending. A stop requested while the run had no ending wins;
 if the child manages to write one during the grace window, the stop terminal replaces
-it so the run still has exactly one terminal outcome.
+it so the run still has exactly one terminal outcome. The first-ending fact is
+write-once: a second Stop or a program shutdown during the first stop's grace cannot
+re-sample it and hand the run to a later child ending.
 The native supervisor writes `native-progress.json` whenever its per-harness outcome
 model changes (waiting, retrying, failed, succeeded), so a cause the harness already
 emitted survives the engine killing the child at its deadline. A failed tool is
