@@ -84,7 +84,11 @@ denied no-ops. Any changed lock with a different script set fails before `npm`
 starts. `allowScripts` is not a blanket switch, and this installer never passes
 `--dangerously-allow-all-scripts`. A configured
 `dangerously-allow-all-scripts=true` is refused before npm runs, because it bypasses
-the two explicit denials. If npm is configured to skip install scripts, the install
+the two explicit denials. The preflight asks npm for the install's effective
+empty-project context, so a caller project's `.npmrc` cannot mask user/global/
+environment settings; npm's boolean spellings (`true`, `1`, `yes`, `on` and their
+false forms) are handled, and an unrecognized value is refused rather than guessed.
+If npm is configured to skip install scripts, the install
 fails with that reason instead of pretending the program is ready. After
 `npm ci`, the installer loads `node-pty`'s native module and executes `koffi`'s libc
 `getpid` binding; a `spawn-helper`, where the platform ships one, must be executable.

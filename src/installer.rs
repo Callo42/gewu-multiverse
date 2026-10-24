@@ -580,7 +580,7 @@ fn verify_dsh_npm_policy_support() -> Result<(), String> {
     let _ = crate::mode::set_mode(&home, crate::mode::PRIVATE_DIR_MODE);
     let _ = crate::mode::set_mode(&cache, crate::mode::PRIVATE_DIR_MODE);
     let result = (|| {
-        let version = npm_config_output(&["--version"], &home, &cache)?;
+        let version = npm_config_output(&["--version"], &home, &cache, &check, None)?;
         let parsed = parse_npm_version(&version).ok_or_else(|| {
             format!(
                 "npm reported an unreadable version ({version}); version 11.16 or newer is needed for DeepSeek Harness because older npm ignores its reviewed install scripts (the old version is unchanged)"
@@ -591,23 +591,48 @@ fn verify_dsh_npm_policy_support() -> Result<(), String> {
                 "npm {version} is older than 11.16 and ignores DeepSeek Harness's reviewed install scripts; update npm to 11.16 or newer and try again (the old version is unchanged)"
             ));
         }
-        let ignore = npm_config_output(&["config", "get", "ignore-scripts"], &home, &cache)?;
-        if config_is_true(&ignore) {
-            return Err(
-                "npm skips install scripts; DeepSeek Harness needs the three reviewed install scripts re-enabled (the old version is unchanged)"
-                    .to_owned(),
-            );
+        // The real install uses the empty stage as its project prefix. Ask npm for
+        // the same effective context here so a caller project's .npmrc cannot mask
+        // user/global/environment configuration that the stage would actually see.
+        let ignore = npm_config_output(
+            &["config", "get", "ignore-scripts"],
+            &home,
+            &cache,
+            &check,
+            Some(&check),
+        )?;
+        match config_truth(&ignore) {
+            Some(true) => {
+                return Err(format!(
+                    "npm skips install scripts (ignore-scripts={ignore}); DeepSeek Harness needs the three reviewed install scripts re-enabled; set ignore-scripts=false or remove it and try again (the old version is unchanged)"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "npm returned an unrecognized ignore-scripts value ({ignore}); set it to false or remove it so the reviewed install scripts can run (the old version is unchanged)"
+                ));
+            }
+            Some(false) => {}
         }
         let dangerous = npm_config_output(
             &["config", "get", "dangerously-allow-all-scripts"],
             &home,
             &cache,
+            &check,
+            Some(&check),
         )?;
-        if config_is_true(&dangerous) {
-            return Err(
-                "npm is configured with dangerously-allow-all-scripts, which runs every dependency script; remove that setting from npm config or the environment and try again (the old version is unchanged)"
-                    .to_owned(),
-            );
+        match config_truth(&dangerous) {
+            Some(true) => {
+                return Err(format!(
+                    "npm is configured with dangerously-allow-all-scripts ({dangerous}), which runs every dependency script; set it to false or remove it from npm config and the environment and try again (the old version is unchanged)"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "npm returned an unrecognized dangerously-allow-all-scripts value ({dangerous}); set it to false or remove it so the reviewed policy is effective (the old version is unchanged)"
+                ));
+            }
+            Some(false) => {}
         }
         Ok(())
     })();
@@ -624,20 +649,36 @@ fn parse_npm_version(version: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-fn config_is_true(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case("true")
+fn config_truth(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" | "undefined" => Some(false),
+        _ => None,
+    }
 }
 
-fn npm_config_output(args: &[&str], home: &Path, cache: &Path) -> Result<String, String> {
-    let output = Command::new("npm")
+fn npm_config_output(
+    args: &[&str],
+    home: &Path,
+    cache: &Path,
+    cwd: &Path,
+    prefix: Option<&Path>,
+) -> Result<String, String> {
+    let mut command = Command::new("npm");
+    command
         .args(args)
+        .current_dir(cwd)
         .env("HOME", home)
         .env("npm_config_cache", cache)
         .env("npm_config_registry", "https://registry.npmjs.org/")
         .env("npm_config_update_notifier", "false")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    if let Some(prefix) = prefix {
+        command.arg("--prefix").arg(prefix);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("npm could not be started: {error}"))?;
     if !output.status.success() {
@@ -663,13 +704,15 @@ fn check_npm_scripts_enabled(stage: &Path, home: &Path, cache: &Path) -> Result<
         return Err("npm could not read its install-script setting".to_owned());
     }
     let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if value == "true" {
-        return Err(
-            "npm skips install scripts; DeepSeek Harness needs the three reviewed install scripts re-enabled (the old version is unchanged)"
-                .to_owned(),
-        );
+    match config_truth(&value) {
+        Some(true) => Err(format!(
+            "npm skips install scripts (ignore-scripts={value}); DeepSeek Harness needs the three reviewed install scripts re-enabled; set ignore-scripts=false or remove it and try again (the old version is unchanged)"
+        )),
+        None => Err(format!(
+            "npm returned an unrecognized ignore-scripts value ({value}); set it to false or remove it so the reviewed install scripts can run (the old version is unchanged)"
+        )),
+        Some(false) => Ok(()),
     }
-    Ok(())
 }
 
 /// The exact install-script set in the locked graph, reviewed by this product. A
@@ -1934,10 +1977,17 @@ mod tests {
         assert_eq!(parse_npm_version("11.16.0"), Some((11, 16, 0)));
         assert_eq!(parse_npm_version("11.17.0-rc.1"), Some((11, 17, 0)));
         assert_eq!(parse_npm_version("npm 11.17.0"), None);
-        assert!(config_is_true("true"));
-        assert!(config_is_true(" TRUE \n"));
-        assert!(!config_is_true("false"));
-        assert!(!config_is_true(""));
+        assert_eq!(config_truth("true"), Some(true));
+        assert_eq!(config_truth(" TRUE \n"), Some(true));
+        assert_eq!(config_truth("1"), Some(true));
+        assert_eq!(config_truth("yes"), Some(true));
+        assert_eq!(config_truth("on"), Some(true));
+        assert_eq!(config_truth("false"), Some(false));
+        assert_eq!(config_truth("0"), Some(false));
+        assert_eq!(config_truth("no"), Some(false));
+        assert_eq!(config_truth("undefined"), Some(false));
+        assert_eq!(config_truth("maybe"), None);
+        assert_eq!(config_truth(""), None);
     }
 
     #[test]

@@ -6,7 +6,7 @@ mod support;
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use gewu_multiverse::harness::{self, Program};
@@ -419,6 +419,57 @@ fn a_staged_foreign_root_keeps_the_journal_and_old_backup() {
         old_binary
     );
     assert!(!journal.exists());
+}
+
+#[test]
+fn a_fresh_old_moved_kill_is_recoverable_and_a_retry_succeeds() {
+    let sandbox = Sandbox::new("fresh-old-moved");
+    let root = sandbox.install_root("pi", "1.4.0");
+    assert!(!root.exists());
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive.clone(), 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"old-moved\"") && text.contains("\"had_old\": false"))
+                .unwrap_or(false)
+                && !root.exists()
+                && stage_dirs(&harness).len() == 1
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the fresh installer reached the old-moved pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(notes.is_empty(), "{notes:?}");
+    assert!(!journal.exists());
+    assert!(stage_dirs(&harness).is_empty());
+    assert!(!root.exists());
+
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let output = run(&sandbox, "pi", &server, &digest);
+    assert!(
+        output.status.success(),
+        "the normal retry failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(harness::installed(&sandbox.data_root(), Program::Pi).is_some());
+    assert!(root.join("pi/pi").is_file());
 }
 
 #[test]
@@ -970,7 +1021,18 @@ exit 0
     for (version, dangerous, ignore, expected) in [
         ("11.15.0", "false", "false", "older than 11.16"),
         ("11.17.0", "true", "false", "dangerously-allow-all-scripts"),
+        ("11.17.0", "1", "false", "dangerously-allow-all-scripts"),
+        ("11.17.0", "yes", "false", "dangerously-allow-all-scripts"),
         ("11.17.0", "false", "true", "skips install scripts"),
+        ("11.17.0", "false", "1", "skips install scripts"),
+        ("11.17.0", "false", "yes", "skips install scripts"),
+        (
+            "11.17.0",
+            "maybe",
+            "false",
+            "unrecognized dangerously-allow-all-scripts",
+        ),
+        ("11.17.0", "false", "maybe", "unrecognized ignore-scripts"),
     ] {
         let _ = fs::remove_file(&marker);
         let mut command = sandbox.product();
@@ -997,6 +1059,130 @@ exit 0
         );
         assert!(stage_dirs(&sandbox.harness_dir("dsh")).is_empty());
     }
+}
+
+fn real_npm_for_policy() -> Option<String> {
+    let output = Command::new("sh")
+        .args(["-c", "command -v npm"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let npm = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if npm.is_empty() {
+        return None;
+    }
+    let version = Command::new(&npm).arg("--version").output().ok()?;
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    let core = version.split('-').next().unwrap_or(&version);
+    let mut pieces = core.split('.');
+    let major: u64 = pieces
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    let minor: u64 = pieces
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    ((major, minor) >= (11, 16)).then_some(npm)
+}
+
+#[test]
+fn the_npm_policy_preflight_uses_the_install_context_and_npm_boolean_forms() {
+    let Some(real_npm) = real_npm_for_policy() else {
+        eprintln!(
+            "skipping: this machine's npm predates 11.16, which the installer refuses for DSH"
+        );
+        return;
+    };
+    let sandbox = Sandbox::new("dsh-npm-context");
+    let root = sandbox.install_root("dsh", "0.2.1-rc.2");
+    dsh_old_install(&root, "0.2.0", 0);
+    let old = fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint");
+    let marker = sandbox.root.join("npm-ci-ran");
+    let project = sandbox.root.join("project");
+    let clean = sandbox.root.join("clean");
+    fs::create_dir_all(&project).expect("the project");
+    fs::create_dir_all(&clean).expect("the clean project");
+    fs::write(
+        project.join(".npmrc"),
+        "dangerously-allow-all-scripts=false\nignore-scripts=false\n",
+    )
+    .expect("the project npmrc");
+    let userconfig = sandbox.root.join("user.npmrc");
+    fs::write(&userconfig, "dangerously-allow-all-scripts=true\n").expect("the user npmrc");
+    write_executable(
+        &sandbox.bin.join("npm"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then exec "$REAL_NPM" "$@"; fi
+if [ "$1" = "config" ]; then exec "$REAL_NPM" "$@"; fi
+: > "$NPM_CI_MARKER"
+exit 1
+"#,
+    );
+
+    let run = |current_dir: &std::path::Path,
+               env: &[(&str, &str)],
+               label: &str|
+     -> std::process::Output {
+        let _ = fs::remove_file(&marker);
+        let mut command = sandbox.product();
+        command
+            .current_dir(current_dir)
+            .env("REAL_NPM", &real_npm)
+            .env("NPM_CI_MARKER", &marker)
+            .args(["--install-harness", "dsh"]);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("the product runs");
+        assert!(
+            !output.status.success(),
+            "{label}: the fake npm ci should have failed"
+        );
+        assert_eq!(
+            fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint"),
+            old,
+            "{label}: the old entrypoint changed"
+        );
+        assert!(
+            stage_dirs(&sandbox.harness_dir("dsh")).is_empty(),
+            "{label}: a stage survived"
+        );
+        output
+    };
+
+    let output = run(
+        &project,
+        &[("NPM_CONFIG_USERCONFIG", userconfig.to_str().expect("utf8"))],
+        "masking",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dangerously-allow-all-scripts"), "{stderr}");
+    assert!(!marker.exists(), "masking reached npm ci");
+
+    for value in ["1", "yes"] {
+        let output = run(
+            &clean,
+            &[("NPM_CONFIG_DANGEROUSLY_ALLOW_ALL_SCRIPTS", value)],
+            value,
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("dangerously-allow-all-scripts"), "{stderr}");
+        assert!(!marker.exists(), "dangerous={value} reached npm ci");
+    }
+    let output = run(&clean, &[("NPM_CONFIG_IGNORE_SCRIPTS", "1")], "ignore");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("skips install scripts"), "{stderr}");
+    assert!(!marker.exists(), "ignore-scripts=1 reached npm ci");
+
+    let output = run(&clean, &[], "accepted");
+    assert!(
+        marker.exists(),
+        "the accepted preflight did not reach npm ci: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

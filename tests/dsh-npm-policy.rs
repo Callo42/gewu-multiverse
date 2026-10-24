@@ -168,11 +168,12 @@ fn run_case(
     template: &Path,
     registry: &str,
     marker: &Path,
-    dangerous: bool,
+    dangerous: Option<&str>,
 ) -> std::process::Output {
+    let label = dangerous.unwrap_or("none");
     let root = sandbox.root.join(format!(
         "run-{}-{}",
-        dangerous,
+        label,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -182,8 +183,8 @@ fn run_case(
     fs::copy(template.join("package.json"), root.join("package.json")).expect("the package file");
     let lock = fs::read_to_string(template.join("package-lock.json")).expect("the lock");
     fs::write(root.join("package-lock.json"), lock).expect("the lock copy");
-    let home = sandbox.root.join(format!("home-{dangerous}"));
-    let cache = sandbox.root.join(format!("cache-{dangerous}"));
+    let home = sandbox.root.join(format!("home-{label}"));
+    let cache = sandbox.root.join(format!("cache-{label}"));
     fs::create_dir_all(&home).expect("the npm home");
     fs::create_dir_all(&cache).expect("the npm cache");
     let mut command = Command::new("npm");
@@ -201,8 +202,8 @@ fn run_case(
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_PATH")
         .env_remove("npm_config_dangerously_allow_all_scripts");
-    if dangerous {
-        command.env("npm_config_dangerously_allow_all_scripts", "true");
+    if let Some(value) = dangerous {
+        command.env("npm_config_dangerously_allow_all_scripts", value);
     }
     command.stdin(Stdio::null()).output().expect("npm ci runs")
 }
@@ -250,7 +251,7 @@ fn the_real_supported_npm_skips_the_denied_lifecycle_script() {
     write(&template.join("package-lock.json"), &lock);
 
     let normal = sandbox.root.join("marker-normal");
-    let output = run_case(&sandbox, &template, &registry.url, &normal, false);
+    let output = run_case(&sandbox, &template, &registry.url, &normal, None);
     assert!(
         output.status.success(),
         "npm ci failed: {}",
@@ -261,15 +262,17 @@ fn the_real_supported_npm_skips_the_denied_lifecycle_script() {
         "a denied postinstall ran on supported npm"
     );
 
-    let bypass = sandbox.root.join("marker-bypass");
-    let output = run_case(&sandbox, &template, &registry.url, &bypass, true);
-    assert!(
-        output.status.success(),
-        "the bypass control failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        bypass.exists(),
-        "the fixture itself did not execute under dangerously-allow-all-scripts"
-    );
+    for value in ["true", "1", "yes"] {
+        let bypass = sandbox.root.join(format!("marker-bypass-{value}"));
+        let output = run_case(&sandbox, &template, &registry.url, &bypass, Some(value));
+        assert!(
+            output.status.success(),
+            "the bypass control {value} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            bypass.exists(),
+            "the fixture did not execute under dangerously-allow-all-scripts={value}"
+        );
+    }
 }
