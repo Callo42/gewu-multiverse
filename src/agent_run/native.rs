@@ -26,6 +26,9 @@ use crate::transcript::{Record, Transcript};
 
 use super::{RunEnd, RunEnding, RunEvidence, RunLog, Shell};
 
+mod outcome;
+use outcome::{Disposition, NativeEvent, NativeOutcome, SupervisorEnd};
+
 /// The run's private native directory under the confined run temp.
 struct NativeFiles {
     root: PathBuf,
@@ -329,6 +332,7 @@ fn start_opencode_server(
 struct OpenCall {
     index: u32,
     tool: String,
+    args: String,
     started: Instant,
 }
 
@@ -382,11 +386,11 @@ fn redact_native_line(secret: &Secret, line: &str, carry: &mut String) -> String
 }
 
 /// The facts the product reads from the native stream.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct NativeState {
-    final_text: Option<String>,
-    terminal: bool,
-    error: Option<String>,
+    /// The per-harness terminal-outcome model. It owns the terminal decision,
+    /// the ordered failure timeline and the text that is safe to commit.
+    outcome: NativeOutcome,
     open: HashMap<String, OpenCall>,
     failed_call: Option<String>,
     first_failure: Option<String>,
@@ -403,6 +407,34 @@ struct NativeState {
     checked_empty: bool,
 }
 
+impl Default for NativeState {
+    fn default() -> Self {
+        Self::new(Program::Builtin)
+    }
+}
+
+impl NativeState {
+    fn new(program: Program) -> Self {
+        Self {
+            outcome: NativeOutcome::new(program),
+            open: HashMap::new(),
+            failed_call: None,
+            first_failure: None,
+            refused_write: None,
+            wrote: false,
+            workspace_wrote: false,
+            pr_ok: false,
+            pr_updated: false,
+            comment_ok: false,
+            forgejo_read_ok: false,
+            pushed: false,
+            uncertain_write: false,
+            tool_ok: false,
+            checked_empty: false,
+        }
+    }
+}
+
 fn codex_tool_approvals() -> String {
     let mut text = String::new();
     for tool in crate::forgejo_tools::TOOL_NAMES {
@@ -413,8 +445,15 @@ fn codex_tool_approvals() -> String {
     text
 }
 
-fn non_success_reason(state: &NativeState) -> String {
-    if let Some(first) = state.first_failure.as_ref() {
+fn non_success_reason(state: &NativeState, requested: RequestedWork) -> String {
+    if let Some(terminal) = state.outcome.terminal_failure_reason() {
+        return terminal;
+    }
+    if let Some(first) = state
+        .outcome
+        .first_tool_failure()
+        .or(state.first_failure.as_ref())
+    {
         return first.clone();
     }
     if let Some(refused) = state.refused_write.as_ref() {
@@ -426,13 +465,42 @@ fn non_success_reason(state: &NativeState) -> String {
     if state.uncertain_write {
         return "the Forgejo write request was accepted but its result could not be read; the effect is uncertain".to_owned();
     }
+    if !state.outcome.saw_tool() && requires_confirmed_tool(requested) {
+        // Codex's in-run workspace sandbox can refuse a command without emitting a
+        // JSON event at all; the refusal reaches only the model, not this stream.
+        // With no supported event surface the product cannot name the denial, but
+        // it must not claim success for work whose tool calls left no confirmed
+        // result. Say exactly what is known.
+        return match state.outcome.program() {
+            Some(Program::Codex) => "the native program ended successfully but no tool call or workspace change was observed; Codex's own workspace sandbox can refuse a command without emitting an event, so the requested work is unconfirmed and this run is not a success".to_owned(),
+            _ => "the native program ended successfully but no tool call or workspace change was observed, so the requested work is unconfirmed and this run is not a success".to_owned(),
+        };
+    }
     "the native program finished without verified success; no matching tool or work fact was recorded".to_owned()
 }
 
-fn run_reason(ending: RunEnding, summary: &str, state: &NativeState) -> Option<String> {
+fn requires_confirmed_tool(requested: RequestedWork) -> bool {
+    matches!(
+        requested,
+        RequestedWork::ReadOnly
+            | RequestedWork::GenericWrite
+            | RequestedWork::PullRequest
+            | RequestedWork::PullRequestUpdate
+            | RequestedWork::Comment
+            | RequestedWork::Push
+            | RequestedWork::ForgejoRead
+    )
+}
+
+fn run_reason(
+    ending: RunEnding,
+    summary: &str,
+    state: &NativeState,
+    requested: RequestedWork,
+) -> Option<String> {
     match ending {
         RunEnding::Succeeded => (!summary.trim().is_empty()).then(|| summary.to_owned()),
-        _ => Some(non_success_reason(state)),
+        _ => Some(non_success_reason(state, requested)),
     }
 }
 
@@ -646,8 +714,9 @@ pub(super) fn run(
     drop(child.stdin.take());
 
     let push_watch = crate::workspace::watch_push(&plan.workspace);
-    let mut state = NativeState::default();
-    let mut last_stderr = String::new();
+    let mut state = NativeState::new(program);
+    let mut stderr_lines: Vec<String> = Vec::new();
+    let mut progress_written = String::new();
     let mut event_file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -704,10 +773,13 @@ pub(super) fn run(
                     transcript,
                     log,
                 );
+                write_progress(shell, &state, &mut progress_written, log);
             } else {
                 let cleaned = redact_native_line(secret, &line, &mut stderr_carry);
                 if !cleaned.trim().is_empty() {
-                    last_stderr = cleaned.clone();
+                    if stderr_lines.len() < 64 {
+                        stderr_lines.push(cleaned.clone());
+                    }
                     log.block(&cleaned);
                 }
             }
@@ -741,8 +813,11 @@ pub(super) fn run(
                 transcript,
                 log,
             );
+            write_progress(shell, &state, &mut progress_written, log);
         } else if !cleaned.trim().is_empty() {
-            last_stderr = cleaned.clone();
+            if stderr_lines.len() < 64 {
+                stderr_lines.push(cleaned.clone());
+            }
             log.block(&cleaned);
         }
     }
@@ -770,7 +845,7 @@ pub(super) fn run(
     if let Some(call) = state.open.values().next().cloned() {
         finish_call(
             &call,
-            1,
+            Some(1),
             None,
             "the program exited before this tool finished".to_owned(),
             transcript,
@@ -778,30 +853,61 @@ pub(super) fn run(
             &mut state,
         );
     }
-    let reason = state
-        .error
-        .clone()
-        .or_else(|| (!last_stderr.is_empty()).then_some(last_stderr))
-        .or_else(|| {
-            exit.signal()
-                .map(|signal| format!("the program was ended by signal {signal}"))
-        })
-        .unwrap_or_else(|| format!("the program exited with code {}", exit.code().unwrap_or(1)));
+    let resolution = state.outcome.finish(exit.code(), SupervisorEnd::Natural);
+    // The natural ending is the final progress state too. OpenCode has no terminal
+    // event, so without this its last persisted state would remain "retrying".
+    match resolution.disposition {
+        Disposition::Failed => {
+            if let Some(reason) = resolution.reason.as_deref() {
+                let _ = crate::run::write_native_progress(&shell.run_dir, "failed", reason, true);
+            }
+        }
+        Disposition::Succeeded => {
+            let _ = crate::run::write_native_progress(&shell.run_dir, "succeeded", "", true);
+        }
+        Disposition::Stopped | Disposition::TimedOut => {}
+    }
+    // Commit only the text the harness marked successful. Failed or retried
+    // attempts never reach the durable transcript.
+    for text in state.outcome.committed_texts() {
+        let _ = transcript.append(&Record::native_text(text.clone()));
+    }
+    let stderr_reason = stderr_cause(&stderr_lines);
+    let generic_exit = resolution.reason.as_deref().is_none_or(|reason| {
+        reason.starts_with("the native program exited with code")
+            || reason == "the native program was ended by a signal"
+    });
+    let reason = if generic_exit {
+        stderr_reason
+            .clone()
+            .or_else(|| resolution.reason.clone())
+            .or_else(|| {
+                exit.signal()
+                    .map(|signal| format!("the program was ended by signal {signal}"))
+            })
+            .unwrap_or_else(|| format!("the program exited with code {}", exit.code().unwrap_or(1)))
+    } else {
+        resolution
+            .reason
+            .clone()
+            .or(stderr_reason)
+            .unwrap_or_else(|| format!("the program exited with code {}", exit.code().unwrap_or(1)))
+    };
     if !exit.success() {
         return RunEnd::failed(reason);
     }
-    if !state.terminal {
+    if resolution.disposition == Disposition::Failed {
+        return RunEnd::failed(reason);
+    }
+    if resolution.disposition != Disposition::Succeeded {
         return RunEnd::failed(
-            "the native program exited without a completion event; the run is not a success"
+            "the native program ended without a completion event; the run is not a success"
                 .to_owned(),
         );
     }
-    if let Some(error) = state.error.clone() {
-        return RunEnd::failed(error);
-    }
 
-    let summary = state
-        .final_text
+    let summary = resolution
+        .text
         .as_deref()
         .map(|text| model::whole_message(text, 4000))
         .unwrap_or_default();
@@ -813,17 +919,17 @@ pub(super) fn run(
         ..RunEvidence::default()
     };
     let instruction = String::from_utf8_lossy(instruction);
+    let requested = requested_work(&instruction, &plan.steps);
     let base = crate::agent_run::ending_for_instruction(&instruction, &summary, &evidence);
     if state.uncertain_write {
         return RunEnd {
             exit_code: 0,
-            reason: Some(non_success_reason(&state)),
+            reason: Some(non_success_reason(&state, requested)),
             ending: RunEnding::Warned,
         };
     }
-    let requested = requested_work(&instruction, &plan.steps);
     let ending = decide_native_ending(base, requested, &state);
-    let reason = run_reason(ending, &summary, &state);
+    let reason = run_reason(ending, &summary, &state, requested);
     RunEnd {
         exit_code: 0,
         reason,
@@ -1127,6 +1233,30 @@ fn plan_key(plan: &crate::run::RunPlan) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Per-launch request/retry settings that fit inside the session deadline.
+///
+/// The harness's own retry budget must be smaller than the product's session
+/// deadline; otherwise a provider hang outlives the engine and is recorded only as
+/// `timed_out`. Three attempts with a bounded request timeout and a margin leave the
+/// harness time to emit its terminal event and its cause.
+#[derive(Debug, Clone, Copy)]
+struct LaunchBudget {
+    request_ms: u64,
+    retry_delay_ms: u64,
+}
+
+fn launch_budget(timeout_secs: u64) -> LaunchBudget {
+    const ATTEMPTS: u64 = 3;
+    let total_ms = timeout_secs.max(1).saturating_mul(1000);
+    let usable = total_ms.saturating_sub(total_ms / 5);
+    let request_ms = (usable / ATTEMPTS).clamp(1_000, 120_000);
+    let retry_delay_ms = (request_ms / 10).clamp(200, 4_000);
+    LaunchBudget {
+        request_ms,
+        retry_delay_ms,
+    }
+}
+
 /// Build the program command, its extra environment and a short config description.
 type Launch = (Vec<String>, Vec<(String, String)>, String);
 
@@ -1150,6 +1280,7 @@ fn build_launch(
         )
     });
     let model = native.model.clone();
+    let budget = launch_budget(plan.timeout_secs);
     match program {
         Program::Pi => {
             let dir = files.root.join("pi");
@@ -1172,6 +1303,16 @@ fn build_launch(
                 }
             });
             write_json(&dir.join("models.json"), &models)?;
+            write_json(
+                &dir.join("settings.json"),
+                &json!({
+                    "httpIdleTimeoutMs": budget.request_ms,
+                    "retry": {
+                        "maxRetries": 2,
+                        "baseDelayMs": budget.retry_delay_ms
+                    }
+                }),
+            )?;
             if let Some((exe, mcp_args)) = mcp.as_ref() {
                 write_json(
                     &dir.join("mcp.json"),
@@ -1213,10 +1354,11 @@ fn build_launch(
                 "workspace-write"
             };
             let mut config = format!(
-                "model = {}\nmodel_provider = \"gewu\"\napproval_policy = \"never\"\nsandbox_mode = {}\n\n[sandbox_workspace_write]\nnetwork_access = true\n\n[features]\nplugins = false\nrecommended_plugins = false\n\n[model_providers.gewu]\nname = \"gewu\"\nbase_url = {}\nwire_api = \"responses\"\n\n[model_providers.gewu.auth]\ncommand = {}\nargs = [\"--print-native-key\", {}]\n",
+                "model = {}\nmodel_provider = \"gewu\"\napproval_policy = \"never\"\nsandbox_mode = {}\n\n[sandbox_workspace_write]\nnetwork_access = true\n\n[features]\nplugins = false\nrecommended_plugins = false\n\n[model_providers.gewu]\nname = \"gewu\"\nbase_url = {}\nwire_api = \"responses\"\nrequest_max_retries = 2\nstream_max_retries = 2\nstream_idle_timeout_ms = {}\n\n[model_providers.gewu.auth]\ncommand = {}\nargs = [\"--print-native-key\", {}]\n",
                 toml_string(&model),
                 toml_string(sandbox),
                 toml_string(&native.base_url),
+                budget.request_ms,
                 toml_string(&files.key_helper.display().to_string()),
                 toml_string(&files.key.display().to_string())
             );
@@ -1263,10 +1405,14 @@ fn build_launch(
                 Protocol::AnthropicMessages => "anthropic-messages",
             };
             let mut overlay = format!(
-                "- id: agent-default-model\n  config:\n    provider: gewu\n    model: {}\n- id: llm-pi-ai\n  config:\n    providers:\n      gewu:\n        apiKeyEnv: GEWU_NATIVE_KEY\n        api: {}\n        baseURL: {}\n        models:\n          - id: {}\n- id: session-title-llm\n  disabled: true\n",
+                "- id: agent-default-model\n  config:\n    provider: gewu\n    model: {}\n- id: llm-pi-ai\n  config:\n    providers:\n      gewu:\n        apiKeyEnv: GEWU_NATIVE_KEY\n        api: {}\n        baseURL: {}\n        timeoutMs: {}\n        streamIdleTimeoutMs: {}\n        retryPolicy:\n          mode: normal\n          maxRetries: 2\n          backoff:\n            initialDelayMs: {}\n            maxDelayMs: {}\n        models:\n          - id: {}\n- id: session-title-llm\n  disabled: true\n",
                 yaml(&model),
                 yaml(api),
                 yaml(&native.base_url),
+                budget.request_ms,
+                budget.request_ms,
+                budget.retry_delay_ms,
+                budget.retry_delay_ms.saturating_mul(4),
                 yaml(&model)
             );
             if let Some((exe, mcp_args)) = mcp.as_ref() {
@@ -1323,7 +1469,9 @@ fn build_launch(
                         "name": "gewu",
                         "options": {
                             "baseURL": native.base_url,
-                            "apiKey": format!("{{file:{}}}", files.key.display())
+                            "apiKey": format!("{{file:{}}}", files.key.display()),
+                            "timeout": budget.request_ms,
+                            "maxRetries": 2
                         },
                         "models": {
                             model.clone(): {"name": model.clone(), "limit": {"context": 32000, "output": 4096}}
@@ -1379,422 +1527,41 @@ fn handle_event(
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return;
     };
-    match program {
-        Program::Pi => pi_event(&value, state, tool_index, plan, transcript, log),
-        Program::Codex => codex_event(&value, state, tool_index, plan, transcript, log),
-        Program::Dsh => dsh_event(&value, state, tool_index, plan, transcript, log),
-        Program::Opencode => opencode_event(&value, state, tool_index, plan, transcript, log),
-        Program::Builtin => {}
-    }
-}
-
-fn pi_event(
-    value: &Value,
-    state: &mut NativeState,
-    tool_index: &mut u32,
-    plan: &crate::run::RunPlan,
-    transcript: &mut Transcript,
-    log: &mut RunLog,
-) {
-    match value.get("type").and_then(Value::as_str) {
-        Some("tool_execution_start") => start_call(
-            value,
-            "toolCallId",
-            "toolName",
-            "args",
-            state,
-            tool_index,
-            plan,
-            transcript,
-            log,
-        ),
-        Some("tool_execution_end") => {
-            let id = value
-                .get("toolCallId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let output = value
-                .get("result")
-                .and_then(|result| result.get("content"))
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let exit = value
-                .get("result")
-                .and_then(|result| result.get("structuredContent"))
-                .and_then(|content| content.get("exit_code"))
-                .and_then(Value::as_i64)
-                .map(|code| code as i32)
-                .or_else(|| {
-                    value
-                        .get("result")
-                        .and_then(|result| result.get("isError"))
-                        .or_else(|| value.get("isError"))
-                        .and_then(Value::as_bool)
-                        .filter(|error| *error)
-                        .map(|_| 1)
+    for event in outcome::line_events(program, &value) {
+        match event {
+            NativeEvent::ToolStarted { id, tool, args } => {
+                state.outcome.observe(NativeEvent::ToolStarted {
+                    id: id.clone(),
+                    tool: tool.clone(),
+                    args: args.clone(),
                 });
-            finish_call_by_id(id, exit, output, state, transcript, log);
-        }
-        Some("message_end") => {
-            if value
-                .get("message")
-                .and_then(|m| m.get("role"))
-                .and_then(Value::as_str)
-                == Some("assistant")
-            {
-                if let Some(message) = value.get("message") {
-                    if let Some(error) = message.get("errorMessage").and_then(Value::as_str)
-                        && !error.trim().is_empty()
-                    {
-                        state.error.get_or_insert_with(|| error.to_owned());
-                    }
-                }
-                if let Some(text) = assistant_text(value.get("message")) {
-                    state.final_text = Some(text.clone());
-                    let _ = transcript.append(&Record::native_text(text));
-                }
+                start_named(&id, &tool, &args, state, tool_index, plan, transcript, log);
             }
-        }
-        Some("auto_retry_end") => {
-            if value.get("success").and_then(Value::as_bool) == Some(false) {
-                let message = value
-                    .get("finalError")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the native provider failed after its retries");
-                state.error.get_or_insert_with(|| message.to_owned());
-            }
-        }
-        Some("agent_settled") => {
-            state.terminal = true;
-            if value.get("aborted").and_then(Value::as_bool) == Some(true) {
-                state.error = Some("the native program was stopped".to_owned());
-            }
-        }
-        Some("error") => {
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("the native program reported an error");
-            state.error = Some(message.to_owned());
-        }
-        _ => {}
-    }
-}
-
-fn codex_event(
-    value: &Value,
-    state: &mut NativeState,
-    tool_index: &mut u32,
-    plan: &crate::run::RunPlan,
-    transcript: &mut Transcript,
-    log: &mut RunLog,
-) {
-    match value.get("type").and_then(Value::as_str) {
-        Some("item.started") | Some("item.completed") => {
-            let Some(item) = value.get("item") else {
-                return;
-            };
-            let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            match kind {
-                "command_execution" => {
-                    let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-                    let command = item
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if value.get("type").and_then(Value::as_str) == Some("item.started") {
-                        start_named(
-                            id, "shell", command, state, tool_index, plan, transcript, log,
-                        );
-                    } else {
-                        let exit = item
-                            .get("exit_code")
-                            .and_then(Value::as_i64)
-                            .map(|code| code as i32);
-                        let output = item
-                            .get("aggregated_output")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned();
-                        let call_id = if id.is_empty() {
-                            format!("codex-command-{}", *tool_index + 1)
-                        } else {
-                            id.to_owned()
-                        };
-                        if !state.open.contains_key(&call_id) {
-                            start_named(
-                                &call_id, "shell", command, state, tool_index, plan, transcript,
-                                log,
-                            );
-                        }
-                        finish_call_by_id(&call_id, exit, output, state, transcript, log);
-                    }
-                }
-                "mcp_tool_call" | "mcp_call" => {
-                    let id = item
-                        .get("id")
-                        .or_else(|| item.get("call_id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let tool = item
-                        .get("tool")
-                        .or_else(|| item.get("tool_name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("forgejo");
-                    let args = item
-                        .get("arguments")
-                        .or_else(|| item.get("args"))
-                        .map(ToString::to_string)
-                        .unwrap_or_default();
-                    if value.get("type").and_then(Value::as_str) == Some("item.started") {
-                        start_named(id, tool, &args, state, tool_index, plan, transcript, log);
-                    } else {
-                        let status = item
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let output = item
-                            .get("result")
-                            .and_then(|result| result.get("content"))
-                            .and_then(Value::as_array)
-                            .and_then(|items| items.first())
-                            .and_then(|item| item.get("text"))
-                            .and_then(Value::as_str)
-                            .or_else(|| item.get("output").and_then(Value::as_str))
-                            .unwrap_or_default()
-                            .to_owned();
-                        let error = item
-                            .get("error")
-                            .and_then(|error| error.get("message"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let exit = error
-                            .as_ref()
-                            .map(|_| 1)
-                            .or_else(|| (status == "failed").then_some(1));
-                        let output = error.unwrap_or(output);
-                        finish_call_by_id(id, exit, output, state, transcript, log);
-                    }
-                }
-                "agent_message" => {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        state.final_text = Some(text.to_owned());
-                        let _ = transcript.append(&Record::native_text(text));
-                    }
-                }
-                "error" => {
-                    // "Model metadata ... not found" is a native warning, not a failed turn.
-                    if let Some(text) = item.get("message").and_then(Value::as_str)
-                        && !text.starts_with("Model metadata")
-                    {
-                        state.error = Some(text.to_owned());
-                    }
-                }
-                _ => {}
-            }
-        }
-        Some("error") => {
-            if let Some(message) = value.get("message").and_then(Value::as_str) {
-                state.error = Some(message.to_owned());
-            }
-        }
-        Some("turn.completed") => state.terminal = true,
-        Some("turn.failed") => {
-            state.terminal = true;
-            state
-                .error
-                .get_or_insert_with(|| "the native turn failed".to_owned());
-        }
-        _ => {}
-    }
-}
-
-fn dsh_event(
-    value: &Value,
-    state: &mut NativeState,
-    tool_index: &mut u32,
-    plan: &crate::run::RunPlan,
-    transcript: &mut Transcript,
-    log: &mut RunLog,
-) {
-    match value.get("type").and_then(Value::as_str) {
-        Some("tool_call") => {
-            let id = value
-                .get("callId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
-            let args = value
-                .get("input")
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            start_named(id, tool, &args, state, tool_index, plan, transcript, log);
-        }
-        Some("tool_result") => {
-            let id = value
-                .get("callId")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let status = value
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("error");
-            let output = value
-                .get("result")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            finish_call_by_id(
+            NativeEvent::ToolFinished {
                 id,
-                (status != "completed").then_some(1),
+                tool,
+                exit,
+                signal,
                 output,
-                state,
-                transcript,
-                log,
-            );
-        }
-        Some("text") => {
-            if let Some(text) = value.get("text").and_then(Value::as_str) {
-                state.final_text = Some(text.to_owned());
-                let _ = transcript.append(&Record::native_text(text));
-            }
-        }
-        Some("final") => {
-            state.terminal = true;
-            if let Some(text) = value.get("text").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    state.final_text = Some(text.to_owned());
+            } => {
+                // The live transcript owns completion; the outcome model records
+                // the result once in finish_call, through the same function the
+                // replay corpus uses.
+                state.outcome.forget_tool(&id);
+                let id = if id.is_empty() {
+                    format!("native-{}", *tool_index + 1)
+                } else {
+                    id
+                };
+                if !state.open.contains_key(&id) {
+                    let name = tool.unwrap_or_else(|| "tool".to_owned());
+                    start_named(&id, &name, "", state, tool_index, plan, transcript, log);
                 }
+                finish_call_by_id(&id, exit, signal, output, state, transcript, log);
             }
-            if let Some(reason) = value
-                .get("reason")
-                .and_then(|reason| reason.get("kind"))
-                .and_then(Value::as_str)
-                && reason != "completed"
-            {
-                state.error = Some(format!("the native run ended: {reason}"));
-            }
+            other => state.outcome.observe(other),
         }
-        Some("error") => {
-            if let Some(message) = value.get("message").and_then(Value::as_str) {
-                state.error = Some(message.to_owned());
-            }
-        }
-        _ => {}
     }
-}
-
-fn opencode_event(
-    value: &Value,
-    state: &mut NativeState,
-    tool_index: &mut u32,
-    plan: &crate::run::RunPlan,
-    transcript: &mut Transcript,
-    log: &mut RunLog,
-) {
-    match value.get("type").and_then(Value::as_str) {
-        Some("tool_use") => {
-            let Some(part) = value.get("part") else {
-                return;
-            };
-            let id = part.get("id").and_then(Value::as_str).unwrap_or_default();
-            let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
-            let state_value = part.get("state");
-            let status = state_value
-                .and_then(|state| state.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or("error");
-            let args = state_value
-                .and_then(|state| state.get("input"))
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            if !state.open.contains_key(id) {
-                start_named(id, tool, &args, state, tool_index, plan, transcript, log);
-            }
-            if status == "completed" || status == "error" {
-                let exit = state_value
-                    .and_then(|state| state.get("metadata"))
-                    .and_then(|metadata| metadata.get("metadata"))
-                    .and_then(|metadata| metadata.get("exit"))
-                    .and_then(Value::as_i64)
-                    .map(|code| code as i32)
-                    .or((status == "error").then_some(1));
-                let output = state_value
-                    .and_then(|state| state.get("output"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                finish_call_by_id(id, exit, output, state, transcript, log);
-            }
-        }
-        Some("text") => {
-            if let Some(text) = value
-                .get("part")
-                .and_then(|part| part.get("text"))
-                .and_then(Value::as_str)
-            {
-                state.final_text = Some(text.to_owned());
-                // Only a text after the last tool and with no open call is a
-                // completion; a later tool start resets this.
-                state.terminal = state.open.is_empty();
-                let _ = transcript.append(&Record::native_text(text));
-            }
-        }
-        Some("error") => {
-            if let Some(message) = value
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-            {
-                state.error = Some(message.to_owned());
-            } else if let Some(message) = value.get("message").and_then(Value::as_str) {
-                state.error = Some(message.to_owned());
-            }
-        }
-        Some("step_finish") => {
-            let reason = value
-                .get("part")
-                .and_then(|part| part.get("reason"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            log.line(&format!("opencode step_finish reason={reason}"));
-            if matches!(reason, "stop" | "end-turn" | "complete") {
-                state.terminal = true;
-            }
-        }
-        _ => {}
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_call(
-    value: &Value,
-    id_key: &str,
-    tool_key: &str,
-    args_key: &str,
-    state: &mut NativeState,
-    tool_index: &mut u32,
-    plan: &crate::run::RunPlan,
-    transcript: &mut Transcript,
-    log: &mut RunLog,
-) {
-    let id = value
-        .get(id_key)
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let tool = value
-        .get(tool_key)
-        .and_then(Value::as_str)
-        .unwrap_or("tool");
-    let args = value
-        .get(args_key)
-        .map(ToString::to_string)
-        .unwrap_or_default();
-    start_named(id, tool, &args, state, tool_index, plan, transcript, log);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1812,14 +1579,13 @@ fn start_named(
         return;
     }
     *tool_index += 1;
-    state.terminal = false;
     let index = *tool_index;
-    let args = model::excerpt(args, 2000);
+    let excerpt = model::excerpt(args, 2000);
     let _ = transcript.append(&Record::tool_call(
         None,
         index,
         tool,
-        &args,
+        &excerpt,
         &plan.workspace.display().to_string(),
     ));
     log.tool_started(tool);
@@ -1828,6 +1594,7 @@ fn start_named(
         OpenCall {
             index,
             tool: tool.to_owned(),
+            args: args.to_owned(),
             started: Instant::now(),
         },
     );
@@ -1836,6 +1603,7 @@ fn start_named(
 fn finish_call_by_id(
     id: &str,
     exit: Option<i32>,
+    signal: Option<String>,
     output: String,
     state: &mut NativeState,
     transcript: &mut Transcript,
@@ -1844,74 +1612,66 @@ fn finish_call_by_id(
     let Some(call) = state.open.remove(id) else {
         return;
     };
-    finish_call(
-        &call,
-        exit.unwrap_or(0),
-        None,
-        output,
-        transcript,
-        log,
-        state,
-    );
+    finish_call(&call, exit, signal, output, transcript, log, state);
 }
 
 fn finish_call(
     call: &OpenCall,
-    exit: i32,
-    signal: Option<i32>,
+    exit: Option<i32>,
+    signal: Option<String>,
     output: String,
     transcript: &mut Transcript,
     log: &mut RunLog,
     state: &mut NativeState,
 ) {
-    let output = model::excerpt(&output, 8000);
+    let stored_output = model::excerpt(&output, 8000);
     let duration = call.started.elapsed().as_millis() as u64;
     log.tool_finished();
-    let failed = signal.is_some() || exit != 0;
-    if !failed && !is_write_tool(&call.tool) {
-        state.tool_ok = true;
-    }
-    if failed {
-        let cause = if output.trim().is_empty() {
-            format!("the native tool exited with code {exit}")
-        } else {
-            output
-                .lines()
-                .last()
-                .unwrap_or("the native tool failed")
-                .trim()
-                .to_owned()
-        };
-        let diagnostic = if cause.to_ascii_lowercase().contains("bubblewrap")
-            && cause.to_ascii_lowercase().contains("permission denied")
-        {
-            format!(
-                "{}: the native sandbox boundary refused this command ({cause}); choose this agent's explicit compatibility mode only if you intend to remove Codex's own sandbox while the product file boundary remains",
-                call.tool
-            )
-        } else {
-            format!("{}: {cause}", call.tool)
-        };
+    let diagnostic =
+        state
+            .outcome
+            .record_tool(&call.tool, &call.args, exit, signal.clone(), &output);
+    if let Some(diagnostic) = diagnostic {
+        let detail = diagnostic
+            .strip_prefix(&format!("{}: ", call.tool))
+            .unwrap_or(&diagnostic)
+            .to_owned();
         if state.first_failure.is_none() {
             state.first_failure = Some(diagnostic.clone());
         }
         if is_write_tool(&call.tool) {
             state.refused_write = Some(diagnostic);
-            log.tool_failure(&call.tool, &cause);
         } else if state.failed_call.is_none() {
             state.failed_call = Some(diagnostic);
-            log.tool_failure(&call.tool, &cause);
         }
+        log.tool_failure(&call.tool, &detail);
+    } else if !is_write_tool(&call.tool) {
+        state.tool_ok = true;
     }
+    let signal_code = signal.as_deref().and_then(signal_number);
     let _ = transcript.append(&Record::tool_result(
         None,
         call.index,
         &call.tool,
-        Some(exit),
-        signal,
+        exit.or(Some(0)),
+        signal_code,
         duration,
-        Some(output),
+        Some(stored_output),
     ));
+}
+
+fn signal_number(name: &str) -> Option<i32> {
+    let name = name.trim().to_ascii_uppercase();
+    Some(match name.as_str() {
+        "SIGHUP" => 1,
+        "SIGINT" => 2,
+        "SIGQUIT" => 3,
+        "SIGKILL" => 9,
+        "SIGSEGV" => 11,
+        "SIGPIPE" => 13,
+        "SIGTERM" => 15,
+        _ => name.strip_prefix("SIG")?.parse().ok()?,
+    })
 }
 
 fn is_write_tool(tool: &str) -> bool {
@@ -1998,6 +1758,62 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
     }
 }
 
+/// The first error sentence in a harness's stderr, with a bounded continuation.
+///
+/// The old adapter reported only the last non-empty line: Codex's TOML error became
+/// the caret line and DSH's parse failure became `Node.js v24.19.0`. A startup
+/// error's first sentence is the cause; stack frames and source markers are not.
+fn stderr_cause(lines: &[String]) -> Option<String> {
+    let index = lines.iter().position(|line| {
+        let line = line.trim_start();
+        line.starts_with("Error: ")
+            || line.starts_with("Error ")
+            || line.starts_with("error: ")
+            || line.to_ascii_lowercase().contains("error:")
+    })?;
+    let mut out = lines[index].trim().to_owned();
+    for line in lines.iter().skip(index + 1).take(4) {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("at ")
+            || line.starts_with("Node.js ")
+            || line.starts_with('^')
+            || line.starts_with('|')
+            || line.starts_with("  ")
+        {
+            break;
+        }
+        if out.ends_with(':') {
+            out.push(' ');
+        } else {
+            out.push_str(": ");
+        }
+        out.push_str(line);
+    }
+    Some(out)
+}
+
+/// Persist the failure model's latest state beside the run, so the engine can
+/// include the last emitted cause in a stop or deadline record even after the
+/// native child is gone.
+fn write_progress(shell: &Shell, state: &NativeState, last: &mut String, log: &mut RunLog) {
+    let Some((progress_state, cause, terminal)) = state.outcome.progress() else {
+        return;
+    };
+    let signature = format!("{progress_state}\u{0}{cause}\u{0}{terminal}");
+    if signature == *last {
+        return;
+    }
+    *last = signature;
+    if let Err(error) =
+        crate::run::write_native_progress(&shell.run_dir, &progress_state, &cause, terminal)
+    {
+        log.line(&format!(
+            "the native progress record cannot be written: {error}"
+        ));
+    }
+}
+
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|error| format!("{} cannot be written: {error}", path.display()))?;
@@ -2033,21 +1849,6 @@ fn toml_string(text: &str) -> String {
 
 fn yaml(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
-}
-
-fn assistant_text(message: Option<&Value>) -> Option<String> {
-    let message = message?;
-    if let Some(text) = message.get("content").and_then(Value::as_str) {
-        return (!text.trim().is_empty()).then(|| text.to_owned());
-    }
-    let content = message.get("content").and_then(Value::as_array)?;
-    let mut text = String::new();
-    for item in content {
-        if let Some(part) = item.get("text").and_then(Value::as_str) {
-            text.push_str(part);
-        }
-    }
-    (!text.trim().is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -2428,7 +2229,13 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            run_reason(RunEnding::Refused, prose, &refused).as_deref(),
+            run_reason(
+                RunEnding::Refused,
+                prose,
+                &refused,
+                RequestedWork::Ambiguous
+            )
+            .as_deref(),
             Some("MCP tool call requires approval, but approval policy is never")
         );
         let first = NativeState {
@@ -2436,7 +2243,8 @@ mod native_proof_tests {
             refused_write: Some("forgejo_update_pull_request: no open pull request".to_owned()),
             ..NativeState::default()
         };
-        let first_reason = run_reason(RunEnding::Refused, prose, &first).expect("reason");
+        let first_reason = run_reason(RunEnding::Refused, prose, &first, RequestedWork::Ambiguous)
+            .expect("reason");
         assert!(first_reason.contains("bubblewrap"), "{first_reason}");
         assert!(
             !first_reason.contains("no open pull request"),
@@ -2446,17 +2254,224 @@ mod native_proof_tests {
             uncertain_write: true,
             ..NativeState::default()
         };
-        let reason = run_reason(RunEnding::Warned, prose, &uncertain).expect("reason");
+        let reason = run_reason(
+            RunEnding::Warned,
+            prose,
+            &uncertain,
+            RequestedWork::Ambiguous,
+        )
+        .expect("reason");
         assert!(!reason.contains("I read the issue"));
         assert!(reason.contains("uncertain"));
         assert_eq!(
-            run_reason(RunEnding::Succeeded, prose, &refused).as_deref(),
+            run_reason(
+                RunEnding::Succeeded,
+                prose,
+                &refused,
+                RequestedWork::Ambiguous
+            )
+            .as_deref(),
             Some(prose)
         );
         assert!(
-            !run_reason(RunEnding::NoWork, prose, &NativeState::default())
-                .expect("reason")
-                .contains("I read the issue")
+            !run_reason(
+                RunEnding::NoWork,
+                prose,
+                &NativeState::default(),
+                RequestedWork::Ambiguous
+            )
+            .expect("reason")
+            .contains("I read the issue")
         );
+    }
+}
+
+/// Replay the failure-signal inventory's exact probe streams through the same
+/// parser the live supervisor uses. The fixture is generated from the inventory by
+/// `tests/fixtures/generate_outcome_corpus.py`; each entry asserts the inventory's
+/// correct terminal outcome and the truthful part of its reason.
+#[cfg(test)]
+mod corpus_tests {
+    use super::*;
+
+    fn disposition_label(disposition: Disposition) -> &'static str {
+        match disposition {
+            Disposition::Succeeded => "succeeded",
+            Disposition::Failed => "failed",
+            Disposition::Stopped => "stopped",
+            Disposition::TimedOut => "timed_out",
+        }
+    }
+
+    #[test]
+    fn every_inventory_probe_replays_through_the_native_outcome_parser() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/native-outcome-corpus.json"
+        ))
+        .expect("the inventory corpus fixture is JSON");
+        let entries = corpus["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 88, "the inventory has 88 probes");
+        assert_eq!(
+            corpus["inventory_sha256"].as_str(),
+            Some("f5460c0a5794b61a58f7ffddb49f50f439685f8e0e7691af8e1ba895c5b57d39"),
+            "the corpus records the inventory it was generated from"
+        );
+        let mut failures = Vec::new();
+        for entry in entries {
+            let id = entry["probe_id"].as_str().unwrap_or("?");
+            let program = Program::parse(entry["harness"].as_str().unwrap_or_default())
+                .unwrap_or_else(|| panic!("{id}: known harness"));
+            let mut outcome = NativeOutcome::new(program);
+            for line in entry["stdout"].as_array().expect("stdout lines") {
+                outcome.observe_line(line.as_str().unwrap_or_default());
+            }
+            let exit = entry["exit_code"].as_i64().map(|code| code as i32);
+            let expected = &entry["expected"];
+            let supervisor = match expected["supervisor"].as_str().unwrap_or("natural") {
+                "stopped" => SupervisorEnd::Stopped,
+                "deadline" => SupervisorEnd::Deadline,
+                _ => SupervisorEnd::Natural,
+            };
+            let resolution = outcome.finish(exit, supervisor);
+            let stderr: Vec<String> = entry["stderr"]
+                .as_array()
+                .expect("stderr lines")
+                .iter()
+                .map(|line| line.as_str().unwrap_or_default().to_owned())
+                .collect();
+            let mut reason = resolution.reason.clone();
+            if reason.as_deref().is_none_or(|reason| {
+                reason.starts_with("the native program exited with code")
+                    || reason == "the native program was ended by a signal"
+            }) {
+                reason = stderr_cause(&stderr).or(reason);
+            }
+            let reason_lower = reason.clone().unwrap_or_default().to_ascii_lowercase();
+
+            let want = expected["disposition"].as_str().unwrap_or_default();
+            let got = disposition_label(resolution.disposition);
+            if got != want {
+                failures.push(format!(
+                    "{id}: disposition {got}, inventory says {want} (reason {reason:?})"
+                ));
+                continue;
+            }
+            for fragment in expected["reason_contains"]
+                .as_array()
+                .expect("reason fragments")
+            {
+                let fragment = fragment.as_str().unwrap_or_default();
+                if !reason_lower.contains(&fragment.to_ascii_lowercase()) {
+                    failures.push(format!(
+                        "{id}: reason {reason:?} does not contain {fragment:?}"
+                    ));
+                }
+            }
+            if let Some(text) = expected["text"].as_str()
+                && resolution.text.as_deref() != Some(text)
+            {
+                failures.push(format!(
+                    "{id}: committed text {:?}, expected {text:?}",
+                    resolution.text
+                ));
+            }
+            if expected["text_absent"].as_bool() == Some(true) && resolution.text.is_some() {
+                failures.push(format!(
+                    "{id}: text from a failed attempt was committed: {:?}",
+                    resolution.text
+                ));
+            }
+            if let Some(saw_tool) = expected["saw_tool"].as_bool()
+                && resolution.saw_tool != saw_tool
+            {
+                failures.push(format!(
+                    "{id}: saw_tool {}, expected {saw_tool}",
+                    resolution.saw_tool
+                ));
+            }
+            if let Some(fragments) = expected["tool_failure_contains"].as_array() {
+                let failure = resolution
+                    .first_tool_failure
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                for fragment in fragments {
+                    let fragment = fragment.as_str().unwrap_or_default();
+                    if !failure.contains(&fragment.to_ascii_lowercase()) {
+                        failures.push(format!(
+                            "{id}: tool failure {:?} does not contain {fragment:?}",
+                            resolution.first_tool_failure
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the inventory corpus found {} mismatch(es):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod unconfirmed_work_tests {
+    use super::*;
+
+    #[test]
+    fn work_that_needs_a_tool_is_never_success_without_a_confirmed_tool_result() {
+        let state = NativeState::new(Program::Codex);
+        let reason = non_success_reason(&state, RequestedWork::GenericWrite);
+        assert!(reason.contains("no tool call"), "{reason}");
+        assert!(reason.contains("sandbox can refuse"), "{reason}");
+        assert!(reason.contains("unconfirmed"), "{reason}");
+        assert!(!requires_confirmed_tool(RequestedWork::Ambiguous));
+        assert!(requires_confirmed_tool(RequestedWork::ReadOnly));
+    }
+
+    #[test]
+    fn the_stderr_cause_is_the_first_error_sentence_not_the_last_stack_line() {
+        let codex = vec![
+            "Error loading config.toml:".to_owned(),
+            "/home/user/config.toml:1:1: invalid key-value pair, expected key".to_owned(),
+            "  |".to_owned(),
+            "1 | { this is not valid config [".to_owned(),
+            "  | ^".to_owned(),
+        ];
+        let reason = stderr_cause(&codex).expect("the codex config cause");
+        assert!(reason.contains("config.toml"), "{reason}");
+        assert!(reason.contains("invalid key-value pair"), "{reason}");
+        assert!(!reason.contains('^'), "{reason}");
+
+        let dsh = vec![
+            "file:///dsh/lib/index.js:3998".to_owned(),
+            "    at parsePatchList".to_owned(),
+            "Error: dsh: failed to parse overlay /tmp/overlay.yml: YAMLException".to_owned(),
+            "    at loadOverlayPatches".to_owned(),
+            "Node.js v24.19.0".to_owned(),
+        ];
+        let reason = stderr_cause(&dsh).expect("the dsh overlay cause");
+        assert!(reason.contains("failed to parse overlay"), "{reason}");
+        assert!(!reason.contains("Node.js"), "{reason}");
+    }
+}
+
+#[cfg(test)]
+mod launch_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_harness_retry_budget_fits_inside_the_session_deadline() {
+        for timeout_secs in [5_u64, 30, 60, 900] {
+            let budget = launch_budget(timeout_secs);
+            let worst = budget.request_ms * 3 + budget.retry_delay_ms + budget.retry_delay_ms * 2;
+            assert!(
+                worst < timeout_secs * 1000,
+                "a {timeout_secs} s session can spend {worst} ms retrying"
+            );
+            assert!(budget.request_ms >= 1_000);
+            assert!(budget.request_ms <= 120_000);
+        }
     }
 }

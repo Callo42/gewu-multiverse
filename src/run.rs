@@ -1222,6 +1222,47 @@ pub const SHELL_CAPABILITY_FILE: &str = "shell.capability";
 /// The marker written when a run's left-over group was stopped by a later start.
 pub const STOPPED_FILE: &str = "run-stopped.json";
 
+/// The native supervisor's latest failure-model state, beside the run's records.
+///
+/// It is written on every change and read by the engine when it has to end a run
+/// from its own deadline: the last cause the harness emitted must survive the
+/// child being killed, so a failing run is not recorded as only `timed_out`.
+pub const NATIVE_PROGRESS_FILE: &str = "native-progress.json";
+
+/// One native run's last emitted failure/progress cause.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeProgress {
+    /// `running`, `waiting`, `retrying`, `failed` or `succeeded`.
+    pub state: String,
+    /// The last emitted cause, in the harness's own words.
+    pub cause: String,
+    /// Whether the cause came from a terminal harness event.
+    pub terminal: bool,
+}
+
+/// Record the native supervisor's latest cause for a deadline or stop ending.
+pub fn write_native_progress(
+    run_dir: &Path,
+    state: &str,
+    cause: &str,
+    terminal: bool,
+) -> io::Result<()> {
+    let progress = NativeProgress {
+        state: state.to_owned(),
+        cause: cause.to_owned(),
+        terminal,
+    };
+    let text = serde_json::to_string_pretty(&progress).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(NATIVE_PROGRESS_FILE), text.as_bytes())
+}
+
+/// Read the native supervisor's latest cause, if it left one.
+pub fn native_progress(run_dir: &Path) -> Option<NativeProgress> {
+    let text = fs::read_to_string(run_dir.join(NATIVE_PROGRESS_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// One left-over process group's ending, written by the program that stopped it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1243,14 +1284,7 @@ pub struct RunStopped {
 /// last and committed to disk, so a later open that finds it also has the marker;
 /// an interrupted pair is retried from the still-present handles.
 pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
-    let record = RunStopped {
-        ts: crate::time::rfc3339(now_unix_ms()),
-        run_id: run_id.to_owned(),
-        pgid,
-        reason: reason.to_owned(),
-    };
-    let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
-    crate::mode::write_private(run_dir.join(STOPPED_FILE), text.as_bytes())?;
+    write_stop_marker(run_dir, run_id, pgid, reason)?;
     transcript::record_outcome_if_missing(
         run_dir,
         run_id,
@@ -1259,6 +1293,19 @@ pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) 
         0,
     )
     .map(|_| ())
+}
+
+/// Write only the stop marker, not a terminal record. A stop that cannot yet be
+/// verified still gets a truthful marker; the terminal record waits for cleanup.
+fn write_stop_marker(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
+    let record = RunStopped {
+        ts: crate::time::rfc3339(now_unix_ms()),
+        run_id: run_id.to_owned(),
+        pgid,
+        reason: reason.to_owned(),
+    };
+    let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(STOPPED_FILE), text.as_bytes())
 }
 
 /// The run id a run directory's name carries.
@@ -1286,12 +1333,74 @@ pub fn ensure_terminal_record(
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
 
+/// A sentence naming an ending the supervisor wrote before the stop was settled.
+fn prior_terminal_note(run_dir: &Path) -> String {
+    let Ok(Some(Record::RunFinished {
+        outcome, reason, ..
+    })) = transcript::terminal_record_checked(run_dir)
+    else {
+        return String::new();
+    };
+    if outcome == RunOutcome::Stopped.as_str() || outcome == RunOutcome::TimedOut.as_str() {
+        return String::new();
+    }
+    match reason {
+        Some(reason) if !reason.trim().is_empty() => {
+            format!("; before the stop the run recorded {outcome}: {reason}")
+        }
+        _ => format!("; before the stop the run recorded {outcome}"),
+    }
+}
+
+/// Write the stop ending as the last terminal record.
+///
+/// A run child can write its own ending just before the engine's stop reaches it.
+/// The stop is the ending the product caused, so it is written last and keeps the
+/// earlier outcome and reason in its sentence; it is never silently kept (which
+/// would show a failure for a stopped run) or lost (which would leave the stop
+/// without a cause). A retry that finds the same stop outcome keeps the record.
+fn reconcile_stop_terminal(
+    run_dir: &Path,
+    run_id: &str,
+    outcome: RunOutcome,
+    sentence: &str,
+) -> Result<(), String> {
+    let existing = transcript::terminal_record_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
+    if let Some(Record::RunFinished {
+        outcome: prior,
+        reason: prior_reason,
+        ..
+    }) = &existing
+        && prior == outcome.as_str()
+        && prior_reason.as_deref() == Some(sentence)
+    {
+        return Ok(());
+    }
+    let mut transcript = transcript::Transcript::open(run_dir)
+        .map_err(|error| format!("the run's ending cannot be recorded: {error}"))?;
+    transcript
+        .append_durable(&Record::run_finished(
+            run_id,
+            outcome,
+            None,
+            0,
+            Some(sentence.to_owned()),
+        ))
+        .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
+}
+
 /// Settle one finished run at the engine's boundary.
 ///
 /// First the recorded group is stopped (or found already gone); then, and only
 /// then, the run's ending is written durably; only after both have succeeded are the
 /// identity handles removed. Any error keeps the handles and reaches the card, so
 /// `Start` retries rather than running beside an unproven leftover.
+///
+/// A run the engine stopped (stopped, timed out, or failed at its deadline) also
+/// gets a stop marker. The marker is written even when the reap cannot be verified,
+/// with that uncertainty in its sentence; the terminal record waits for a verified
+/// reap so a later retry can still decide it.
 pub fn settle_run(
     run_dir: &Path,
     pgid: u32,
@@ -1299,20 +1408,62 @@ pub fn settle_run(
     reason: Option<String>,
     grace: std::time::Duration,
 ) -> Result<bool, String> {
-    let mut reaped = reap_process_group(pgid, run_dir, grace).map_err(categorize_cleanup)?;
-    // A native helper may have called setsid and therefore not be in the leader's
-    // group. Its inherited capability is the ownership proof; enumerate and close
-    // every such group before the identities are removed.
-    reaped |= reap_capability_groups(run_dir, grace).map_err(categorize_cleanup)?;
-    if outcome == RunOutcome::Stopped && !run_dir.join(STOPPED_FILE).exists() {
-        let run_id = run_id_of(run_dir).map_err(categorize_cleanup)?;
-        let sentence = reason
+    let stop = (outcome == RunOutcome::Stopped).then(|| {
+        reason
             .clone()
-            .unwrap_or_else(|| "the run was stopped on request".to_owned());
-        write_run_stopped(run_dir, run_id, pgid, &sentence)
+            .unwrap_or_else(|| "the run was stopped on request".to_owned())
+    });
+    settle_run_with_stop(run_dir, pgid, outcome, reason, grace, stop)
+}
+
+/// [`settle_run`] with the engine's own stop reason.
+///
+/// Pass `Some(reason)` whenever the engine is why the run ended, even when the
+/// terminal outcome is `TimedOut` or `Failed` (a deadline failure). Pass `None` for
+/// an ending the run produced itself.
+pub fn settle_run_with_stop(
+    run_dir: &Path,
+    pgid: u32,
+    outcome: RunOutcome,
+    reason: Option<String>,
+    grace: std::time::Duration,
+    stop: Option<String>,
+) -> Result<bool, String> {
+    let run_id = run_id_of(run_dir).map_err(categorize_cleanup)?;
+    let reaped = (|| {
+        let mut reaped = reap_process_group(pgid, run_dir, grace)?;
+        // A native helper may have called setsid and therefore not be in the leader's
+        // group. Its inherited capability is the ownership proof; enumerate and close
+        // every such group before the identities are removed.
+        reaped |= reap_capability_groups(run_dir, grace)?;
+        Ok::<bool, String>(reaped)
+    })();
+    let mut stop_sentence = None;
+    if let Some(stop_reason) = stop {
+        let mut sentence = format!("{stop_reason}{}", prior_terminal_note(run_dir));
+        if let Err(error) = &reaped {
+            sentence.push_str(&format!(
+                "; its process group could not be verified as stopped: {}",
+                categorize_cleanup(error.clone())
+            ));
+        }
+        write_stop_marker(run_dir, run_id, pgid, &sentence)
             .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+        stop_sentence = Some(sentence);
     }
-    ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
+    let reaped = match reaped {
+        Ok(reaped) => reaped,
+        Err(error) => return Err(categorize_cleanup(error)),
+    };
+    match stop_sentence {
+        Some(sentence) => {
+            reconcile_stop_terminal(run_dir, run_id, outcome, &sentence)
+                .map_err(categorize_cleanup)?;
+        }
+        None => {
+            ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
+        }
+    }
     // `reap_process_group` only returns Ok when no unverified member survives, and
     // it writes its own run_stopped ending when it had to signal a group.
     clear_process_records(run_dir);
@@ -2716,5 +2867,175 @@ mod review3_identity_tests {
         }
         assert!(ended, "the verified process was not signalled");
         let _ = fs::remove_dir_all(&run_dir);
+    }
+}
+
+#[cfg(test)]
+mod stop_record_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "gewu-stop-record-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("scratch root");
+        root
+    }
+
+    fn run_with_terminal(root: &Path, outcome: RunOutcome, reason: &str) -> PathBuf {
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let mut transcript = transcript::Transcript::open(&run).expect("transcript");
+        transcript
+            .append_durable(&Record::run_finished(
+                "run-1700000200000-0001",
+                outcome,
+                None,
+                10,
+                Some(reason.to_owned()),
+            ))
+            .expect("terminal record");
+        run
+    }
+
+    fn stop_reason(run: &Path) -> String {
+        let text = fs::read_to_string(run.join(STOPPED_FILE)).expect("run-stopped.json");
+        let record: RunStopped = serde_json::from_str(&text).expect("stop record JSON");
+        record.reason
+    }
+
+    fn terminal(run: &Path) -> Record {
+        transcript::terminal_record(run).expect("terminal record")
+    }
+
+    #[test]
+    fn a_timed_out_run_records_the_stop_and_keeps_the_last_cause() {
+        let root = scratch("timeout");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Failed,
+            "the native provider reported 500: synthetic status 500",
+        );
+        let reason = "the run reached its time limit and was stopped; last reported cause: the native provider reported 500: synthetic status 500";
+        let settled = settle_run_with_stop(
+            &run,
+            4_000_000,
+            RunOutcome::TimedOut,
+            Some(reason.to_owned()),
+            Duration::from_millis(50),
+            Some(reason.to_owned()),
+        )
+        .expect("the timeout settles");
+        assert!(!settled);
+        let marker = stop_reason(&run);
+        assert!(marker.contains("time limit"), "{marker}");
+        assert!(marker.contains("synthetic status 500"), "{marker}");
+        assert!(
+            marker.contains("before the stop the run recorded failed"),
+            "the earlier terminal record was not reconciled: {marker}"
+        );
+        match terminal(&run) {
+            Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "timed_out");
+                assert!(reason.contains("synthetic status 500"), "{reason}");
+            }
+            other => panic!("the timeout did not end last: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stop_after_a_run_wrote_its_own_ending_is_reconciled() {
+        let root = scratch("reconcile");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Failed,
+            "the native provider reported AUTH: 401 unauthorized",
+        );
+        settle_run_with_stop(
+            &run,
+            4_000_001,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(50),
+            Some("the run was stopped on request".to_owned()),
+        )
+        .expect("the stop settles");
+        let marker = stop_reason(&run);
+        assert!(marker.contains("before the stop"), "{marker}");
+        assert!(marker.contains("401 unauthorized"), "{marker}");
+        match terminal(&run) {
+            Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "stopped");
+                assert!(reason.contains("before the stop"), "{reason}");
+                assert!(reason.contains("401 unauthorized"), "{reason}");
+            }
+            other => panic!("the stop did not end last: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_reap_still_writes_a_truthful_stop_marker() {
+        let root = scratch("reap-failure");
+        let run = root.join("run-1700000200000-0003");
+        fs::create_dir_all(&run).expect("run dir");
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("unrelated group starts");
+        let pid = child.id();
+        fs::write(run.join("session.pid"), pid.to_string()).expect("session pid");
+        fs::write(run.join("session.pgid"), pid.to_string()).expect("session pgid");
+        std::thread::sleep(Duration::from_millis(50));
+        let error = settle_run_with_stop(
+            &run,
+            pid,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(80),
+            Some("the run was stopped on request".to_owned()),
+        )
+        .expect_err("an unverified group cannot be claimed stopped");
+        assert!(
+            error.contains("unverified") || error.contains("cannot be verified"),
+            "the reap failure was not named: {error}"
+        );
+        let marker = stop_reason(&run);
+        assert!(marker.contains("stopped on request"), "{marker}");
+        assert!(
+            marker.contains("could not be verified as stopped"),
+            "the stop marker hid the failed reap: {marker}"
+        );
+        assert!(
+            transcript::terminal_record(&run).is_none(),
+            "an unverified reap wrote a terminal ending"
+        );
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
     }
 }

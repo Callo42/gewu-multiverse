@@ -1221,7 +1221,14 @@ impl Inner {
 
     fn poll_agent(&mut self, index: usize, now: Instant) {
         let desired = self.agents[index].desired;
-        let mut ended: Option<(SessionEnd, Instant, PathBuf, u32)> = None;
+        let mut ended: Option<(
+            SessionEnd,
+            Instant,
+            PathBuf,
+            u32,
+            bool,
+            Option<run::NativeProgress>,
+        )> = None;
         if let Some(run) = self.agents[index].running.as_mut() {
             if !run.stopping {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
@@ -1235,10 +1242,33 @@ impl Inner {
                 run.stop_deadline = Some(now + Duration::from_secs(1));
             }
             if let Some(status) = run.handle.try_status() {
-                let end = if desired == Desired::Stopped || run.stop_requested {
+                let engine_stopped = desired == Desired::Stopped || run.stop_requested;
+                let timed_out = run.timed_out;
+                let progress = if timed_out {
+                    run::native_progress(&run.run_dir)
+                } else {
+                    None
+                };
+                let end = if engine_stopped {
                     SessionEnd::Stopped
-                } else if run.timed_out {
-                    SessionEnd::TimedOut
+                } else if timed_out {
+                    // A harness that reported its own failure before the engine's
+                    // deadline is not only "timed out": the last cause survives the
+                    // kill and supplies a failed ending with a reason.
+                    match progress.as_ref() {
+                        Some(progress)
+                            if !progress.cause.trim().is_empty()
+                                && matches!(progress.state.as_str(), "failed" | "retrying") =>
+                        {
+                            SessionEnd::Failed {
+                                reason: crate::forgejo_tools::sentence(format!(
+                                    "the run reached its time limit with a reported failure: {}",
+                                    progress.cause
+                                )),
+                            }
+                        }
+                        _ => SessionEnd::TimedOut,
+                    }
                 } else if status.success() {
                     // Exit 0 is not the whole outcome: the run's own terminal record
                     // says whether its last sentence refused the instruction or found
@@ -1249,18 +1279,46 @@ impl Inner {
                         reason: session_failure_reason(&run.run_dir, status),
                     }
                 };
-                ended = Some((end, run.started, run.run_dir.clone(), run.handle.pid()));
+                ended = Some((
+                    end,
+                    run.started,
+                    run.run_dir.clone(),
+                    run.handle.pid(),
+                    engine_stopped || timed_out,
+                    progress,
+                ));
             }
         }
-        if let Some((end, started, run_dir, pid)) = ended {
+        if let Some((end, started, run_dir, pid, engine_stopped, progress)) = ended {
             self.observe_confinement_refusal(&run_dir);
             // A supervisor killed from outside can leave the shell it started in
             // the run's process group. The boundary settles the run in this order:
             // stop or find the group gone, write (or keep) a durable ending, and
             // only then remove the identity handles. An error at either step keeps
             // the handles and is reported on the card; Start retries it (F-02).
-            let (outcome, reason) = outcome_for_end(&end);
-            let settled = run::settle_run(&run_dir, pid, outcome, reason, self.options.stop_grace);
+            let (outcome, mut reason) = outcome_for_end(&end);
+            // The engine's own deadline must carry the last cause the harness
+            // emitted: the child is already gone, so the persisted progress record
+            // is the only surviving source.
+            if let Some(progress) = progress
+                && !progress.cause.trim().is_empty()
+            {
+                let base = reason
+                    .clone()
+                    .unwrap_or_else(|| "the run was ended by the product".to_owned());
+                if !base.contains(&progress.cause) {
+                    reason = Some(format!("{base}; last reported cause: {}", progress.cause));
+                }
+            }
+            let stop_reason = if engine_stopped { reason.clone() } else { None };
+            let settled = run::settle_run_with_stop(
+                &run_dir,
+                pid,
+                outcome,
+                reason,
+                self.options.stop_grace,
+                stop_reason,
+            );
             self.agents[index].leftover = settled.err();
             if self.agents[index].leftover.is_some() {
                 self.agents[index].leftover_targets = vec![RecoveryTarget::Run(run_dir.clone())];
@@ -5352,10 +5410,58 @@ mod tests {
                 ..
             }
         ));
+        let run_dir = fake.last_run_dir().expect("the timed-out run directory");
+        assert!(
+            run_dir.join(run::STOPPED_FILE).is_file(),
+            "a timed-out run left no stop record"
+        );
         tick(&mut engine, &clock, RESTART_DELAY);
         wait_started(&fake, 2);
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_deadline_keeps_the_native_failure_cause_instead_of_only_timing_out() {
+        let root = scratch_root("engine-deadline-cause");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        run::write_native_progress(
+            &run_dir,
+            "retrying",
+            "the native provider reported: synthetic status 500",
+            false,
+        )
+        .expect("the native progress record");
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        let board = engine.board();
+        match board.agents[0].recent.last() {
+            Some(SessionEnd::Failed { reason }) => {
+                assert!(reason.contains("500"), "the cause was lost: {reason}");
+            }
+            other => panic!("a failing harness was recorded only as {other:?}"),
+        }
+        let stop: run::RunStopped = serde_json::from_str(
+            &fs::read_to_string(run_dir.join(run::STOPPED_FILE)).expect("stop record"),
+        )
+        .expect("stop record JSON");
+        assert!(stop.reason.contains("500"), "{}", stop.reason);
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("terminal record");
+        assert!(
+            matches!(
+                &terminal,
+                crate::transcript::Record::RunFinished { outcome, .. } if outcome == "failed"
+            ),
+            "the terminal record lost the failure: {terminal:?}"
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
