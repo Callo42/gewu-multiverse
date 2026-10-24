@@ -192,12 +192,13 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
     wait_for_shell(&run_dir, pgid);
     stop_group(pgid);
     wait_child(&mut supervisor);
-    let settled = run::settle_run(
+    let settled = run::settle_ending(
         &run_dir,
         pgid,
         run::RunOutcome::Stopped,
         Some("the run was stopped on request".to_owned()),
         Duration::from_secs(3),
+        Some("the run was stopped on request".to_owned()),
         run::FirstEnding::Stop,
     )
     .expect("the normal stop settles");
@@ -225,7 +226,7 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
         );
     }
     assert_eq!(
-        run::reap_leftover_run(&run_dir, Duration::from_millis(100)),
+        run::recover_ending(&run_dir, Duration::from_millis(100)),
         Ok(false),
         "a cleanly stopped run was reported as uncertain"
     );
@@ -251,7 +252,7 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
         terminal(&old).is_none(),
         "the control unexpectedly wrote an ending"
     );
-    let error = run::reap_leftover_run(&old, Duration::from_millis(100))
+    let error = run::recover_ending(&old, Duration::from_millis(100))
         .expect_err("an ending-less started run must stay uncertain");
     assert!(
         error.contains("cleanup unverified") && error.contains("cannot be verified"),
@@ -284,7 +285,7 @@ fn a_killed_product_reopen_reaps_the_real_sleeping_child_and_records_its_ending(
         !group_members(pgid).is_empty(),
         "the killed supervisor's shell did not survive; the reopen cannot be proven"
     );
-    let reaped = run::reap_leftover_run(&run_dir, Duration::from_secs(3)).expect("the reopen reap");
+    let reaped = run::recover_ending(&run_dir, Duration::from_secs(3)).expect("the reopen reap");
     assert!(reaped, "the left-over group was not reported as reaped");
     assert!(
         group_members(pgid).is_empty(),
@@ -321,12 +322,13 @@ fn a_killed_product_reopen_reaps_the_real_sleeping_child_and_records_its_ending(
     );
     stop_group(next_pgid);
     wait_child(&mut next_supervisor);
-    let _ = run::settle_run(
+    let _ = run::settle_ending(
         &next,
         next_pgid,
         run::RunOutcome::Stopped,
         Some("test cleanup".to_owned()),
         Duration::from_secs(3),
+        Some("test cleanup".to_owned()),
         run::FirstEnding::Stop,
     );
     let _ = fs::remove_dir_all(&root);
@@ -355,7 +357,7 @@ fn an_interrupted_ending_write_keeps_the_handles_and_is_retried() {
     run::write_shell_record(&run_dir, pid, pid).expect("the shell identity record");
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o555))
         .expect("the run directory becomes read-only");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(300))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(300))
         .expect_err("an ending that cannot be written is a cleanup failure");
     assert!(
         error.contains("cannot be written"),
@@ -375,7 +377,7 @@ fn an_interrupted_ending_write_keeps_the_handles_and_is_retried() {
     );
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
         .expect("the run directory is repaired");
-    let retried = run::reap_leftover_run(&run_dir, Duration::from_millis(300))
+    let retried = run::recover_ending(&run_dir, Duration::from_millis(300))
         .expect("the repaired retry writes the ending");
     assert!(!retried, "the second pass reported a live group");
     assert!(
@@ -831,7 +833,7 @@ fn a_terminal_outcome_does_not_clear_unverified_capability_evidence() {
         .spawn()
         .expect("unrelated child");
     let unrelated_pid = unrelated.id();
-    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    let result = run::recover_ending(&run_dir, Duration::from_millis(150));
     let unrelated_alive = unrelated.try_wait().expect("status").is_none();
     let capability_retained = run_dir.join(run::SHELL_CAPABILITY_FILE).is_file();
     let false_marker = run_dir.join(run::STOPPED_FILE).is_file();

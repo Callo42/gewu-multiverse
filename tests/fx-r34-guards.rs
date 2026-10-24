@@ -968,7 +968,7 @@ fn a_supervisor_waiting_for_the_model_is_reaped_before_its_first_shell() {
         request.is_some()
     });
     let no_capability = !run_dir.join("shell.capability").exists();
-    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    let result = run::recover_ending(&run_dir, Duration::from_millis(150));
     let stopped = wait_until(Duration::from_secs(2), || {
         supervisor.try_wait().is_ok_and(|status| status.is_some())
     });
@@ -1016,7 +1016,7 @@ fn a_killed_supervisors_shell_is_reaped_at_the_next_start() {
         !shell_members(pgid).is_empty(),
         "the killed supervisor's shell did not survive; the test cannot prove the reap"
     );
-    let reaped = run::reap_leftover_run(&run_dir, Duration::from_secs(3)).expect("the reap");
+    let reaped = run::recover_ending(&run_dir, Duration::from_secs(3)).expect("the reap");
     assert!(reaped, "the left-over group was not reported as reaped");
     assert!(
         shell_members(pgid).is_empty(),
@@ -1179,7 +1179,7 @@ fn a_stale_shell_record_never_owns_an_unrelated_group() {
     );
     fs::write(run_dir.join("shell.pid"), pid.to_string()).expect("shell pid");
     fs::write(run_dir.join("shell.pgid"), pid.to_string()).expect("shell pgid");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect_err("a live unverified group must be reported, not discarded");
     assert!(
         error.contains("cannot be verified") || error.contains("cannot be read"),
@@ -1217,7 +1217,7 @@ fn a_reused_supervisor_pid_is_never_identity() {
     );
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
     fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect_err("a live unverified group must be reported, not discarded");
     assert!(
         error.contains("cannot be verified") || error.contains("cannot be read"),
@@ -1265,7 +1265,7 @@ fn an_unverified_shell_identity_never_signals_the_group() {
         format!("{pid} {pid} {boot} {wrong_start}\n"),
     )
     .expect("shell identity");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect_err("a live unverified group must be reported, not discarded");
     assert!(
         error.contains("cannot be verified") || error.contains("cannot be read"),
@@ -1427,7 +1427,7 @@ fn an_inherited_capability_finds_the_group_before_its_pid_record() {
     // No shell record yet; only the inherited capability and the group number.
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
     fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
-    let reaped = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let reaped = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect("the capability group is reaped");
     assert!(
         reaped,
@@ -1472,7 +1472,7 @@ fn an_unrelated_process_opening_the_named_marker_is_not_owned() {
     );
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
     fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect_err("a merely opened marker path must not be ownership");
     assert!(
         error.contains("cannot be verified") || error.contains("cannot be read"),
@@ -1517,7 +1517,7 @@ fn an_unrelated_process_opening_the_capability_record_is_not_owned() {
     );
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
     fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect_err("opening the record file must not be ownership");
     assert!(
         error.contains("cannot be verified") || error.contains("cannot be read"),
@@ -1831,7 +1831,7 @@ fn a_find_reader_of_the_run_directory_is_not_owned() {
     // Stale numeric records name the reader's group.
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
     fs::write(run_dir.join("session.pgid"), pid.to_string()).expect("session pgid");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect_err("a run-directory argv is not ownership");
     assert!(
         error.contains("cannot be verified") || error.contains("cannot be read"),
@@ -1893,7 +1893,7 @@ fn an_inaccessible_unrelated_process_does_not_hide_a_readable_holder() {
     let capability = run::prepare_shell_capability(&run_dir).expect("capability");
     let mut holder = spawn_unrelated_group("readable-holder");
     drop(capability);
-    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    let result = run::recover_ending(&run_dir, Duration::from_millis(150));
     let stopped = wait_until(Duration::from_secs(2), || {
         holder.try_wait().is_ok_and(|status| status.is_some())
     });
@@ -1929,7 +1929,7 @@ fn an_inaccessible_unrelated_process_does_not_block_previous_boot_disposition() 
             .set_times(old)
             .expect("old record");
     }
-    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    let result = run::recover_ending(&run_dir, Duration::from_millis(150));
     stop_unrelated(reader);
     assert!(!result.expect("a reboot proves no old holder can survive"));
     assert!(run_dir.join("run-stopped.json").is_file());
@@ -1993,7 +1993,7 @@ fn an_inaccessible_capability_holder_blocks_start_and_keeps_evidence() {
         }),
         "the holder's fd table did not become inaccessible"
     );
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(150))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(150))
         .expect_err("an inaccessible capability holder is unresolved uncertainty");
     assert!(
         error.contains("file descriptors cannot be read") || error.contains("cleanup is uncertain"),

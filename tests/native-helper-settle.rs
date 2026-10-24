@@ -37,7 +37,7 @@ fn a_setsid_helper_holding_the_run_capability_is_found_and_closed() {
     {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let result = gewu_multiverse::run::reap_leftover_run(&dir, Duration::from_secs(2));
+    let result = gewu_multiverse::run::recover_ending(&dir, Duration::from_secs(2));
     let _ = child.kill();
     let _ = child.wait();
     let reaped = result.expect("the existing capability scan must close the helper");
@@ -82,12 +82,13 @@ fn normal_settle_closes_a_setsid_helper_before_clearing_records() {
         .trim()
         .parse()
         .expect("helper pid number");
-    let settled = gewu_multiverse::run::settle_run(
+    let settled = gewu_multiverse::run::settle_ending(
         &dir,
         leader_pid,
         gewu_multiverse::run::RunOutcome::Stopped,
         None,
         Duration::from_secs(2),
+        Some("the run was stopped on request".to_owned()),
         gewu_multiverse::run::FirstEnding::Stop,
     );
     let helper_alive = Path::new(&format!("/proc/{helper_pid}")).exists();

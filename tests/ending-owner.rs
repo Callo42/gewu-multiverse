@@ -1,15 +1,73 @@
 //! Mechanical guard for the single run-ending owner.
 //!
-//! Production code outside `src/run.rs` may request an ending, but it must not
-//! write terminal/stop/first-ending/uncertainty records or signal a run handle
-//! itself. Tests are excluded: they intentionally construct records directly.
+//! Every production file except the owner (`src/run.rs`) and the transcript storage
+//! primitive (`src/transcript.rs`) is scanned. A terminal/stop/first-ending/
+//! uncertainty write, or a raw run-process signal, outside the owner is a hard
+//! failure. Server/installer process adapters are listed explicitly because they
+//! signal their own child processes, not agent runs.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn production(path: &str) -> String {
-    let text = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
-        .unwrap_or_else(|error| panic!("{path} cannot be read: {error}"));
+const ENDING_TOKENS: &[&str] = &[
+    "Record::RunFinished {",
+    "Record::run_finished(",
+    "\"run-stopped.json\"",
+    "\"first-ending.json\"",
+    "\"ending-uncertain.json\"",
+    "write_run_stopped",
+    "write_stop_marker",
+    "write_terminal_replacing",
+    "ensure_terminal_record",
+    "record_outcome_if_missing",
+    "settle_run_with_stop",
+    "settle_run(",
+    "reap_leftover_run",
+    "ensure_first_ending",
+    "record_ending_uncertainty",
+    "pin_first_ending",
+    "ending_uncertainty(",
+    "recorded_first_ending(",
+    "STOPPED_FILE",
+    "FIRST_ENDING_FILE",
+    "ENDING_UNCERTAIN_FILE",
+    "stop_running_session",
+];
+
+const SIGNAL_TOKENS: &[&str] = &["signal_group(", "killpg(", ".handle.signal("];
+
+/// Server/installer process groups, not run endings. They may use the raw signal
+/// primitive on their own children; ending tokens are still banned in them.
+const NON_RUN_PROCESS_FILES: &[&str] = &["src/bundled_forgejo/mod.rs", "src/installer.rs"];
+
+fn strip_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '/' && chars.peek() == Some(&'/') {
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(next) = chars.next() {
+                if next == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn production_text(text: &str) -> String {
+    let text = strip_comments(text);
     let marker = "#[cfg(test)]\nmod tests {";
     match text.find(marker) {
         Some(index) => text[..index].to_owned(),
@@ -17,31 +75,73 @@ fn production(path: &str) -> String {
     }
 }
 
-#[test]
-fn only_the_owner_writes_endings_or_signals_run_handles() {
-    let forbidden = [
-        "run::ensure_first_ending",
-        "run::settle_run_with_stop",
-        "run::reap_leftover_run",
-        "run::write_run_stopped",
-        "run::record_ending_uncertainty",
-        "run::write_stop_marker",
-        "Record::run_finished",
-        "STOPPED_FILE",
-        "FIRST_ENDING_FILE",
-        "ENDING_UNCERTAIN_FILE",
-        ".handle.signal(",
-        "stop_running_session",
-    ];
-    for path in ["src/engine/mod.rs", "src/agent_run.rs", "src/main.rs"] {
-        let text = production(path);
-        for token in forbidden {
-            assert!(
-                !text.contains(token),
-                "`{token}` is used outside the run-ending owner in {path}"
-            );
+fn violations(relative: &str, text: &str) -> Vec<String> {
+    let body = production_text(text);
+    let mut banned: Vec<&str> = ENDING_TOKENS.to_vec();
+    if !NON_RUN_PROCESS_FILES.contains(&relative) {
+        banned.extend_from_slice(SIGNAL_TOKENS);
+    }
+    banned
+        .into_iter()
+        .filter(|token| body.contains(token))
+        .map(|token| format!("`{token}` in {relative}"))
+        .collect()
+}
+
+fn source_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.join("src")];
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
+                files.push(path);
+            }
         }
     }
+    files.sort();
+    files
+}
+
+#[test]
+fn only_the_owner_writes_endings_or_signals_run_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found = Vec::new();
+    for path in source_files(root) {
+        let relative = path
+            .strip_prefix(root)
+            .expect("a source path under the crate")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "src/run.rs" || relative == "src/transcript.rs" {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{relative} cannot be read: {error}"));
+        found.extend(violations(&relative, &text));
+    }
+    assert!(
+        found.is_empty(),
+        "ending writes/signals outside the owner:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn the_guard_catches_a_bypassing_fixture() {
+    let typed = "fn bypass(){ let _ = crate::transcript::Record::RunFinished { outcome: \"x\", reason: None, exit_code: None, duration_ms: 0, run_id: \"r\", ts: \"t\" }; }";
+    assert!(!violations("src/bypass.rs", typed).is_empty());
+    let aliased = "use crate::run as r; fn bypass(){ let _ = r::settle_run_with_stop(); }";
+    assert!(!violations("src/bypass.rs", aliased).is_empty());
+    let signal = "fn bypass(){ killpg(1, SIGTERM); }";
+    assert!(!violations("src/bypass.rs", signal).is_empty());
+    let literal = "fn bypass(){ let _ = \"first-ending.json\"; }";
+    assert!(!violations("src/bypass.rs", literal).is_empty());
 }
 
 #[test]
@@ -49,6 +149,7 @@ fn the_owner_exposes_the_ending_requests() {
     let text = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/run.rs"))
         .expect("the owner source");
     for token in [
+        "pub fn prepare_ending",
         "pub fn request_stop",
         "pub fn request_force",
         "pub fn stop_uncertain",
@@ -57,6 +158,8 @@ fn the_owner_exposes_the_ending_requests() {
         "pub fn recover_ending",
         "pub fn write_natural_ending",
         "pub fn write_failed_ending",
+        "pub fn signal_run_group",
+        "pub fn signal_starting_group",
     ] {
         assert!(text.contains(token), "the owner lacks `{token}`");
     }

@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 
 use crate::engine::session::RunningSession;
 
+static ATOMIC_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 use serde::{Deserialize, Serialize};
 
 use crate::time::now_unix_ms;
@@ -1331,13 +1333,46 @@ struct EndingUncertainty {
     error: String,
 }
 
+/// Install one private file without ever replacing an existing one. The caller's
+/// first evidence wins; a racing second writer sees `AlreadyExists` and succeeds
+/// without touching the file.
+fn write_once_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let sequence = ATOMIC_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let stage = parent.join(format!(
+        ".write-once.part-{}-{}-{sequence}",
+        std::process::id(),
+        now_unix_ms()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(crate::mode::SECRET_FILE_MODE)
+            .open(&stage)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        match fs::hard_link(&stage, path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let dir = fs::File::open(parent)?;
+        dir.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&stage);
+    result
+}
+
 /// Record that this run's ending cannot be decided cleanly.
 ///
 /// This is written before a cleanup stop when the first-ending fact cannot be
 /// written, and when a persisted fact contradicts the run's terminal record. A
 /// reader that sees it must report uncertainty and keep the handles, never claim a
 /// clean stop or outcome.
-pub fn record_ending_uncertainty(run_dir: &Path, run_id: &str, error: &str) -> io::Result<()> {
+fn record_ending_uncertainty(run_dir: &Path, run_id: &str, error: &str) -> io::Result<()> {
     let expected = run_id_of_io(run_dir)?;
     if run_id != expected {
         return Err(io::Error::other(format!(
@@ -1345,22 +1380,20 @@ pub fn record_ending_uncertainty(run_dir: &Path, run_id: &str, error: &str) -> i
         )));
     }
     // The first evidence is the truth; a later reader must not replace it with a
-    // narrower or derivative error.
-    if run_dir.join(ENDING_UNCERTAIN_FILE).exists() {
-        return Ok(());
-    }
+    // narrower or derivative error. The no-clobber link below does the check
+    // atomically, so two writers cannot both install evidence.
     let record = EndingUncertainty {
         ts: crate::time::rfc3339(now_unix_ms()),
         run_id: run_id.to_owned(),
         error: error.to_owned(),
     };
     let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
-    crate::mode::write_private(run_dir.join(ENDING_UNCERTAIN_FILE), text.as_bytes())
+    write_once_private(&run_dir.join(ENDING_UNCERTAIN_FILE), text.as_bytes())
 }
 
 /// Read this run's uncertainty evidence, if any. A foreign or malformed record is
 /// itself uncertainty, never "none".
-pub fn ending_uncertainty(run_dir: &Path) -> Result<Option<String>, String> {
+fn ending_uncertainty(run_dir: &Path) -> Result<Option<String>, String> {
     let expected = run_id_of(run_dir)?;
     let path = run_dir.join(ENDING_UNCERTAIN_FILE);
     let text = match fs::read_to_string(&path) {
@@ -1394,7 +1427,7 @@ fn run_id_of_io(run_dir: &Path) -> io::Result<&str> {
 ///
 /// A malformed record is an error, never "no fact": guessing would let a later
 /// writer change which ending happened first.
-pub fn recorded_first_ending(run_dir: &Path) -> Result<Option<FirstEnding>, String> {
+pub(crate) fn recorded_first_ending(run_dir: &Path) -> Result<Option<FirstEnding>, String> {
     let expected = run_id_of(run_dir)?;
     if let Some(error) = ending_uncertainty(run_dir)? {
         return Err(format!("the run's ending is uncertain: {error}"));
@@ -1424,7 +1457,7 @@ pub fn recorded_first_ending(run_dir: &Path) -> Result<Option<FirstEnding>, Stri
 /// an atomic no-clobber hard link. If two writers race, the first link wins and both
 /// callers read the winner. This is called before any signal the fact governs, so a
 /// crash/reopen cannot lose the first stop.
-pub fn ensure_first_ending(
+fn ensure_first_ending(
     run_dir: &Path,
     run_id: &str,
     proposed: FirstEnding,
@@ -1492,7 +1525,7 @@ pub fn ensure_first_ending(
 /// either failure is returned rather than swallowed. The terminal ending is written
 /// last and committed to disk, so a later open that finds it also has the marker;
 /// an interrupted pair is retried from the still-present handles.
-pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
+fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
     let fact = match recorded_first_ending(run_dir) {
         Ok(fact) => fact,
         Err(error) => {
@@ -1559,7 +1592,7 @@ fn run_id_of(run_dir: &Path) -> Result<&str, String> {
 /// to have no live member, and before [`clear_process_records`]. A failure leaves
 /// every handle in place so a later Start can retry instead of trusting an absent
 /// record.
-pub fn ensure_terminal_record(
+fn ensure_terminal_record(
     run_dir: &Path,
     outcome: RunOutcome,
     reason: Option<String>,
@@ -1568,6 +1601,32 @@ pub fn ensure_terminal_record(
     transcript::record_outcome_if_missing(run_dir, run_id, outcome, reason, 0)
         .map(|_| ())
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
+}
+
+/// The run's own terminal ending, as a read-only value for the engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalEnding {
+    /// The typed outcome.
+    pub outcome: RunOutcome,
+    /// The reason sentence, when the run wrote one.
+    pub reason: Option<String>,
+}
+
+/// Read the run's terminal ending without exposing record construction to callers.
+pub fn terminal_ending(run_dir: &Path) -> Result<Option<TerminalEnding>, String> {
+    let record = transcript::terminal_record_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
+    let Some(transcript::Record::RunFinished {
+        outcome, reason, ..
+    }) = record
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TerminalEnding {
+        outcome: RunOutcome::parse(&outcome)
+            .ok_or_else(|| format!("the run's ending `{outcome}` is unknown"))?,
+        reason,
+    }))
 }
 
 /// Whether this run has a terminal record, without turning an unreadable
@@ -1617,9 +1676,19 @@ fn write_terminal_replacing(
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
 
+/// Prepare a first ending without signalling a handle. This is the owner request
+/// used when the caller has already reached the force phase of its own protocol.
+pub fn prepare_ending(
+    run_dir: &Path,
+    run_id: &str,
+    proposed: FirstEnding,
+) -> Result<FirstEnding, String> {
+    pin_first_ending(run_dir, run_id, proposed)
+}
+
 /// The owner's fact-pinning step: persist the first ending for this run, and on any
 /// failure persist the uncertainty evidence and return the error.
-pub fn pin_first_ending(
+fn pin_first_ending(
     run_dir: &Path,
     run_id: &str,
     proposed: FirstEnding,
@@ -1700,15 +1769,21 @@ fn wait_session_status(handle: &mut dyn RunningSession, limit: Duration) -> bool
     }
 }
 
-/// Signal a starting child's group by the pid the job reported. The job owns the
-/// wait and reaps it when it returns.
-pub fn signal_starting_group(pid: u32, force: bool) {
+/// The owner's raw process-group signal. Every run/child group signal uses this
+/// function; adapters outside `run.rs` call it instead of `killpg`.
+pub fn signal_run_group(pid: u32, force: bool) {
     let signal = if force {
         nix::sys::signal::Signal::SIGKILL
     } else {
         nix::sys::signal::Signal::SIGTERM
     };
     let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
+}
+
+/// Signal a starting child's group by the pid the job reported. The job owns the
+/// wait and reaps it when it returns.
+pub fn signal_starting_group(pid: u32, force: bool) {
+    signal_run_group(pid, force);
 }
 
 /// Settle a run whose self-written terminal record may already exist. The caller
@@ -1733,7 +1808,11 @@ pub fn recover_ending(run_dir: &Path, grace: Duration) -> Result<bool, String> {
 
 /// Write the one failed ending for a run that could not start a child.
 pub fn write_failed_ending(run_dir: &Path, run_id: &str, reason: &str) -> Result<(), String> {
-    pin_first_ending(run_dir, run_id, FirstEnding::Terminal)?;
+    if pin_first_ending(run_dir, run_id, FirstEnding::Terminal)? == FirstEnding::Stop {
+        // The stop already owns the one ending. The failed spawn path must not add
+        // a second terminal after the fact.
+        return Ok(());
+    }
     ensure_terminal_record(run_dir, RunOutcome::Failed, Some(reason.to_owned()))
 }
 
@@ -1746,7 +1825,20 @@ pub fn write_natural_ending(
     duration_ms: u64,
     reason: Option<String>,
 ) -> Result<(), String> {
-    pin_first_ending(run_dir, run_id, FirstEnding::Terminal)?;
+    let first = pin_first_ending(run_dir, run_id, FirstEnding::Terminal)?;
+    if first == FirstEnding::Stop {
+        // A stop won before this process reached its own ending. The stop settle
+        // owns the terminal; do not append a natural one after it.
+        return Ok(());
+    }
+    if transcript::terminal_record_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?
+        .is_some()
+    {
+        // One terminal already exists; appending another would violate the owner's
+        // one-ending rule.
+        return Ok(());
+    }
     let mut transcript = transcript::Transcript::open(run_dir)
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))?;
     transcript
@@ -1771,22 +1863,6 @@ pub fn write_natural_ending(
 /// gets a stop marker. The marker is written even when the reap cannot be verified,
 /// with that uncertainty in its sentence; the terminal record waits for a verified
 /// reap so a later retry can still decide it.
-pub fn settle_run(
-    run_dir: &Path,
-    pgid: u32,
-    outcome: RunOutcome,
-    reason: Option<String>,
-    grace: std::time::Duration,
-    first_ending: FirstEnding,
-) -> Result<bool, String> {
-    let stop = (outcome == RunOutcome::Stopped).then(|| {
-        reason
-            .clone()
-            .unwrap_or_else(|| "the run was stopped on request".to_owned())
-    });
-    settle_run_with_stop(run_dir, pgid, outcome, reason, grace, stop, first_ending)
-}
-
 /// [`settle_run`] with the engine's own stop reason and the write-once first-ending
 /// fact.
 ///
@@ -1796,7 +1872,7 @@ pub fn settle_run(
 /// write one during the grace window, the stop record replaces it so the run still
 /// has exactly one terminal outcome. A later Stop, shutdown, settle, reap or reopen
 /// cannot change this fact.
-pub fn settle_run_with_stop(
+fn settle_run_with_stop(
     run_dir: &Path,
     pgid: u32,
     outcome: RunOutcome,
@@ -2746,7 +2822,7 @@ fn unverified_group(pgid: u32) -> Result<bool, String> {
 ///
 /// `Ok(true)` means a group was found and stopped; `Ok(false)` means there was
 /// nothing left. `Err` is one plain sentence for the card when a process survives.
-pub fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
+fn reap_leftover_run(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
     reap_leftover_run_inner(run_dir, grace).map_err(categorize_cleanup)
 }
 
@@ -3724,6 +3800,94 @@ mod stop_record_tests {
             Record::RunFinished { outcome, .. } => assert_eq!(outcome, "succeeded"),
             other => panic!("the ending changed: {other:?}"),
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_natural_writer_after_a_stop_fact_adds_no_terminal() {
+        let root = scratch("natural-after-stop");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("stop fact");
+        write_natural_ending(
+            &run,
+            run_id,
+            RunOutcome::Succeeded,
+            Some(0),
+            10,
+            Some("the child finished after the stop".to_owned()),
+        )
+        .expect("the natural writer returns without a terminal");
+        assert!(
+            transcript::terminal_record(&run).is_none(),
+            "a Stop fact was followed by a natural terminal"
+        );
+        settle_ending(
+            &run,
+            4_000_030,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(20),
+            Some("the run was stopped on request".to_owned()),
+            FirstEnding::Stop,
+        )
+        .expect("the stop settles");
+        let records = transcript::read(&run).expect("transcript").records;
+        let terminals: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::RunFinished { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        match terminals[0] {
+            Record::RunFinished { outcome, .. } => assert_eq!(outcome, "stopped"),
+            other => panic!("unexpected ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_writer_after_a_stop_fact_adds_no_terminal() {
+        let root = scratch("failed-after-stop");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("stop fact");
+        write_failed_ending(&run, run_id, "the child never started")
+            .expect("the failed writer returns without a terminal");
+        assert!(
+            transcript::terminal_record(&run).is_none(),
+            "a Stop fact was followed by a failed terminal"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_uncertainty_writers_keep_the_first_evidence() {
+        let root = scratch("uncertainty-concurrent");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let run_id = "run-1700000200000-0001";
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for error in ["first writer", "second writer"] {
+            let run = run.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                record_ending_uncertainty(&run, run_id, error)
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread").expect("writer");
+        }
+        let evidence = ending_uncertainty(&run).expect("read").expect("evidence");
+        assert!(
+            evidence == "first writer" || evidence == "second writer",
+            "{evidence}"
+        );
+        let records = fs::read_to_string(run.join(ENDING_UNCERTAIN_FILE)).expect("file");
+        assert!(records.contains(&evidence));
         let _ = fs::remove_dir_all(&root);
     }
 

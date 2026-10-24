@@ -299,10 +299,7 @@ impl SessionSpawner for RealSpawner {
                     let recorded =
                         write_pid(&run_dir, pid).and_then(|()| write_pgid(&run_dir, pid));
                     if let Err(reason) = recorded {
-                        let _ = nix::sys::signal::killpg(
-                            nix::unistd::Pid::from_raw(pid as i32),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
+                        crate::run::signal_run_group(pid, true);
                         let _ = child.wait();
                         let _ = ready_tx.send(Err(reason));
                         return;
@@ -311,7 +308,7 @@ impl SessionSpawner for RealSpawner {
                     let status = child.wait();
                     // The pid/group records are identity handles, not transient
                     // bookkeeping. They stay until the engine has written a durable
-                    // ending and verified cleanup (`run::settle_run`), or until a
+                    // ending and verified cleanup (`run::settle_ending`), or until a
                     // later open does the same. Removing them here lost the only
                     // recovery handle of a run whose supervisor wrote no shell
                     // record, even though its ending had not been recorded yet.
@@ -372,19 +369,14 @@ impl RunningSession for HostedSession {
     }
 
     fn signal(&mut self, force: bool) {
-        let signal = if force {
-            nix::sys::signal::Signal::SIGKILL
-        } else {
-            nix::sys::signal::Signal::SIGTERM
-        };
-        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(self.pid as i32), signal);
+        crate::run::signal_run_group(self.pid, force);
     }
 }
 
 impl Drop for HostedSession {
     fn drop(&mut self) {
         if self.exited.is_none() {
-            self.signal(true);
+            crate::run::signal_run_group(self.pid, true);
         }
     }
 }

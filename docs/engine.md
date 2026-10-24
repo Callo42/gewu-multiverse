@@ -266,10 +266,20 @@ post-stop ending with one `stopped` terminal plus the stop record, while a persi
 One owner in `run.rs` performs every ending operation: it pins the fact, sends the
 polite/force signals, writes the stop and terminal records, settles and releases the
 identity handles, performs reopen recovery, and records uncertainty. Engine callers
-only request an ending (`request_stop`, `stop_uncertain`, `settle_ending`,
-`recover_ending`, `write_natural_ending`, `write_failed_ending`); they never write an
-ending record or signal a run handle directly. `tests/ending-owner.rs` mechanically
-rejects any such write or signal in production code outside the owner.
+only request an ending (`prepare_ending`, `request_stop`, `stop_uncertain`,
+`settle_ending`, `recover_ending`, `write_natural_ending`, `write_failed_ending`);
+they never write an ending record or signal a run handle directly.
+
+The owner consults the durable fact it returns: a natural or failed writer that sees
+`stop` already won adds no terminal; only a `terminal` fact writes one. Uncertainty
+evidence is installed with an atomic no-clobber link, so the first evidence survives
+concurrent writers.
+
+`tests/ending-owner.rs` scans every production `src` file except `src/run.rs` (the
+owner) and `src/transcript.rs` (the record storage primitive), strips tests and
+comments, and rejects typed terminal constructions, literal ending file names,
+low-level settlement calls and raw run signals. It also feeds deliberately bypassing
+source fixtures through the same check.
 
 The fact is trusted only when it names this exact run and agrees with its records. A
 missing/corrupt terminal under a persisted `terminal` fact, a foreign `run_id`, an

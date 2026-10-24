@@ -44,7 +44,7 @@ use crate::run::process_alive;
 use crate::run::{self, LOG_FILE};
 use std::os::unix::process::ExitStatusExt;
 
-use crate::transcript::{self, TRANSCRIPT_FILE};
+use crate::transcript::TRANSCRIPT_FILE;
 
 use self::clock::{RealClock, SharedClock};
 #[cfg(test)]
@@ -1017,23 +1017,16 @@ fn end_from_outcome(summary: &run::RunSummary) -> Option<SessionEnd> {
 }
 
 /// The ending already written by a run, as the engine's own session ending.
-fn end_from_terminal_record(record: &transcript::Record) -> Option<SessionEnd> {
-    let transcript::Record::RunFinished {
-        outcome, reason, ..
-    } = record
-    else {
-        return None;
-    };
-    let reason = crate::forgejo_tools::sentence(reason.clone().unwrap_or_default());
-    match crate::run::RunOutcome::parse(outcome) {
-        Some(crate::run::RunOutcome::Succeeded) => Some(SessionEnd::Succeeded),
-        Some(crate::run::RunOutcome::Refused) => Some(SessionEnd::Refused { reason }),
-        Some(crate::run::RunOutcome::NoWork) => Some(SessionEnd::NoWork { reason }),
-        Some(crate::run::RunOutcome::Warned) => Some(SessionEnd::Warned { reason }),
-        Some(crate::run::RunOutcome::Failed) => Some(SessionEnd::Failed { reason }),
-        Some(crate::run::RunOutcome::TimedOut) => Some(SessionEnd::TimedOut),
-        Some(crate::run::RunOutcome::Stopped) => Some(SessionEnd::Stopped),
-        None => None,
+fn end_from_terminal_ending(ending: &run::TerminalEnding) -> Option<SessionEnd> {
+    let reason = crate::forgejo_tools::sentence(ending.reason.clone().unwrap_or_default());
+    match ending.outcome {
+        crate::run::RunOutcome::Succeeded => Some(SessionEnd::Succeeded),
+        crate::run::RunOutcome::Refused => Some(SessionEnd::Refused { reason }),
+        crate::run::RunOutcome::NoWork => Some(SessionEnd::NoWork { reason }),
+        crate::run::RunOutcome::Warned => Some(SessionEnd::Warned { reason }),
+        crate::run::RunOutcome::Failed => Some(SessionEnd::Failed { reason }),
+        crate::run::RunOutcome::TimedOut => Some(SessionEnd::TimedOut),
+        crate::run::RunOutcome::Stopped => Some(SessionEnd::Stopped),
     }
 }
 
@@ -1299,7 +1292,7 @@ impl Inner {
                 // only when the write-once fact says Stop.
                 let stop_wins = (engine_stopped || timed_out)
                     && !matches!(first_ending, Some(run::FirstEnding::Terminal));
-                let terminal = transcript::terminal_record(&run.run_dir);
+                let terminal = run::terminal_ending(&run.run_dir).ok().flatten();
                 let progress = if timed_out && stop_wins {
                     run::native_progress(&run.run_dir)
                 } else {
@@ -1331,7 +1324,7 @@ impl Inner {
                         deadline_end()
                     }
                 } else if let Some(record) = terminal.as_ref() {
-                    end_from_terminal_record(record).unwrap_or_else(|| {
+                    end_from_terminal_ending(record).unwrap_or_else(|| {
                         if status.success() {
                             session_success_end(&run.run_dir)
                         } else {
@@ -1430,8 +1423,8 @@ impl Inner {
             // engine's stop ending (or preserved the child's earlier ending). Read
             // the one terminal record back and use it for the board, so the card and
             // the transcript cannot disagree.
-            if let Some(record) = transcript::terminal_record(&run_dir)
-                && let Some(actual) = end_from_terminal_record(&record)
+            if let Some(record) = run::terminal_ending(&run_dir).ok().flatten()
+                && let Some(actual) = end_from_terminal_ending(&record)
             {
                 end = actual;
             }
@@ -2075,10 +2068,8 @@ fn session_failure_reason(run_dir: &Path, status: std::process::ExitStatus) -> S
     // failure, a tool's refusal, a declared step's output). The log's last line is
     // the process-exit line the product itself appends, so it is never the reason
     // (W31-7, F3).
-    if let Some(transcript::Record::RunFinished {
-        reason: Some(reason),
-        ..
-    }) = transcript::terminal_record(run_dir)
+    if let Some(ending) = run::terminal_ending(run_dir).ok().flatten()
+        && let Some(reason) = ending.reason
     {
         let reason = crate::forgejo_tools::sentence(reason);
         if !reason.is_empty() {
@@ -2099,15 +2090,12 @@ fn session_failure_reason(run_dir: &Path, status: std::process::ExitStatus) -> S
 
 /// The ending a cleanly exited run recorded for itself.
 fn session_success_end(run_dir: &Path) -> SessionEnd {
-    if let Some(transcript::Record::RunFinished {
-        outcome, reason, ..
-    }) = transcript::terminal_record(run_dir)
-    {
-        let reason = crate::forgejo_tools::sentence(reason.unwrap_or_default());
-        match crate::run::RunOutcome::parse(&outcome) {
-            Some(crate::run::RunOutcome::Refused) => return SessionEnd::Refused { reason },
-            Some(crate::run::RunOutcome::NoWork) => return SessionEnd::NoWork { reason },
-            Some(crate::run::RunOutcome::Warned) => return SessionEnd::Warned { reason },
+    if let Some(ending) = run::terminal_ending(run_dir).ok().flatten() {
+        let reason = crate::forgejo_tools::sentence(ending.reason.unwrap_or_default());
+        match ending.outcome {
+            crate::run::RunOutcome::Refused => return SessionEnd::Refused { reason },
+            crate::run::RunOutcome::NoWork => return SessionEnd::NoWork { reason },
+            crate::run::RunOutcome::Warned => return SessionEnd::Warned { reason },
             _ => {}
         }
     }
@@ -3064,13 +3052,13 @@ impl EngineApi for Engine {
                 }
             }
             if let Some(server) = inner.forgejo.child.as_mut() {
-                signal_group(server.pid(), nix::sys::signal::Signal::SIGTERM);
+                bundled_forgejo::signal_process_group(server.pid(), false);
             }
             if let Some(pid) = inner.forgejo.start_pid {
-                signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+                bundled_forgejo::signal_process_group(pid, false);
             }
             for pid in &inner.forgejo.helper_pids {
-                signal_group(*pid, nix::sys::signal::Signal::SIGTERM);
+                bundled_forgejo::signal_process_group(*pid, false);
             }
         }
         if !first_ending_errors.is_empty() {
@@ -3145,7 +3133,7 @@ impl EngineApi for Engine {
             for pid in appeared {
                 if !signalled.contains(&pid) {
                     signalled.push(pid);
-                    signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+                    bundled_forgejo::signal_process_group(pid, false);
                 }
             }
             if !alive || started.elapsed() >= grace {
@@ -3167,9 +3155,8 @@ impl EngineApi for Engine {
                         match run_id
                             .as_deref()
                             .ok_or_else(|| "the run directory has no run id".to_owned())
-                            .and_then(|run_id| {
-                                run::pin_first_ending(&run.run_dir, run_id, proposed)
-                            }) {
+                            .and_then(|run_id| run::prepare_ending(&run.run_dir, run_id, proposed))
+                        {
                             Ok(ending) => run.first_ending = Some(ending),
                             Err(error) => {
                                 let reason = run::stop_uncertain(
@@ -3208,12 +3195,12 @@ impl EngineApi for Engine {
             if let Some(pid) = inner.forgejo.start_pid.take() {
                 // The job that spawned this child owns its reaping. It has seen the
                 // generation change; this is the last bound if it is still blocked.
-                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                bundled_forgejo::signal_process_group(pid, true);
             }
             for pid in std::mem::take(&mut inner.forgejo.helper_pids) {
                 // The token helper's job owns the wait and reaping; the force below
                 // ends it if it is still in the grace window's shadow.
-                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                bundled_forgejo::signal_process_group(pid, true);
             }
             inner.forgejo.state = ForgejoState::Stopped;
             inner.forgejo.admin_token = None;
@@ -3291,12 +3278,6 @@ fn lock_inner(inner: &Arc<Mutex<Inner>>) -> std::sync::MutexGuard<'_, Inner> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
-}
-
-/// Signal a process group by the pid that leads it. A pid that is already gone is
-/// not an error: the job that owns it reaps it and notices the generation change.
-fn signal_group(pid: u32, signal: nix::sys::signal::Signal) {
-    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
 }
 
 impl Drop for Engine {
@@ -7104,7 +7085,7 @@ mod tests {
         let board = engine.board();
         assert!(matches!(board.agents[0].session, SessionState::Idle));
         let run_dir = fake.last_run_dir().expect("the spawned run directory");
-        // `settle_run` writes the durable ending on the session thread just after
+        // `settle_ending` writes the durable ending on the session thread just after
         // the child is reaped; the liveness check above is not a write barrier.
         let deadline = Instant::now() + Duration::from_secs(2);
         while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
