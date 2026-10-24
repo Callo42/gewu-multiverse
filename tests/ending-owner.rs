@@ -1,6 +1,6 @@
 //! Mechanical guard for the single run-ending owner.
 //!
-//! Every production file except the owner (`src/run.rs`) and the transcript storage
+//! Every production file except the owner (`src/run.rs` and its `src/run/` submodules) and the transcript storage
 //! primitive (`src/transcript.rs`) is scanned. A terminal/stop/first-ending/
 //! uncertainty write, or a raw run-process signal, outside the owner is a hard
 //! failure. Server/installer process adapters are listed explicitly because they
@@ -130,7 +130,7 @@ fn only_the_owner_writes_endings_or_signals_run_handles() {
             .expect("a source path under the crate")
             .to_string_lossy()
             .replace('\\', "/");
-        if relative == "src/run.rs" || relative == "src/transcript.rs" {
+        if relative == "src/run.rs" || relative.starts_with("src/run/") || relative == "src/transcript.rs" {
             continue;
         }
         let text = fs::read_to_string(&path)

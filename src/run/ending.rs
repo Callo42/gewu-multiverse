@@ -122,7 +122,7 @@ impl Drop for PreparedRun {
 /// bounded wait, and record stopped when exit is confirmed; otherwise leave explicit
 /// uncertainty. It must never claim that no child was started.
 fn settle_dropped_child(run_dir: &Path, run_id: &str, pid: u32) {
-    let _ = super::adapter_signal_run_group(pid, true);
+    super::adapter_signal_run_group(pid, true);
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     loop {
         match nix::sys::wait::waitpid(
