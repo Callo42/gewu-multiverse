@@ -891,48 +891,45 @@ fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
         return RequestedWork::Comment;
     }
     let compound_action = read_prefix
-        && [" and ", " then ", " and then "]
-            .iter()
-            .any(|joiner| lower.contains(joiner))
-        && tokens.iter().any(|word| {
-            matches!(
-                *word,
-                "change"
-                    | "refactor"
-                    | "rename"
-                    | "rewrite"
-                    | "implement"
-                    | "modify"
-                    | "update"
-                    | "fix"
-                    | "create"
-                    | "delete"
-                    | "remove"
-                    | "add"
-                    | "write"
-                    | "edit"
-                    | "apply"
-                    | "close"
-                    | "reopen"
-                    | "comment"
-                    | "push"
-            )
+        && tokens.iter().enumerate().any(|(index, word)| {
+            if !matches!(*word, "and" | "then") {
+                return false;
+            }
+            let mut next = index + 1;
+            if tokens.get(next) == Some(&"then") {
+                next += 1;
+            }
+            tokens.get(next).is_some_and(|word| {
+                matches!(
+                    *word,
+                    "change"
+                        | "refactor"
+                        | "rename"
+                        | "rewrite"
+                        | "implement"
+                        | "modify"
+                        | "update"
+                        | "fix"
+                        | "create"
+                        | "delete"
+                        | "remove"
+                        | "add"
+                        | "write"
+                        | "edit"
+                        | "apply"
+                        | "close"
+                        | "reopen"
+                        | "comment"
+                        | "push"
+                )
+            })
         });
     if read_prefix && !compound_action && !update_pr && !open_pr {
-        let local_read = [
-            "file",
-            "code",
-            "source",
-            "local",
-            "repository",
-            "readme",
-            "module",
-            "function",
-        ]
-        .iter()
-        .any(|word| tokens.contains(word));
-        let forgejo_noun =
-            forgejo || (tokens.contains(&"comment") || tokens.contains(&"pr")) && !local_read;
+        let comment_local =
+            tokens.contains(&"code") || tokens.contains(&"file") || tokens.contains(&"source");
+        let pr_explicit = tokens.contains(&"pr") || lower.contains("pull request");
+        let comment_explicit = tokens.contains(&"comment") && !comment_local;
+        let forgejo_noun = forgejo || pr_explicit || comment_explicit;
         return if forgejo_noun {
             RequestedWork::ForgejoRead
         } else {
@@ -2267,6 +2264,37 @@ mod native_proof_tests {
         );
         assert_eq!(
             requested_work("Read the comment.", &[]),
+            RequestedWork::ForgejoRead
+        );
+        assert_eq!(
+            requested_work("Read the code comment in src/main.rs.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the local repository README.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the issue and fix the parser.", &[]),
+            RequestedWork::GenericWrite
+        );
+        assert_eq!(
+            requested_work("Review and change the form.", &[]),
+            RequestedWork::GenericWrite
+        );
+    }
+    #[test]
+    fn c2_action_must_follow_the_connector_and_pr_object_keeps_its_fact() {
+        assert_eq!(
+            requested_work("Read the update and the logs.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the logs and update the file.", &[]),
+            RequestedWork::GenericWrite
+        );
+        assert_eq!(
+            requested_work("Read the PR in the repository.", &[]),
             RequestedWork::ForgejoRead
         );
         assert_eq!(
