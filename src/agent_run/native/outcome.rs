@@ -181,6 +181,9 @@ pub(super) enum NativeEvent {
     /// Text from an attempt. `successful` is true only when the harness marked
     /// that attempt successful (Pi's assistant message with no error).
     Text { text: String, successful: bool },
+    /// The harness marked this attempt successful without ending the turn
+    /// (Pi's assistant message with no error). It may carry text through `Text`.
+    AttemptSucceeded,
     /// The harness's own successful terminal event.
     TerminalSuccess,
     /// The harness's own terminal failure.
@@ -240,12 +243,20 @@ pub(super) struct NativeOutcome {
     terminal_failure: Option<ProviderDetail>,
     attempt_failures: Vec<ProviderDetail>,
     waiting: Option<String>,
-    /// Text the harness marked successful (Pi per-attempt success, or the text
-    /// committed by a terminal success).
+    /// Text already committed by a terminal successful attempt.
     committed_text: Vec<String>,
-    /// Text that is only a candidate until the harness ends successfully.
+    /// Text of the current attempt when the harness itself marked that message
+    /// successful (Pi). It is committed only by the terminal success; an
+    /// `AttemptFailure` clears it.
+    successful_text: Option<String>,
+    /// Text of the current attempt for the harnesses that mark success at the
+    /// terminal event rather than on the message (Codex, DSH, OpenCode). It is
+    /// cleared by an `AttemptFailure` and committed only by a terminal success.
     pending_text: Option<String>,
     tool_failures: Vec<String>,
+    /// The first failed tool's diagnostic. A tool warning is attached to a run,
+    /// never used as a session-level or deadline failure cause.
+    tool_warning: Option<String>,
     first_tool_failure: Option<String>,
     failed_call: Option<String>,
     refused_write: Option<String>,
@@ -253,7 +264,8 @@ pub(super) struct NativeOutcome {
     saw_tool: bool,
     settled: bool,
     aborted: bool,
-    last_message_successful: bool,
+    /// Whether the current attempt was marked successful, even if it had no text.
+    successful_attempt: bool,
     progress: Option<Progress>,
 }
 
@@ -285,6 +297,12 @@ impl NativeOutcome {
     pub(super) fn observe(&mut self, event: NativeEvent) {
         match event {
             NativeEvent::ToolStarted { id, tool, args } => {
+                // A tool call ends the current assistant message's candidacy: its
+                // text belongs to an earlier, non-terminal turn. Only text from a
+                // later successful attempt may be committed.
+                self.successful_text = None;
+                self.pending_text = None;
+                self.successful_attempt = false;
                 self.saw_tool = true;
                 if !id.is_empty() && !self.open.iter().any(|(open_id, _, _)| *open_id == id) {
                     self.open.push((id, tool, args));
@@ -308,18 +326,30 @@ impl NativeOutcome {
                 self.record_tool(&tool, &command, exit, signal, &output);
             }
             NativeEvent::Text { text, successful } => {
-                self.last_message_successful = successful;
                 if successful {
-                    self.committed_text.push(text);
+                    // Pi's per-attempt success: keep it for this attempt only.
+                    self.successful_text = Some(text);
                     self.pending_text = None;
                 } else {
                     self.pending_text = Some(text);
                 }
             }
+            NativeEvent::AttemptSucceeded => {
+                self.successful_attempt = true;
+                self.pending_text = None;
+            }
             NativeEvent::TerminalSuccess => {
                 self.terminal_success = true;
+                self.successful_attempt = true;
                 self.settled = true;
-                if let Some(text) = self.pending_text.take() {
+                // Only the attempt the harness marks terminally successful may
+                // contribute text. A failed attempt's text was cleared by its
+                // `AttemptFailure`; an empty successful attempt commits nothing.
+                if let Some(text) = self
+                    .successful_text
+                    .take()
+                    .or_else(|| self.pending_text.take())
+                {
                     self.committed_text.push(text);
                 }
                 self.clear_waiting();
@@ -330,7 +360,10 @@ impl NativeOutcome {
             }
             NativeEvent::TerminalFailure { detail } => {
                 self.terminal_success = false;
+                self.successful_attempt = false;
                 self.settled = true;
+                self.successful_text = None;
+                self.pending_text = None;
                 if self.terminal_failure.is_none() {
                     self.terminal_failure = Some(detail.clone());
                 }
@@ -341,7 +374,11 @@ impl NativeOutcome {
                 });
             }
             NativeEvent::AttemptFailure { detail, waiting } => {
-                self.last_message_successful = false;
+                self.successful_attempt = false;
+                // This attempt failed. Its text belongs to the failed attempt and
+                // must not be committed by a later terminal success.
+                self.successful_text = None;
+                self.pending_text = None;
                 let reason = detail.reason();
                 self.attempt_failures.push(detail);
                 if waiting {
@@ -361,14 +398,14 @@ impl NativeOutcome {
                     }
                 } else if self.program == Some(Program::Pi)
                     && self.terminal_failure.is_none()
-                    && self.last_message_successful
+                    && self.successful_attempt
                 {
                     // Pi does not emit auto_retry_end on a first-try success. The
                     // settled turn after a successful assistant message is its
-                    // terminal success.
+                    // terminal success, and only that message's text is committed.
                     self.terminal_success = true;
                     self.clear_waiting();
-                    if let Some(text) = self.pending_text.take() {
+                    if let Some(text) = self.successful_text.take() {
                         self.committed_text.push(text);
                     }
                 }
@@ -408,16 +445,11 @@ impl NativeOutcome {
             self.failed_call = Some(diagnostic.clone());
         }
         self.tool_failures.push(diagnostic.clone());
-        // A failed tool is a real failure on the timeline, but it is not terminal:
-        // the harness may recover and a warning is not a failed session.
-        if self.progress.is_none() {
-            self.progress = Some(Progress {
-                kind: ProgressKind::Attempt,
-                cause: self
-                    .first_tool_failure
-                    .clone()
-                    .unwrap_or_else(|| "a native tool failed".to_owned()),
-            });
+        // A failed tool is a warning attached to the run. It never becomes the
+        // session-level failure reason or a deadline cause: a tool's return is
+        // not the command's success and not the harness's terminal contract.
+        if self.tool_warning.is_none() {
+            self.tool_warning = Some(diagnostic.clone());
         }
         Some(diagnostic)
     }
@@ -579,7 +611,10 @@ impl NativeOutcome {
             Some(Program::Opencode) => {
                 // OpenCode has no terminal event. Its own exit status decides
                 // whether a later attempt recovered; text alone is not success.
-                if exit == Some(0) && self.pending_text.is_some() {
+                if exit == Some(0) {
+                    // OpenCode's own exit 0 is the terminal contract. It may have
+                    // no final text; a recovered attempt without text is still a
+                    // success and commits nothing.
                     resolution.disposition = Disposition::Succeeded;
                     resolution.reason = None;
                     if let Some(text) = self.pending_text.take() {
@@ -627,23 +662,36 @@ impl NativeOutcome {
     /// The progress snapshot the supervisor persists after a state change. The
     /// engine reads it when it has to end a run from its own deadline, so the last
     /// emitted cause survives a killed child.
-    pub(super) fn progress(&self) -> Option<(String, String, bool)> {
-        let progress = self.progress.as_ref()?;
-        let state = match progress.kind {
-            ProgressKind::Terminal => {
-                if self.terminal_failure.is_some() {
-                    "failed"
-                } else {
-                    "succeeded"
-                }
+    pub(super) fn progress(&self) -> Option<(String, String, bool, Option<String>)> {
+        let (state, cause, terminal) = match self.progress.as_ref() {
+            Some(progress) => {
+                let state = match progress.kind {
+                    ProgressKind::Terminal => {
+                        if self.terminal_failure.is_some() {
+                            "failed"
+                        } else {
+                            "succeeded"
+                        }
+                    }
+                    ProgressKind::Attempt => "retrying",
+                };
+                (
+                    state.to_owned(),
+                    progress.cause.clone(),
+                    matches!(progress.kind, ProgressKind::Terminal),
+                )
             }
-            ProgressKind::Attempt => "retrying",
+            // A failed tool is a warning, not a failure: persist it even when no
+            // provider attempt has emitted a cause, so the deadline can attach it
+            // while the outcome stays TimedOut.
+            None if self.tool_warning.is_some() => ("running".to_owned(), String::new(), false),
+            None => return None,
         };
-        Some((
-            state.to_owned(),
-            progress.cause.clone(),
-            matches!(progress.kind, ProgressKind::Terminal),
-        ))
+        Some((state, cause, terminal, self.tool_warning.clone()))
+    }
+
+    pub(super) fn tool_warning(&self) -> Option<&String> {
+        self.tool_warning.as_ref()
     }
 }
 
@@ -943,9 +991,14 @@ fn pi_events(value: &Value) -> Vec<NativeEvent> {
             if let Some(text) = text_of(message) {
                 events.push(NativeEvent::Text { text, successful });
             }
-            if let Some(error) = error {
+            if successful {
+                events.push(NativeEvent::AttemptSucceeded);
+            } else {
+                let detail = error.map(ProviderDetail::from_text).unwrap_or_else(|| {
+                    ProviderDetail::message("the native attempt ended with an error")
+                });
                 events.push(NativeEvent::AttemptFailure {
-                    detail: ProviderDetail::from_text(error),
+                    detail,
                     waiting: false,
                 });
             }
@@ -1550,6 +1603,71 @@ mod timeline_tests {
         assert_eq!(
             resolution.text, None,
             "a candidate from a turn the harness did not complete was committed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attempt_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn pi_terminal_success_does_not_commit_a_failed_attempts_partial_text() {
+        let mut outcome = NativeOutcome::new(Program::Pi);
+        for line in [
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"Stream ended without finish_reason","content":[{"type":"text","text":"partial"}]}}"#,
+            r#"{"type":"auto_retry_start","attempt":1,"maxAttempts":3}"#,
+            r#"{"type":"auto_retry_end","success":true,"attempt":1}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
+        ] {
+            outcome.observe_line(line);
+        }
+        let resolution = outcome.finish(Some(0), SupervisorEnd::Natural);
+        assert_eq!(resolution.disposition, Disposition::Succeeded);
+        assert_eq!(
+            resolution.text, None,
+            "text from the failed attempt was committed"
+        );
+    }
+
+    #[test]
+    fn a_failed_tool_then_a_deadline_is_timed_out_with_the_tool_as_a_warning() {
+        let mut outcome = NativeOutcome::new(Program::Pi);
+        for line in [
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash","args":{"command":"false"}}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash","result":{"content":[{"type":"text","text":"(no output)\n\nCommand exited with code 1"}],"structuredContent":{"exit_code":1},"isError":true},"isError":true}"#,
+        ] {
+            outcome.observe_line(line);
+        }
+        assert_eq!(outcome.deadline_cause(), None);
+        let warning = outcome.progress().and_then(|(_, _, _, warning)| warning);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("exit code 1")),
+            "the tool warning was not persisted: {warning:?}"
+        );
+        let resolution = outcome.finish(None, SupervisorEnd::Deadline);
+        assert_eq!(
+            resolution.disposition,
+            Disposition::TimedOut,
+            "a tool warning became a session failure"
+        );
+        assert!(
+            resolution
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("time limit"),
+            "the deadline reason is not a timeout: {:?}",
+            resolution.reason
+        );
+        assert!(
+            resolution
+                .first_tool_failure
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exit code 1")
         );
     }
 }

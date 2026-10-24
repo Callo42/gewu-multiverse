@@ -1239,6 +1239,10 @@ pub struct NativeProgress {
     pub cause: String,
     /// Whether the cause came from a terminal harness event.
     pub terminal: bool,
+    /// The first failed tool's diagnostic, kept as a warning. It is never a
+    /// session-level or deadline failure cause.
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 /// Record the native supervisor's latest cause for a deadline or stop ending.
@@ -1247,11 +1251,13 @@ pub fn write_native_progress(
     state: &str,
     cause: &str,
     terminal: bool,
+    warning: Option<&str>,
 ) -> io::Result<()> {
     let progress = NativeProgress {
         state: state.to_owned(),
         cause: cause.to_owned(),
         terminal,
+        warning: warning.map(str::to_owned),
     };
     let text = serde_json::to_string_pretty(&progress).map_err(io::Error::other)?;
     crate::mode::write_private(run_dir.join(NATIVE_PROGRESS_FILE), text.as_bytes())

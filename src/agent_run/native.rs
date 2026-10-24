@@ -859,11 +859,23 @@ pub(super) fn run(
     match resolution.disposition {
         Disposition::Failed => {
             if let Some(reason) = resolution.reason.as_deref() {
-                let _ = crate::run::write_native_progress(&shell.run_dir, "failed", reason, true);
+                let _ = crate::run::write_native_progress(
+                    &shell.run_dir,
+                    "failed",
+                    reason,
+                    true,
+                    state.outcome.tool_warning().map(String::as_str),
+                );
             }
         }
         Disposition::Succeeded => {
-            let _ = crate::run::write_native_progress(&shell.run_dir, "succeeded", "", true);
+            let _ = crate::run::write_native_progress(
+                &shell.run_dir,
+                "succeeded",
+                "",
+                true,
+                state.outcome.tool_warning().map(String::as_str),
+            );
         }
         Disposition::Stopped | Disposition::TimedOut => {}
     }
@@ -1807,17 +1819,24 @@ fn stderr_cause(lines: &[String]) -> Option<String> {
 /// include the last emitted cause in a stop or deadline record even after the
 /// native child is gone.
 fn write_progress(shell: &Shell, state: &NativeState, last: &mut String, log: &mut RunLog) {
-    let Some((progress_state, cause, terminal)) = state.outcome.progress() else {
+    let Some((progress_state, cause, terminal, warning)) = state.outcome.progress() else {
         return;
     };
-    let signature = format!("{progress_state}\u{0}{cause}\u{0}{terminal}");
+    let signature = format!(
+        "{progress_state}\u{0}{cause}\u{0}{terminal}\u{0}{}",
+        warning.as_deref().unwrap_or_default()
+    );
     if signature == *last {
         return;
     }
     *last = signature;
-    if let Err(error) =
-        crate::run::write_native_progress(&shell.run_dir, &progress_state, &cause, terminal)
-    {
+    if let Err(error) = crate::run::write_native_progress(
+        &shell.run_dir,
+        &progress_state,
+        &cause,
+        terminal,
+        warning.as_deref(),
+    ) {
         log.line(&format!(
             "the native progress record cannot be written: {error}"
         ));
@@ -2486,5 +2505,113 @@ mod launch_budget_tests {
                 assert!(opencode_request_ms(timeout_secs) * 12 < timeout_secs * 1000);
             }
         }
+    }
+}
+
+/// Correction-1 cases at the shared parser: text and causes belong to the
+/// attempt/tool that produced them. Failed-attempt text is never committed, and
+/// a failed tool is a deadline warning, not a session failure.
+#[cfg(test)]
+mod attempt_replay_tests {
+    use super::*;
+
+    #[test]
+    fn attempt_ownership_cases_replay_through_the_same_parser() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/native-outcome-attempt-cases.json"
+        ))
+        .expect("the attempt corpus fixture is JSON");
+        let entries = corpus["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 9);
+        let mut failures = Vec::new();
+        for entry in entries {
+            let id = entry["case"].as_str().unwrap_or("?");
+            let program = Program::parse(entry["harness"].as_str().unwrap_or_default())
+                .unwrap_or_else(|| panic!("{id}: known harness"));
+            let mut outcome = NativeOutcome::new(program);
+            for line in entry["stdout"].as_array().expect("stdout") {
+                outcome.observe_line(line.as_str().unwrap_or_default());
+            }
+            let exit = entry["exit_code"].as_i64().map(|code| code as i32);
+            let supervisor = match entry["supervisor"].as_str().unwrap_or("natural") {
+                "deadline" => SupervisorEnd::Deadline,
+                "stopped" => SupervisorEnd::Stopped,
+                _ => SupervisorEnd::Natural,
+            };
+            let expected = &entry["expected"];
+            let resolution = outcome.finish(exit, supervisor);
+            let want = expected["disposition"].as_str().unwrap_or_default();
+            let got = match resolution.disposition {
+                Disposition::Succeeded => "succeeded",
+                Disposition::Failed => "failed",
+                Disposition::Stopped => "stopped",
+                Disposition::TimedOut => "timed_out",
+            };
+            if got != want {
+                failures.push(format!(
+                    "{id}: disposition {got}, expected {want} (reason {:?})",
+                    resolution.reason
+                ));
+            }
+            if expected["text_absent"].as_bool() == Some(true) && resolution.text.is_some() {
+                failures.push(format!(
+                    "{id}: failed-attempt text was committed: {:?}",
+                    resolution.text
+                ));
+            }
+            let reason = resolution
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            for fragment in expected["reason_contains"].as_array().into_iter().flatten() {
+                let fragment = fragment.as_str().unwrap_or_default().to_ascii_lowercase();
+                if !reason.contains(&fragment) {
+                    failures.push(format!(
+                        "{id}: reason {:?} lacks {fragment:?}",
+                        resolution.reason
+                    ));
+                }
+            }
+            if let Some(fragments) = expected["tool_failure_contains"].as_array() {
+                let failure = resolution
+                    .first_tool_failure
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                for fragment in fragments {
+                    let fragment = fragment.as_str().unwrap_or_default().to_ascii_lowercase();
+                    if !failure.contains(&fragment) {
+                        failures.push(format!(
+                            "{id}: tool warning {:?} lacks {fragment:?}",
+                            resolution.first_tool_failure
+                        ));
+                    }
+                }
+            }
+            if supervisor == SupervisorEnd::Deadline {
+                // The deadline cause is provider/terminal only. A failed tool is
+                // persisted as a warning so the engine can name it without
+                // changing the TimedOut ending.
+                if outcome.deadline_cause().is_some() {
+                    failures.push(format!("{id}: a failed tool became the deadline cause"));
+                }
+                let warning = outcome
+                    .progress()
+                    .and_then(|(_, _, _, warning)| warning)
+                    .unwrap_or_default();
+                if !warning.to_ascii_lowercase().contains("exit code 1") {
+                    failures.push(format!(
+                        "{id}: the deadline warning is not the tool result: {warning:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "attempt ownership replay found {} mismatch(es):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 }

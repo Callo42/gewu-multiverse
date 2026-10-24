@@ -256,7 +256,11 @@ just before a stop is reconciled: the stop ending is written last and repeats th
 outcome and reason, rather than leaving a stopped run marked failed or losing the cause.
 The native supervisor writes `native-progress.json` whenever its per-harness outcome
 model changes (waiting, retrying, failed, succeeded), so a cause the harness already
-emitted survives the engine killing the child at its deadline. If a
+emitted survives the engine killing the child at its deadline. A failed tool is
+persisted there as a warning, never as the session cause: a deadline with only a tool
+warning stays `timed_out` and the stop record names the warning. Text is bound to the
+attempt that produced it; a failed or retried attempt's partial text is never
+committed by a later terminal success. If a
 process survives the reap, the sentence is kept and drawn on the agent's card; a known
 live process is `live leftover`, a live process whose ownership is unproven is
 `unverified leftover`, and a run that left no ownership record (or whose record/ending

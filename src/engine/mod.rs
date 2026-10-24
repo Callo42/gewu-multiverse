@@ -1300,14 +1300,26 @@ impl Inner {
             // The engine's own deadline must carry the last cause the harness
             // emitted: the child is already gone, so the persisted progress record
             // is the only surviving source.
-            if let Some(progress) = progress
-                && !progress.cause.trim().is_empty()
-            {
-                let base = reason
-                    .clone()
-                    .unwrap_or_else(|| "the run was ended by the product".to_owned());
-                if !base.contains(&progress.cause) {
-                    reason = Some(format!("{base}; last reported cause: {}", progress.cause));
+            if let Some(progress) = progress.as_ref() {
+                if !progress.cause.trim().is_empty() {
+                    let base = reason
+                        .clone()
+                        .unwrap_or_else(|| "the run was ended by the product".to_owned());
+                    if !base.contains(&progress.cause) {
+                        reason = Some(format!("{base}; last reported cause: {}", progress.cause));
+                    }
+                }
+                // A failed tool is a warning attached to the run, never a
+                // session-level failure cause: it is named here but cannot turn a
+                // deadline into `failed`.
+                if let Some(warning) = progress.warning.as_deref().filter(|w| !w.trim().is_empty())
+                {
+                    let base = reason
+                        .clone()
+                        .unwrap_or_else(|| "the run was ended by the product".to_owned());
+                    if !base.contains(warning) {
+                        reason = Some(format!("{base}; tool warning: {warning}"));
+                    }
                 }
             }
             let stop_reason = if engine_stopped { reason.clone() } else { None };
@@ -5422,6 +5434,57 @@ mod tests {
     }
 
     #[test]
+    fn a_deadline_with_a_failed_tool_stays_timed_out_and_names_the_warning() {
+        let root = scratch_root("engine-deadline-tool-warning");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        run::write_native_progress(
+            &run_dir,
+            "running",
+            "",
+            false,
+            Some("shell: the native tool exited with code 1"),
+        )
+        .expect("the native progress record");
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        let board = engine.board();
+        match board.agents[0].recent.last() {
+            Some(SessionEnd::TimedOut) => {}
+            other => panic!("a failed tool changed the deadline ending: {other:?}"),
+        }
+        let stop: run::RunStopped = serde_json::from_str(
+            &fs::read_to_string(run_dir.join(run::STOPPED_FILE)).expect("stop record"),
+        )
+        .expect("stop record JSON");
+        assert!(
+            stop.reason
+                .contains("tool warning: shell: the native tool exited with code 1"),
+            "{}",
+            stop.reason
+        );
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("terminal record");
+        match terminal {
+            crate::transcript::Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "timed_out");
+                assert!(reason.contains("tool warning"), "{reason}");
+            }
+            other => panic!("unexpected terminal record: {other:?}"),
+        }
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_deadline_keeps_the_native_failure_cause_instead_of_only_timing_out() {
         let root = scratch_root("engine-deadline-cause");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
@@ -5436,6 +5499,7 @@ mod tests {
             "retrying",
             "the native provider reported: synthetic status 500",
             false,
+            None,
         )
         .expect("the native progress record");
         tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
