@@ -123,6 +123,14 @@ pub fn install(
     };
     fs::create_dir_all(&directory)
         .map_err(|error| format!("the install directory cannot be created: {error}"))?;
+    let directory_metadata = fs::symlink_metadata(&directory)
+        .map_err(|error| format!("the install directory cannot be read: {error}"))?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(format!(
+            "the {} install directory is not a plain directory; it was left untouched",
+            program.label()
+        ));
+    }
     let _ = crate::mode::set_mode(&directory, crate::mode::PRIVATE_DIR_MODE);
     let _lock = InstallLock::acquire(&directory, program)?;
     // A killed predecessor is repaired before this attempt reads or replaces the
@@ -225,7 +233,10 @@ pub fn recover_pending(data_root: &Path) -> Vec<String> {
         let Some(directory) = root.parent().map(Path::to_path_buf) else {
             continue;
         };
-        if !directory.is_dir() {
+        if fs::symlink_metadata(&directory)
+            .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+            .unwrap_or(true)
+        {
             continue;
         }
         // A live install (or a lock this installer did not write) owns the
