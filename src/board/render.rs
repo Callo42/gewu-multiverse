@@ -3191,23 +3191,9 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             &keys,
             theme::bold(theme::AMBER),
         );
-    } else if text_util::width(
-        "s start/stop   e instruction   l log   t transcript   j raw   d remove   esc back",
-    ) <= inner.width.saturating_sub(2) as usize
-    {
-        let line =
-            "s start/stop   e instruction   l log   t transcript   j raw   d remove   esc back";
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            actions_y,
-            line,
-            theme::fg(theme::MUTED),
-        );
     } else {
-        let line1 = "s start/stop   e instruction   l log   t transcript";
-        let line2 = "j raw transcript   d remove   esc back";
+        let line1 = "s start/stop  e instruction  p program  m model";
+        let line2 = "l log  t transcript  j raw  d remove  esc back";
         text_util::put(
             buf,
             inner,

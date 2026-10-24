@@ -2256,22 +2256,7 @@ impl EngineApi for Engine {
                     .flatten()
                     .is_some();
                 let inherited_key = credentials::model_key(&inner.credentials, &name).ok();
-                if program.is_native()
-                    && !explicit_key
-                    && let Some(key) = inherited_key.as_ref()
-                {
-                    credentials::record_secret(
-                        &inner.credentials,
-                        Some("model_keys"),
-                        &name,
-                        key.expose(),
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "the program change was not saved: the current model key for `{name}` could not be saved ({error})"
-                        )
-                    })?;
-                }
+                let settings_before = inner.settings.clone();
                 let Some(saved) = inner.settings.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
@@ -2311,7 +2296,34 @@ impl EngineApi for Engine {
                 } else if saved.codex_sandbox.is_empty() {
                     saved.codex_sandbox = "native".to_owned();
                 }
-                inner.save_settings()?;
+                if let Err(error) = inner.save_settings() {
+                    inner.settings = settings_before;
+                    return Err(format!(
+                        "the program change was not saved; the previous selection was restored ({error})"
+                    ));
+                }
+                if program.is_native()
+                    && !explicit_key
+                    && let Some(key) = inherited_key.as_ref()
+                {
+                    if let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.expose(),
+                    ) {
+                        inner.settings = settings_before;
+                        let restore = inner.save_settings();
+                        return Err(match restore {
+                            Ok(()) => format!(
+                                "the program change was rolled back: the current model key for `{name}` could not be saved ({error})"
+                            ),
+                            Err(restore_error) => format!(
+                                "the program change could not be restored after a key-save failure ({error}); the settings file also failed to restore ({restore_error})"
+                            ),
+                        });
+                    }
+                }
                 inner.agents[index].last_error = None;
                 inner.note(format!("`{name}` now runs with {}", program.label()));
                 Ok(())
@@ -2334,6 +2346,7 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                let settings_before = inner.settings.clone();
                 let Some(saved) = inner.settings.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
@@ -2342,16 +2355,31 @@ impl EngineApi for Engine {
                     protocol: protocol.id().to_owned(),
                     model,
                 });
+                if let Err(error) = inner.save_settings() {
+                    inner.settings = settings_before;
+                    return Err(format!(
+                        "the model change was not saved; the previous selection was restored ({error})"
+                    ));
+                }
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
-                    credentials::record_secret(
+                    if let Err(error) = credentials::record_secret(
                         &inner.credentials,
                         Some("model_keys"),
                         &name,
                         key.trim(),
-                    )
-                    .map_err(|error| format!("the model key could not be kept: {error}"))?;
+                    ) {
+                        inner.settings = settings_before;
+                        let restore = inner.save_settings();
+                        return Err(match restore {
+                            Ok(()) => format!(
+                                "the model change was rolled back: the key could not be saved ({error})"
+                            ),
+                            Err(restore_error) => format!(
+                                "the model change could not be restored after a key-save failure ({error}); the settings file also failed to restore ({restore_error})"
+                            ),
+                        });
+                    }
                 }
-                inner.save_settings()?;
                 inner.agents[index].last_error = None;
                 inner.note(format!("`{name}`'s connection is saved for its next run"));
                 Ok(())
@@ -2366,6 +2394,7 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                let settings_before = inner.settings.clone();
                 let Some(saved) = inner.settings.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
@@ -2373,10 +2402,15 @@ impl EngineApi for Engine {
                     return Err("the sandbox choice applies only to Codex".to_owned());
                 }
                 saved.codex_sandbox = mode.to_owned();
-                inner.save_settings()?;
+                if let Err(error) = inner.save_settings() {
+                    inner.settings = settings_before;
+                    return Err(format!(
+                        "the sandbox choice was not saved; the previous selection was restored ({error})"
+                    ));
+                }
                 inner.agents[index].last_error = None;
                 inner.note(format!(
-                    "`{name}`'s Codex sandbox choice is saved for its next run"
+                    "`{name}`'s Codex sandbox is saved for its next run"
                 ));
                 Ok(())
             }
@@ -6331,5 +6365,41 @@ mod tests {
             REPOSITORY_REFRESH <= Duration::from_secs(2),
             "the board can stay stale for {REPOSITORY_REFRESH:?}"
         );
+    }
+    #[test]
+    fn c5_a_settings_save_failure_restores_the_prior_program_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-c5-settings-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "chat-completions".to_owned(),
+                model: "fixture".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("the fixture model saves");
+        let before = engine.board().agents[0].program.clone();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+            .expect("the root becomes read-only");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "pi".to_owned(),
+            protocol: Some("chat-completions".to_owned()),
+        });
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("the root is writable again");
+        assert!(result.is_err(), "the save failure was reported as success");
+        assert_eq!(engine.board().agents[0].program, before);
     }
 }

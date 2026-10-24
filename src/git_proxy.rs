@@ -149,6 +149,90 @@ fn read_headers(stream: &mut TcpStream) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+fn percent_decode(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn fixed_route(raw: &str, repos: &[String], method: &str) -> Option<String> {
+    let decoded = percent_decode(raw)?;
+    if decoded.contains('\\') || decoded.contains('\0') || decoded.contains("//") {
+        return None;
+    }
+    let (path, query) = decoded
+        .split_once('?')
+        .map_or((decoded.as_str(), ""), |(p, q)| (p, q));
+    if path.contains('?') {
+        return None;
+    }
+    let mut segments = path.split('/');
+    if segments.next() != Some("") {
+        return None;
+    }
+    let mut clean = Vec::new();
+    for segment in segments {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
+        }
+        clean.push(segment);
+    }
+    let joined = clean.join("/");
+    let (_, rest) = repos.iter().find_map(|repo| {
+        joined
+            .strip_prefix(&format!("{repo}.git/"))
+            .map(|rest| (repo, rest))
+    })?;
+    let info = rest == "info/refs"
+        && method == "GET"
+        && (query == "service=git-upload-pack" || query == "service=git-receive-pack");
+    let head = rest == "HEAD" && method == "GET" && query.is_empty();
+    let upload = rest == "git-upload-pack" && method == "POST" && query.is_empty();
+    let receive = rest == "git-receive-pack" && method == "POST" && query.is_empty();
+    if info || head || upload || receive {
+        Some(if info {
+            format!("/{joined}?{query}")
+        } else {
+            format!("/{joined}")
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_lengths(lines: &[String]) -> Option<usize> {
+    let mut found = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value.trim().parse::<usize>().ok()?);
+        }
+    }
+    found
+}
+
 fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &str) -> Option<()> {
     client
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -159,38 +243,30 @@ fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &
     let head = read_headers(&mut client)?;
     let split = head.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     let header_text = String::from_utf8_lossy(&head[..split]).into_owned();
-    let mut lines = header_text.split("\r\n");
-    let mut request = lines.next()?.split_whitespace();
+    let mut parsed = header_text.split("\r\n");
+    let mut request = parsed.next()?.split_whitespace();
     let method = request.next()?.to_ascii_uppercase();
     let target = request.next()?;
     if method != "GET" && method != "POST" {
         return None;
     }
-    let path = target.strip_prefix("http://")?;
-    let (authority, path) = path.split_once('/')?;
-    let path = format!("/{path}");
+    let absolute = target.strip_prefix("http://")?;
+    let (authority, raw_path) = absolute.split_once('/')?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     if authority != format!("{host}:{port}") {
         return None;
     }
-    let lower = path.to_ascii_lowercase();
-    let repo_ok = repos
-        .iter()
-        .any(|repo| lower.starts_with(&format!("/{repo}.git/")));
-    if !repo_ok
-        || !(lower.contains("/info/refs")
-            || lower.ends_with("/git-upload-pack")
-            || lower.ends_with("/git-receive-pack"))
-    {
+    let path = fixed_route(&format!("/{raw_path}"), repos, &method)?;
+    let headers: Vec<String> = parsed
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let content_length = parse_lengths(&headers).unwrap_or(0);
+    if method == "POST" && content_length == 0 {
         return None;
     }
-    let content_length = lines
-        .clone()
-        .find_map(|line| {
-            line.split_once(':')
-                .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        })
-        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
     let mut body = head[split..].to_vec();
     while body.len() < content_length {
         let mut chunk = [0u8; 8192];
@@ -214,10 +290,7 @@ fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &
         .ok()?;
     let mut out =
         format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: {auth}\r\n");
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
+    for line in &headers {
         let Some((name, _)) = line.split_once(':') else {
             continue;
         };
@@ -227,6 +300,7 @@ fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &
             || name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("connection")
             || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -243,4 +317,58 @@ fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &
     upstream.read_to_end(&mut response).ok()?;
     client.write_all(&response).ok()?;
     Some(())
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    fn repos() -> Vec<String> {
+        vec!["team/workspace".to_owned()]
+    }
+    #[test]
+    fn exact_smart_http_routes_keep_the_service_query() {
+        assert_eq!(
+            fixed_route(
+                "/team/workspace.git/info/refs?service=git-receive-pack",
+                &repos(),
+                "GET"
+            )
+            .as_deref(),
+            Some("/team/workspace.git/info/refs?service=git-receive-pack")
+        );
+        assert!(fixed_route("/team/workspace.git/git-receive-pack", &repos(), "POST").is_some());
+        assert!(fixed_route("/team/workspace.git/HEAD", &repos(), "GET").is_some());
+    }
+    #[test]
+    fn traversal_encoded_separators_and_wrong_queries_are_rejected() {
+        for path in [
+            "/team/workspace.git/../team/other.git/info/refs?service=git-receive-pack",
+            "/team/workspace.git/%2e%2e/team/other.git/info/refs?service=git-receive-pack",
+            "/team/workspace.git/%2f..%2fother/info/refs?service=git-receive-pack",
+            "/team/workspace.git//git-receive-pack",
+            "/team/workspace.git/./git-receive-pack",
+            "/team/workspace.git/info/refs?service=git-upload-pack&extra=1",
+            "/team/workspace.git/git-receive-pack?service=git-receive-pack",
+        ] {
+            assert!(fixed_route(path, &repos(), "POST").is_none(), "{path}");
+        }
+    }
+    #[test]
+    fn ambiguous_request_framing_is_rejected() {
+        assert!(
+            parse_lengths(&[
+                "Transfer-Encoding: chunked".to_owned(),
+                "Content-Length: 5".to_owned()
+            ])
+            .is_none()
+        );
+        assert!(
+            parse_lengths(&[
+                "Content-Length: 5".to_owned(),
+                "Content-Length: 6".to_owned()
+            ])
+            .is_none()
+        );
+        assert_eq!(parse_lengths(&["Content-Length: 5".to_owned()]), Some(5));
+    }
 }

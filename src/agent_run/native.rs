@@ -347,6 +347,13 @@ fn redact_native(secret: &Secret, text: &str) -> String {
 }
 
 fn redact_native_line(secret: &Secret, line: &str, carry: &mut String) -> String {
+    let plain = secret.expose();
+    let suffix_prefix = (4..plain.len().min(line.len() + 1)).any(|n| line.ends_with(&plain[..n]));
+    if suffix_prefix {
+        // Withhold the whole line until the following fragment can be checked.
+        carry.push_str(line);
+        return String::new();
+    }
     let combined = format!("{carry}{line}");
     let redacted = redact_native(secret, &combined);
     // Keep a bounded tail so a secret split across two native stdout lines is
@@ -379,6 +386,7 @@ struct NativeState {
     workspace_wrote: bool,
     pr_ok: bool,
     comment_ok: bool,
+    forgejo_read_ok: bool,
     pushed: bool,
     uncertain_write: bool,
     tool_ok: bool,
@@ -453,6 +461,11 @@ pub(super) fn run(
             Ok(proxy) => proxy,
             Err(reason) => return RunEnd::failed(reason),
         };
+    log.line(if git_proxy.is_some() {
+        "native Git: fixed supervisor transport"
+    } else {
+        "native Git: no supervisor transport"
+    });
     if let Some(proxy) = git_proxy.as_ref() {
         let path = files.home.join(".gitconfig");
         let mut text = std::fs::read_to_string(&path).unwrap_or_default();
@@ -791,6 +804,8 @@ enum RequestedWork {
     GenericWrite,
     PullRequest,
     Comment,
+    Push,
+    ForgejoRead,
     Ambiguous,
 }
 
@@ -800,7 +815,30 @@ enum RequestedWork {
 /// workspace witness; everything else stays ambiguous and therefore warned.
 fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
     let lower = instruction.trim().to_ascii_lowercase();
-    let read_phrasing = [
+    let change_words = [
+        "change",
+        "refactor",
+        "rename",
+        "rewrite",
+        "implement",
+        "modify",
+        "update",
+        "fix",
+        "create",
+        "delete",
+        "remove",
+        "add ",
+        "write",
+        "edit",
+        "apply",
+    ];
+    let changes = change_words.iter().any(|word| lower.contains(word));
+    let imperative_comment = lower.starts_with("comment")
+        || lower.contains("leave a comment")
+        || lower.contains("post a comment")
+        || lower.contains("write a comment")
+        || lower.contains("add a comment");
+    let read_prefix = [
         "read ",
         "summarize",
         "summarise",
@@ -810,50 +848,35 @@ fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
     ]
     .iter()
     .any(|word| lower.starts_with(word));
-    let asks_pr = ["pull request", "open a pr", "open pr"]
+    let forgejo = ["issue", "pull request", "forgejo", "repository"]
         .iter()
         .any(|word| lower.contains(word));
-    let asks_comment = lower.contains("comment")
-        && (lower.contains("leave a comment")
-            || lower.contains("post a comment")
-            || lower.contains("write a comment")
-            || lower.contains("add a comment"));
-    let asks_push = lower.contains("push");
-    if asks_pr || asks_comment || asks_push {
-        if asks_pr {
-            return RequestedWork::PullRequest;
-        }
-        if asks_comment {
-            return RequestedWork::Comment;
-        }
+    if imperative_comment {
+        return RequestedWork::Comment;
+    }
+    if lower.contains("pull request") || lower.starts_with("open a pr") {
+        return RequestedWork::PullRequest;
+    }
+    if lower.starts_with("push ") || lower == "push" {
+        return RequestedWork::Push;
+    }
+    if read_prefix && !changes {
+        return if forgejo {
+            RequestedWork::ForgejoRead
+        } else {
+            RequestedWork::ReadOnly
+        };
+    }
+    if changes || !steps.is_empty() {
         return RequestedWork::GenericWrite;
     }
-    if read_phrasing {
+    if forgejo {
+        return RequestedWork::ForgejoRead;
+    }
+    if lower.contains("read") || lower.contains("inspect") {
         return RequestedWork::ReadOnly;
     }
-    let write_words = [
-        "rename",
-        "write",
-        "edit",
-        "fix",
-        "implement",
-        "modify",
-        "delete",
-        "remove",
-        "create",
-        "add ",
-        "update",
-    ];
-    if write_words.iter().any(|word| lower.contains(word)) || !steps.is_empty() {
-        return RequestedWork::GenericWrite;
-    }
-    if lower.is_empty() {
-        RequestedWork::Ambiguous
-    } else if lower.contains("read") || lower.contains("inspect") {
-        RequestedWork::ReadOnly
-    } else {
-        RequestedWork::Ambiguous
-    }
+    RequestedWork::Ambiguous
 }
 
 fn decide_native_ending(
@@ -873,8 +896,10 @@ fn decide_native_ending(
             let matched = match requested {
                 RequestedWork::PullRequest => state.pr_ok && state.pushed,
                 RequestedWork::Comment => state.comment_ok,
-                RequestedWork::GenericWrite => state.workspace_wrote,
+                RequestedWork::GenericWrite => state.workspace_wrote || state.pushed,
+                RequestedWork::Push => state.pushed,
                 RequestedWork::ReadOnly => state.tool_ok,
+                RequestedWork::ForgejoRead => state.forgejo_read_ok,
                 RequestedWork::Ambiguous => false,
             };
             if matched {
@@ -1768,6 +1793,12 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
             None,
             action,
         ));
+        if ok
+            && (tool.ends_with(crate::forgejo_tools::LIST_ASSIGNED_ISSUES)
+                || tool.ends_with(crate::forgejo_tools::READ_ISSUE_OR_PULL))
+        {
+            state.forgejo_read_ok = true;
+        }
         if tool.ends_with(crate::forgejo_tools::LIST_ASSIGNED_ISSUES)
             && ok
             && outcome
@@ -1950,7 +1981,7 @@ mod native_proof_tests {
         );
         assert_eq!(
             requested_work("Read the comment on the issue and summarize it.", &[]),
-            RequestedWork::ReadOnly
+            RequestedWork::ForgejoRead
         );
         let comment = NativeState {
             comment_ok: true,
@@ -1964,6 +1995,55 @@ mod native_proof_tests {
     }
 
     #[test]
+    fn c2_imperative_comment_change_and_push_use_their_own_facts() {
+        assert_eq!(
+            requested_work("Comment on the issue.", &[]),
+            RequestedWork::Comment
+        );
+        assert_eq!(
+            requested_work("Review and change the form.", &[]),
+            RequestedWork::GenericWrite
+        );
+        assert_eq!(requested_work("Push the branch.", &[]), RequestedWork::Push);
+        let pushed = NativeState {
+            pushed: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::Push, &pushed),
+            RunEnding::Succeeded
+        );
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &pushed),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn c3_forgejo_read_needs_the_supervisor_ledger() {
+        let native_only = NativeState {
+            tool_ok: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(
+                RunEnding::Succeeded,
+                RequestedWork::ForgejoRead,
+                &native_only
+            ),
+            RunEnding::Warned
+        );
+        let ledger = NativeState {
+            forgejo_read_ok: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::ForgejoRead, &ledger),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
     fn r7_native_redaction_covers_json_escaped_and_split_secrets() {
         let secret = Secret::new("sk-runtime-secret-value".to_owned());
         let escaped = serde_json::to_string(secret.expose()).expect("quoted");
@@ -1971,6 +2051,7 @@ mod native_proof_tests {
         let mut carry = String::new();
         let first = redact_native_line(&secret, "prefix sk-runtime-", &mut carry);
         let second = redact_native_line(&secret, "secret-value suffix", &mut carry);
+        assert!(first.is_empty(), "the first split line persisted: {first}");
         let text = format!("{first}{second}");
         assert!(!text.contains(secret.expose()), "{text}");
         let line = redact_native_line(&secret, &format!("value={escaped}"), &mut carry);
@@ -1981,7 +2062,7 @@ mod native_proof_tests {
     fn r2_read_only_comment_succeeds_from_a_read_fact_and_generic_write_needs_a_witness() {
         assert_eq!(
             requested_work("Read the comment on the issue and summarize it.", &[]),
-            RequestedWork::ReadOnly
+            RequestedWork::ForgejoRead
         );
         let read = NativeState {
             tool_ok: true,
