@@ -7574,7 +7574,7 @@ mod tests {
         let result = engine.send(Command::SetAgentProgram {
             name: "agent-1".to_owned(),
             program: "codex".to_owned(),
-            protocol: Some("chat-completions".to_owned()),
+            protocol: None,
         });
         assert!(result.is_err(), "the unconfigured program choice succeeded");
         assert_eq!(engine.board().agents[0].program, "builtin");
