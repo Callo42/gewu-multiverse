@@ -1621,3 +1621,36 @@ mod form_tests {
         }
     }
 }
+
+/// Remove one secret entry from the credentials file, if present.
+pub fn remove_secret(path: &Path, table: Option<&str>, key: &str) -> Result<(), CredentialsError> {
+    let _guard = write_lock();
+    let mut root = match read_value(path) {
+        Ok(value) => value,
+        Err(CredentialsError::Absent { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let removed = match table {
+        Some(name) => root
+            .get_mut(name)
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|entries| entries.remove(key))
+            .is_some(),
+        None => root
+            .as_table_mut()
+            .and_then(|entries| entries.remove(key))
+            .is_some(),
+    };
+    if !removed {
+        return Ok(());
+    }
+    let text = toml::to_string_pretty(&root).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
+    })
+}

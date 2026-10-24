@@ -2460,15 +2460,18 @@ impl EngineApi for Engine {
             Command::SetEndpoint { url, model, key } => {
                 let url = url.trim().to_owned();
                 let model = model.trim().to_owned();
+                let previous_key = credentials::model_key(&inner.credentials, "").ok();
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                     credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
                         .map_err(|error| format!("the model key could not be kept: {error}"))?;
                 }
-                inner.commit_settings(|settings| {
+                if let Err(error) = inner.commit_settings(|settings| {
                     settings.endpoint.url = url;
                     settings.endpoint.model = model;
                     Ok(())
-                })?;
+                }) {
+                    return Err(restore_endpoint_key(&inner, previous_key, error));
+                }
                 inner.endpoint_test = EndpointTest::NotRun;
                 inner.note("your model is saved");
                 Ok(())
@@ -2492,17 +2495,20 @@ impl EngineApi for Engine {
                         "the built-in engine needs a Chat Completions connection".to_owned()
                     );
                 }
+                let previous_key = credentials::model_key(&inner.credentials, "").ok();
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                     credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
                         .map_err(|error| format!("the model key could not be kept: {error}"))?;
                 }
-                inner.commit_settings(|settings| {
+                if let Err(error) = inner.commit_settings(|settings| {
                     settings.endpoint.url.clear();
                     settings.endpoint.base_url = base;
                     settings.endpoint.protocol = protocol.id().to_owned();
                     settings.endpoint.model = model;
                     Ok(())
-                })?;
+                }) {
+                    return Err(restore_endpoint_key(&inner, previous_key, error));
+                }
                 inner.endpoint_test = EndpointTest::NotRun;
                 inner.note("the default connection is saved");
                 Ok(())
@@ -2885,7 +2891,22 @@ impl EngineApi for Engine {
                 };
                 let grace = inner.options.stop_grace;
                 stop_agent(&mut inner.agents[index], grace)?;
-                inner.set_desired(index, Desired::Stopped)?;
+                // The stop already happened; the runtime must say Stopped even if
+                // the settings file cannot record it, or the scheduler restarts.
+                inner.agents[index].desired = Desired::Stopped;
+                let committed = inner.commit_settings(|settings| {
+                    if let Some(saved) = settings.agent_mut(&name) {
+                        saved.set_desired(Desired::Stopped);
+                    }
+                    Ok(())
+                });
+                if let Err(error) = committed {
+                    inner.agents[index].removal_pending = false;
+                    inner.agents[index].removal_retry_at = None;
+                    return Err(format!(
+                        "`{name}` was stopped, but the removal could not be saved; it was not removed ({error})"
+                    ));
+                }
                 inner.agents[index].removal_pending = true;
                 inner.agents[index].removal_retry_at = None;
                 inner.note(format!("`{name}` is being removed"));
@@ -2962,9 +2983,21 @@ impl EngineApi for Engine {
                 };
                 let grace = inner.options.stop_grace;
                 stop_agent(&mut inner.agents[index], grace)?;
-                inner.set_desired(index, Desired::Stopped)?;
-                inner.note(format!("`{name}` stopped"));
-                Ok(())
+                inner.agents[index].desired = Desired::Stopped;
+                match inner.commit_settings(|settings| {
+                    if let Some(saved) = settings.agent_mut(&name) {
+                        saved.set_desired(Desired::Stopped);
+                    }
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        inner.note(format!("`{name}` stopped"));
+                        Ok(())
+                    }
+                    Err(error) => Err(format!(
+                        "`{name}` was stopped, but the stopped state could not be saved; it will start again the next time the program opens ({error})"
+                    )),
+                }
             }
             Command::StartForgejo => {
                 if matches!(
@@ -4367,6 +4400,30 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                 ));
             }
         }
+    }
+}
+
+/// Restore the model key after a failed endpoint settings commit. The key was
+/// written before the copy was committed; a settings failure must not pair the old
+/// endpoint with the new provider's key.
+fn restore_endpoint_key(
+    inner: &Inner,
+    previous: Option<credentials::Secret>,
+    error: String,
+) -> String {
+    let restored = match previous {
+        Some(secret) => {
+            credentials::record_secret(&inner.credentials, None, "model_key", secret.expose())
+        }
+        None => credentials::remove_secret(&inner.credentials, None, "model_key"),
+    };
+    match restored {
+        Ok(()) => {
+            format!("the connection was not saved; the previous model key was restored ({error})")
+        }
+        Err(restore_error) => format!(
+            "the connection was not saved; the previous model key could not be restored ({error}); the key restore also failed ({restore_error})"
+        ),
     }
 }
 
@@ -7552,6 +7609,119 @@ mod tests {
             "the board can stay stale for {REPOSITORY_REFRESH:?}"
         );
     }
+    #[test]
+    fn f2_a_failed_stop_save_still_stops_and_does_not_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f2-stop-save");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("the settings file is read-only");
+        let result = engine.send(Command::Stop {
+            name: "agent-1".to_owned(),
+        });
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("the settings file is writable again");
+        assert!(result.is_err(), "the failed save was reported as success");
+        assert!(result.unwrap_err().contains("was stopped, but"));
+        for _ in 0..5 {
+            tick(&mut engine, &clock, Duration::from_secs(1));
+        }
+        assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
+        assert!(fake.live().is_empty());
+        assert_eq!(engine.board().agents[0].desired, Desired::Stopped);
+    }
+
+    #[test]
+    fn f2_a_failed_remove_save_still_stops_and_keeps_the_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f2-remove-save");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("the settings file is read-only");
+        let result = engine.send(Command::RemoveAgent {
+            name: "agent-1".to_owned(),
+        });
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("the settings file is writable again");
+        assert!(
+            result.is_err(),
+            "the failed removal was reported as success"
+        );
+        assert!(result.unwrap_err().contains("was stopped, but the removal"));
+        for _ in 0..5 {
+            tick(&mut engine, &clock, Duration::from_secs(1));
+        }
+        assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
+        assert!(fake.live().is_empty());
+        assert_eq!(
+            engine.board().agents.len(),
+            1,
+            "the agent was removed anyway"
+        );
+        assert_eq!(engine.board().agents[0].desired, Desired::Stopped);
+    }
+
+    #[test]
+    fn f2_a_failed_endpoint_commit_restores_the_previous_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f2-endpoint-key");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let layout = Layout::rooted_at(root.clone()).expect("layout");
+        let credentials_path = layout.credentials_file();
+        let before = credentials::model_key(&credentials_path, "")
+            .expect("the previous key")
+            .expose()
+            .to_owned();
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("the settings file is read-only");
+        let result = engine_send_with_settings(
+            &root,
+            settings,
+            Command::SetEndpoint {
+                url: "http://127.0.0.1:9/v1/chat/completions".to_owned(),
+                model: "new-model".to_owned(),
+                key: Some("new-key".to_owned()),
+            },
+        );
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("the settings file is writable again");
+        assert!(result.is_err(), "the failed endpoint commit succeeded");
+        let after = credentials::model_key(&credentials_path, "")
+            .expect("the key after rollback")
+            .expose()
+            .to_owned();
+        assert_eq!(after, before, "the new key was left on the old endpoint");
+    }
+
+    fn engine_send_with_settings(
+        root: &Path,
+        settings: Settings,
+        command: Command,
+    ) -> Result<(), String> {
+        let mut options = test_options(root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )?;
+        engine.send(command)
+    }
+
     #[test]
     fn f1_a_failed_program_choice_is_not_persisted_by_the_next_save() {
         let root = scratch_root("engine-f1-program-rollback");
