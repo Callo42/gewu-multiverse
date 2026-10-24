@@ -231,7 +231,7 @@ pub fn tools_with_forgejo(forgejo: bool) -> Vec<ToolSpec> {
 /// is the issue or pull-request number, and no call takes a token. The descriptions
 /// say what the tool can touch and which bound applies, so the model is told the same
 /// limits the tool enforces.
-fn forgejo_tools() -> Vec<ToolSpec> {
+pub(crate) fn forgejo_tools() -> Vec<ToolSpec> {
     let repository = || {
         serde_json::json!({
             "type": "string",
@@ -1296,6 +1296,7 @@ mod tests {
         let stub = Stub::start(vec![StubReply {
             status: 429,
             body: r#"{"error":"slow down"}"#.to_owned(),
+            content_type: None,
             retry_after_secs: Some(7),
             delay: Duration::ZERO,
         }]);
@@ -1320,6 +1321,7 @@ mod tests {
         let stub = Stub::start(vec![StubReply {
             status: 200,
             body: COMPLETION.to_owned(),
+            content_type: None,
             retry_after_secs: None,
             delay: Duration::from_secs(30),
         }]);

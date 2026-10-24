@@ -182,6 +182,38 @@ pub enum Record {
         /// The model id the run will ask for.
         model: String,
     },
+    /// A native agent program was started. It records the immutable actual program,
+    /// version, connection and model of this run, before any native output arrives.
+    NativeStarted {
+        /// When.
+        ts: String,
+        /// The run's identity.
+        run_id: String,
+        /// The agent the run belongs to.
+        agent: String,
+        /// Program id.
+        harness: String,
+        /// Actual program version.
+        version: String,
+        /// Program path.
+        program: String,
+        /// Connection protocol.
+        protocol: String,
+        /// API base URL.
+        base_url: String,
+        /// Model id.
+        model: String,
+        /// The explicit Codex sandbox mode, when the program is Codex.
+        #[serde(default)]
+        codex_sandbox: Option<String>,
+    },
+    /// A text message from the native program, for the readable transcript.
+    NativeText {
+        /// When.
+        ts: String,
+        /// The bounded, redacted text.
+        text: String,
+    },
     /// The model call is in flight.
     ///
     /// Written **before** the request goes out, so a run that is waiting on a slow
@@ -447,6 +479,41 @@ impl Record {
         }
     }
 
+    /// The opening record of a native program run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_started(
+        run_id: &str,
+        agent: &str,
+        harness: &str,
+        version: &str,
+        program: &str,
+        protocol: &str,
+        base_url: &str,
+        model: &str,
+        codex_sandbox: Option<&str>,
+    ) -> Self {
+        Record::NativeStarted {
+            ts: stamp(),
+            run_id: run_id.to_owned(),
+            agent: agent.to_owned(),
+            harness: harness.to_owned(),
+            version: version.to_owned(),
+            program: program.to_owned(),
+            protocol: protocol.to_owned(),
+            base_url: base_url.to_owned(),
+            model: model.to_owned(),
+            codex_sandbox: codex_sandbox.map(str::to_owned),
+        }
+    }
+
+    /// One text message from a native program.
+    pub fn native_text(text: impl Into<String>) -> Self {
+        Record::NativeText {
+            ts: stamp(),
+            text: text.into(),
+        }
+    }
+
     /// The record of a model request about to be sent.
     pub fn model_request(
         run_id: &str,
@@ -609,6 +676,8 @@ impl Record {
             Record::ToolResult { .. } => "tool_result",
             Record::ChildExit { .. } => "child_exit",
             Record::RunLimits { .. } => "run_limits",
+            Record::NativeStarted { .. } => "native_started",
+            Record::NativeText { .. } => "native_text",
             Record::ModelRequestSent { .. } => "model_request_sent",
             Record::ModelRequest { .. } => "model_request",
             Record::ModelReply { .. } => "model_reply",
@@ -629,6 +698,8 @@ impl Record {
             | Record::ToolResult { ts, .. }
             | Record::ChildExit { ts, .. }
             | Record::RunLimits { ts, .. }
+            | Record::NativeStarted { ts, .. }
+            | Record::NativeText { ts, .. }
             | Record::ModelRequestSent { ts, .. }
             | Record::ModelRequest { ts, .. }
             | Record::ModelReply { ts, .. }

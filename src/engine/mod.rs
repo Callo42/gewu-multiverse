@@ -18,7 +18,7 @@ pub mod last_seen;
 pub mod session;
 pub mod settings;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -33,9 +33,10 @@ use crate::bundled_forgejo::{self, PreparedInstance, RunningForgejo};
 use crate::credentials::{self, CredentialsFile, Secret};
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, Provisioning, SessionEnd, SessionState, UpgradeView,
+    ForgejoView, ProgramView, Provisioning, RunProgramView, SessionEnd, SessionState, UpgradeView,
 };
 use crate::forgejo::{DEFAULT_TIMEOUT, ForgejoClient, ForgejoError, Repository};
+use crate::harness::{self, Program, Protocol};
 use crate::identity;
 use crate::mode::{SECRET_FILE_MODE, set_mode};
 use crate::paths::Layout;
@@ -49,7 +50,8 @@ use self::clock::{RealClock, SharedClock};
 #[cfg(test)]
 use self::session::FakeSpawner;
 use self::session::{
-    PreparedSession, RealSpawner, RunningSession, SessionRepository, SessionRequest, SessionSpawner,
+    NativeRequest, PreparedSession, RealSpawner, RunningSession, SessionRepository, SessionRequest,
+    SessionSpawner,
 };
 use self::settings::{AgentSettings, MAX_AGENTS, Settings};
 
@@ -310,6 +312,10 @@ fn build(
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
     let (_, leftovers) = recover_stale_sessions(&options.layout, options.stop_grace)?;
     remove_stale_run_temps();
+    // A kill between the installer's two directory renames is restored before the
+    // first picture reads the program cards. A live install owns its directory and
+    // is not touched.
+    let install_recovery = harness::recover_pending(&options.data_root);
     let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
     // The recovery result is part of the first picture: Inner::new must receive it
     // before it loads the agent cards, or a failed cleanup is silently dropped and
@@ -322,6 +328,9 @@ fn build(
         leftovers,
     )?;
     inner.upgrade = upgrade;
+    for note in install_recovery {
+        inner.note(note);
+    }
     last_seen::write(options.layout.root(), env!("CARGO_PKG_VERSION"))?;
     // An installation from the old screens may still hold `config.toml`. The new
     // engine does not read it and does not convert it; it says once, on the first
@@ -565,6 +574,17 @@ struct Inner {
     sequence: u64,
     stopping: bool,
     generation: u64,
+    /// Install progress/errors for the Program screen.
+    program_states: HashMap<String, ProgramState>,
+}
+
+#[derive(Default)]
+struct ProgramState {
+    installing: Option<Option<u8>>,
+    phase: Option<harness::InstallPhase>,
+    error: Option<String>,
+    cancel: Option<harness::CancelToken>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Inner {
@@ -663,6 +683,7 @@ impl Inner {
             sequence: 0,
             stopping: false,
             generation: 0,
+            program_states: HashMap::new(),
         };
         // A number this installation has ever used is never reused, even when the
         // agent is gone from the settings. The names on disk are the floor for an
@@ -1200,7 +1221,14 @@ impl Inner {
 
     fn poll_agent(&mut self, index: usize, now: Instant) {
         let desired = self.agents[index].desired;
-        let mut ended: Option<(SessionEnd, Instant, PathBuf, u32)> = None;
+        let mut ended: Option<(
+            SessionEnd,
+            Instant,
+            PathBuf,
+            u32,
+            bool,
+            Option<run::NativeProgress>,
+        )> = None;
         if let Some(run) = self.agents[index].running.as_mut() {
             if !run.stopping {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
@@ -1214,10 +1242,33 @@ impl Inner {
                 run.stop_deadline = Some(now + Duration::from_secs(1));
             }
             if let Some(status) = run.handle.try_status() {
-                let end = if desired == Desired::Stopped || run.stop_requested {
+                let engine_stopped = desired == Desired::Stopped || run.stop_requested;
+                let timed_out = run.timed_out;
+                let progress = if timed_out {
+                    run::native_progress(&run.run_dir)
+                } else {
+                    None
+                };
+                let end = if engine_stopped {
                     SessionEnd::Stopped
-                } else if run.timed_out {
-                    SessionEnd::TimedOut
+                } else if timed_out {
+                    // A harness that reported its own failure before the engine's
+                    // deadline is not only "timed out": the last cause survives the
+                    // kill and supplies a failed ending with a reason.
+                    match progress.as_ref() {
+                        Some(progress)
+                            if !progress.cause.trim().is_empty()
+                                && matches!(progress.state.as_str(), "failed" | "retrying") =>
+                        {
+                            SessionEnd::Failed {
+                                reason: crate::forgejo_tools::sentence(format!(
+                                    "the run reached its time limit with a reported failure: {}",
+                                    progress.cause
+                                )),
+                            }
+                        }
+                        _ => SessionEnd::TimedOut,
+                    }
                 } else if status.success() {
                     // Exit 0 is not the whole outcome: the run's own terminal record
                     // says whether its last sentence refused the instruction or found
@@ -1228,18 +1279,58 @@ impl Inner {
                         reason: session_failure_reason(&run.run_dir, status),
                     }
                 };
-                ended = Some((end, run.started, run.run_dir.clone(), run.handle.pid()));
+                ended = Some((
+                    end,
+                    run.started,
+                    run.run_dir.clone(),
+                    run.handle.pid(),
+                    engine_stopped || timed_out,
+                    progress,
+                ));
             }
         }
-        if let Some((end, started, run_dir, pid)) = ended {
+        if let Some((end, started, run_dir, pid, engine_stopped, progress)) = ended {
             self.observe_confinement_refusal(&run_dir);
             // A supervisor killed from outside can leave the shell it started in
             // the run's process group. The boundary settles the run in this order:
             // stop or find the group gone, write (or keep) a durable ending, and
             // only then remove the identity handles. An error at either step keeps
             // the handles and is reported on the card; Start retries it (F-02).
-            let (outcome, reason) = outcome_for_end(&end);
-            let settled = run::settle_run(&run_dir, pid, outcome, reason, self.options.stop_grace);
+            let (outcome, mut reason) = outcome_for_end(&end);
+            // The engine's own deadline must carry the last cause the harness
+            // emitted: the child is already gone, so the persisted progress record
+            // is the only surviving source.
+            if let Some(progress) = progress.as_ref() {
+                if !progress.cause.trim().is_empty() {
+                    let base = reason
+                        .clone()
+                        .unwrap_or_else(|| "the run was ended by the product".to_owned());
+                    if !base.contains(&progress.cause) {
+                        reason = Some(format!("{base}; last reported cause: {}", progress.cause));
+                    }
+                }
+                // A failed tool is a warning attached to the run, never a
+                // session-level failure cause: it is named here but cannot turn a
+                // deadline into `failed`.
+                if let Some(warning) = progress.warning.as_deref().filter(|w| !w.trim().is_empty())
+                {
+                    let base = reason
+                        .clone()
+                        .unwrap_or_else(|| "the run was ended by the product".to_owned());
+                    if !base.contains(warning) {
+                        reason = Some(format!("{base}; tool warning: {warning}"));
+                    }
+                }
+            }
+            let stop_reason = if engine_stopped { reason.clone() } else { None };
+            let settled = run::settle_run_with_stop(
+                &run_dir,
+                pid,
+                outcome,
+                reason,
+                self.options.stop_grace,
+                stop_reason,
+            );
             self.agents[index].leftover = settled.err();
             if self.agents[index].leftover.is_some() {
                 self.agents[index].leftover_targets = vec![RecoveryTarget::Run(run_dir.clone())];
@@ -1342,8 +1433,8 @@ impl Inner {
                 .clone()
                 .or_else(|| Some("cleanup unverified".to_owned()));
         }
-        if !self.settings.endpoint.configured() || !self.credential_key_present() {
-            return Some("needs a model".to_owned());
+        if let Some(reason) = self.program_block(agent) {
+            return Some(reason);
         }
         if agent.instruction_chars == 0 {
             return Some("needs an instruction".to_owned());
@@ -1527,6 +1618,24 @@ impl Inner {
             }
         }
         let agent = &self.agents[index];
+        let saved_agent = self.settings.agent(&agent_name).cloned()?;
+        let program = saved_agent.harness();
+        let (protocol, base_url, model) = self.connection_for(&saved_agent)?;
+        let native = if program.is_native() {
+            let installed = harness::installed(&self.options.data_root, program)?;
+            Some(NativeRequest {
+                harness: program.id().to_owned(),
+                version: installed.version,
+                program: installed.executable,
+                install_root: installed.root,
+                protocol: protocol.id().to_owned(),
+                base_url: base_url.clone(),
+                model: model.clone(),
+                codex_sandbox: saved_agent.codex_sandbox.clone(),
+            })
+        } else {
+            None
+        };
         self.sequence = self.sequence.saturating_add(1);
         let run_id = run::new_run_id(self.sequence);
         let run_dir = paths.run_dir(&run_id);
@@ -1553,8 +1662,12 @@ impl Inner {
             workspace,
             instruction: paths.instruction().to_path_buf(),
             skills_dir: paths.skills_dir().to_path_buf(),
-            endpoint: self.settings.endpoint.url.clone(),
-            model: self.settings.endpoint.model.clone(),
+            endpoint: if native.is_none() {
+                self.settings.endpoint.chat_url()
+            } else {
+                base_url.clone()
+            },
+            model: model.clone(),
             max_turns: self.settings.endpoint.turns(),
             timeout_secs: self.options.session_timeout.as_secs(),
             credentials: self.credentials.clone(),
@@ -1564,6 +1677,290 @@ impl Inner {
             repositories,
             confinement,
             hide,
+            native,
+        })
+    }
+
+    /// The selected connection for one agent: its explicit provider for a native
+    /// program, or the shared endpoint for the legacy built-in engine.
+    fn connection_for(
+        &self,
+        agent: &settings::AgentSettings,
+    ) -> Option<(Protocol, String, String)> {
+        if agent.harness().is_native() {
+            let provider = agent.provider()?;
+            if !provider.configured() {
+                return None;
+            }
+            Some((
+                provider.protocol(),
+                provider.base_url.trim_end_matches('/').to_owned(),
+                provider.model.clone(),
+            ))
+        } else {
+            if !self.settings.endpoint.configured() {
+                return None;
+            }
+            Some((
+                self.settings.endpoint.protocol(),
+                self.settings.endpoint.base_url(),
+                self.settings.endpoint.model.clone(),
+            ))
+        }
+    }
+
+    /// Probe Codex's own bundled bubblewrap before a default-sandbox Start. Codex
+    /// 0.164 does not emit a native event when this setup fails, so Start would
+    /// otherwise show only a later downstream refusal. The probe uses no secrets
+    /// and inherits the product's existing outer Landlock.
+    fn codex_sandbox_block(&self, agent: &AgentRuntime) -> Option<String> {
+        let saved = self.settings.agent(&agent.name)?;
+        if saved.harness() != Program::Codex || saved.codex_sandbox == "full-access" {
+            return None;
+        }
+        let installed = harness::installed(&self.options.data_root, Program::Codex)?;
+        let bwrap = installed.root.join("codex-resources").join("bwrap");
+        if !bwrap.is_file() {
+            return Some(
+                "Codex's native sandbox helper is missing from this installation".to_owned(),
+            );
+        }
+        let mut child = match std::process::Command::new(&bwrap)
+            .args([
+                "--unshare-user",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "/bin/true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return Some(format!(
+                    "the native sandbox boundary cannot start ({error})"
+                ));
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(
+                        "the native sandbox preflight did not finish within 2 seconds".to_owned(),
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(format!(
+                        "the native sandbox preflight could not be read ({error})"
+                    ));
+                }
+            }
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        if status.is_some_and(|status| status.success()) {
+            return None;
+        }
+        let detail = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("the native sandbox boundary refused its probe")
+            .trim();
+        Some(format!(
+            "the native sandbox boundary is unavailable ({detail}); choose this agent's explicit compatibility mode only if you intend to remove Codex's own sandbox while the product file boundary remains"
+        ))
+    }
+
+    /// Why one agent's selected program/connection cannot start, if it cannot.
+    fn program_block(&self, agent: &AgentRuntime) -> Option<String> {
+        let saved = self.settings.agent(&agent.name)?;
+        if let Some(unknown) = saved.unknown_harness() {
+            return Some(format!("unknown saved program `{unknown}`"));
+        }
+        let program = saved.harness();
+        if program == Program::Builtin {
+            if !self.settings.endpoint.configured() {
+                return Some("needs a model".to_owned());
+            }
+            if credentials::model_key(&self.credentials, &agent.name).is_err() {
+                return Some("needs a model key".to_owned());
+            }
+            return None;
+        }
+        let Some(installed) = harness::installed(&self.options.data_root, program) else {
+            return Some(format!("{} is not installed", program.label()));
+        };
+        let Some((protocol, _base, model)) = self.connection_for(saved) else {
+            return Some("choose this agent's connection and model".to_owned());
+        };
+        if model.trim().is_empty() {
+            return Some("choose this agent's model".to_owned());
+        }
+        if let Some(error) = harness::compatibility_error(program, protocol) {
+            return Some(error);
+        }
+        if credentials::model_key(&self.credentials, &agent.name).is_err() {
+            return Some("needs a model key".to_owned());
+        }
+        if program == Program::Dsh {
+            if let Some(prerequisite) = program.prerequisite_missing() {
+                return Some(prerequisite.to_owned());
+            }
+        }
+        if installed.program != program {
+            return Some("the installed program is for another program".to_owned());
+        }
+        None
+    }
+
+    /// The installed-state cards for the Program screen.
+    fn program_views(&self) -> Vec<ProgramView> {
+        harness::NATIVE_PROGRAMS
+            .into_iter()
+            .map(|program| {
+                let installed = harness::installed(&self.options.data_root, program);
+                let state = self.program_states.get(program.id());
+                ProgramView {
+                    id: program.id().to_owned(),
+                    label: program.label().to_owned(),
+                    version: program.pinned_version().to_owned(),
+                    installed_version: installed.as_ref().map(|item| item.version.clone()),
+                    installed: installed.is_some(),
+                    license: program.license().to_owned(),
+                    download_mb: program.download_mb(),
+                    prerequisite: program.prerequisite().map(str::to_owned),
+                    installing: state.and_then(|state| state.installing),
+                    installing_phase: state
+                        .and_then(|state| state.phase)
+                        .map(|phase| phase.label().to_owned()),
+                    error: state.and_then(|state| state.error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Give a newly created agent the installation's default program. A fresh
+    /// installation is Pi (set by `Settings::load`); an existing file without a
+    /// default leaves the built-in engine. A native default snapshots the current
+    /// connection once.
+    fn assign_new_agent_program(&mut self, name: &str) -> Result<(), String> {
+        let program = self
+            .settings
+            .default_harness
+            .as_deref()
+            .and_then(Program::parse)
+            .unwrap_or(Program::Builtin);
+        let endpoint = self.settings.endpoint.clone();
+        let key = credentials::model_key(&self.credentials, name).ok();
+        let explicit_key = credentials::agent_model_key(&self.credentials, name)
+            .ok()
+            .flatten()
+            .is_some();
+        let Some(agent) = self.settings.agent_mut(name) else {
+            return Ok(());
+        };
+        agent.set_harness(program);
+        if program.is_native() && agent.provider.is_none() && endpoint.configured() {
+            agent.provider = Some(settings::AgentProvider {
+                base_url: endpoint.base_url(),
+                protocol: endpoint.protocol().id().to_owned(),
+                model: endpoint.model.clone(),
+            });
+        }
+        if program == Program::Codex {
+            agent.codex_sandbox = "native".to_owned();
+        }
+        if program.is_native()
+            && !explicit_key
+            && let Some(key) = key
+        {
+            credentials::record_secret(
+                &self.credentials,
+                Some("model_keys"),
+                name,
+                key.expose(),
+            )
+            .map_err(|error| {
+                format!(
+                    "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The immutable program facts of the newest run, when there is one.
+    fn active_program(&self, agent: &AgentRuntime) -> Option<RunProgramView> {
+        let dir = agent.newest_run.as_deref()?;
+        if let Ok(Some(native)) = crate::run::NativePlan::read(dir) {
+            let program = Program::parse(&native.harness).unwrap_or(Program::Builtin);
+            return Some(RunProgramView {
+                program: native.harness.clone(),
+                label: program.label().to_owned(),
+                version: native.version,
+                protocol: native.protocol,
+                base_url: native.base_url,
+                model: native.model,
+                codex_sandbox: (!native.codex_sandbox.is_empty()).then_some(native.codex_sandbox),
+            });
+        }
+        let plan = run::RunPlan::read(dir).ok()?;
+        Some(RunProgramView {
+            program: "builtin".to_owned(),
+            label: Program::Builtin.label().to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol: Protocol::ChatCompletions.id().to_owned(),
+            base_url: plan.endpoint,
+            model: plan.model,
+            codex_sandbox: None,
+        })
+    }
+
+    /// The saved facts the next run of one agent will use.
+    fn next_program(&self, agent: &AgentRuntime) -> Option<RunProgramView> {
+        let saved = self.settings.agent(&agent.name)?;
+        let program = saved.harness();
+        let (protocol, _, model) = self.connection_for(saved).unwrap_or((
+            Protocol::ChatCompletions,
+            String::new(),
+            String::new(),
+        ));
+        Some(RunProgramView {
+            program: program.id().to_owned(),
+            label: program.label().to_owned(),
+            version: harness::installed(&self.options.data_root, program)
+                .map(|installed| installed.version)
+                .unwrap_or_else(|| "not installed".to_owned()),
+            protocol: protocol.id().to_owned(),
+            base_url: self
+                .connection_for(saved)
+                .map(|(_, base, _)| base)
+                .unwrap_or_default(),
+            model,
+            codex_sandbox: (program == Program::Codex).then(|| {
+                if saved.codex_sandbox == "full-access" {
+                    "full-access".to_owned()
+                } else {
+                    "native".to_owned()
+                }
+            }),
         })
     }
 }
@@ -1789,10 +2186,13 @@ impl EngineApi for Engine {
         let endpoint = EndpointView {
             configured: inner.settings.endpoint.configured(),
             url: inner.settings.endpoint.url.clone(),
+            base_url: inner.settings.endpoint.base_url(),
+            protocol: inner.settings.endpoint.protocol().id().to_owned(),
             model: inner.settings.endpoint.model.clone(),
             key_present: inner.credential_key_present(),
             test: inner.endpoint_test.clone(),
         };
+        let programs = inner.program_views();
         // An upgrade whose warnings changed shows them once more before the board;
         // a same-version open keeps the acknowledgement (F-06).
         let terms_acknowledged = inner.settings.terms_acknowledged
@@ -1857,6 +2257,70 @@ impl EngineApi for Engine {
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
                 last_result_is_work: agent.last_result_is_work,
+                program: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| saved.harness().id().to_owned())
+                    .unwrap_or_else(|| "builtin".to_owned()),
+                program_label: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| {
+                        saved
+                            .unknown_harness()
+                            .map(|unknown| format!("unknown program `{unknown}`"))
+                            .unwrap_or_else(|| saved.harness().label().to_owned())
+                    })
+                    .unwrap_or_else(|| Program::Builtin.label().to_owned()),
+                unknown_program: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| saved.unknown_harness()),
+                program_installed: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| saved.harness())
+                    .filter(|program| program.is_native())
+                    .map(|program| harness::installed(&inner.options.data_root, program).is_some())
+                    .unwrap_or(true),
+                program_version: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| harness::installed(&inner.options.data_root, saved.harness()))
+                    .map(|installed| installed.version),
+                protocol: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(protocol, _, _)| protocol.id().to_owned())
+                    .unwrap_or_else(|| inner.settings.endpoint.protocol().id().to_owned()),
+                base_url: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(_, base, _)| base)
+                    .unwrap_or_else(|| inner.settings.endpoint.base_url()),
+                model: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(_, _, model)| model)
+                    .unwrap_or_else(|| inner.settings.endpoint.model.clone()),
+                key_present: credentials::model_key(&inner.credentials, &agent.name).is_ok(),
+                program_error: inner.program_block(agent),
+                active_program: inner.active_program(agent),
+                next_program: inner.next_program(agent),
+                codex_sandbox: inner
+                    .settings
+                    .agent(&agent.name)
+                    .filter(|saved| saved.harness() == Program::Codex)
+                    .map(|saved| {
+                        if saved.codex_sandbox == "full-access" {
+                            "full-access".to_owned()
+                        } else {
+                            "native".to_owned()
+                        }
+                    }),
             })
             .collect();
         BoardView {
@@ -1874,6 +2338,7 @@ impl EngineApi for Engine {
             forgejo,
             agents,
             endpoint,
+            programs,
             notice,
             admin_password,
             confined: inner.options.confinement.confined(),
@@ -1916,6 +2381,314 @@ impl EngineApi for Engine {
                 inner.note("your model is saved");
                 Ok(())
             }
+            Command::SetConnection {
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let model = model.trim().to_owned();
+                let Some(protocol) = Protocol::parse(&protocol) else {
+                    return Err("that connection type is not one this product knows".to_owned());
+                };
+                if base.is_empty() || model.is_empty() {
+                    return Err("the API address and model are both needed".to_owned());
+                }
+                if protocol != Protocol::ChatCompletions {
+                    return Err(
+                        "the built-in engine needs a Chat Completions connection".to_owned()
+                    );
+                }
+                inner.settings.endpoint.url.clear();
+                inner.settings.endpoint.base_url = base;
+                inner.settings.endpoint.protocol = protocol.id().to_owned();
+                inner.settings.endpoint.model = model;
+                if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+                    credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
+                        .map_err(|error| format!("the model key could not be kept: {error}"))?;
+                }
+                inner.save_settings()?;
+                inner.endpoint_test = EndpointTest::NotRun;
+                inner.note("the default connection is saved");
+                Ok(())
+            }
+            Command::SetAgentProgram {
+                name,
+                program,
+                protocol,
+            } => {
+                let Some(program) = Program::parse(&program) else {
+                    return Err("that program is not one this product knows".to_owned());
+                };
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let endpoint = inner.settings.endpoint.clone();
+                let explicit_key = credentials::agent_model_key(&inner.credentials, &name)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let inherited_key = credentials::model_key(&inner.credentials, &name).ok();
+                let settings_before = inner.settings.clone();
+                let Some(saved) = inner.settings.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let requested = protocol.as_deref().and_then(Protocol::parse);
+                if let Some(requested) = requested
+                    && let Some(error) = harness::compatibility_error(program, requested)
+                {
+                    return Err(error);
+                }
+                saved.set_harness(program);
+                if program.is_native() {
+                    if saved.provider.is_none() {
+                        if !endpoint.configured() {
+                            return Err("set the default connection first, then choose this agent's program".to_owned());
+                        }
+                        saved.provider = Some(settings::AgentProvider {
+                            base_url: endpoint.base_url(),
+                            protocol: endpoint.protocol().id().to_owned(),
+                            model: endpoint.model.clone(),
+                        });
+                    }
+                    let chosen = requested
+                        .or_else(|| {
+                            saved
+                                .provider
+                                .as_ref()
+                                .and_then(|provider| Protocol::parse(&provider.protocol))
+                        })
+                        .filter(|protocol| program.supports(*protocol))
+                        .unwrap_or_else(|| program.supported_protocols()[0]);
+                    if let Some(provider) = saved.provider.as_mut() {
+                        provider.protocol = chosen.id().to_owned();
+                    }
+                }
+                if program != Program::Codex {
+                    saved.codex_sandbox.clear();
+                } else if saved.codex_sandbox.is_empty() {
+                    saved.codex_sandbox = "native".to_owned();
+                }
+                if let Err(error) = inner.save_settings() {
+                    inner.settings = settings_before;
+                    return Err(format!(
+                        "the program change was not saved; the previous selection was restored ({error})"
+                    ));
+                }
+                if program.is_native()
+                    && !explicit_key
+                    && let Some(key) = inherited_key.as_ref()
+                {
+                    if let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.expose(),
+                    ) {
+                        inner.settings = settings_before;
+                        let restore = inner.save_settings();
+                        return Err(match restore {
+                            Ok(()) => format!(
+                                "the program change was rolled back: the current model key for `{name}` could not be saved ({error})"
+                            ),
+                            Err(restore_error) => format!(
+                                "the program change could not be restored after a key-save failure ({error}); the settings file also failed to restore ({restore_error})"
+                            ),
+                        });
+                    }
+                }
+                inner.agents[index].last_error = None;
+                inner.note(format!("`{name}` now runs with {}", program.label()));
+                Ok(())
+            }
+            Command::SetAgentModel {
+                name,
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let Some(protocol) = Protocol::parse(&protocol) else {
+                    return Err("that connection type is not one this product knows".to_owned());
+                };
+                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let model = model.trim().to_owned();
+                if base.is_empty() || model.is_empty() {
+                    return Err("the API address and model are both needed".to_owned());
+                }
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let settings_before = inner.settings.clone();
+                let Some(saved) = inner.settings.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                saved.provider = Some(settings::AgentProvider {
+                    base_url: base,
+                    protocol: protocol.id().to_owned(),
+                    model,
+                });
+                if let Err(error) = inner.save_settings() {
+                    inner.settings = settings_before;
+                    return Err(format!(
+                        "the model change was not saved; the previous selection was restored ({error})"
+                    ));
+                }
+                if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+                    if let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.trim(),
+                    ) {
+                        inner.settings = settings_before;
+                        let restore = inner.save_settings();
+                        return Err(match restore {
+                            Ok(()) => format!(
+                                "the model change was rolled back: the key could not be saved ({error})"
+                            ),
+                            Err(restore_error) => format!(
+                                "the model change could not be restored after a key-save failure ({error}); the settings file also failed to restore ({restore_error})"
+                            ),
+                        });
+                    }
+                }
+                inner.agents[index].last_error = None;
+                inner.note(format!("`{name}`'s connection is saved for its next run"));
+                Ok(())
+            }
+            Command::SetAgentCodexSandbox { name, mode } => {
+                let mode = mode.trim();
+                if mode != "native" && mode != "full-access" {
+                    return Err(
+                        "that Codex sandbox choice is not one this product knows".to_owned()
+                    );
+                }
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let settings_before = inner.settings.clone();
+                let Some(saved) = inner.settings.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                if saved.harness() != Program::Codex {
+                    return Err("the sandbox choice applies only to Codex".to_owned());
+                }
+                saved.codex_sandbox = mode.to_owned();
+                if let Err(error) = inner.save_settings() {
+                    inner.settings = settings_before;
+                    return Err(format!(
+                        "the sandbox choice was not saved; the previous selection was restored ({error})"
+                    ));
+                }
+                inner.agents[index].last_error = None;
+                inner.note(format!(
+                    "`{name}`'s Codex sandbox is saved for its next run"
+                ));
+                Ok(())
+            }
+            Command::InstallProgram { id } => {
+                let Some(program) = Program::parse(&id).filter(|program| program.is_native())
+                else {
+                    return Err("there is no installable program with that name".to_owned());
+                };
+                if inner
+                    .program_states
+                    .get(&id)
+                    .is_some_and(|state| state.installing.is_some())
+                {
+                    inner.note(format!("{} is already installing", program.label()));
+                    return Ok(());
+                }
+                let cancel = harness::CancelToken::new();
+                let state = inner.program_states.entry(id.clone()).or_default();
+                state.installing = Some(None);
+                state.phase = Some(harness::InstallPhase::Preparing);
+                state.error = None;
+                state.cancel = Some(cancel.clone());
+                inner.note(format!("installing {}", program.label()));
+                let inner_arc = Arc::clone(&self.inner);
+                let data_root = inner.options.data_root.clone();
+                drop(inner);
+                let handle = std::thread::spawn(move || {
+                    let result =
+                        harness::install_cancellable(&data_root, program, &cancel, |sample| {
+                            if let Ok(mut inner) = inner_arc.lock()
+                                && let Some(state) = inner.program_states.get_mut(program.id())
+                            {
+                                state.installing = Some(sample.percent);
+                                state.phase = Some(sample.phase);
+                            }
+                        });
+                    if let Ok(mut inner) = inner_arc.lock()
+                        && let Some(state) = inner.program_states.get_mut(program.id())
+                    {
+                        state.installing = None;
+                        state.phase = None;
+                        state.cancel = None;
+                        match result {
+                            Ok(installed) => {
+                                state.error = None;
+                                inner.note(format!(
+                                    "{} {} is installed",
+                                    program.label(),
+                                    installed.version
+                                ));
+                            }
+                            Err(error) if error == harness::INSTALL_CANCELED => {
+                                state.error = None;
+                                inner.note(format!(
+                                    "installing {} was canceled; the previous version is unchanged",
+                                    program.label()
+                                ));
+                            }
+                            Err(error) => {
+                                state.error = Some(crate::forgejo_tools::sentence(error.clone()));
+                                inner.note(format!(
+                                    "{} could not be installed: {error}",
+                                    program.label()
+                                ));
+                            }
+                        }
+                    }
+                });
+                if let Some(state) = lock_inner(&self.inner).program_states.get_mut(&id) {
+                    state.thread = Some(handle);
+                }
+                Ok(())
+            }
+            Command::CancelInstallProgram { id } => {
+                let Some(program) = Program::parse(&id).filter(|program| program.is_native())
+                else {
+                    return Err("there is no installable program with that name".to_owned());
+                };
+                let Some(state) = inner.program_states.get(&id) else {
+                    inner.note(format!("{} is not installing", program.label()));
+                    return Ok(());
+                };
+                if state.installing.is_none() {
+                    inner.note(format!("{} is not installing", program.label()));
+                    return Ok(());
+                }
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+                inner.note(format!(
+                    "canceling the {} install; the previous version stays usable",
+                    program.label()
+                ));
+                Ok(())
+            }
+            Command::TestAgentModel { name } => {
+                if inner.settings.agent(&name).is_none() {
+                    return Err(format!("there is no agent named `{name}`"));
+                }
+                inner.note(
+                    "the selected model was not tested; Start will use the program's own error",
+                );
+                Ok(())
+            }
             Command::TestEndpoint => {
                 inner.endpoint_test = EndpointTest::Running;
                 let inner_arc = Arc::clone(&self.inner);
@@ -1939,6 +2712,7 @@ impl EngineApi for Engine {
                     let name = format!("agent-{number}");
                     if inner.settings.agent(&name).is_none() {
                         inner.settings.add_agent(&name, Desired::Stopped)?;
+                        inner.assign_new_agent_program(&name)?;
                         ensure_agent_paths(&inner.options.layout, &name)?;
                         let runtime = AgentRuntime::load(&inner, &name);
                         inner.agents.push(runtime);
@@ -1956,6 +2730,7 @@ impl EngineApi for Engine {
             Command::AddAgent => {
                 let name = inner.settings.allocate_agent_name()?;
                 inner.settings.add_agent(&name, Desired::Stopped)?;
+                inner.assign_new_agent_program(&name)?;
                 ensure_agent_paths(&inner.options.layout, &name)?;
                 let runtime = AgentRuntime::load(&inner, &name);
                 inner.agents.push(runtime);
@@ -2013,6 +2788,16 @@ impl EngineApi for Engine {
                     inner.agents[index].leftover_targets.clear();
                     inner.agents[index].session = SessionState::Idle;
                     inner.agents[index].next_at = None;
+                }
+                if let Some(reason) = inner
+                    .program_block(&inner.agents[index])
+                    .or_else(|| inner.codex_sandbox_block(&inner.agents[index]))
+                {
+                    inner.agents[index].session = SessionState::Blocked {
+                        reason: reason.clone(),
+                    };
+                    inner.note(format!("not started — {reason}"));
+                    return Ok(());
                 }
                 inner.set_desired(index, Desired::Started);
                 let agent = &mut inner.agents[index];
@@ -2150,6 +2935,11 @@ impl EngineApi for Engine {
             }
             inner.stopping = true;
             inner.generation = inner.generation.saturating_add(1);
+            for state in inner.program_states.values() {
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+            }
             // Ask every group politely. A start or spawn still in flight records its
             // child's pid, and is signalled again as that pid appears below.
             for agent in &mut inner.agents {
@@ -2293,6 +3083,31 @@ impl EngineApi for Engine {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+        // Cancelled installs clean their own stage. Wait inside the caller's grace so
+        // a quit does not leave a download writing behind the board; a stage that
+        // cannot finish is journaled and recovered on the next open.
+        let install_jobs: Vec<std::thread::JoinHandle<()>> = {
+            let mut inner = lock_inner(&self.inner);
+            for state in inner.program_states.values_mut() {
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+            }
+            inner
+                .program_states
+                .values_mut()
+                .filter_map(|state| state.thread.take())
+                .collect()
+        };
+        let install_deadline = Instant::now() + grace.min(Duration::from_secs(2));
+        for handle in install_jobs {
+            while !handle.is_finished() && Instant::now() < install_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
         // A clean exit records the version too, so an installation that is opened and
         // closed many times keeps one current line.
@@ -4607,10 +5422,110 @@ mod tests {
                 ..
             }
         ));
+        let run_dir = fake.last_run_dir().expect("the timed-out run directory");
+        assert!(
+            run_dir.join(run::STOPPED_FILE).is_file(),
+            "a timed-out run left no stop record"
+        );
         tick(&mut engine, &clock, RESTART_DELAY);
         wait_started(&fake, 2);
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_deadline_with_a_failed_tool_stays_timed_out_and_names_the_warning() {
+        let root = scratch_root("engine-deadline-tool-warning");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        run::write_native_progress(
+            &run_dir,
+            "running",
+            "",
+            false,
+            Some("shell: the native tool exited with code 1"),
+        )
+        .expect("the native progress record");
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        let board = engine.board();
+        match board.agents[0].recent.last() {
+            Some(SessionEnd::TimedOut) => {}
+            other => panic!("a failed tool changed the deadline ending: {other:?}"),
+        }
+        let stop: run::RunStopped = serde_json::from_str(
+            &fs::read_to_string(run_dir.join(run::STOPPED_FILE)).expect("stop record"),
+        )
+        .expect("stop record JSON");
+        assert!(
+            stop.reason
+                .contains("tool warning: shell: the native tool exited with code 1"),
+            "{}",
+            stop.reason
+        );
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("terminal record");
+        match terminal {
+            crate::transcript::Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "timed_out");
+                assert!(reason.contains("tool warning"), "{reason}");
+            }
+            other => panic!("unexpected terminal record: {other:?}"),
+        }
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deadline_keeps_the_native_failure_cause_instead_of_only_timing_out() {
+        let root = scratch_root("engine-deadline-cause");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        run::write_native_progress(
+            &run_dir,
+            "retrying",
+            "the native provider reported: synthetic status 500",
+            false,
+            None,
+        )
+        .expect("the native progress record");
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        let board = engine.board();
+        match board.agents[0].recent.last() {
+            Some(SessionEnd::Failed { reason }) => {
+                assert!(reason.contains("500"), "the cause was lost: {reason}");
+            }
+            other => panic!("a failing harness was recorded only as {other:?}"),
+        }
+        let stop: run::RunStopped = serde_json::from_str(
+            &fs::read_to_string(run_dir.join(run::STOPPED_FILE)).expect("stop record"),
+        )
+        .expect("stop record JSON");
+        assert!(stop.reason.contains("500"), "{}", stop.reason);
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("terminal record");
+        assert!(
+            matches!(
+                &terminal,
+                crate::transcript::Record::RunFinished { outcome, .. } if outcome == "failed"
+            ),
+            "the terminal record lost the failure: {terminal:?}"
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5583,6 +6498,13 @@ mod tests {
         let board = engine.board();
         assert!(matches!(board.agents[0].session, SessionState::Idle));
         let run_dir = fake.last_run_dir().expect("the spawned run directory");
+        // `settle_run` writes the durable ending on the session thread just after
+        // the child is reaped; the liveness check above is not a write barrier.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "shutdown during spawn left no durable ending"
@@ -5799,5 +6721,307 @@ mod tests {
             REPOSITORY_REFRESH <= Duration::from_secs(2),
             "the board can stay stale for {REPOSITORY_REFRESH:?}"
         );
+    }
+    #[test]
+    fn c5_a_settings_save_failure_restores_the_prior_program_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-c5-settings-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "chat-completions".to_owned(),
+                model: "fixture".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("the fixture model saves");
+        let before = engine.board().agents[0].program.clone();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+            .expect("the root becomes read-only");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "pi".to_owned(),
+            protocol: Some("chat-completions".to_owned()),
+        });
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("the root is writable again");
+        assert!(result.is_err(), "the save failure was reported as success");
+        assert_eq!(engine.board().agents[0].program, before);
+    }
+    #[test]
+    fn c6_key_snapshot_write_failure_rolls_back_program_and_other_agents() {
+        let root = scratch_root("engine-c6-key-failure");
+        let settings = write_ready(
+            &root,
+            &[("agent-1", Desired::Stopped), ("agent-2", Desired::Stopped)],
+        );
+        let layout = Layout::rooted_at(root.clone()).expect("layout");
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let credentials = layout.credentials_file();
+        let mut root: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&credentials).expect("credentials read"))
+                .expect("credentials parse");
+        root.as_table_mut().expect("table").remove("model_keys");
+        crate::mode::write_private(
+            &credentials,
+            toml::to_string_pretty(&root)
+                .expect("credentials serialise")
+                .as_bytes(),
+        )
+        .expect("credentials without per-agent keys");
+        credentials::record_secret(&credentials, None, "model_key", "fixture-default-key")
+            .expect("default key");
+        let before_one = engine.board().agents[0].program.clone();
+        let before_two = engine.board().agents[1].program.clone();
+        let before_provider = engine.inner.lock().expect("inner").settings.agents[0]
+            .provider
+            .clone();
+        let before_other_provider = engine.inner.lock().expect("inner").settings.agents[1]
+            .provider
+            .clone();
+        std::fs::set_permissions(
+            &credentials,
+            std::os::unix::fs::PermissionsExt::from_mode(0o400),
+        )
+        .expect("credentials become read-only");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "pi".to_owned(),
+            protocol: Some("chat-completions".to_owned()),
+        });
+        let _ = std::fs::set_permissions(
+            &credentials,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        );
+        assert!(
+            result.is_err(),
+            "key snapshot failure was reported as success"
+        );
+        assert_eq!(engine.board().agents[0].program, before_one);
+        assert_eq!(engine.board().agents[1].program, before_two);
+        assert_eq!(
+            engine.inner.lock().expect("inner").settings.agents[0].provider,
+            before_provider
+        );
+        assert_eq!(
+            engine.inner.lock().expect("inner").settings.agents[1].provider,
+            before_other_provider
+        );
+        let saved = Settings::load(&settings::path_in(layout.root())).expect("durable settings");
+        assert_eq!(saved.agents[0].harness(), Program::Builtin);
+        assert_eq!(saved.agents[0].provider, before_provider);
+        assert_eq!(saved.agents[1].provider, before_other_provider);
+        assert!(
+            credentials::agent_model_key(&credentials, "agent-1")
+                .expect("key read")
+                .is_none(),
+            "an explicit agent key appeared after the failed snapshot"
+        );
+        assert_eq!(
+            credentials::model_key(&credentials, "agent-1")
+                .expect("default key")
+                .expose(),
+            "fixture-default-key"
+        );
+    }
+
+    struct ResetTestArtifact;
+
+    impl Drop for ResetTestArtifact {
+        fn drop(&mut self) {
+            crate::harness::set_test_artifact(None, None);
+        }
+    }
+
+    #[test]
+    fn shutdown_cancels_a_running_install_and_keeps_the_old_version() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_root("engine-install-shutdown");
+        let install = root.join("data/harnesses/pi/1.4.0");
+        fs::create_dir_all(install.join("pi")).expect("the old install");
+        let old_binary = install.join("pi/pi");
+        fs::write(&old_binary, "#!/bin/sh\necho old-pi\n").expect("the old binary");
+        fs::set_permissions(&old_binary, fs::Permissions::from_mode(0o755))
+            .expect("the old binary mode");
+        fs::write(
+            install.join("install.json"),
+            r#"{"program":"pi","version":"1.3.9","sha256":"fixture","license":"MIT","entrypoint":"pi/pi","resources":null,"installed_at":"2026-10-23T00:00:00.000Z"}"#,
+        )
+        .expect("the old record");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("the loopback address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => {
+                        request.extend_from_slice(&buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let body = vec![3u8; 2 * 1024 * 1024];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            for part in body.chunks(4096) {
+                if stream.write_all(part).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let _reset = ResetTestArtifact;
+        crate::harness::set_test_artifact(
+            Some(&format!("http://{address}/package")),
+            Some(&"0".repeat(64)),
+        );
+
+        let mut engine = open_for_test(
+            test_options(&root),
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            Settings::default(),
+        )
+        .expect("the test engine opens");
+        engine
+            .send(Command::InstallProgram {
+                id: "pi".to_owned(),
+            })
+            .expect("the install starts");
+        let harness_dir = root.join("data/harnesses/pi");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut downloading = false;
+        while Instant::now() < deadline {
+            if let Ok(entries) = fs::read_dir(&harness_dir) {
+                downloading = entries.flatten().any(|entry| {
+                    let stage = entry.path();
+                    stage
+                        .file_name()
+                        .map(|name| name.to_string_lossy().starts_with(".stage-"))
+                        .unwrap_or(false)
+                        && fs::metadata(stage.join("pi.tar.part"))
+                            .map(|metadata| metadata.len() > 0)
+                            .unwrap_or(false)
+                });
+            }
+            if downloading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(downloading, "the install did not reach the download");
+
+        let started = Instant::now();
+        engine.shutdown(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown waited for the whole download"
+        );
+        assert_eq!(
+            fs::read_to_string(&old_binary).expect("the old binary"),
+            "#!/bin/sh\necho old-pi\n"
+        );
+        let stages: Vec<_> = fs::read_dir(&harness_dir)
+            .expect("the harness directory")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".stage-"))
+            .collect();
+        assert!(stages.is_empty(), "a canceled stage survived shutdown");
+    }
+    #[test]
+    fn below_start_block_reasons_never_report_started() {
+        type Mutation = fn(&mut Settings);
+        let cases: [(&str, Mutation); 4] = [
+            ("neg-provider", |settings| settings.endpoint.url.clear()),
+            ("neg-key", |settings| {
+                settings.agents[0].harness = "builtin".to_owned()
+            }),
+            ("neg-program", |settings| {
+                settings.agents[0].harness = "codex".to_owned()
+            }),
+            ("neg-unknown", |settings| {
+                settings.agents[0].harness = "potato".to_owned()
+            }),
+        ];
+        for (name, mutate) in cases {
+            let root = scratch_root(name);
+            let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+            mutate(&mut settings);
+            settings
+                .save(&settings::path_in(
+                    Layout::rooted_at(root.clone())
+                        .expect("the test layout is absolute")
+                        .root(),
+                ))
+                .expect("settings");
+            let clock = Arc::new(FakeClock::new());
+            let fake = Arc::new(FakeSpawner::new());
+            let mut engine = open_test_engine(&root, settings, clock, fake.clone());
+            if name == "neg-key" {
+                let _ = std::fs::remove_file(
+                    Layout::rooted_at(root.clone())
+                        .expect("layout")
+                        .credentials_file(),
+                );
+            }
+            engine
+                .send(Command::Start {
+                    name: "agent-1".to_owned(),
+                })
+                .expect("Start is accepted");
+            assert_eq!(fake.counts().1, 0, "{name} started a session");
+            let board = engine.board();
+            match &board.agents[0].session {
+                SessionState::Blocked { reason } => assert!(
+                    reason.contains("model")
+                        || reason.contains("installed")
+                        || reason.contains("unknown"),
+                    "{name}: {reason}"
+                ),
+                other => panic!("{name}: expected Blocked, got {other:?}"),
+            }
+            if name == "neg-unknown" {
+                assert!(
+                    board.agents[0].program_label.contains("potato"),
+                    "{}",
+                    board.agents[0].program_label
+                );
+            }
+        }
     }
 }

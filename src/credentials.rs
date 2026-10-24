@@ -395,6 +395,19 @@ pub fn model_key(path: &Path, agent: &str) -> Result<Secret, CredentialsError> {
     Ok(Secret::new(key.to_owned()))
 }
 
+/// The agent's own `[model_keys]` entry, without the top-level fallback. A missing
+/// entry is `None`; an unreadable file is an error.
+pub fn agent_model_key(path: &Path, agent: &str) -> Result<Option<Secret>, CredentialsError> {
+    let value = read_value(path)?;
+    let key = value
+        .get("model_keys")
+        .and_then(|keys| keys.get(agent))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    Ok((!key.is_empty()).then(|| Secret::new(key.to_owned())))
+}
+
 /// Read an earlier installation's role token, from `forgejo_token`.
 ///
 /// The current product makes one administrator token and never a role token, but

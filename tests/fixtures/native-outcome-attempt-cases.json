@@ -1,0 +1,164 @@
+{
+  "entries": [
+    {
+      "case": "pi-recovered-without-success-text",
+      "exit_code": 0,
+      "expected": {
+        "disposition": "succeeded",
+        "text_absent": true,
+        "tool_failure_contains": null
+      },
+      "harness": "pi",
+      "stdout": [
+        "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"error\",\"errorMessage\":\"Stream ended without finish_reason\",\"content\":[{\"type\":\"text\",\"text\":\"partial\"}]}}",
+        "{\"type\":\"auto_retry_start\",\"attempt\":1,\"maxAttempts\":3}",
+        "{\"type\":\"auto_retry_end\",\"success\":true,\"attempt\":1}",
+        "{\"type\":\"agent_settled\",\"aborted\":false}"
+      ],
+      "supervisor": "natural"
+    },
+    {
+      "case": "codex-recovered-without-success-text",
+      "exit_code": 0,
+      "expected": {
+        "disposition": "succeeded",
+        "text_absent": true,
+        "tool_failure_contains": null
+      },
+      "harness": "codex",
+      "stdout": [
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"partial\"}}",
+        "{\"type\":\"error\",\"message\":\"Reconnecting... 1/5 (stream disconnected before completion)\"}",
+        "{\"type\":\"turn.completed\"}"
+      ],
+      "supervisor": "natural"
+    },
+    {
+      "case": "dsh-recovered-without-success-text",
+      "exit_code": 0,
+      "expected": {
+        "disposition": "succeeded",
+        "text_absent": true,
+        "tool_failure_contains": null
+      },
+      "harness": "dsh",
+      "stdout": [
+        "{\"type\":\"text\",\"text\":\"partial\"}",
+        "{\"type\":\"error\",\"message\":\"transport retry\"}",
+        "{\"type\":\"status\",\"phase\":\"turn_end\",\"turn\":1,\"reason\":{\"kind\":\"completed\"}}"
+      ],
+      "supervisor": "natural"
+    },
+    {
+      "case": "opencode-recovered-without-success-text",
+      "exit_code": 0,
+      "expected": {
+        "disposition": "succeeded",
+        "text_absent": true,
+        "tool_failure_contains": null
+      },
+      "harness": "opencode",
+      "stdout": [
+        "{\"type\":\"text\",\"part\":{\"text\":\"partial\"}}",
+        "{\"type\":\"error\",\"error\":{\"type\":\"provider.transport\",\"message\":\"retry\"}}"
+      ],
+      "supervisor": "natural"
+    },
+    {
+      "case": "pi-failed-tool-then-deadline",
+      "exit_code": null,
+      "expected": {
+        "disposition": "timed_out",
+        "reason_contains": [
+          "time limit"
+        ],
+        "tool_failure_contains": [
+          "exit code 1"
+        ]
+      },
+      "harness": "pi",
+      "stdout": [
+        "{\"type\":\"tool_execution_start\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"args\":{\"command\":\"false\"}}",
+        "{\"type\":\"tool_execution_end\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"(no output)\\n\\nCommand exited with code 1\"}],\"structuredContent\":{\"exit_code\":1},\"isError\":true},\"isError\":true}"
+      ],
+      "supervisor": "deadline"
+    },
+    {
+      "case": "codex-failed-tool-then-deadline",
+      "exit_code": null,
+      "expected": {
+        "disposition": "timed_out",
+        "reason_contains": [
+          "time limit"
+        ],
+        "tool_failure_contains": [
+          "exit code 1"
+        ]
+      },
+      "harness": "codex",
+      "stdout": [
+        "{\"type\":\"item.started\",\"item\":{\"id\":\"i1\",\"type\":\"command_execution\",\"command\":\"false\"}}",
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"i1\",\"type\":\"command_execution\",\"exit_code\":1,\"status\":\"failed\",\"aggregated_output\":\"\"}}"
+      ],
+      "supervisor": "deadline"
+    },
+    {
+      "case": "dsh-failed-tool-then-deadline",
+      "exit_code": null,
+      "expected": {
+        "disposition": "timed_out",
+        "reason_contains": [
+          "time limit"
+        ],
+        "tool_failure_contains": [
+          "exit code 1"
+        ]
+      },
+      "harness": "dsh",
+      "stdout": [
+        "{\"type\":\"tool_call\",\"callId\":\"c1\",\"tool\":\"bash\",\"input\":{\"command\":\"false\",\"description\":\"run false\"}}",
+        "{\"type\":\"tool_result\",\"callId\":\"c1\",\"status\":\"completed\",\"result\":\"[stderr]\\n[exit code: 1]\"}"
+      ],
+      "supervisor": "deadline"
+    },
+    {
+      "case": "opencode-failed-tool-then-deadline",
+      "exit_code": null,
+      "expected": {
+        "disposition": "timed_out",
+        "reason_contains": [
+          "time limit"
+        ],
+        "tool_failure_contains": [
+          "exit code 1"
+        ]
+      },
+      "harness": "opencode",
+      "stdout": [
+        "{\"type\":\"tool_use\",\"part\":{\"id\":\"p1\",\"tool\":\"shell\",\"state\":{\"status\":\"completed\",\"metadata\":{\"metadata\":{\"exit\":1}},\"output\":\"(no output)\"}}}"
+      ],
+      "supervisor": "deadline"
+    },
+    {
+      "case": "pi-text-before-tool-with-no-final-text",
+      "exit_code": 0,
+      "expected": {
+        "disposition": "failed",
+        "reason_contains": [
+          "completion"
+        ],
+        "text_absent": true,
+        "tool_failure_contains": null
+      },
+      "harness": "pi",
+      "stdout": [
+        "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"content\":[{\"type\":\"text\",\"text\":\"intermediate\"}]}}",
+        "{\"type\":\"tool_execution_start\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"args\":{\"command\":\"true\"}}",
+        "{\"type\":\"tool_execution_end\",\"toolCallId\":\"c1\",\"toolName\":\"bash\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"structuredContent\":{\"exit_code\":0}},\"isError\":false}",
+        "{\"type\":\"agent_settled\",\"aborted\":false}"
+      ],
+      "supervisor": "natural"
+    }
+  ],
+  "source": "correction-1 attempt ownership cases"
+}
