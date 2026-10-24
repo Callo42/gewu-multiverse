@@ -390,3 +390,59 @@ mod tests {
         assert!(text.contains("bound of 8 writes"));
     }
 }
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn tools() -> ForgejoTools {
+        ForgejoTools::new(
+            crate::run::RunForgejo {
+                url: "http://127.0.0.1:1".to_owned(),
+                login: "agent".to_owned(),
+                repositories: Vec::new(),
+            },
+            "/tmp",
+            "agent",
+            Secret::new("fixture".to_owned()),
+        )
+    }
+
+    #[test]
+    fn c6_six_tools_marker_requires_an_actual_six_tool_list_not_initialize() {
+        let root = std::env::temp_dir().join(format!(
+            "gewu-ready-{}-{}",
+            std::process::id(),
+            crate::time::now_unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("ready root");
+        let ready = root.join("ready");
+        let mut output = Vec::new();
+        serve_loop(
+            Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n"),
+            &mut output,
+            &mut tools(),
+            &root.join("ledger"),
+            &root.join("writes"),
+            &Secret::new("fixture".to_owned()),
+            Some(&ready),
+        );
+        assert!(!ready.exists(), "initialize alone armed readiness");
+        let mut output = Vec::new();
+        serve_loop(
+            Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"),
+            &mut output,
+            &mut tools(),
+            &root.join("ledger"),
+            &root.join("writes"),
+            &Secret::new("fixture".to_owned()),
+            Some(&ready),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ready).expect("ready marker"),
+            "6-tools-ready"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

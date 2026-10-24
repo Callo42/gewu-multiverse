@@ -6402,4 +6402,58 @@ mod tests {
         assert!(result.is_err(), "the save failure was reported as success");
         assert_eq!(engine.board().agents[0].program, before);
     }
+    #[test]
+    fn c6_key_snapshot_write_failure_rolls_back_program_and_other_agents() {
+        let root = scratch_root("engine-c6-key-failure");
+        let settings = write_ready(
+            &root,
+            &[("agent-1", Desired::Stopped), ("agent-2", Desired::Stopped)],
+        );
+        let layout = Layout::rooted_at(root.clone()).expect("layout");
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let credentials = layout.credentials_file();
+        let mut root: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&credentials).expect("credentials read"))
+                .expect("credentials parse");
+        root.as_table_mut().expect("table").remove("model_keys");
+        crate::mode::write_private(
+            &credentials,
+            toml::to_string_pretty(&root)
+                .expect("credentials serialise")
+                .as_bytes(),
+        )
+        .expect("credentials without per-agent keys");
+        credentials::record_secret(&credentials, None, "model_key", "fixture-default-key")
+            .expect("default key");
+        let before_one = engine.board().agents[0].program.clone();
+        let before_two = engine.board().agents[1].program.clone();
+        std::fs::set_permissions(
+            &credentials,
+            std::os::unix::fs::PermissionsExt::from_mode(0o400),
+        )
+        .expect("credentials become read-only");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "pi".to_owned(),
+            protocol: Some("chat-completions".to_owned()),
+        });
+        let _ = std::fs::set_permissions(
+            &credentials,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        );
+        assert!(
+            result.is_err(),
+            "key snapshot failure was reported as success"
+        );
+        assert_eq!(engine.board().agents[0].program, before_one);
+        assert_eq!(engine.board().agents[1].program, before_two);
+    }
 }
