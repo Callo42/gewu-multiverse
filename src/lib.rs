@@ -46,6 +46,7 @@ pub mod engine;
 pub mod engine_api;
 pub mod forgejo;
 pub mod forgejo_tools;
+mod git_proxy;
 pub mod harness;
 pub mod identity;
 pub mod mcp_forgejo;

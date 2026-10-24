@@ -448,6 +448,26 @@ pub(super) fn run(
         log.line("mcp bridge: off — no Forgejo context or own token");
     }
     let _mcp_server = mcp_server;
+    let git_proxy =
+        match crate::git_proxy::GitProxy::start(&shell.run_dir, &plan.agent, &plan.credentials) {
+            Ok(proxy) => proxy,
+            Err(reason) => return RunEnd::failed(reason),
+        };
+    if let Some(proxy) = git_proxy.as_ref() {
+        let path = files.home.join(".gitconfig");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("[http]\n\tproxy = ");
+        text.push_str(&proxy.url());
+        text.push('\n');
+        if let Err(error) = crate::mode::write_private(&path, text.as_bytes()) {
+            return RunEnd::failed(format!(
+                "the native Git transport config cannot be written: {error}"
+            ));
+        }
+    }
 
     let workspace_before = workspace_fingerprint(&plan.workspace);
     let (mut argv, envs, config_note) = match build_launch(plan, native, program, protocol, &files)
@@ -502,7 +522,6 @@ pub(super) fn run(
                     .ok()
                     .and_then(|exe| exe.parent().map(|parent| parent.display().to_string()))
                     .unwrap_or_default(),
-                shell.askpass.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
                 files.mcp_socket.as_ref().and_then(|path| path.parent()).map(|path| path.display().to_string()).unwrap_or_default(),
             ],
             "write": [files.root.display().to_string()],
@@ -540,17 +559,10 @@ pub(super) fn run(
     if let Some(password) = opencode_password.as_deref() {
         command.env("OPENCODE_PASSWORD", password);
     }
-    // The agent's own Forgejo token reaches git through the existing askpass route.
-    if let Some(askpass) = shell.askpass.as_ref() {
-        command
-            .env("GIT_ASKPASS", exe.clone())
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env(crate::workspace::ASKPASS_CREDENTIALS, askpass)
-            .env(crate::workspace::ASKPASS_AGENT, &plan.agent);
-        if let Some(login) = shell.login.as_ref() {
-            command.env(crate::workspace::ASKPASS_LOGIN, login);
-        }
-    }
+    // The native program never receives the Forgejo token or an askpass path.
+    // Its Git transport is a fixed-target loopback proxy owned by this supervisor.
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    let _git_proxy = git_proxy;
 
     let mut child = match command.spawn() {
         Ok(child) => child,

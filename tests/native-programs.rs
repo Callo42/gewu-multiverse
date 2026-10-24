@@ -462,6 +462,15 @@ fn native_pi_reads_an_issue_pushes_a_branch_and_opens_a_pull_request() {
             name: "agent-1".to_owned(),
         })
         .expect("agent-1 stops");
+    let secret = credentials::forgejo_agent_token(&layout.credentials_file(), "agent-1")
+        .expect("the agent token reads");
+    assert!(
+        model
+            .requests()
+            .iter()
+            .all(|request| !request.body.contains(secret.expose())),
+        "a native MODEL request carried the agent's Forgejo token"
+    );
     engine.shutdown(Duration::from_secs(10));
 }
 
@@ -694,6 +703,15 @@ fn native_codex_reads_an_issue_pushes_and_opens_a_pull_request() {
             name: "agent-1".to_owned(),
         })
         .expect("agent-1 stops");
+    let secret = credentials::forgejo_agent_token(&layout.credentials_file(), "agent-1")
+        .expect("the agent token reads");
+    assert!(
+        model
+            .requests()
+            .iter()
+            .all(|request| !request.body.contains(secret.expose())),
+        "a native MODEL request carried the agent's Forgejo token"
+    );
     engine.shutdown(Duration::from_secs(10));
 }
 
@@ -872,6 +890,15 @@ fn native_dsh_reads_an_issue_pushes_and_opens_a_pull_request() {
             name: "agent-1".to_owned(),
         })
         .expect("stop");
+    let secret = credentials::forgejo_agent_token(&layout.credentials_file(), "agent-1")
+        .expect("the agent token reads");
+    assert!(
+        model
+            .requests()
+            .iter()
+            .all(|request| !request.body.contains(secret.expose())),
+        "a native MODEL request carried the agent's Forgejo token"
+    );
     engine.shutdown(Duration::from_secs(10));
 }
 
@@ -1036,5 +1063,14 @@ fn native_opencode_runs_its_own_shell_tool_inside_the_product_boundary() {
             name: "agent-1".to_owned(),
         })
         .expect("stop");
+    let secret = credentials::forgejo_agent_token(&layout.credentials_file(), "agent-1")
+        .expect("the agent token reads");
+    assert!(
+        model
+            .requests()
+            .iter()
+            .all(|request| !request.body.contains(secret.expose())),
+        "a native MODEL request carried the agent's Forgejo token"
+    );
     engine.shutdown(Duration::from_secs(10));
 }
