@@ -117,53 +117,7 @@ fn main() -> ExitCode {
             mcp_forgejo::serve_supervised(&socket, &state, &run, &credentials, &agent, &workspace)
                 .clamp(0, 255) as u8,
         ),
-        Invocation::InstallHarness { program } => {
-            let Some(program) = gewu_multiverse::harness::Program::parse(&program) else {
-                eprintln!("gewu-multiverse: there is no program named `{program}`");
-                return ExitCode::FAILURE;
-            };
-            if !program.is_native() {
-                eprintln!("gewu-multiverse: the built-in engine needs no install");
-                return ExitCode::FAILURE;
-            }
-            let data_root = match bundled_forgejo::data_root() {
-                Ok(root) => root,
-                Err(error) => {
-                    eprintln!("gewu-multiverse: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let mut last = None;
-            match gewu_multiverse::harness::install(&data_root, program, |percent| {
-                if percent != last {
-                    last = percent;
-                    match percent {
-                        Some(percent) => eprintln!(
-                            "gewu-multiverse: installing {} — {percent}%",
-                            program.label()
-                        ),
-                        None => eprintln!("gewu-multiverse: installing {}…", program.label()),
-                    }
-                }
-            }) {
-                Ok(installed) => {
-                    println!(
-                        "gewu-multiverse: {} {} is ready at {}",
-                        program.label(),
-                        installed.version,
-                        installed.executable.display()
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!(
-                        "gewu-multiverse: {} could not be installed: {error}",
-                        program.label()
-                    );
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Invocation::InstallHarness { program } => install_harness(&program),
         Invocation::PrintNativeKey { key } => match std::fs::read_to_string(&key) {
             Ok(text) => {
                 println!("{}", text.trim());
@@ -219,6 +173,91 @@ enum StartupError {
     /// The installation's directories or the engine could not be opened.
     #[error("{0}")]
     Engine(String),
+}
+
+/// Install one native program from the official package. Ctrl-C, SIGTERM and the
+/// terminal closing stop at the next safe point and leave the previous version in
+/// place; the CLI never leaves a half-written stage behind on a signal it can see.
+fn install_harness(name: &str) -> ExitCode {
+    let Some(program) = gewu_multiverse::harness::Program::parse(name) else {
+        eprintln!("gewu-multiverse: there is no program named `{name}`");
+        return ExitCode::FAILURE;
+    };
+    if !program.is_native() {
+        eprintln!("gewu-multiverse: the built-in engine needs no install");
+        return ExitCode::FAILURE;
+    }
+    let data_root = match bundled_forgejo::data_root() {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("gewu-multiverse: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cancel = gewu_multiverse::harness::CancelToken::new();
+    let mut registered = Vec::new();
+    for signal in [SIGINT, SIGTERM, SIGHUP] {
+        match signal_hook::flag::register(signal, cancel.flag()) {
+            Ok(id) => registered.push(id),
+            Err(error) => {
+                eprintln!("gewu-multiverse: the installer cannot watch for signals: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let mut last = String::new();
+    let result =
+        gewu_multiverse::harness::install_cancellable(&data_root, program, &cancel, |sample| {
+            let text = match (sample.phase, sample.percent) {
+                (gewu_multiverse::harness::InstallPhase::Downloading, Some(percent)) => {
+                    format!("downloading {} — {percent}%", program.label())
+                }
+                (gewu_multiverse::harness::InstallPhase::Downloading, None) => {
+                    format!("downloading {}…", program.label())
+                }
+                (gewu_multiverse::harness::InstallPhase::Unpacking, _) => {
+                    format!("unpacking {}…", program.label())
+                }
+                (gewu_multiverse::harness::InstallPhase::InstallingPackages, _) => {
+                    format!("installing {}'s locked packages…", program.label())
+                }
+                (gewu_multiverse::harness::InstallPhase::Verifying, _) => {
+                    format!("checking {}…", program.label())
+                }
+                (gewu_multiverse::harness::InstallPhase::Preparing, _) => {
+                    format!("preparing the {} install…", program.label())
+                }
+            };
+            if text != last {
+                last = text.clone();
+                eprintln!("gewu-multiverse: {text}");
+            }
+        });
+    for id in registered {
+        signal_hook::low_level::unregister(id);
+    }
+    match result {
+        Ok(installed) => {
+            println!(
+                "gewu-multiverse: {} {} is ready at {}",
+                program.label(),
+                installed.version,
+                installed.executable.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) if error == gewu_multiverse::harness::INSTALL_CANCELED => {
+            eprintln!("gewu-multiverse: install canceled; the previous version is unchanged");
+            ExitCode::from(130)
+        }
+        Err(error) => {
+            eprintln!(
+                "gewu-multiverse: {} could not be installed: {error}",
+                program.label()
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Fetch the pinned Forgejo with one line of progress, for `--install-forgejo`.

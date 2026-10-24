@@ -967,14 +967,32 @@ fn started_agent_names(board: &Board) -> Vec<&str> {
 /// what stops and the reopen sentence instead of losing them (F-13).
 fn quit_warning_text(board: &Board, width: u16, budget: u16) -> String {
     let started = started_agent_names(board);
-    if started.is_empty() {
+    let installing: Vec<&str> = board
+        .view
+        .programs
+        .iter()
+        .filter(|program| program.installing.is_some())
+        .map(|program| program.label.as_str())
+        .collect();
+    if started.is_empty() && installing.is_empty() {
         return "quit stops Forgejo; it starts again on reopen — q again quits".to_owned();
     }
-    let names = join_names(&started);
-    let line = if started.len() == 1 {
-        format!("quit stops {names} and Forgejo; they start again on reopen — q again quits")
+    let line = if installing.is_empty() {
+        let names = join_names(&started);
+        if started.len() == 1 {
+            format!("quit stops {names} and Forgejo; they start again on reopen — q again quits")
+        } else {
+            format!("quit stops {names}, and Forgejo; they start again on reopen — q again quits")
+        }
     } else {
-        format!("quit stops {names}, and Forgejo; they start again on reopen — q again quits")
+        let installs = join_names(&installing);
+        let cancel = format!("cancels installing {installs}");
+        if started.is_empty() {
+            format!("quit {cancel}; the previous version is kept — q again quits")
+        } else {
+            let names = join_names(&started);
+            format!("quit stops {names} and {cancel}; q again quits")
+        }
     };
     if text_util::wrap(&line, width.saturating_sub(2) as usize).len() as u16 <= budget {
         return line;
@@ -984,10 +1002,20 @@ fn quit_warning_text(board: &Board, width: u16, budget: u16) -> String {
     } else {
         "agents"
     };
-    format!(
-        "quit stops {} {noun} and Forgejo; they start again on reopen — q again quits",
-        started.len()
-    )
+    if started.is_empty() {
+        format!(
+            "quit cancels {} install{}; the previous version is kept — q again quits",
+            installing.len(),
+            if installing.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "quit stops {} {noun} and cancels {} install{}; q again quits",
+            started.len(),
+            installing.len(),
+            if installing.len() == 1 { "" } else { "s" }
+        )
+    }
 }
 
 /// How many rows the footer really needs. It is the single count both the
@@ -3512,8 +3540,14 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
     {
         let detail = match (&view.error, view.installing) {
             (Some(error), _) => format!("✗ {}", status::plain(error)),
-            (None, Some(Some(percent))) => format!("◐ installing — {percent}%"),
-            (None, Some(None)) => "◐ installing…".to_owned(),
+            (None, Some(Some(percent))) => match view.installing_phase.as_deref() {
+                Some(phase) => format!("◐ {phase} — {percent}%"),
+                None => format!("◐ installing — {percent}%"),
+            },
+            (None, Some(None)) => match view.installing_phase.as_deref() {
+                Some(phase) => format!("◐ {phase}…"),
+                None => "◐ installing…".to_owned(),
+            },
             (None, None) => format!(
                 "{} · {} · about {} MB{}",
                 view.version,
@@ -3591,13 +3625,23 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::fg(theme::MUTED),
         );
     }
-    let actions = "↑↓ program   ←→ connection   ⏎ use   i install   esc back";
+    let installing = board
+        .view
+        .programs
+        .iter()
+        .find(|view| view.id == program.id())
+        .is_some_and(|view| view.installing.is_some());
+    let actions = if installing {
+        "↑↓ program   i cancel install   esc back"
+    } else {
+        "↑↓ program   ←→ connection   ⏎ use   i install   esc back"
+    };
     text_util::put(
         buf,
         inner,
         inner.x + 1,
         inner.bottom().saturating_sub(2),
-        actions,
+        &text_util::ellipsize_words(actions, inner.width.saturating_sub(2) as usize),
         theme::fg(theme::MUTED),
     );
     if let Some(notice) = board.notice() {

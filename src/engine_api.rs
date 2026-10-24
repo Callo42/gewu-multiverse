@@ -135,6 +135,8 @@ pub struct ProgramView {
     pub prerequisite: Option<String>,
     /// An install in progress, 0-100 when known.
     pub installing: Option<Option<u8>>,
+    /// The current install phase word (`downloading`, `installing packages`, …).
+    pub installing_phase: Option<String>,
     /// The newest install failure, one sentence.
     pub error: Option<String>,
 }
@@ -371,6 +373,10 @@ pub enum Command {
     },
     /// Install one native program into the product's data directory.
     InstallProgram {
+        id: String,
+    },
+    /// Stop one in-flight install, keeping the previous usable version.
+    CancelInstallProgram {
         id: String,
     },
     /// Test one agent's selected model with one real request.

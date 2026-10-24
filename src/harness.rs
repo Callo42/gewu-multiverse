@@ -7,14 +7,12 @@
 //! legacy path and is represented by an empty saved value.
 
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-use sha2::{Digest, Sha256};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::installer::{CancelToken, INSTALL_CANCELED, InstallPhase, InstallProgress};
 
 /// A pinned native program. `Builtin` is the product's own direct loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +30,7 @@ pub const NATIVE_PROGRAMS: [Program; 4] =
     [Program::Pi, Program::Codex, Program::Dsh, Program::Opencode];
 
 /// The official artefact URL for one pinned program.
-fn artefact_url(program: Program) -> Option<&'static str> {
+pub(crate) fn artefact_url(program: Program) -> Option<&'static str> {
     match program {
         Program::Pi => Some(
             "https://github.com/earendil-works/pi/releases/download/v1.4.0/pi-linux-x64.tar.gz",
@@ -43,13 +41,13 @@ fn artefact_url(program: Program) -> Option<&'static str> {
         Program::Opencode => {
             Some("https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.1.4.tgz")
         }
-        Program::Dsh => None,
+        Program::Dsh => Some("https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.2.1-rc.2.tgz"),
         Program::Builtin => None,
     }
 }
 
 /// The official artefact SHA-256 for the single-file tarballs.
-fn artefact_sha256(program: Program) -> &'static str {
+pub(crate) fn artefact_sha256(program: Program) -> &'static str {
     match program {
         Program::Pi => "f2e4e4329603223d03260cdb8bd5033dbdc1f73ba58ab8939db2e56546e115d2",
         Program::Codex => "3ec55053109608d5038f7e50750f7d25f768dfd740fef071aa710e2559b63aac",
@@ -57,6 +55,49 @@ fn artefact_sha256(program: Program) -> &'static str {
         Program::Dsh => "40e3d025c0240c4316ff42dee9bedc7709c0fb38aea10543b47076ed2af52e1d",
         Program::Builtin => "",
     }
+}
+
+/// One official package address and its declared SHA-256. Debug builds accept a
+/// test-only override so the installer's own paths can be exercised without the
+/// public network; release builds never read those variables.
+pub(crate) struct Artifact {
+    pub url: String,
+    pub sha256: String,
+}
+
+#[cfg(test)]
+static TEST_ARTIFACT: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Unit tests in this crate use a loopback server without touching process
+/// environment variables. Integration tests exercise the debug-only environment
+/// override in a child process instead.
+#[cfg(test)]
+pub(crate) fn set_test_artifact(url: Option<&str>, sha256: Option<&str>) {
+    if let Ok(mut slot) = TEST_ARTIFACT.lock() {
+        *slot = url
+            .zip(sha256)
+            .map(|(url, sha)| (url.to_owned(), sha.to_owned()));
+    }
+}
+
+pub(crate) fn artifact(program: Program) -> Option<Artifact> {
+    #[cfg(test)]
+    if let Some((url, sha256)) = TEST_ARTIFACT.lock().ok().and_then(|slot| slot.clone()) {
+        return Some(Artifact { url, sha256 });
+    }
+    #[cfg(debug_assertions)]
+    if let (Ok(url), Ok(sha256)) = (
+        std::env::var("GEWU_INSTALL_TEST_URL"),
+        std::env::var("GEWU_INSTALL_TEST_SHA256"),
+    ) && !url.is_empty()
+        && !sha256.is_empty()
+    {
+        return Some(Artifact { url, sha256 });
+    }
+    Some(Artifact {
+        url: artefact_url(program)?.to_owned(),
+        sha256: artefact_sha256(program).to_owned(),
+    })
 }
 
 /// The wire/provider protocol a connection speaks.
@@ -168,7 +209,7 @@ impl Program {
     pub fn prerequisite(self) -> Option<&'static str> {
         match self {
             Self::Builtin | Self::Pi | Self::Codex | Self::Opencode => None,
-            Self::Dsh => Some("Node.js 24.9 or newer and npm"),
+            Self::Dsh => Some("Node 24.9+ / npm 11.16+"),
         }
     }
 
@@ -203,17 +244,28 @@ impl Program {
         if !command_exists("node") || !command_exists("npm") {
             return Some("Node.js 24.9 or newer and npm are needed for DeepSeek Harness");
         }
-        let output = std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .ok()?;
+        let output = match std::process::Command::new("node").arg("--version").output() {
+            Ok(output) if output.status.success() => output,
+            _ => return Some("Node.js 24.9 or newer is needed for DeepSeek Harness"),
+        };
         let version = String::from_utf8_lossy(&output.stdout);
         let version = version.trim().trim_start_matches('v');
         let mut pieces = version.split('.');
-        let major: u32 = pieces.next()?.parse().ok()?;
-        let minor: u32 = pieces.next()?.parse().ok()?;
+        let major = pieces.next().and_then(|piece| piece.parse::<u32>().ok());
+        let minor = pieces.next().and_then(|piece| piece.parse::<u32>().ok());
+        let Some((major, minor)) = major.zip(minor) else {
+            return Some("Node.js 24.9 or newer is needed for DeepSeek Harness");
+        };
         if major < 24 || (major == 24 && minor < 9) {
             return Some("Node.js 24.9 or newer is needed for DeepSeek Harness");
+        }
+        if !std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            return Some("npm is needed for DeepSeek Harness");
         }
         None
     }
@@ -298,27 +350,139 @@ pub fn record_path(root: &Path) -> PathBuf {
 /// different version is still read (and shown as not tested) rather than silently
 /// treated as the pin; the caller sees the actual version.
 pub fn installed(data_root: &Path, program: Program) -> Option<InstalledProgram> {
+    read_installed_at_root(&install_root(data_root, program), program)
+}
+
+/// Read one install at an explicit root (the published root, or a completed stage
+/// before it is renamed). A record is not enough: the entrypoint must be a real
+/// executable below the root, and DeepSeek Harness must still carry its native
+/// terminal and FFI helpers.
+pub(crate) fn read_installed_at_root(root: &Path, program: Program) -> Option<InstalledProgram> {
     if !program.is_native() {
         return None;
     }
-    let root = install_root(data_root, program);
-    let text = fs::read_to_string(record_path(&root)).ok()?;
+    let root_metadata = fs::symlink_metadata(root).ok()?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return None;
+    }
+    let text = fs::read_to_string(record_path(root)).ok()?;
     let record: InstallRecord = serde_json::from_str(&text).ok()?;
     if record.program != program.id() {
         return None;
     }
-    let executable = root.join(&record.entrypoint);
-    if !executable.is_file() {
+    let relative = safe_relative(&record.entrypoint)?;
+    let executable = root.join(relative);
+    let root_canon = fs::canonicalize(root).ok()?;
+    let executable_canon = fs::canonicalize(&executable).ok()?;
+    if !executable_canon.starts_with(&root_canon) {
+        return None;
+    }
+    let metadata = fs::metadata(&executable).ok()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return None;
+    }
+    if program == Program::Dsh && !dsh_helpers_ready(root) {
         return None;
     }
     Some(InstalledProgram {
         program,
         version: record.version,
-        root,
+        root: root.to_path_buf(),
         executable,
         sha256: record.sha256,
         license: record.license,
     })
+}
+
+fn safe_relative(text: &str) -> Option<PathBuf> {
+    let path = Path::new(text);
+    if text.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn node_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{}-{arch}", std::env::consts::OS)
+}
+
+fn dsh_helpers_ready(root: &Path) -> bool {
+    let modules = root.join("node_modules");
+    let package = modules.join("@deepseek-ai/dsh/package.json");
+    let Some(value) = fs::read_to_string(package)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return false;
+    };
+    if value.get("version").and_then(serde_json::Value::as_str) != Some("0.2.1-rc.2") {
+        return false;
+    }
+    let platform = node_platform();
+    if ![
+        modules.join(format!("node-pty/prebuilds/{platform}/pty.node")),
+        modules.join("node-pty/build/Release/pty.node"),
+        modules.join("node-pty/build/Debug/pty.node"),
+    ]
+    .into_iter()
+    .any(|path| path.is_file())
+    {
+        return false;
+    }
+    if !modules.join("koffi/package.json").is_file() || !koffi_native_present(&modules) {
+        return false;
+    }
+    for helper in [
+        modules.join(format!("node-pty/prebuilds/{platform}/spawn-helper")),
+        modules.join("node-pty/build/Release/spawn-helper"),
+    ] {
+        if helper.is_file()
+            && fs::metadata(&helper)
+                .map(|metadata| metadata.permissions().mode() & 0o111 == 0)
+                .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn koffi_native_present(modules: &Path) -> bool {
+    fn has_node_file(path: &Path, depth: u8) -> bool {
+        let Ok(entries) = fs::read_dir(path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "node")
+            {
+                return true;
+            }
+            if depth > 0 && path.is_dir() && has_node_file(&path, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    if has_node_file(&modules.join("@koromix"), 2) {
+        return true;
+    }
+    // A source build puts the binding below koffi/build; that is still the helper
+    // the locked package asked its install script to produce.
+    modules.join("koffi/build").is_dir() && has_node_file(&modules.join("koffi/build"), 3)
 }
 
 /// The installed state of every native program, in display order.
@@ -329,282 +493,34 @@ pub fn installed_all(data_root: &Path) -> Vec<(Program, Option<InstalledProgram>
         .collect()
 }
 
-/// Install one pinned program into the product's data directory. Old installs are
-/// preserved until the new stage is complete; a failure removes only the stage.
+/// Install one pinned program into the product's data directory. The previous
+/// usable version is kept until the new stage is complete and verified.
 pub fn install(
     data_root: &Path,
     program: Program,
-    mut progress: impl FnMut(Option<u8>),
+    progress: impl FnMut(Option<u8>),
 ) -> Result<InstalledProgram, String> {
-    if !program.is_native() {
-        return Err("the built-in engine needs no install".to_owned());
-    }
-    if let Some(existing) = installed(data_root, program)
-        && existing.version == program.pinned_version()
-    {
-        return Ok(existing);
-    }
-    if let Some(prerequisite) = program.prerequisite_missing() {
-        return Err(prerequisite.to_owned());
-    }
-    let root = install_root(data_root, program);
-    if let Some(parent) = root.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("{} cannot be created: {error}", parent.display()))?;
-    }
-    let stage = root.with_extension(format!("part-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&stage);
-    fs::create_dir_all(&stage)
-        .map_err(|error| format!("{} cannot be created: {error}", stage.display()))?;
-    let result = (|| -> Result<(), String> {
-        match program {
-            Program::Pi => {
-                let archive = stage.join("pi.tar.gz");
-                download(
-                    artefact_url(program).unwrap(),
-                    &archive,
-                    artefact_sha256(program),
-                    &mut progress,
-                )?;
-                extract(&archive, &stage)?;
-                if !stage.join("pi/pi").is_file() {
-                    return Err("the Pi package did not contain the expected program".to_owned());
-                }
-            }
-            Program::Codex => {
-                let archive = stage.join("codex.tar.gz");
-                download(
-                    artefact_url(program).unwrap(),
-                    &archive,
-                    artefact_sha256(program),
-                    &mut progress,
-                )?;
-                extract(&archive, &stage)?;
-                if !stage.join("bin/codex").is_file() {
-                    return Err("the Codex package did not contain the expected program".to_owned());
-                }
-            }
-            Program::Opencode => {
-                let archive = stage.join("opencode.tgz");
-                download(
-                    artefact_url(program).unwrap(),
-                    &archive,
-                    artefact_sha256(program),
-                    &mut progress,
-                )?;
-                extract(&archive, &stage)?;
-                if !stage.join("package/bin/opencode").is_file() {
-                    return Err(
-                        "the OpenCode package did not contain the expected program".to_owned()
-                    );
-                }
-            }
-            Program::Dsh => install_dsh(&stage, &mut progress)?,
-            Program::Builtin => unreachable!(),
-        }
-        let entrypoint = match program {
-            Program::Pi => "pi/pi",
-            Program::Codex => "bin/codex",
-            Program::Opencode => "package/bin/opencode",
-            Program::Dsh => "node_modules/.bin/dsh",
-            Program::Builtin => unreachable!(),
-        };
-        let resources = (program == Program::Dsh).then(|| {
-            format!(
-                "npm lock sha256 {}",
-                hex(&Sha256::digest(include_bytes!(
-                    "../vendor/dsh/package-lock.json"
-                )))
-            )
-        });
-        let record = InstallRecord {
-            program: program.id().to_owned(),
-            version: program.pinned_version().to_owned(),
-            sha256: artefact_sha256(program).to_owned(),
-            license: program.license().to_owned(),
-            entrypoint: entrypoint.to_owned(),
-            resources,
-            installed_at: now(),
-        };
-        let text = serde_json::to_string_pretty(&record)
-            .map_err(|error| format!("the install record cannot be written: {error}"))?;
-        crate::mode::write_private(record_path(&stage), text.as_bytes())
-            .map_err(|error| format!("the install record cannot be written: {error}"))?;
-        let _ = crate::mode::set_mode(&stage, crate::mode::PRIVATE_DIR_MODE);
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_dir_all(&stage);
-        return Err(error);
-    }
-    let old = root.with_extension(format!("old-{}", std::process::id()));
-    let had_old = root.exists();
-    if had_old {
-        fs::rename(&root, &old).map_err(|error| {
-            format!(
-                "the old {} install cannot be moved aside: {error}",
-                program.label()
-            )
-        })?;
-    }
-    if let Err(error) = fs::rename(&stage, &root) {
-        if had_old {
-            let _ = fs::rename(&old, &root);
-        }
-        let _ = fs::remove_dir_all(&stage);
-        return Err(format!(
-            "{} cannot be put in place: {error}",
-            program.label()
-        ));
-    }
-    let _ = fs::remove_dir_all(&old);
-    installed(data_root, program).ok_or_else(|| {
-        format!(
-            "{} was installed but its record cannot be read back",
-            program.label()
-        )
+    let cancel = CancelToken::new();
+    let mut progress = progress;
+    install_cancellable(data_root, program, &cancel, |sample| {
+        progress(sample.percent)
     })
 }
 
-fn download(
-    url: &str,
-    target: &Path,
-    expected_sha256: &str,
-    progress: &mut impl FnMut(Option<u8>),
-) -> Result<(), String> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(900)))
-        .http_status_as_error(false)
-        .build()
-        .new_agent();
-    let response = agent
-        .get(url)
-        .header("Accept", "application/octet-stream")
-        .call()
-        .map_err(|error| format!("{url} could not be reached ({error})"))?;
-    let status = response.status().as_u16();
-    if !(200..=299).contains(&status) {
-        return Err(format!("{url} answered HTTP {status}"));
-    }
-    let total = response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let stage = target.with_extension("part");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(crate::mode::SECRET_FILE_MODE)
-        .open(&stage)
-        .map_err(|error| format!("{} cannot be written: {error}", stage.display()))?;
-    let mut reader = response.into_body().into_reader();
-    let mut hasher = Sha256::new();
-    let mut received = 0u64;
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("{url} stopped while downloading: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        file.write_all(&buffer[..read])
-            .map_err(|error| format!("{} cannot be written: {error}", stage.display()))?;
-        received += read as u64;
-        progress(
-            total
-                .filter(|total| *total > 0)
-                .map(|total| ((received.saturating_mul(100) / total).min(100)) as u8),
-        );
-    }
-    file.sync_all()
-        .map_err(|error| format!("{} cannot be synced: {error}", stage.display()))?;
-    drop(file);
-    let actual = hex(&hasher.finalize());
-    if actual != expected_sha256 {
-        let _ = fs::remove_file(&stage);
-        return Err(format!(
-            "{url} did not match its published checksum (got {actual})"
-        ));
-    }
-    fs::rename(&stage, target)
-        .map_err(|error| format!("{} cannot be put in place: {error}", target.display()))
+/// The cancellable install the board and the installer flag use. The callback is
+/// called for every phase, so an unknown percentage is never shown as a number.
+pub fn install_cancellable(
+    data_root: &Path,
+    program: Program,
+    cancel: &CancelToken,
+    progress: impl FnMut(InstallProgress),
+) -> Result<InstalledProgram, String> {
+    crate::installer::install(data_root, program, cancel, progress)
 }
 
-fn extract(archive: &Path, target: &Path) -> Result<(), String> {
-    let status = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(target)
-        .status()
-        .map_err(|error| format!("the archive cannot be unpacked: {error}"))?;
-    if !status.success() {
-        return Err("the archive could not be unpacked".to_owned());
-    }
-    let _ = fs::remove_file(archive);
-    Ok(())
-}
-
-fn install_dsh(stage: &Path, progress: &mut impl FnMut(Option<u8>)) -> Result<(), String> {
-    progress(None);
-    let home = stage.join("npm-home");
-    let cache = stage.join("npm-cache");
-    fs::create_dir_all(&home).map_err(|error| format!("{error}"))?;
-    fs::create_dir_all(&cache).map_err(|error| format!("{error}"))?;
-    crate::mode::write_private(
-        stage.join("package.json"),
-        include_bytes!("../vendor/dsh/package.json"),
-    )
-    .map_err(|error| format!("the DeepSeek Harness package file cannot be written: {error}"))?;
-    crate::mode::write_private(
-        stage.join("package-lock.json"),
-        include_bytes!("../vendor/dsh/package-lock.json"),
-    )
-    .map_err(|error| format!("the DeepSeek Harness lockfile cannot be written: {error}"))?;
-    let status = std::process::Command::new("npm")
-        .args([
-            "ci",
-            "--no-audit",
-            "--no-fund",
-            "--prefix",
-            stage.to_str().unwrap_or("."),
-        ])
-        .env("HOME", &home)
-        .env("npm_config_cache", &cache)
-        .status()
-        .map_err(|error| format!("npm could not be started: {error}"))?;
-    if !status.success() {
-        return Err("npm could not install DeepSeek Harness from its locked packages".to_owned());
-    }
-    let package = stage.join("node_modules/@deepseek-ai/dsh/package.json");
-    let text = fs::read_to_string(&package).map_err(|error| {
-        format!("the installed DeepSeek Harness record cannot be read: {error}")
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|error| format!("the installed DeepSeek Harness record is not valid: {error}"))?;
-    if value.get("version").and_then(serde_json::Value::as_str)
-        != Some(Program::Dsh.pinned_version())
-    {
-        return Err(format!(
-            "npm installed a different DeepSeek Harness version than {}",
-            Program::Dsh.pinned_version()
-        ));
-    }
-    let _ = fs::remove_dir_all(&home);
-    let _ = fs::remove_dir_all(&cache);
-    Ok(())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
+/// Repair interrupted installs before the first picture is drawn.
+pub fn recover_pending(data_root: &Path) -> Vec<String> {
+    crate::installer::recover_pending(data_root)
 }
 
 /// Why a selected program/protocol cannot start, in one product sentence.
@@ -690,6 +606,9 @@ mod tests {
         std::fs::create_dir_all(install.join("bin")).expect("the fixture root");
         let executable = install.join("bin/pi");
         std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("the fixture binary");
+        let mut mode = std::fs::metadata(&executable).expect("mode").permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&executable, mode).expect("the fixture mode");
         let record = InstallRecord {
             program: Program::Pi.id().to_owned(),
             version: Program::Pi.pinned_version().to_owned(),
@@ -711,35 +630,6 @@ mod tests {
         std::fs::remove_file(&executable).expect("remove the binary");
         assert!(installed(&root, Program::Pi).is_none());
         assert!(installed(&root, Program::Codex).is_none());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_wrong_checksum_leaves_no_part_and_the_right_one_installs() {
-        let root = std::env::temp_dir().join(format!(
-            "gewu-harness-download-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&root).expect("the fixture root");
-        let body = b"an official package stand-in";
-        let source = crate::test_stub::Stub::start(vec![crate::test_stub::StubReply::status(
-            200,
-            String::from_utf8_lossy(body).into_owned(),
-        )]);
-        let target = root.join("package");
-        let error = download(&source.url(), &target, &"0".repeat(64), &mut |_| {})
-            .expect_err("a wrong checksum is refused");
-        assert!(error.contains("checksum"), "{error}");
-        assert!(!target.exists());
-        assert!(!target.with_extension("part").exists());
-        let digest = Sha256::digest(body);
-        let digest = hex(&digest);
-        download(&source.url(), &target, &digest, &mut |_| {}).expect("the right checksum");
-        assert_eq!(std::fs::read(&target).expect("the package"), body);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -49,6 +49,7 @@ pub mod forgejo_tools;
 mod git_proxy;
 pub mod harness;
 pub mod identity;
+mod installer;
 pub mod mcp_forgejo;
 pub mod mode;
 pub mod model;

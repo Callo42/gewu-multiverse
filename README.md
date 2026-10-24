@@ -191,8 +191,9 @@ Forgejo binary is additionally pinned by digest and signed upstream.
 It downloads the current prebuilt program to `~/.local/bin/gewu-multiverse`, the
 Forgejo it needs (about 122 MB), and the one agent program you named (Pi by default)
 to `~/.local/share/gewu-multiverse/`. Every package is checked against its published
-SHA-256 or npm integrity. DeepSeek Harness needs Node 24.9 or newer and npm; its
-locked closure is about 613 packages and 753 MB. Nothing else is downloaded unless
+SHA-256 or npm integrity. DeepSeek Harness needs Node 24.9 or newer and npm 11.16.0
+or newer (older npm ignores the reviewed install-script policy); its locked closure
+is about 613 packages and 753 MB. Nothing else is downloaded unless
 you name it. If `~/.local/bin`
 is not on your `PATH`, the installer says how to add it. The prebuilt program is for
 64-bit x86 Linux with glibc 2.39 or newer (for example Ubuntu 24.04 or newer).
