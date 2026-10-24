@@ -256,8 +256,12 @@ before a stop wins: the stop changes only the agent's desired state, writes no s
 marker and adds no second ending. A stop requested while the run had no ending wins;
 if the child manages to write one during the grace window, the stop terminal replaces
 it so the run still has exactly one terminal outcome. The first-ending fact is
-write-once: a second Stop or a program shutdown during the first stop's grace cannot
-re-sample it and hand the run to a later child ending.
+write-once and is persisted at `first-ending.json` in the run's private directory
+before the first stop, deadline or shutdown signal. A second Stop, a program shutdown,
+settle, reap or reopen reads that file; it cannot re-sample the fact or hand the run
+to a later child ending. Recovery uses it too: a persisted `stop` replaces a child's
+post-stop ending with one `stopped` terminal plus the stop record, while a persisted
+`terminal` keeps the child's ending and writes no stop record.
 The native supervisor writes `native-progress.json` whenever its per-harness outcome
 model changes (waiting, retrying, failed, succeeded), so a cause the harness already
 emitted survives the engine killing the child at its deadline. A failed tool is

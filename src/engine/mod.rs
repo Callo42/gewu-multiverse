@@ -465,6 +465,9 @@ struct RunningState {
     /// The run's first ending, recorded once when it happens. A later Stop,
     /// shutdown, settle, reap or reopen never changes it.
     first_ending: Option<run::FirstEnding>,
+    /// The last failure to persist the first-ending fact, if any. It is retried on
+    /// the next deadline tick; the run is not signalled until the fact is durable.
+    first_ending_error: Option<String>,
 }
 
 /// The facts `poll_agent` hands from the running state to the settle boundary.
@@ -1260,17 +1263,22 @@ impl Inner {
         if let Some(run) = self.agents[index].running.as_mut() {
             if !run.stopping {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
-                    run.timed_out = true;
-                    run.stopping = true;
-                    run.first_ending.get_or_insert_with(|| {
-                        if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
-                            run::FirstEnding::Terminal
-                        } else {
-                            run::FirstEnding::Stop
+                    match pin_first_ending(run) {
+                        Ok(_) => {
+                            run.first_ending_error = None;
+                            run.timed_out = true;
+                            run.stopping = true;
+                            run.stop_deadline = Some(now + self.options.stop_grace);
+                            run.handle.signal(false);
                         }
-                    });
-                    run.stop_deadline = Some(now + self.options.stop_grace);
-                    run.handle.signal(false);
+                        Err(error) => {
+                            // Do not signal a run whose first ending is not durable:
+                            // reopen would otherwise have no fact to honour.
+                            if run.first_ending_error.is_none() {
+                                run.first_ending_error = Some(error);
+                            }
+                        }
+                    }
                 }
             } else if run.stop_deadline.is_some_and(|deadline| now >= deadline) {
                 run.handle.signal(true);
@@ -1351,6 +1359,14 @@ impl Inner {
                 ));
             }
         }
+        if let Some(agent) = self.agents.get(index)
+            && let Some(error) = agent
+                .running
+                .as_ref()
+                .and_then(|run| run.first_ending_error.clone())
+        {
+            self.note(format!("the deadline stop cannot be recorded: {error}"));
+        }
         if let Some((mut end, started, run_dir, pid, stop_wins, progress, first_ending)) = ended {
             self.observe_confinement_refusal(&run_dir);
             // A supervisor killed from outside can leave the shell it started in
@@ -1392,7 +1408,11 @@ impl Inner {
                 reason,
                 self.options.stop_grace,
                 stop_reason,
-                first_ending.unwrap_or(run::FirstEnding::Stop),
+                first_ending.unwrap_or(if stop_wins {
+                    run::FirstEnding::Stop
+                } else {
+                    run::FirstEnding::Terminal
+                }),
             );
             self.agents[index].leftover = settled.err();
             if self.agents[index].leftover.is_some() {
@@ -2815,11 +2835,11 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                let grace = inner.options.stop_grace;
+                stop_agent(&mut inner.agents[index], grace)?;
                 inner.set_desired(index, Desired::Stopped);
                 inner.agents[index].removal_pending = true;
                 inner.agents[index].removal_retry_at = None;
-                let grace = inner.options.stop_grace;
-                stop_agent(&mut inner.agents[index], grace);
                 inner.save_settings()?;
                 inner.note(format!("`{name}` is being removed"));
                 Ok(())
@@ -2895,9 +2915,9 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
-                inner.set_desired(index, Desired::Stopped);
                 let grace = inner.options.stop_grace;
-                stop_agent(&mut inner.agents[index], grace);
+                stop_agent(&mut inner.agents[index], grace)?;
+                inner.set_desired(index, Desired::Stopped);
                 inner.save_settings()?;
                 inner.note(format!("`{name}` stopped"));
                 Ok(())
@@ -3000,6 +3020,7 @@ impl EngineApi for Engine {
 
     fn shutdown(&mut self, grace: Duration) {
         let started = Instant::now();
+        let mut first_ending_errors: Vec<String> = Vec::new();
         {
             let mut inner = lock_inner(&self.inner);
             if inner.stopping {
@@ -3016,15 +3037,16 @@ impl EngineApi for Engine {
             // child's pid, and is signalled again as that pid appears below.
             for agent in &mut inner.agents {
                 if let Some(run) = agent.running.as_mut() {
-                    run.stopping = true;
-                    run.first_ending.get_or_insert_with(|| {
-                        if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
-                            run::FirstEnding::Terminal
-                        } else {
-                            run::FirstEnding::Stop
+                    match pin_first_ending(run) {
+                        Ok(_) => {
+                            run.stopping = true;
+                            run.handle.signal(false);
                         }
-                    });
-                    run.handle.signal(false);
+                        Err(error) => first_ending_errors.push(format!(
+                            "`{}`: the shutdown ending cannot be recorded: {error}",
+                            agent.name
+                        )),
+                    }
                 }
                 if let Some(pid) = agent.starting_pid {
                     signal_group(pid, nix::sys::signal::Signal::SIGTERM);
@@ -3039,6 +3061,13 @@ impl EngineApi for Engine {
             for pid in &inner.forgejo.helper_pids {
                 signal_group(*pid, nix::sys::signal::Signal::SIGTERM);
             }
+        }
+        if !first_ending_errors.is_empty() {
+            let mut inner = lock_inner(&self.inner);
+            for note in first_ending_errors.drain(..) {
+                inner.note(note);
+            }
+            // A failed first attempt is retried before the forced stop below.
         }
         // The bounded hand-over: a start or spawn that is between spawning its child
         // and returning must see the new generation and stop that child itself. The
@@ -3113,6 +3142,14 @@ impl EngineApi for Engine {
             let mut inner = lock_inner(&self.inner);
             for agent in &mut inner.agents {
                 if let Some(mut run) = agent.running.take() {
+                    if run.first_ending.is_none()
+                        && let Err(error) = pin_first_ending(&mut run)
+                    {
+                        first_ending_errors.push(format!(
+                            "`{}`: the shutdown ending cannot be recorded before the forced stop: {error}",
+                            agent.name
+                        ));
+                    }
                     stop_running_session(&mut run.handle, Duration::from_millis(500));
                     let first_ending = run.first_ending.or(Some(run::FirstEnding::Stop));
                     settled_runs.push((run.run_dir.clone(), run.handle.pid(), first_ending));
@@ -3143,6 +3180,12 @@ impl EngineApi for Engine {
             inner.forgejo.start_requested = false;
             inner.forgejo.start_inflight = false;
             inner.forgejo.provisioned = false;
+        }
+        if !first_ending_errors.is_empty() {
+            let mut inner = lock_inner(&self.inner);
+            for note in first_ending_errors.drain(..) {
+                inner.note(note);
+            }
         }
         // Settle every run whose supervisor this shutdown ended, outside the lock.
         // The run gets a durable ending before its handles go; if either step fails
@@ -3447,9 +3490,24 @@ fn ensure_agent_paths(layout: &Layout, name: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn stop_agent(agent: &mut AgentRuntime, grace: Duration) {
-    agent.next_at = None;
-    agent.session = SessionState::Idle;
+/// Persist the first-ending fact before any signal it governs, and return the
+/// durable winner. The file wins over memory; a caller cannot re-sample it later.
+fn pin_first_ending(run: &mut RunningState) -> Result<run::FirstEnding, String> {
+    let run_id =
+        run_id_in(&run.run_dir).ok_or_else(|| "the run directory has no run id".to_owned())?;
+    let proposed = run.first_ending.unwrap_or_else(|| {
+        if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
+            run::FirstEnding::Terminal
+        } else {
+            run::FirstEnding::Stop
+        }
+    });
+    let actual = run::ensure_first_ending(&run.run_dir, run_id, proposed)?;
+    run.first_ending = Some(actual);
+    Ok(actual)
+}
+
+fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
     if agent.starting {
         // The job checks the desired choice after every wait, stops a child it has
         // already spawned, and clears `starting` itself.
@@ -3459,18 +3517,17 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) {
         agent.starting = false;
     }
     if let Some(run) = agent.running.as_mut() {
+        // The durable fact is written before the stop signal. If it cannot be
+        // written, no signal is sent and the Stop reports the failure.
+        pin_first_ending(run)?;
         run.stopping = true;
-        run.first_ending.get_or_insert_with(|| {
-            if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
-                run::FirstEnding::Terminal
-            } else {
-                run::FirstEnding::Stop
-            }
-        });
         run.stop_requested = true;
         run.stop_deadline = Some(Instant::now() + grace);
         run.handle.signal(false);
     }
+    agent.next_at = None;
+    agent.session = SessionState::Idle;
+    Ok(())
 }
 
 // ---- background work -------------------------------------------------------
@@ -4012,11 +4069,14 @@ fn session_job(
         drop(guard);
         if let Ok(mut handle) = spawned {
             let pid = handle.pid();
-            let first_ending = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
+            let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
+            let first_ending =
+                run::ensure_first_ending(&request.run_dir, &request.run_id, proposed)
+                    .unwrap_or(proposed);
             stop_running_session(&mut handle, Duration::from_secs(1));
             let _ = run::settle_run_with_stop(
                 &request.run_dir,
@@ -4043,11 +4103,14 @@ fn session_job(
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
             let pid = handle.pid();
-            let first_ending = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
+            let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
+            let first_ending =
+                run::ensure_first_ending(&request.run_dir, &request.run_id, proposed)
+                    .unwrap_or(proposed);
             stop_running_session(&mut handle, Duration::from_secs(1));
             let reason = if stopping {
                 "the run was stopped when the program closed"
@@ -4093,6 +4156,7 @@ fn session_job(
                 stop_requested: false,
                 timed_out: false,
                 first_ending: None,
+                first_ending_error: None,
             });
             guard.agents[index].newest_run = Some(request.run_dir.clone());
             guard.agents[index].activity_refresh_at = None;
@@ -5531,6 +5595,7 @@ mod tests {
             }
         ));
         let run_dir = fake.last_run_dir().expect("the timed-out run directory");
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Stop));
         assert!(
             run_dir.join(run::STOPPED_FILE).is_file(),
             "a timed-out run left no stop record"
@@ -5570,6 +5635,31 @@ mod tests {
             .collect()
     }
 
+    fn first_ending(run_dir: &Path) -> Option<run::FirstEnding> {
+        run::recorded_first_ending(run_dir).expect("the first ending reads")
+    }
+
+    #[test]
+    fn a_natural_finish_persists_terminal_as_the_first_ending() {
+        let root = scratch_root("engine-natural-fact");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert_eq!(
+            first_ending(&run_dir),
+            Some(run::FirstEnding::Terminal),
+            "a natural finish was recorded as an engine stop"
+        );
+        assert!(!run_dir.join(run::STOPPED_FILE).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_stop_after_the_runs_ending_keeps_the_one_ending_and_writes_no_stop_record() {
         let root = scratch_root("engine-finish-then-stop");
@@ -5590,6 +5680,7 @@ mod tests {
                 name: "agent-1".to_owned(),
             })
             .expect("stop");
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
         let board = engine.board();
@@ -5624,6 +5715,7 @@ mod tests {
                 name: "agent-1".to_owned(),
             })
             .expect("first stop");
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Stop));
         // The child managed to write an ending during the first stop's grace.
         write_terminal_record(&run_dir, run::RunOutcome::Succeeded, "a post-signal ending");
         // A second Stop must not re-sample the ordering fact and hand the run to the
@@ -5645,6 +5737,79 @@ mod tests {
             "the run kept two terminal records: {endings:?}"
         );
         assert_eq!(endings[0].0, "stopped");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_crash_after_a_persisted_stop_reopens_as_stopped() {
+        let child_env = "GEWU_CRASH_REOPEN_CHILD";
+        if std::env::var_os(child_env).is_some() {
+            let root =
+                PathBuf::from(std::env::var("GEWU_CRASH_REOPEN_ROOT").expect("the crash root"));
+            let settings = Settings::load(&settings::path_in(&root)).expect("the crash settings");
+            let clock = Arc::new(FakeClock::new());
+            let fake = Arc::new(FakeSpawner::new());
+            let mut engine = open_test_engine(&root, settings, clock, Arc::clone(&fake));
+            tick(&mut engine, &FakeClock::new(), Duration::ZERO);
+            wait_started(&fake, 1);
+            let run_dir = fake.last_run_dir().expect("the crash run directory");
+            engine
+                .send(Command::Stop {
+                    name: "agent-1".to_owned(),
+                })
+                .expect("the first stop");
+            write_terminal_record(
+                &run_dir,
+                run::RunOutcome::Succeeded,
+                "the child finished during the first stop's grace",
+            );
+            assert_eq!(
+                first_ending(&run_dir),
+                Some(run::FirstEnding::Stop),
+                "the first stop was not durable before the crash"
+            );
+            fs::write(
+                root.join("crash-run-dir.txt"),
+                run_dir.display().to_string(),
+            )
+            .expect("the crash run path");
+            // Hard crash: no Drop, no shutdown, no settle.
+            std::process::abort();
+        }
+
+        let root = scratch_root("engine-crash-reopen");
+        write_ready(&root, &[("agent-1", Desired::Started)]);
+        let exe = std::env::current_exe().expect("the test executable");
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("engine::tests::a_crash_after_a_persisted_stop_reopens_as_stopped")
+            .arg("--nocapture")
+            .env(child_env, "1")
+            .env("GEWU_CRASH_REOPEN_ROOT", &root)
+            .status()
+            .expect("the crashing child runs");
+        assert!(!status.success(), "the child did not crash");
+        let run_dir = PathBuf::from(
+            fs::read_to_string(root.join("crash-run-dir.txt")).expect("the crash run path"),
+        );
+        let settings = Settings::load(&settings::path_in(&root)).expect("the reopen settings");
+        let mut reopened = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        tick(&mut reopened, &FakeClock::new(), Duration::ZERO);
+        assert_eq!(
+            first_ending(&run_dir),
+            Some(run::FirstEnding::Stop),
+            "the reopen lost the first-ending fact"
+        );
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        let endings = terminal_outcomes(&run_dir);
+        assert_eq!(endings.len(), 1, "the reopen kept two endings: {endings:?}");
+        assert_eq!(endings[0].0, "stopped");
+        assert!(reopened.board().agents[0].leftover.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -5696,6 +5861,7 @@ mod tests {
             "the run finished before the deadline",
         );
         tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
         let board = engine.board();
         assert_eq!(board.agents[0].recent.last(), Some(&SessionEnd::Succeeded));
         assert!(

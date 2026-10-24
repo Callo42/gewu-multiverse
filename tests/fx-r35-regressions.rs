@@ -198,6 +198,7 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
         run::RunOutcome::Stopped,
         Some("the run was stopped on request".to_owned()),
         Duration::from_secs(3),
+        run::FirstEnding::Stop,
     )
     .expect("the normal stop settles");
     let _ = settled;
@@ -326,6 +327,7 @@ fn a_killed_product_reopen_reaps_the_real_sleeping_child_and_records_its_ending(
         run::RunOutcome::Stopped,
         Some("test cleanup".to_owned()),
         Duration::from_secs(3),
+        run::FirstEnding::Stop,
     );
     let _ = fs::remove_dir_all(&root);
 }

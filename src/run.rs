@@ -11,11 +11,14 @@
 //!     plan.json         what the run was started with, written before it starts
 //!     run.log           the agent process's own output, and the tool's own lines
 //!     transcript.jsonl  the append-only record of what happened
+//!     first-ending.json the write-once fact of which ending happened first
 //!     skills/           the skill set this run had installed
 //! ```
 
 use std::fs;
 use std::io;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::prelude::OwnedFd;
 use std::path::{Path, PathBuf};
 
@@ -286,7 +289,8 @@ pub fn parse_steps(text: &str) -> Vec<String> {
 /// Which ending happened first for a run: its own terminal record, or the first
 /// engine stop/deadline/shutdown request. It is recorded once, when the first ending
 /// occurs, and is never re-sampled by a later Stop, shutdown, settle or reopen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FirstEnding {
     /// The run wrote its own terminal record before any engine stop was requested.
     Terminal,
@@ -1232,6 +1236,8 @@ pub const SHELL_CAPABILITY_FILE: &str = "shell.capability";
 
 /// The marker written when a run's left-over group was stopped by a later start.
 pub const STOPPED_FILE: &str = "run-stopped.json";
+/// The write-once first-ending fact, written before any signal it governs.
+pub const FIRST_ENDING_FILE: &str = "first-ending.json";
 
 /// The native supervisor's latest failure-model state, beside the run's records.
 ///
@@ -1294,6 +1300,90 @@ pub struct RunStopped {
     pub reason: String,
 }
 
+/// The durable first-ending fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirstEndingRecord {
+    /// When the fact was recorded, in RFC 3339 UTC.
+    ts: String,
+    /// The run the fact belongs to.
+    run_id: String,
+    /// Which ending happened first.
+    ending: FirstEnding,
+}
+
+/// Read the durable first-ending fact, if this run has one.
+///
+/// A malformed record is an error, never "no fact": guessing would let a later
+/// writer change which ending happened first.
+pub fn recorded_first_ending(run_dir: &Path) -> Result<Option<FirstEnding>, String> {
+    let path = run_dir.join(FIRST_ENDING_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!("the run's first ending cannot be read: {error}"));
+        }
+    };
+    let record: FirstEndingRecord = serde_json::from_str(&text)
+        .map_err(|error| format!("the run's first ending is malformed: {error}"))?;
+    Ok(Some(record.ending))
+}
+
+/// Record the first-ending fact once and return the fact that won.
+///
+/// The record is written to a private temporary file, fsynced, and installed with
+/// an atomic no-clobber hard link. If two writers race, the first link wins and both
+/// callers read the winner. This is called before any signal the fact governs, so a
+/// crash/reopen cannot lose the first stop.
+pub fn ensure_first_ending(
+    run_dir: &Path,
+    run_id: &str,
+    proposed: FirstEnding,
+) -> Result<FirstEnding, String> {
+    if let Some(existing) = recorded_first_ending(run_dir)? {
+        return Ok(existing);
+    }
+    let record = FirstEndingRecord {
+        ts: crate::time::rfc3339(now_unix_ms()),
+        run_id: run_id.to_owned(),
+        ending: proposed,
+    };
+    let text = serde_json::to_string_pretty(&record)
+        .map_err(|error| format!("the run's first ending cannot be encoded: {error}"))?;
+    let target = run_dir.join(FIRST_ENDING_FILE);
+    let stage = run_dir.join(format!(
+        ".first-ending.part-{}-{}",
+        std::process::id(),
+        now_unix_ms()
+    ));
+    let write = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(crate::mode::SECRET_FILE_MODE)
+            .open(&stage)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        match fs::hard_link(&stage, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        // Make the directory entry durable too. Failure here is not hidden: the
+        // file may exist but a power loss before the sync is not promised.
+        if let Ok(dir) = fs::File::open(run_dir) {
+            dir.sync_all()?;
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(&stage);
+    write.map_err(|error| format!("the run's first ending cannot be written: {error}"))?;
+    recorded_first_ending(run_dir)?
+        .ok_or_else(|| "the run's first ending was written but cannot be read".to_owned())
+}
+
 /// Write the `run_stopped` record and the run's terminal record.
 ///
 /// Both are written before the caller may remove the run's identity handles, and
@@ -1301,15 +1391,36 @@ pub struct RunStopped {
 /// last and committed to disk, so a later open that finds it also has the marker;
 /// an interrupted pair is retried from the still-present handles.
 pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
-    write_stop_marker(run_dir, run_id, pgid, reason)?;
-    transcript::record_outcome_if_missing(
-        run_dir,
-        run_id,
-        RunOutcome::Stopped,
-        Some(reason.to_owned()),
-        0,
-    )
-    .map(|_| ())
+    match recorded_first_ending(run_dir).map_err(io::Error::other)? {
+        Some(FirstEnding::Stop) => {
+            write_stop_marker(run_dir, run_id, pgid, reason)?;
+            write_terminal_replacing(run_dir, run_id, RunOutcome::Stopped, reason)
+                .map_err(io::Error::other)
+        }
+        Some(FirstEnding::Terminal) => {
+            let terminal =
+                transcript::terminal_record_checked(run_dir).map_err(io::Error::other)?;
+            if terminal.is_none() {
+                return Err(io::Error::other(
+                    "the run recorded a terminal ending first, but that ending cannot be read",
+                ));
+            }
+            Ok(())
+        }
+        None => {
+            // Runs from before the durable fact keep the legacy recovery: record the
+            // cleanup stop and preserve whatever terminal the run wrote.
+            write_stop_marker(run_dir, run_id, pgid, reason)?;
+            transcript::record_outcome_if_missing(
+                run_dir,
+                run_id,
+                RunOutcome::Stopped,
+                Some(reason.to_owned()),
+                0,
+            )
+            .map(|_| ())
+        }
+    }
 }
 
 /// Write only the stop marker, not a terminal record. A stop that cannot yet be
@@ -1414,17 +1525,13 @@ pub fn settle_run(
     outcome: RunOutcome,
     reason: Option<String>,
     grace: std::time::Duration,
+    first_ending: FirstEnding,
 ) -> Result<bool, String> {
     let stop = (outcome == RunOutcome::Stopped).then(|| {
         reason
             .clone()
             .unwrap_or_else(|| "the run was stopped on request".to_owned())
     });
-    let first_ending = if terminal_recorded(run_dir).unwrap_or(true) {
-        FirstEnding::Terminal
-    } else {
-        FirstEnding::Stop
-    };
     settle_run_with_stop(run_dir, pgid, outcome, reason, grace, stop, first_ending)
 }
 
@@ -1447,6 +1554,13 @@ pub fn settle_run_with_stop(
     first_ending: FirstEnding,
 ) -> Result<bool, String> {
     let run_id = run_id_of(run_dir).map_err(categorize_cleanup)?;
+    // The durable fact is the only source. If the caller has not persisted one yet,
+    // write its proposed fact before the reap can signal the group. A later settle
+    // reads the same fact even if the process that proposed it is gone.
+    let first_ending = match recorded_first_ending(run_dir)? {
+        Some(persisted) => persisted,
+        None => ensure_first_ending(run_dir, run_id, first_ending)?,
+    };
     let existing = transcript::terminal_record_checked(run_dir)
         .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
     if stop.is_some() && first_ending == FirstEnding::Terminal && existing.is_some() {
@@ -2416,6 +2530,22 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
     // A permissions failure is a recovery failure, not "no records": it must
     // reach the card and block a replacement run (review-3).
     process_records_readable(run_dir)?;
+    // Pin the first ending before recovery can signal anything or write an ending.
+    // A run whose own terminal record already exists keeps it; otherwise this crash
+    // recovery is the first stop and owns the one stopped outcome.
+    let pinned_run_id = run_id_of(run_dir)?;
+    let proposed = if transcript::terminal_record_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?
+        .is_some()
+    {
+        FirstEnding::Terminal
+    } else {
+        FirstEnding::Stop
+    };
+    // Recovery must still stop a live child when the fact cannot be written. The
+    // fact error is returned at the boundary, keeping the identity handles, so a
+    // later retry can record the ending instead of claiming one now.
+    let pin_error = ensure_first_ending(run_dir, pinned_run_id, proposed).err();
     // A live shell identity names the group even if an old `session.*` pair has
     // been overtaken by pid reuse. `recorded_group` stays the supervisor-first
     // record for the private run-temp path. The inherited anonymous capability
@@ -2453,6 +2583,21 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
                             .to_owned(),
                     );
                 }
+                // The durable first-ending fact decides whether this recovery
+                // replaces a post-stop child ending or leaves a terminal-first
+                // ending alone. write_run_stopped reads that fact.
+                if let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) {
+                    write_run_stopped(
+                        run_dir,
+                        run_id,
+                        0,
+                        "the run's first stop was still in flight when the engine reopened",
+                    )
+                    .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+                }
+                if let Some(error) = pin_error.clone() {
+                    return Err(error);
+                }
                 clear_process_records(run_dir);
                 return Ok(false);
             }
@@ -2478,6 +2623,9 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
                     )
                     .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
                 }
+                if let Some(error) = pin_error.clone() {
+                    return Err(error);
+                }
                 clear_process_records(run_dir);
                 return Ok(false);
             }
@@ -2490,6 +2638,9 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
             return Err(
                 "cleanup unverified: the run started but its process records are lost; cleanup cannot be verified".to_owned(),
             );
+        }
+        if let Some(error) = pin_error.clone() {
+            return Err(error);
         }
         clear_process_records(run_dir);
         return Ok(false);
@@ -2506,7 +2657,20 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
     }
     if !reaped && !unverified_group(pgid)? {
         match transcript::terminal_record_checked(run_dir) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                // Honor the durable fact even when the child wrote an ending
+                // during the first stop's grace: Stop replaces it; Terminal keeps
+                // it and writes no marker.
+                if let Some(run_id) = run_dir.file_name().and_then(std::ffi::OsStr::to_str) {
+                    write_run_stopped(
+                        run_dir,
+                        run_id,
+                        pgid,
+                        "the run's first stop was still in flight when the engine reopened",
+                    )
+                    .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+                }
+            }
             Ok(None) => {
                 // The recorded numbers survived but nothing is alive: the supervisor
                 // died before it could close the run. Give it the ending the reopen
@@ -2527,6 +2691,9 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
                 ));
             }
         }
+    }
+    if let Some(error) = pin_error {
+        return Err(error);
     }
     clear_process_records(run_dir);
     Ok(reaped)
@@ -3093,6 +3260,121 @@ mod stop_record_tests {
         assert!(
             run.join(STOPPED_FILE).is_file(),
             "the cleanup was not recorded"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_persisted_stop_replaces_a_child_ending_on_recovery() {
+        let root = scratch("recovery-persisted-stop");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the child finished during the first stop's grace",
+        );
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("the first ending");
+        write_run_stopped(
+            &run,
+            run_id,
+            4_000_004,
+            "the first stop was still in flight when the engine reopened",
+        )
+        .expect("the recovery stop record");
+        assert!(run.join(STOPPED_FILE).is_file());
+        let records = transcript::read(&run).expect("transcript").records;
+        let terminals: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::RunFinished { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 1, "recovery kept two endings");
+        match terminals[0] {
+            Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "stopped");
+                assert!(reason.contains("still in flight"), "{reason}");
+            }
+            other => panic!("the persisted stop did not own the ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reopen_after_a_persisted_stop_replaces_the_child_ending() {
+        let root = scratch("reopen-persisted-stop");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the child finished during the first stop's grace",
+        );
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("the first ending");
+        let reaped =
+            reap_leftover_run(&run, Duration::from_millis(20)).expect("the reopen settles the run");
+        assert!(!reaped);
+        assert!(run.join(STOPPED_FILE).is_file());
+        let records = transcript::read(&run).expect("transcript").records;
+        let terminals: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::RunFinished { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 1, "the reopen kept two endings");
+        match terminals[0] {
+            Record::RunFinished { outcome, .. } => assert_eq!(outcome, "stopped"),
+            other => panic!("the reopen did not write one stopped ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_persisted_terminal_recovery_keeps_the_ending_and_writes_no_marker() {
+        let root = scratch("recovery-persisted-terminal");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the run finished before the stop",
+        );
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Terminal).expect("the first ending");
+        write_run_stopped(
+            &run,
+            run_id,
+            4_000_005,
+            "a leftover group was cleaned after the ending",
+        )
+        .expect("the recovery cleanup");
+        assert!(
+            !run.join(STOPPED_FILE).is_file(),
+            "a terminal-first recovery wrote a false stop record"
+        );
+        match terminal(&run) {
+            Record::RunFinished { outcome, .. } => assert_eq!(outcome, "succeeded"),
+            other => panic!("the ending changed: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_persisted_first_ending_is_write_once() {
+        let root = scratch("first-ending-write-once");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let run_id = "run-1700000200000-0001";
+        assert_eq!(
+            ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("first"),
+            FirstEnding::Stop
+        );
+        assert_eq!(
+            ensure_first_ending(&run, run_id, FirstEnding::Terminal).expect("second"),
+            FirstEnding::Stop,
+            "a later writer changed the first ending"
+        );
+        assert_eq!(
+            recorded_first_ending(&run).expect("read"),
+            Some(FirstEnding::Stop)
         );
         let _ = fs::remove_dir_all(&root);
     }

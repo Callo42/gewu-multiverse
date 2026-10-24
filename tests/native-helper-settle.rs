@@ -88,6 +88,7 @@ fn normal_settle_closes_a_setsid_helper_before_clearing_records() {
         gewu_multiverse::run::RunOutcome::Stopped,
         None,
         Duration::from_secs(2),
+        gewu_multiverse::run::FirstEnding::Stop,
     );
     let helper_alive = Path::new(&format!("/proc/{helper_pid}")).exists();
     if helper_alive {
