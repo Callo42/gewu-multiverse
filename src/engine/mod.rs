@@ -4050,9 +4050,11 @@ fn session_job(
             guard.agents[index].starting_pid = Some(pid);
         }
     };
-    let started = prepared.guard.start(|run_dir, workspace, _owner_on_spawn| {
-        spawner.spawn_with(run_dir, workspace, &mut on_spawn)
-    });
+    let started = prepared
+        .guard
+        .start(&mut on_spawn, |run_dir, workspace, owner_on_spawn| {
+            spawner.spawn_with(run_dir, workspace, owner_on_spawn)
+        });
     let now = clock.now();
     let mut guard = lock_inner(&inner);
     let Some(index) = guard.agent_index(&request.agent) else {

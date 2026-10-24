@@ -3984,7 +3984,7 @@ mod stop_record_tests {
         let guard =
             ending::Owner::prepare(&run, "run-1700000200000-0001", &root).expect("prepare the run");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = guard.start(|_, _, _| panic!("fixture spawn panic"));
+            let _ = guard.start(&mut |_| {}, |_, _, _| panic!("fixture spawn panic"));
         }));
         assert!(result.is_err(), "the fixture did not panic");
         assert!(
@@ -3996,6 +3996,45 @@ mod stop_record_tests {
             terminal,
             Record::RunFinished { ref outcome, .. } if outcome == "stopped"
         ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_panicking_spawn_after_a_child_is_reported_stops_the_child() {
+        let root = scratch("panicking-spawn-with-child");
+        let run = root.join("run-1700000200000-0001");
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("fixture child");
+        let pid = child.id();
+        drop(child);
+        let guard =
+            ending::Owner::prepare(&run, "run-1700000200000-0001", &root).expect("prepare the run");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = guard.start(&mut |_| {}, |_, _, on_pid| {
+                on_pid(pid);
+                panic!("fixture spawn panic after the child");
+            });
+        }));
+        assert!(result.is_err(), "the fixture did not panic");
+        assert!(!process_alive(pid), "the reported child survived the panic");
+        let terminal = transcript::terminal_record(&run).expect("no terminal after the panic");
+        let reason = match terminal {
+            Record::RunFinished {
+                outcome, reason, ..
+            } => {
+                assert_eq!(outcome, "stopped");
+                reason.unwrap_or_default()
+            }
+            _ => panic!("not a terminal"),
+        };
+        assert!(!reason.contains("no child was started"), "{reason}");
+        assert!(run.join(STOPPED_FILE).is_file());
         let _ = fs::remove_dir_all(&root);
     }
 

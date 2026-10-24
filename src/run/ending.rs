@@ -34,6 +34,7 @@ pub struct PreparedRun {
     run_id: String,
     workspace: PathBuf,
     armed: bool,
+    pid: Option<u32>,
 }
 
 impl Owner {
@@ -45,6 +46,7 @@ impl Owner {
             run_id: run_id.to_owned(),
             workspace: workspace.to_path_buf(),
             armed: true,
+            pid: None,
         })
     }
 }
@@ -57,18 +59,24 @@ impl PreparedRun {
 
     /// Start the child. On a spawn error the owner records the failed ending before
     /// returning the error; the guard is consumed either way.
-    pub fn start<F>(mut self, spawn: F) -> Result<StartedRun, String>
+    pub fn start<F>(mut self, observer: &mut dyn FnMut(u32), spawn: F) -> Result<StartedRun, String>
     where
         F: FnOnce(&Path, &Path, &mut dyn FnMut(u32)) -> Result<Box<dyn RunningSession>, String>,
     {
-        let mut spawned = |pid: u32| {
-            // The engine records the pid in its own callback; this owner call is a
-            // no-op, kept so the closure shape is explicit.
-            let _ = pid;
+        // Keep `armed` true through the fallible call. The callback records the pid in
+        // the guard before forwarding it, so a panic after the child exists reaches
+        // Drop with a known pid and settles it rather than claiming no child.
+        let spawned = {
+            let run_dir = &self.run_dir;
+            let workspace = &self.workspace;
+            let recorded_pid = &mut self.pid;
+            let mut on_child = |pid: u32| {
+                *recorded_pid = Some(pid);
+                observer(pid);
+            };
+            spawn(run_dir, workspace, &mut on_child)
         };
-        // Keep `armed` true through the fallible call. A panic unwinds through Drop,
-        // which records the prepared-run ending. Only the two normal results clear it.
-        match spawn(&self.run_dir, &self.workspace, &mut spawned) {
+        match spawned {
             Ok(inner) => {
                 self.armed = false;
                 Ok(StartedRun {
@@ -94,14 +102,94 @@ impl PreparedRun {
 
 impl Drop for PreparedRun {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = request_cancel_prepared(
-                &self.run_dir,
-                &self.run_id,
-                "the prepared run was dropped before it was spawned",
-            );
+        if !self.armed {
+            return;
+        }
+        match self.pid {
+            None => {
+                let _ = request_cancel_prepared(
+                    &self.run_dir,
+                    &self.run_id,
+                    "the prepared run was dropped before it was spawned",
+                );
+            }
+            Some(pid) => settle_dropped_child(&self.run_dir, &self.run_id, pid),
         }
     }
+}
+
+/// The start panicked after a child was reported. Stop its group, reap it with a
+/// bounded wait, and record stopped when exit is confirmed; otherwise leave explicit
+/// uncertainty. It must never claim that no child was started.
+fn settle_dropped_child(run_dir: &Path, run_id: &str, pid: u32) {
+    let _ = super::adapter_signal_run_group(pid, true);
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        match nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(pid as i32),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+        ) {
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                if std::time::Instant::now() >= deadline {
+                    record_child_uncertainty(
+                        run_dir,
+                        run_id,
+                        pid,
+                        "the started child did not confirm exit after its start panicked",
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(_) => {
+                record_child_stopped(
+                    run_dir,
+                    run_id,
+                    pid,
+                    "the run's start panicked after its child was created; the child was stopped",
+                );
+                return;
+            }
+            Err(nix::errno::Errno::ECHILD) => {
+                if super::process_alive(pid) {
+                    record_child_uncertainty(
+                        run_dir,
+                        run_id,
+                        pid,
+                        "the started child is not this process's child and is still alive",
+                    );
+                } else {
+                    record_child_stopped(
+                        run_dir,
+                        run_id,
+                        pid,
+                        "the run's start panicked after its child was created; the child is gone",
+                    );
+                }
+                return;
+            }
+            Err(_) => {
+                record_child_uncertainty(
+                    run_dir,
+                    run_id,
+                    pid,
+                    "the started child's exit could not be verified",
+                );
+                return;
+            }
+        }
+    }
+}
+
+fn record_child_stopped(run_dir: &Path, run_id: &str, pid: u32, reason: &str) {
+    let _ = super::pin_first_ending(run_dir, run_id, FirstEnding::Stop);
+    let _ = super::write_stop_marker(run_dir, run_id, pid, reason);
+    let _ = super::write_terminal_replacing(run_dir, run_id, RunOutcome::Stopped, reason, &seal());
+}
+
+fn record_child_uncertainty(run_dir: &Path, run_id: &str, pid: u32, reason: &str) {
+    let _ = super::write_stop_marker(run_dir, run_id, pid, reason);
+    let _ = super::record_ending_uncertainty(run_dir, run_id, reason);
 }
 
 /// A started child, owned by the owner. The handle and signal primitive are private.
