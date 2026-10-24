@@ -5,6 +5,7 @@
 mod support;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -351,6 +352,53 @@ fn a_hard_kill_after_the_old_root_rename_is_recovered_before_use() {
 }
 
 #[test]
+fn a_staged_not_ready_old_restores_and_settles_by_identity() {
+    let sandbox = Sandbox::new("staged-old-not-ready");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    fs::set_permissions(
+        root.join("pi/pi"),
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("the old entrypoint mode");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename-before-journal");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"staged\""))
+                .unwrap_or(false)
+                && !root.exists()
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the pre-journal pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(notes.is_empty(), "staged old-not-ready: {notes:?}");
+    assert!(!journal.exists());
+    let mode = fs::metadata(root.join("pi/pi"))
+        .expect("the restored entrypoint")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0);
+}
+
+#[test]
 fn a_staged_foreign_root_keeps_the_journal_and_old_backup() {
     let sandbox = Sandbox::new("staged-foreign");
     let root = sandbox.install_root("pi", "1.4.0");
@@ -419,6 +467,69 @@ fn a_staged_foreign_root_keeps_the_journal_and_old_backup() {
         old_binary
     );
     assert!(!journal.exists());
+}
+
+#[test]
+fn an_old_not_ready_restored_root_settles_and_a_retry_succeeds() {
+    let sandbox = Sandbox::new("old-not-ready");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    fs::set_permissions(
+        root.join("pi/pi"),
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("the old entrypoint mode");
+    assert!(harness::installed(&sandbox.data_root(), Program::Pi).is_none());
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"old-moved\""))
+                .unwrap_or(false)
+                && !root.exists()
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the old-moved pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(notes.is_empty(), "first recovery: {notes:?}");
+    assert!(!journal.exists(), "the old restoration journal was kept");
+    assert!(root.join("pi/pi").is_file());
+    let mode = fs::metadata(root.join("pi/pi"))
+        .expect("the restored entrypoint")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0, "the test old root became executable");
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(notes.is_empty(), "second recovery: {notes:?}");
+
+    let retry_archive = pi_archive(&sandbox.root);
+    let retry_digest = sha256_hex(&retry_archive);
+    let retry_server = support::Server::body(retry_archive, 64 * 1024, Duration::ZERO);
+    let retry = run(&sandbox, "pi", &retry_server, &retry_digest);
+    assert!(
+        retry.status.success(),
+        "the normal retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(harness::installed(&sandbox.data_root(), Program::Pi).is_some());
 }
 
 #[test]
@@ -595,6 +706,125 @@ fn a_published_foreign_root_without_a_backup_keeps_the_journal() {
     );
     assert!(journal.exists(), "the recovery journal was removed");
     assert!(harness.join("foreign-backup/pi/pi").is_file());
+}
+
+#[test]
+fn a_published_old_not_ready_root_settles_without_calling_it_ready() {
+    let sandbox = Sandbox::new("published-old-not-ready");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    fs::set_permissions(
+        root.join("pi/pi"),
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("the old entrypoint mode");
+    assert!(harness::installed(&sandbox.data_root(), Program::Pi).is_none());
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-publish");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"published\""))
+                .unwrap_or(false)
+                && root.join("install.json").is_file()
+                && fs::read_dir(&harness)
+                    .expect("the harness directory")
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the after-publish pause");
+    child.kill().expect("SIGKILL");
+    let status = child.wait().expect("the installer is reaped");
+    assert_eq!(status.signal(), Some(9));
+    let old = fs::read_dir(&harness)
+        .expect("the harness directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".old-"))
+        })
+        .expect("the old backup");
+    // Simulate a rollback that already restored the false-ready old root while the
+    // journal still says published: the new root moves aside, the old tree returns.
+    fs::rename(&root, harness.join("review-new-root")).expect("the test moves the new root");
+    fs::rename(&old, &root).expect("the test restores the old tree");
+    let notes = harness::recover_pending(&sandbox.data_root());
+    assert!(
+        notes.is_empty(),
+        "published old-not-ready recovery: {notes:?}"
+    );
+    assert!(!journal.exists(), "the published journal was kept");
+    assert!(harness::installed(&sandbox.data_root(), Program::Pi).is_none());
+    let mode = fs::metadata(root.join("pi/pi"))
+        .expect("the restored entrypoint")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0);
+}
+
+#[test]
+fn cancelling_after_a_not_ready_old_rename_restores_it() {
+    let sandbox = Sandbox::new("cancel-old-not-ready");
+    let root = sandbox.install_root("pi", "1.4.0");
+    pi_old_install(&root, "1.3.9");
+    fs::set_permissions(
+        root.join("pi/pi"),
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("the old entrypoint mode");
+    let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
+    let archive = pi_archive(&sandbox.root);
+    let digest = sha256_hex(&archive);
+    let server = support::Server::body(archive, 64 * 1024, Duration::ZERO);
+    let mut command = sandbox.product();
+    server.set_on(&mut command, &digest);
+    command.env("GEWU_INSTALL_TEST_PAUSE", "after-old-rename");
+    let mut child = command
+        .args(["--install-harness", "pi"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the installer starts");
+    let harness = sandbox.harness_dir("pi");
+    let journal = harness.join(".install-journal");
+    let ready = wait_until(
+        || {
+            fs::read_to_string(&journal)
+                .map(|text| text.contains("\"old-moved\""))
+                .unwrap_or(false)
+                && !root.exists()
+        },
+        Duration::from_secs(15),
+    );
+    assert!(ready, "the installer reached the old-moved pause");
+    signal(&child, "INT");
+    let status = child.wait().expect("the installer ends");
+    assert_eq!(status.code(), Some(130), "{status:?}");
+    assert!(!journal.exists());
+    assert_eq!(
+        fs::read(root.join("pi/pi")).expect("the restored old binary"),
+        old_binary
+    );
+    let mode = fs::metadata(root.join("pi/pi"))
+        .expect("the restored entrypoint")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0);
 }
 
 #[test]

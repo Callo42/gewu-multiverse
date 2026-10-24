@@ -55,8 +55,10 @@ and the owned backup is cleaned. If a cancel/rename failure cannot verify that t
 root is restored, the error names the uncertainty and the journal plus owned backup
 are kept; recovery also keeps the journal when the version root is foreign,
 ambiguous or the backup is missing, and settles only a verified old restore or an
-owned readable new publication. Removing a foreign destination is always the
-person's action, never the installer's. A stage left by the earlier pre-journal installer
+owned readable new publication. A verified old restore means its recorded identity is
+back, not that a previously incomplete old install is healthy; a later install can
+replace it. Removing a foreign destination is always the person's action, never the
+installer's. A stage left by the earlier pre-journal installer
 is recognised only by its exact name and package-file contents; a lone complete
 legacy backup is restored when the version root is missing. Foreign stages,
 backups, symlinked journals and unrecognised locks are preserved.

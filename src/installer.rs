@@ -1262,11 +1262,11 @@ fn rollback(
         let _ = sync_dir(directory);
         return Err(problems.join("; "));
     }
-    if journal.had_old && (harness::read_installed_at_root(root, program).is_none()) {
-        return Err(
-            "the previous version is present at its root but does not read back as ready; the journal was kept"
-                .to_owned(),
-        );
+    if journal.had_old && !prior_root_matches(root, journal.prior_record_sha256.as_deref()) {
+        return Err(format!(
+            "the previous {} version is present at its root but its recorded identity was not verified; the journal was kept",
+            program.label()
+        ));
     }
     let _ = fs::remove_file(journal_path);
     let _ = sync_dir(directory);
@@ -1310,9 +1310,11 @@ fn prior_root_matches(root: &Path, prior_record_sha256: Option<&str>) -> bool {
     plain_dir(root) && sha256_file(&root.join("install.json")).ok().as_deref() == Some(expected)
 }
 
-fn prior_root_settled(root: &Path, program: Program, prior_record_sha256: Option<&str>) -> bool {
+fn prior_root_settled(root: &Path, prior_record_sha256: Option<&str>) -> bool {
+    // Identity verification, not health: a carried old tree may have a
+    // non-executable entrypoint or missing helper and is still the old install.
+    // The NEW published root keeps its separate readiness check.
     prior_root_matches(root, prior_record_sha256)
-        && harness::read_installed_at_root(root, program).is_some()
 }
 
 fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(), String> {
@@ -1372,13 +1374,9 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                             )
                         })?;
                         sync_dir(directory)?;
-                        if !prior_root_settled(
-                            root,
-                            program,
-                            journal.prior_record_sha256.as_deref(),
-                        ) {
+                        if !prior_root_settled(root, journal.prior_record_sha256.as_deref()) {
                             return Err(
-                                "the previous install was put back but does not read back as its recorded version; the journal was kept"
+                                "the previous install was put back but its recorded identity could not be verified; the journal was kept"
                                     .to_owned(),
                             );
                         }
@@ -1462,13 +1460,9 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                             )
                         })?;
                         sync_dir(directory)?;
-                        if !prior_root_settled(
-                            root,
-                            program,
-                            journal.prior_record_sha256.as_deref(),
-                        ) {
+                        if !prior_root_settled(root, journal.prior_record_sha256.as_deref()) {
                             return Err(
-                                "the previous install was put back but does not read back as its recorded version; the journal was kept"
+                                "the previous install was put back but its recorded identity could not be verified; the journal was kept"
                                     .to_owned(),
                             );
                         }
@@ -1511,8 +1505,7 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                             .map(|path| path.display().to_string())
                             .unwrap_or_default()
                     ));
-                } else if prior_root_settled(root, program, journal.prior_record_sha256.as_deref())
-                {
+                } else if prior_root_settled(root, journal.prior_record_sha256.as_deref()) {
                     // Rollback already put the verified old tree back at the root.
                     if stage.exists() {
                         remove_owned_stage(&stage, program, &journal.token)?;
@@ -1550,11 +1543,7 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                                 .map(|path| path.display().to_string())
                                 .unwrap_or_default()
                         ));
-                    } else if prior_root_settled(
-                        root,
-                        program,
-                        journal.prior_record_sha256.as_deref(),
-                    ) {
+                    } else if prior_root_settled(root, journal.prior_record_sha256.as_deref()) {
                         // A rollback restored the old tree after publication.
                     } else {
                         return Err(
@@ -1577,9 +1566,9 @@ fn recover_locked(directory: &Path, root: &Path, program: Program) -> Result<(),
                         )
                     })?;
                     sync_dir(directory)?;
-                    if !prior_root_settled(root, program, journal.prior_record_sha256.as_deref()) {
+                    if !prior_root_settled(root, journal.prior_record_sha256.as_deref()) {
                         return Err(
-                            "the previous install was put back but does not read back as its recorded version; the journal was kept"
+                            "the previous install was put back but its recorded identity could not be verified; the journal was kept"
                                 .to_owned(),
                         );
                     }
