@@ -402,6 +402,36 @@ struct NativeState {
     checked_empty: bool,
 }
 
+fn codex_tool_approvals() -> String {
+    let mut text = String::new();
+    for tool in crate::forgejo_tools::TOOL_NAMES {
+        text.push_str(&format!(
+            "\n[mcp_servers.gewu_forgejo.tools.{tool}]\napproval_mode = \"approve\"\n"
+        ));
+    }
+    text
+}
+
+fn non_success_reason(state: &NativeState) -> String {
+    if let Some(refused) = state.refused_write.as_ref() {
+        return refused.clone();
+    }
+    if let Some(failed) = state.failed_call.as_ref() {
+        return failed.clone();
+    }
+    if state.uncertain_write {
+        return "the Forgejo write request was accepted but its result could not be read; the effect is uncertain".to_owned();
+    }
+    "the native program finished without verified success; no matching tool or work fact was recorded".to_owned()
+}
+
+fn run_reason(ending: RunEnding, summary: &str, state: &NativeState) -> Option<String> {
+    match ending {
+        RunEnding::Succeeded => (!summary.trim().is_empty()).then(|| summary.to_owned()),
+        _ => Some(non_success_reason(state)),
+    }
+}
+
 /// Run one native program. The caller has already read the instruction, key, skills
 /// and declared steps; this function owns the program and its records.
 #[allow(clippy::too_many_arguments)]
@@ -783,20 +813,13 @@ pub(super) fn run(
     if state.uncertain_write {
         return RunEnd {
             exit_code: 0,
-            reason: Some(summary),
+            reason: Some(non_success_reason(&state)),
             ending: RunEnding::Warned,
         };
     }
     let requested = requested_work(&instruction, &plan.steps);
     let ending = decide_native_ending(base, requested, &state);
-    let reason = if summary.trim().is_empty() && matches!(ending, RunEnding::Warned) {
-        Some(
-            "the native program finished without a tool result; the result is not verified"
-                .to_owned(),
-        )
-    } else {
-        (!summary.trim().is_empty()).then_some(summary.clone())
-    };
+    let reason = run_reason(ending, &summary, &state);
     RunEnd {
         exit_code: 0,
         reason,
@@ -1192,6 +1215,7 @@ fn build_launch(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
+                config.push_str(&codex_tool_approvals());
             }
             crate::mode::write_private(dir.join("config.toml"), config.as_bytes())
                 .map_err(|error| format!("the Codex configuration cannot be written: {error}"))?;
@@ -2312,6 +2336,57 @@ mod native_proof_tests {
         assert_eq!(
             requested_work("Review and change the form.", &[]),
             RequestedWork::GenericWrite
+        );
+    }
+    #[test]
+    fn a1_codex_config_approves_exactly_the_six_product_tools() {
+        let text = codex_tool_approvals();
+        assert_eq!(
+            text.matches("[mcp_servers.gewu_forgejo.tools.").count(),
+            crate::forgejo_tools::TOOL_NAMES.len()
+        );
+        assert_eq!(text.matches("approval_mode = \"approve\"").count(), 6);
+        for tool in crate::forgejo_tools::TOOL_NAMES {
+            assert!(text.contains(&format!(".tools.{tool}]")), "missing {tool}");
+        }
+        for forbidden in [
+            "default_tools_approval_mode",
+            "approval_policy",
+            "enabled_tools",
+            "mcp_servers.gewu_forgejo.tools.default",
+        ] {
+            assert!(!text.contains(forbidden), "unexpected {forbidden}");
+        }
+    }
+
+    #[test]
+    fn a2_non_success_reason_never_repeats_success_prose() {
+        let prose = "I read the issue, pushed, opened the pull request, and commented.";
+        let refused = NativeState {
+            refused_write: Some(
+                "MCP tool call requires approval, but approval policy is never".to_owned(),
+            ),
+            ..NativeState::default()
+        };
+        assert_eq!(
+            run_reason(RunEnding::Refused, prose, &refused).as_deref(),
+            Some("MCP tool call requires approval, but approval policy is never")
+        );
+        let uncertain = NativeState {
+            uncertain_write: true,
+            ..NativeState::default()
+        };
+        let reason = run_reason(RunEnding::Warned, prose, &uncertain).expect("reason");
+        assert!(!reason.contains("I read the issue"));
+        assert!(reason.contains("uncertain"));
+        assert_eq!(
+            run_reason(RunEnding::Succeeded, prose, &refused).as_deref(),
+            Some(prose)
+        );
+        assert!(
+            !run_reason(RunEnding::NoWork, prose, &NativeState::default())
+                .expect("reason")
+                .contains("I read the issue")
         );
     }
 }
