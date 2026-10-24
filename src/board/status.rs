@@ -871,6 +871,18 @@ mod tests {
             no_assigned_work: false,
             last_work_result: None,
             last_result_is_work: false,
+            program: "builtin".to_owned(),
+            program_label: "built-in engine".to_owned(),
+            program_installed: true,
+            program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            protocol: "chat-completions".to_owned(),
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            model: "lab-chat-1".to_owned(),
+            key_present: true,
+            program_error: None,
+            active_program: None,
+            next_program: None,
+            codex_sandbox: None,
         }
     }
 

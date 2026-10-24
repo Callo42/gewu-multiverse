@@ -494,6 +494,18 @@ impl EngineApi for FakeEngine {
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
                 last_result_is_work: agent.last_result_is_work,
+                program: "builtin".to_owned(),
+                program_label: "built-in engine".to_owned(),
+                program_installed: true,
+                program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                protocol: "chat-completions".to_owned(),
+                base_url: self.endpoint_url.clone(),
+                model: self.endpoint_model.clone(),
+                key_present: self.endpoint_key_present,
+                program_error: None,
+                active_program: None,
+                next_program: None,
+                codex_sandbox: None,
             })
             .collect();
         BoardView {
@@ -527,10 +539,13 @@ impl EngineApi for FakeEngine {
                 admin_login_kept: false,
             },
             agents,
+            programs: Vec::new(),
             endpoint: EndpointView {
                 configured: !self.endpoint_url.trim().is_empty()
                     && !self.endpoint_model.trim().is_empty(),
                 url: self.endpoint_url.clone(),
+                base_url: self.endpoint_url.clone(),
+                protocol: "chat-completions".to_owned(),
                 model: self.endpoint_model.clone(),
                 key_present: self.endpoint_key_present,
                 test: self.test.clone(),
@@ -559,6 +574,38 @@ impl EngineApi for FakeEngine {
                 }
                 self.test = EndpointTest::NotRun;
                 self.test_pending = false;
+            }
+            Command::SetConnection {
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let _ = protocol;
+                self.endpoint_url = base_url;
+                self.endpoint_model = model;
+                if let Some(key) = key {
+                    if !key.is_empty() {
+                        self.endpoint_key_present = true;
+                    }
+                }
+                self.test = EndpointTest::NotRun;
+                self.test_pending = false;
+            }
+            Command::SetAgentProgram { name, program, .. } => {
+                self.notice = Some(format!("{name} now runs with {program}"));
+            }
+            Command::SetAgentModel { name, .. } => {
+                self.notice = Some(format!("{name}'s connection is saved"));
+            }
+            Command::SetAgentCodexSandbox { name, mode } => {
+                self.notice = Some(format!("{name}'s Codex sandbox is {mode}"));
+            }
+            Command::InstallProgram { id } => {
+                self.notice = Some(format!("installing {id}"));
+            }
+            Command::TestAgentModel { name } => {
+                self.notice = Some(format!("{name}'s model was not tested"));
             }
             Command::TestEndpoint => {
                 self.test = EndpointTest::Running;

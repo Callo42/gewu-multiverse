@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::engine_api::Desired;
+use crate::harness::{Program, Protocol};
 use crate::mode::SECRET_FILE_MODE;
 use crate::naming::is_safe_agent_name;
 
@@ -53,19 +54,31 @@ pub struct Settings {
     /// it starts at the highest number its names and directories show.
     #[serde(default)]
     pub next_agent: usize,
+    /// The program new agents get when the installation is fresh. `None` on an
+    /// existing file means the built-in engine; a missing file is a fresh install
+    /// and is loaded as `Some("pi")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_harness: Option<String>,
 }
 
 /// The shared endpoint. It holds no key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointSettings {
-    /// The completions URL as written.
+    /// The completions URL as written (the legacy full address).
     #[serde(default)]
     pub url: String,
+    /// The API base URL for a new-style connection, without `/chat/completions`.
+    #[serde(default)]
+    pub base_url: String,
+    /// The connection protocol: `chat-completions`, `responses` or
+    /// `anthropic-messages`.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
     /// The model id.
     #[serde(default)]
     pub model: String,
-    /// How many model turns one session may take.
+    /// How many model turns one session may take (built-in only).
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
 }
@@ -78,6 +91,8 @@ impl Default for EndpointSettings {
     fn default() -> Self {
         Self {
             url: String::new(),
+            base_url: String::new(),
+            protocol: default_protocol(),
             model: String::new(),
             max_turns: DEFAULT_MAX_TURNS,
         }
@@ -85,9 +100,37 @@ impl Default for EndpointSettings {
 }
 
 impl EndpointSettings {
-    /// Whether a URL and a model are both set.
+    /// Whether an address and a model are both set.
     pub fn configured(&self) -> bool {
-        !self.url.trim().is_empty() && !self.model.trim().is_empty()
+        (!self.url.trim().is_empty() || !self.base_url.trim().is_empty())
+            && !self.model.trim().is_empty()
+    }
+
+    /// The connection protocol, defaulting to Chat Completions for a legacy file.
+    pub fn protocol(&self) -> Protocol {
+        Protocol::parse(&self.protocol).unwrap_or(Protocol::ChatCompletions)
+    }
+
+    /// The API base URL. A legacy full `/chat/completions` address is accepted
+    /// without rewriting the file.
+    pub fn base_url(&self) -> String {
+        let base = self.base_url.trim();
+        if !base.is_empty() {
+            return base.trim_end_matches('/').to_owned();
+        }
+        let url = self.url.trim().trim_end_matches('/');
+        url.strip_suffix("/chat/completions")
+            .unwrap_or(url)
+            .to_owned()
+    }
+
+    /// The full Chat Completions address the built-in engine posts to.
+    pub fn chat_url(&self) -> String {
+        let url = self.url.trim();
+        if !url.is_empty() {
+            return url.to_owned();
+        }
+        format!("{}/chat/completions", self.base_url())
     }
 
     /// The turn bound actually used: a zero in a hand-written file is not a bound.
@@ -119,6 +162,48 @@ pub struct AgentSettings {
     /// `started` or `stopped`.
     #[serde(default = "default_desired")]
     pub desired: String,
+    /// The native program id. Empty/absent is the built-in engine (legacy).
+    #[serde(default)]
+    pub harness: String,
+    /// This agent's explicit connection, written at creation for a native program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<AgentProvider>,
+    /// The Codex sandbox choice: empty/`native` is normal; `full-access` is the
+    /// explicit compatibility opt-in that runs Codex without its own sandbox inside the
+    /// product's enforced Landlock.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codex_sandbox: String,
+}
+
+/// One agent's explicit provider connection. It holds no key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProvider {
+    /// API base URL, without `/chat/completions`.
+    #[serde(default)]
+    pub base_url: String,
+    /// `chat-completions`, `responses` or `anthropic-messages`.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    /// The model id.
+    #[serde(default)]
+    pub model: String,
+}
+
+impl AgentProvider {
+    /// The protocol with the legacy default.
+    pub fn protocol(&self) -> Protocol {
+        Protocol::parse(&self.protocol).unwrap_or(Protocol::ChatCompletions)
+    }
+
+    /// Whether an address and model are both present.
+    pub fn configured(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+    }
+}
+
+fn default_protocol() -> String {
+    "chat-completions".to_owned()
 }
 
 fn default_desired() -> String {
@@ -126,6 +211,25 @@ fn default_desired() -> String {
 }
 
 impl AgentSettings {
+    /// The selected program, with an empty/unknown saved value read as built-in.
+    pub fn harness(&self) -> Program {
+        Program::parse(&self.harness).unwrap_or(Program::Builtin)
+    }
+
+    /// Set the selected program; built-in is written as the empty legacy value.
+    pub fn set_harness(&mut self, program: Program) {
+        self.harness = if program == Program::Builtin {
+            String::new()
+        } else {
+            program.id().to_owned()
+        };
+    }
+
+    /// The explicit provider for a native agent, if one was written.
+    pub fn provider(&self) -> Option<&AgentProvider> {
+        self.provider.as_ref()
+    }
+
     /// The saved choice, read back as the contract's word.
     pub fn desired(&self) -> Desired {
         if self.desired == "started" {
@@ -152,7 +256,10 @@ impl Settings {
             Ok(text) => toml::from_str(&text)
                 .map_err(|error| format!("{} is not valid: {error}", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+                return Ok(Self {
+                    default_harness: Some(Program::Pi.id().to_owned()),
+                    ..Self::default()
+                });
             }
             Err(error) => return Err(format!("{} cannot be read: {error}", path.display())),
         };
@@ -204,6 +311,9 @@ impl Settings {
         let mut agent = AgentSettings {
             name: name.to_owned(),
             desired: String::new(),
+            harness: String::new(),
+            provider: None,
+            codex_sandbox: String::new(),
         };
         agent.set_desired(desired);
         self.agents.push(agent);
@@ -295,6 +405,7 @@ mod tests {
         let settings = Settings::load(&path_in(&root)).expect("a missing file is not an error");
         assert!(settings.agents.is_empty());
         assert!(!settings.terms_acknowledged);
+        assert_eq!(settings.default_harness.as_deref(), Some("pi"));
     }
 
     #[test]
@@ -320,6 +431,52 @@ mod tests {
             Desired::Stopped
         );
         assert_eq!(read.next_free_name(), "agent-3");
+    }
+
+    #[test]
+    fn an_existing_file_without_a_default_keeps_the_builtin_engine() {
+        let root = crate::test_support::scratch_root("settings-legacy");
+        let path = path_in(&root);
+        let settings = Settings::default();
+        settings.save(&path).expect("saved");
+        let read = Settings::load(&path).expect("read");
+        assert!(read.default_harness.is_none());
+        assert!(read.agents.is_empty());
+        let mut upgraded = read;
+        upgraded
+            .add_agent("scribe", Desired::Stopped)
+            .expect("agent");
+        assert_eq!(
+            upgraded.agent("scribe").expect("present").harness(),
+            Program::Builtin
+        );
+    }
+
+    #[test]
+    fn a_saved_agent_program_and_compatible_connection_round_trip() {
+        let root = crate::test_support::scratch_root("settings-program");
+        let path = path_in(&root);
+        let mut settings = Settings::default();
+        settings
+            .add_agent("agent-1", Desired::Stopped)
+            .expect("the agent");
+        let agent = settings.agent_mut("agent-1").expect("present");
+        agent.set_harness(Program::Codex);
+        agent.provider = Some(AgentProvider {
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            protocol: "responses".to_owned(),
+            model: "synthetic-model".to_owned(),
+        });
+        agent.codex_sandbox = "full-access".to_owned();
+        settings.save(&path).expect("saved");
+        let read = Settings::load(&path).expect("read");
+        let agent = read.agent("agent-1").expect("present");
+        assert_eq!(agent.harness(), Program::Codex);
+        assert_eq!(
+            agent.provider().expect("provider").protocol(),
+            Protocol::Responses
+        );
+        assert_eq!(agent.codex_sandbox, "full-access");
     }
 
     #[test]

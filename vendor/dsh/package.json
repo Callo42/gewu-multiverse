@@ -1,0 +1,8 @@
+{
+  "name": "dsh-install",
+  "private": true,
+  "description": "The locked official DeepSeek Harness package used by gewu-multiverse.",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.2"
+  }
+}

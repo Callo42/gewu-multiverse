@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn a_pager_hand_off_writes_no_history_into_the_users_home() {
         // H-6: `less` wrote `~/.lesshst` when `o`/`T` handed it the log or transcript.
-        let scratch = Path::new("/tmp/fxr12-scratch");
+        let scratch = Path::new("/tmp/editor-scratch");
         let (_, env) = handoff_plan("less -R", Handoff::View, scratch);
         let env: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(env["LESSHISTFILE"], "/dev/null");
@@ -376,11 +376,11 @@ mod tests {
         // F7: `~/.lesshst` was gone after H-6 but `~/.local/share/nano` remained,
         // because `-N` is `--noconvert`, not "no history". Each program the product
         // itself picks now has a state location of its own.
-        let scratch = Path::new("/tmp/fxr12-scratch");
+        let scratch = Path::new("/tmp/editor-scratch");
         let (nano, env) = handoff_plan("nano", Handoff::Edit, scratch);
         assert_eq!(nano, "nano");
         let env: std::collections::HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(env["XDG_DATA_HOME"], "/tmp/fxr12-scratch");
+        assert_eq!(env["XDG_DATA_HOME"], "/tmp/editor-scratch");
         for vi in ["vi", "vim", "nvim", "/usr/bin/vim"] {
             let (program, _) = handoff_plan(vi, Handoff::Edit, scratch);
             assert!(program.ends_with(" -i NONE"), "{program}");

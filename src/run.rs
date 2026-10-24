@@ -170,6 +170,57 @@ impl RunPlan {
     }
 }
 
+/// The native program's immutable run facts, written before the run starts.
+pub const NATIVE_PLAN_FILE: &str = "native.json";
+
+/// The native child's positive process identity, written as soon as it exists.
+pub const NATIVE_IDENTITY_FILE: &str = "native.identity";
+
+/// The non-secret facts of one native run. The program, version, connection,
+/// model and explicit Codex sandbox are frozen here; a later settings save cannot
+/// change what an active or finished run did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePlan {
+    /// The program id (`pi`, `codex`, `dsh`, `opencode`).
+    pub harness: String,
+    /// The actual program version.
+    pub version: String,
+    /// The executable.
+    pub program: PathBuf,
+    /// The program's product-owned install root (read/exec handled separately).
+    pub install_root: PathBuf,
+    /// `chat-completions`, `responses` or `anthropic-messages`.
+    pub protocol: String,
+    /// API base URL.
+    pub base_url: String,
+    /// Model id.
+    pub model: String,
+    /// `native` for the program's own sandbox, `full-access` for the explicit
+    /// Codex compatibility choice inside the product Landlock.
+    #[serde(default)]
+    pub codex_sandbox: String,
+}
+
+impl NativePlan {
+    /// Write the plan at 0600.
+    pub fn write(&self, run_dir: &Path) -> io::Result<()> {
+        let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        crate::mode::write_private(run_dir.join(NATIVE_PLAN_FILE), text.as_bytes())
+    }
+
+    /// Read the plan, or `None` for a built-in run.
+    pub fn read(run_dir: &Path) -> io::Result<Option<Self>> {
+        match fs::read_to_string(run_dir.join(NATIVE_PLAN_FILE)) {
+            Ok(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(io::Error::other),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// The plan file's name.
 pub const PLAN_FILE: &str = "plan.json";
 
@@ -1248,7 +1299,11 @@ pub fn settle_run(
     reason: Option<String>,
     grace: std::time::Duration,
 ) -> Result<bool, String> {
-    let reaped = reap_process_group(pgid, run_dir, grace).map_err(categorize_cleanup)?;
+    let mut reaped = reap_process_group(pgid, run_dir, grace).map_err(categorize_cleanup)?;
+    // A native helper may have called setsid and therefore not be in the leader's
+    // group. Its inherited capability is the ownership proof; enumerate and close
+    // every such group before the identities are removed.
+    reaped |= reap_capability_groups(run_dir, grace).map_err(categorize_cleanup)?;
     ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
     // `reap_process_group` only returns Ok when no unverified member survives, and
     // it writes its own run_stopped ending when it had to signal a group.
@@ -1398,6 +1453,54 @@ pub fn write_shell_record(run_dir: &Path, pid: u32, _pgid: u32) -> io::Result<()
         run_dir.join(SHELL_PGID_FILE),
         live_group.to_string().as_bytes(),
     )
+}
+
+/// Record a native child's positive identity as soon as the child exists.
+///
+/// The native CLI is not the product's shell and may close inherited descriptors,
+/// so its boot/start identity is the durable handle a later open uses after the
+/// product run process is gone. The record is written by the run process before any
+/// native output is consumed.
+pub fn write_native_identity(run_dir: &Path, pid: u32) -> io::Result<()> {
+    let (group, identity) = process_identity(pid)?
+        .ok_or_else(|| io::Error::other("the native program's live identity cannot be read"))?;
+    let line = format!("{pid} {group} {} {}\n", identity.boot, identity.start);
+    crate::mode::write_private(run_dir.join(NATIVE_IDENTITY_FILE), line.as_bytes())
+}
+
+#[derive(Debug, Clone)]
+struct NativeRecord {
+    pid: u32,
+    pgid: u32,
+    identity: ProcessIdentity,
+}
+
+fn read_native_record(run_dir: &Path) -> Option<NativeRecord> {
+    let text = fs::read_to_string(run_dir.join(NATIVE_IDENTITY_FILE)).ok()?;
+    let mut fields = text.split_whitespace();
+    Some(NativeRecord {
+        pid: fields.next()?.parse().ok()?,
+        pgid: fields.next()?.parse().ok()?,
+        identity: ProcessIdentity {
+            boot: fields.next()?.to_owned(),
+            start: fields.next()?.parse().ok()?,
+        },
+    })
+}
+
+/// Whether the native identity names the same live process in the same group.
+fn native_identity_is_live(run_dir: &Path, pgid: u32) -> io::Result<bool> {
+    let Some(record) = read_native_record(run_dir) else {
+        return Ok(false);
+    };
+    if record.pgid != pgid {
+        return Ok(false);
+    }
+    let Some((_, live_group, start)) = process_facts(record.pid)? else {
+        return Ok(false);
+    };
+    let boot = boot_id()?;
+    Ok(live_group == pgid && ProcessIdentity { boot, start } == record.identity)
 }
 
 /// Create the run's anonymous ownership capability and record its object.
@@ -1602,6 +1705,7 @@ pub fn clear_process_records(run_dir: &Path) {
         SHELL_PGID_FILE,
         SHELL_IDENTITY_FILE,
         SHELL_CAPABILITY_FILE,
+        NATIVE_IDENTITY_FILE,
     ] {
         let _ = fs::remove_file(run_dir.join(name));
     }
@@ -1624,7 +1728,10 @@ pub fn recorded_group(run_dir: &Path) -> Option<(u32, u32)> {
     if let Some(pgid) = read_number(run_dir, SHELL_PGID_FILE) {
         return Some((pgid, pgid));
     }
-    read_shell_record(run_dir).map(|record| (record.pid, record.pgid))
+    if let Some(record) = read_shell_record(run_dir) {
+        return Some((record.pid, record.pgid));
+    }
+    read_native_record(run_dir).map(|record| (record.pid, record.pgid))
 }
 
 /// Every process in a recorded group, read from the kernel's `stat` only. No
@@ -1686,6 +1793,7 @@ fn live_run_pids(pgid: u32, run_dir: &Path) -> Result<Vec<u32>, String> {
     }
     if shell_identity_is_live(run_dir, pgid).map_err(|error| error.to_string())?
         || group_holds_capability(pgid, run_dir)?
+        || native_identity_is_live(run_dir, pgid).map_err(|error| error.to_string())?
     {
         return Ok(members);
     }
@@ -1766,6 +1874,7 @@ fn process_records_readable(run_dir: &Path) -> Result<(), String> {
         SHELL_PGID_FILE,
         SHELL_IDENTITY_FILE,
         SHELL_CAPABILITY_FILE,
+        NATIVE_IDENTITY_FILE,
         PLAN_FILE,
         crate::transcript::TRANSCRIPT_FILE,
     ] {
@@ -2023,6 +2132,7 @@ fn run_predates_boot(run_dir: &Path) -> bool {
         crate::transcript::TRANSCRIPT_FILE,
         SHELL_IDENTITY_FILE,
         SHELL_CAPABILITY_FILE,
+        NATIVE_IDENTITY_FILE,
     ] {
         let Ok(metadata) = fs::metadata(run_dir.join(name)) else {
             continue;
@@ -2078,6 +2188,30 @@ fn categorize_cleanup(reason: String) -> String {
     } else {
         format!("cleanup unverified: {reason}")
     }
+}
+
+/// Close every live group that still holds this run's inherited capability.
+///
+/// The capability is kernel-owned and cannot be copied into the run by name. A
+/// group is accepted only after `capability_group` has verified the descriptor
+/// (dev/ino/token) of a live member; `reap_process_group` then applies the same
+/// pidfd/boot/start ownership checks as the leader path.
+fn reap_capability_groups(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
+    let mut seen = Vec::new();
+    let mut reaped = false;
+    for _ in 0..32 {
+        let Some(group) = capability_group(run_dir)? else {
+            return Ok(reaped);
+        };
+        if seen.contains(&group) {
+            return Err(format!(
+                "live leftover: capability-holding group {group} survived reaping"
+            ));
+        }
+        seen.push(group);
+        reaped |= reap_process_group(group, run_dir, grace)?;
+    }
+    Err("live leftover: too many capability-holding groups survived reaping".to_owned())
 }
 
 fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
@@ -2162,7 +2296,8 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
         clear_process_records(run_dir);
         return Ok(false);
     };
-    let reaped = reap_process_group(pgid, run_dir, grace)?;
+    let mut reaped = reap_process_group(pgid, run_dir, grace)?;
+    reaped |= reap_capability_groups(run_dir, grace)?;
     if !reaped && unverified_group(pgid)? {
         // A live group whose ownership cannot be established is not touched, but
         // it is not hidden either: the open reports it, the card names it and
@@ -2339,6 +2474,25 @@ pub fn readable_transcript(run_dir: &Path) -> String {
             } => out.push_str(&format!(
                 "{ts}  bounds: {max_turns} turns, {timeout_secs} s, model {model}\n"
             )),
+            Record::NativeStarted {
+                ts,
+                harness,
+                version,
+                protocol,
+                base_url,
+                model,
+                codex_sandbox,
+                ..
+            } => out.push_str(&format!(
+                "{ts}  native program: {harness} {version}, {protocol} at {base_url}, model {model}{}\n",
+                codex_sandbox
+                    .as_deref()
+                    .map(|mode| format!(", Codex sandbox {mode}"))
+                    .unwrap_or_default()
+            )),
+            Record::NativeText { ts, text } => {
+                out.push_str(&format!("{ts}  native: {}\n", bounded(text, 4000)));
+            }
             Record::ModelReply {
                 ts,
                 turn,

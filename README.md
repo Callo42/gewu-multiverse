@@ -39,8 +39,19 @@ requests are its own. The board shows the whole thing at a glance:
 - **Agents with their own accounts.** Each agent is a Forgejo account named
   `gewu-<agent>`. When it commits, comments or opens a pull request, Forgejo shows the
   agent as the author, not you.
-- **One model for all of them.** You give one model address and one key. Every agent
-  uses them, with its own instruction.
+- **A real agent program per agent.** A fresh install brings Pi 1.4.0. On an
+  agent's Program screen (`p`) you can install and select Codex 0.164.0, DeepSeek
+  Harness 0.2.1-rc.2 or OpenCode 2.1.4, each from its official pinned package. The
+  program owns its model turns, tools, retries, compaction and session; the product
+  owns the run boundary, the Forgejo tools and the record.
+- **One default connection, and a saved choice per agent.** The first-run model
+  address and key are the default. Each agent can save its own compatible
+  provider/protocol/address/model/key; a save is used by that agent's next run, while
+  the running run keeps the exact facts it started with. The board and the agent
+  screen show active and next when they differ.
+- **Migrate only when you choose.** An agent made by an older installation keeps the
+  built-in engine. Its instruction, workspace, steps, skills, account and records are
+  untouched until you deliberately choose another program.
 - **A card for each agent.** A filled circle means working, a half circle means waiting
   for its next run, an empty ring means stopped or not started. The board card keeps
   the few words: the agent's name, its Forgejo login, its state, one last line and its
@@ -168,14 +179,21 @@ One line, no Rust:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
+# Pi is installed by default. Other official programs are explicit:
+sh install.sh --harness pi,codex
+sh install.sh --harness none        # only the built-in engine
 ```
 
 The one-liner trusts the TLS connection to GitHub and the repository's release page —
 the checksum detects a damaged download, not a replaced release — and the bundled
 Forgejo binary is additionally pinned by digest and signed upstream.
 
-It downloads the current prebuilt program to `~/.local/bin/gewu-multiverse`, and the
-Forgejo it needs (about 122 MB) to `~/.local/share/gewu-multiverse/`. If `~/.local/bin`
+It downloads the current prebuilt program to `~/.local/bin/gewu-multiverse`, the
+Forgejo it needs (about 122 MB), and the one agent program you named (Pi by default)
+to `~/.local/share/gewu-multiverse/`. Every package is checked against its published
+SHA-256 or npm integrity. DeepSeek Harness needs Node 24.9 or newer and npm; its
+locked closure is about 613 packages and 753 MB. Nothing else is downloaded unless
+you name it. If `~/.local/bin`
 is not on your `PATH`, the installer says how to add it. The prebuilt program is for
 64-bit x86 Linux with glibc 2.39 or newer (for example Ubuntu 24.04 or newer).
 

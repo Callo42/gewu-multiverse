@@ -1098,6 +1098,7 @@ fn a_relative_configuration_root_writes_the_first_runs_plan_and_log() {
         login: "gewu-agent-1".to_owned(),
         email: "gewu-agent-1@agents.invalid".to_owned(),
         forgejo_url: "http://127.0.0.1:1".to_owned(),
+        native: None,
         repositories: Vec::new(),
         confinement: gewu_multiverse::confinement::Method::None,
         hide: Vec::new(),
