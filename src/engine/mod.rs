@@ -6498,6 +6498,13 @@ mod tests {
         let board = engine.board();
         assert!(matches!(board.agents[0].session, SessionState::Idle));
         let run_dir = fake.last_run_dir().expect("the spawned run directory");
+        // `settle_run` writes the durable ending on the session thread just after
+        // the child is reaped; the liveness check above is not a write barrier.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "shutdown during spawn left no durable ending"
