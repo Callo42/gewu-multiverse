@@ -85,8 +85,8 @@ The candidate's live tests use an isolated bundled Forgejo and a loopback
 - Pi, Codex and DeepSeek Harness each completed: real native start under Landlock,
   a native shell write, a model-driven call through the product MCP server to read an
   issue, `git push`, open a pull request as the agent, and comment as the agent.
-- OpenCode completed: real native start under Landlock and its own `shell` tool
-  wrote a file. OpenCode 2.1.4 exposes MCP tools through its Code Mode catalog; the
-  candidate configures the server and records its connection, but a model-driven
-  OpenCode MCP call is **not claimed** by this candidate. This remains a gap against
-  the full four-program MCP acceptance.
+- OpenCode completed: real native start under Landlock, a native `shell` write, and
+  model-driven calls through its Code Mode catalog to read an issue, push a branch,
+  open a pull request and comment as the agent. The MCP target is added to the
+  run-private OpenCode server after the warm session, and the product admits it only
+  after all six tools register.
