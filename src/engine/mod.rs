@@ -6682,7 +6682,7 @@ mod tests {
                 pid.to_string().as_bytes(),
             )
             .map_err(|error| format!("the group cannot be written: {error}"))?;
-            let mut transcript = crate::transcript::Transcript::open(&run_dir)
+            let mut transcript = crate::transcript::Transcript::open(run_dir)
                 .map_err(|error| format!("the transcript cannot open: {error}"))?;
             transcript
                 .append(&crate::transcript::Record::run_started(
