@@ -1733,7 +1733,7 @@ pub fn recover_ending(run_dir: &Path, grace: Duration) -> Result<bool, String> {
 
 /// Write the one failed ending for a run that could not start a child.
 pub fn write_failed_ending(run_dir: &Path, run_id: &str, reason: &str) -> Result<(), String> {
-    ensure_first_ending(run_dir, run_id, FirstEnding::Terminal)?;
+    pin_first_ending(run_dir, run_id, FirstEnding::Terminal)?;
     ensure_terminal_record(run_dir, RunOutcome::Failed, Some(reason.to_owned()))
 }
 
@@ -1746,7 +1746,7 @@ pub fn write_natural_ending(
     duration_ms: u64,
     reason: Option<String>,
 ) -> Result<(), String> {
-    ensure_first_ending(run_dir, run_id, FirstEnding::Terminal)?;
+    pin_first_ending(run_dir, run_id, FirstEnding::Terminal)?;
     let mut transcript = transcript::Transcript::open(run_dir)
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))?;
     transcript
