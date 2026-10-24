@@ -30,4 +30,4 @@ per-harness variants:
 
 The Rust test
 `agent_run::native::attempt_replay_tests::attempt_ownership_cases_replay_through_the_same_parser`
-replays all eight entries.
+replays all nine entries.
