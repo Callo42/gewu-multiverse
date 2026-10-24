@@ -389,6 +389,7 @@ struct NativeState {
     error: Option<String>,
     open: HashMap<String, OpenCall>,
     failed_call: Option<String>,
+    first_failure: Option<String>,
     refused_write: Option<String>,
     wrote: bool,
     workspace_wrote: bool,
@@ -413,6 +414,9 @@ fn codex_tool_approvals() -> String {
 }
 
 fn non_success_reason(state: &NativeState) -> String {
+    if let Some(first) = state.first_failure.as_ref() {
+        return first.clone();
+    }
     if let Some(refused) = state.refused_write.as_ref() {
         return refused.clone();
     }
@@ -1500,7 +1504,18 @@ fn codex_event(
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned();
-                        finish_call_by_id(id, exit, output, state, transcript, log);
+                        let call_id = if id.is_empty() {
+                            format!("codex-command-{}", *tool_index + 1)
+                        } else {
+                            id.to_owned()
+                        };
+                        if !state.open.contains_key(&call_id) {
+                            start_named(
+                                &call_id, "shell", command, state, tool_index, plan, transcript,
+                                log,
+                            );
+                        }
+                        finish_call_by_id(&call_id, exit, output, state, transcript, log);
                     }
                 }
                 "mcp_tool_call" | "mcp_call" => {
@@ -1851,11 +1866,24 @@ fn finish_call(
                 .trim()
                 .to_owned()
         };
+        let diagnostic = if cause.to_ascii_lowercase().contains("bubblewrap")
+            && cause.to_ascii_lowercase().contains("permission denied")
+        {
+            format!(
+                "{}: the native sandbox boundary refused this command ({cause}); choose this agent's explicit compatibility mode only if you intend to remove Codex's own sandbox while the product file boundary remains",
+                call.tool
+            )
+        } else {
+            format!("{}: {cause}", call.tool)
+        };
+        if state.first_failure.is_none() {
+            state.first_failure = Some(diagnostic.clone());
+        }
         if is_write_tool(&call.tool) {
-            state.refused_write = Some(format!("{}: {cause}", call.tool));
+            state.refused_write = Some(diagnostic);
             log.tool_failure(&call.tool, &cause);
         } else if state.failed_call.is_none() {
-            state.failed_call = Some(format!("{}: {cause}", call.tool));
+            state.failed_call = Some(diagnostic);
             log.tool_failure(&call.tool, &cause);
         }
     }
@@ -2386,6 +2414,17 @@ mod native_proof_tests {
         assert_eq!(
             run_reason(RunEnding::Refused, prose, &refused).as_deref(),
             Some("MCP tool call requires approval, but approval policy is never")
+        );
+        let first = NativeState {
+            first_failure: Some("shell: the native sandbox boundary refused this command (bubblewrap: Permission denied)".to_owned()),
+            refused_write: Some("forgejo_update_pull_request: no open pull request".to_owned()),
+            ..NativeState::default()
+        };
+        let first_reason = run_reason(RunEnding::Refused, prose, &first).expect("reason");
+        assert!(first_reason.contains("bubblewrap"), "{first_reason}");
+        assert!(
+            !first_reason.contains("no open pull request"),
+            "{first_reason}"
         );
         let uncertain = NativeState {
             uncertain_write: true,
