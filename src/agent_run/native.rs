@@ -311,8 +311,7 @@ fn start_opencode_server(
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if socket_parent.join("connected").is_file() {
-            std::thread::sleep(Duration::from_millis(300));
+        if socket_parent.join("tools-ready-6").is_file() {
             return Ok(Some((HelperProcess { child }, url, password)));
         }
         if !crate::run::process_alive(child.id()) {
@@ -322,7 +321,7 @@ fn start_opencode_server(
     }
     let _ = child.kill();
     let _ = child.wait();
-    Err("OpenCode's private server did not initialize its MCP bridge".to_owned())
+    Err("OpenCode's private server did not register all six MCP tools".to_owned())
 }
 
 /// One tool call still open in the native event stream.
@@ -331,6 +330,40 @@ struct OpenCall {
     index: u32,
     tool: String,
     started: Instant,
+}
+
+/// Redact a known secret in raw, JSON-escaped and line-split forms before any
+/// event or transcript persistence. Exact replacement is tried first; the escaped
+/// JSON form covers a native program emitting a JSON string.
+fn redact_native(secret: &Secret, text: &str) -> String {
+    let mut out = secret.redact(text);
+    if let Ok(quoted) = serde_json::to_string(secret.expose()) {
+        let escaped = quoted.trim_matches('"');
+        if escaped != secret.expose() && out.contains(escaped) {
+            out = out.replace(escaped, "[redacted]");
+        }
+    }
+    out
+}
+
+fn redact_native_line(secret: &Secret, line: &str, carry: &mut String) -> String {
+    let combined = format!("{carry}{line}");
+    let redacted = redact_native(secret, &combined);
+    // Keep a bounded tail so a secret split across two native stdout lines is
+    // removed when the second half arrives. Only the new suffix is persisted.
+    *carry = combined
+        .chars()
+        .rev()
+        .take(256)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let cut = redacted
+        .len()
+        .saturating_sub(line.len())
+        .min(redacted.len());
+    redacted[cut..].to_owned()
 }
 
 /// The facts the product reads from the native stream.
@@ -343,6 +376,11 @@ struct NativeState {
     failed_call: Option<String>,
     refused_write: Option<String>,
     wrote: bool,
+    workspace_wrote: bool,
+    pr_ok: bool,
+    comment_ok: bool,
+    pushed: bool,
+    uncertain_write: bool,
     tool_ok: bool,
     checked_empty: bool,
 }
@@ -577,11 +615,13 @@ pub(super) fn run(
     }
     drop(tx);
 
+    let mut stdout_carry = String::new();
+    let mut stderr_carry = String::new();
     let mut status = None;
     while status.is_none() {
         while let Ok((is_stdout, line)) = rx.try_recv() {
             if is_stdout {
-                let cleaned = secret.redact(&line);
+                let cleaned = redact_native_line(secret, &line, &mut stdout_carry);
                 if let Err(error) = writeln!(event_file, "{cleaned}") {
                     log.line(&format!(
                         "the native event record cannot be written: {error}"
@@ -597,7 +637,7 @@ pub(super) fn run(
                     log,
                 );
             } else {
-                let cleaned = secret.redact(&line);
+                let cleaned = redact_native_line(secret, &line, &mut stderr_carry);
                 if !cleaned.trim().is_empty() {
                     last_stderr = cleaned.clone();
                     log.block(&cleaned);
@@ -617,7 +657,11 @@ pub(super) fn run(
     }
     // Drain lines that were already in the pipe when the process exited.
     while let Ok((is_stdout, line)) = rx.recv_timeout(Duration::from_millis(200)) {
-        let cleaned = secret.redact(&line);
+        let cleaned = if is_stdout {
+            redact_native_line(secret, &line, &mut stdout_carry)
+        } else {
+            redact_native_line(secret, &line, &mut stderr_carry)
+        };
         if is_stdout {
             let _ = writeln!(event_file, "{cleaned}");
             handle_event(
@@ -646,17 +690,19 @@ pub(super) fn run(
             base.as_deref(),
         );
         state.wrote = true;
+        state.pushed = true;
     }
     apply_ledger(&files, transcript, &mut state);
     if workspace_fingerprint(&plan.workspace) != workspace_before {
         state.wrote = true;
+        state.workspace_wrote = true;
     }
 
     let exit = status.expect("the child exited");
     if let Some(call) = state.open.values().next().cloned() {
         finish_call(
             &call,
-            exit.code().unwrap_or(1),
+            1,
             None,
             "the program exited before this tool finished".to_owned(),
             transcript,
@@ -675,11 +721,6 @@ pub(super) fn run(
         .unwrap_or_else(|| format!("the program exited with code {}", exit.code().unwrap_or(1)));
     if !exit.success() {
         return RunEnd::failed(reason);
-    }
-    if program == Program::Opencode && state.final_text.is_some() {
-        // The official 2.1.4 final assistant message arrives as a `text` event;
-        // retain it as the completion fact even when it follows the last tool.
-        state.terminal = true;
     }
     if !state.terminal {
         return RunEnd::failed(
@@ -705,12 +746,15 @@ pub(super) fn run(
     };
     let instruction = String::from_utf8_lossy(instruction);
     let base = crate::agent_run::ending_for_instruction(&instruction, &summary, &evidence);
-    let wants_write = instruction_wants_write(&instruction, &plan.steps);
-    let ending = match base {
-        RunEnding::Succeeded if wants_write && !state.wrote => RunEnding::Warned,
-        RunEnding::Succeeded if !wants_write && !state.tool_ok => RunEnding::Warned,
-        other => other,
-    };
+    if state.uncertain_write {
+        return RunEnd {
+            exit_code: 0,
+            reason: Some(summary),
+            ending: RunEnding::Warned,
+        };
+    }
+    let requested = requested_work(&instruction, &plan.steps);
+    let ending = decide_native_ending(base, requested, &state);
     let reason = if summary.trim().is_empty() && matches!(ending, RunEnding::Warned) {
         Some(
             "the native program finished without a tool result; the result is not verified"
@@ -729,29 +773,106 @@ pub(super) fn run(
 /// Whether the instruction asks for a change, not only a report. This is a
 /// bounded prose check: the tool/work witness below still decides whether the
 /// change happened, and a read-only request may complete from a successful tool.
-fn instruction_wants_write(instruction: &str, steps: &[String]) -> bool {
-    let lower = instruction.to_ascii_lowercase();
-    const WRITE_WORDS: [&str; 18] = [
-        "pull request",
-        "comment",
-        "push",
-        "commit",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedWork {
+    ReadOnly,
+    GenericWrite,
+    PullRequest,
+    Comment,
+    Ambiguous,
+}
+
+/// A bounded request classification for the native boundary. This is not a general
+/// intent classifier: explicit read phrasing wins; explicit PR/comment/push asks
+/// need the matching supervisor fact; only an ordinary change word may use a
+/// workspace witness; everything else stays ambiguous and therefore warned.
+fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
+    let lower = instruction.trim().to_ascii_lowercase();
+    let read_phrasing = [
+        "read ",
+        "summarize",
+        "summarise",
+        "inspect ",
+        "list ",
+        "review ",
+    ]
+    .iter()
+    .any(|word| lower.starts_with(word));
+    let asks_pr = ["pull request", "open a pr", "open pr"]
+        .iter()
+        .any(|word| lower.contains(word));
+    let asks_comment = lower.contains("comment")
+        && (lower.contains("leave a comment")
+            || lower.contains("post a comment")
+            || lower.contains("write a comment")
+            || lower.contains("add a comment"));
+    let asks_push = lower.contains("push");
+    if asks_pr || asks_comment || asks_push {
+        if asks_pr {
+            return RequestedWork::PullRequest;
+        }
+        if asks_comment {
+            return RequestedWork::Comment;
+        }
+        return RequestedWork::GenericWrite;
+    }
+    if read_phrasing {
+        return RequestedWork::ReadOnly;
+    }
+    let write_words = [
+        "rename",
         "write",
         "edit",
-        "create",
-        "update",
         "fix",
         "implement",
         "modify",
         "delete",
         "remove",
+        "create",
         "add ",
-        "open a pr",
-        "review and change",
-        "apply",
-        "make the change",
+        "update",
     ];
-    WRITE_WORDS.iter().any(|word| lower.contains(word)) || !steps.is_empty()
+    if write_words.iter().any(|word| lower.contains(word)) || !steps.is_empty() {
+        return RequestedWork::GenericWrite;
+    }
+    if lower.is_empty() {
+        RequestedWork::Ambiguous
+    } else if lower.contains("read") || lower.contains("inspect") {
+        RequestedWork::ReadOnly
+    } else {
+        RequestedWork::Ambiguous
+    }
+}
+
+fn decide_native_ending(
+    base: RunEnding,
+    requested: RequestedWork,
+    state: &NativeState,
+) -> RunEnding {
+    let base = if matches!(base, RunEnding::NoWork)
+        && !(state.checked_empty && !state.wrote && state.failed_call.is_none())
+    {
+        RunEnding::Warned
+    } else {
+        base
+    };
+    match base {
+        RunEnding::Succeeded => {
+            let matched = match requested {
+                RequestedWork::PullRequest => state.pr_ok && state.pushed,
+                RequestedWork::Comment => state.comment_ok,
+                RequestedWork::GenericWrite => state.workspace_wrote,
+                RequestedWork::ReadOnly => state.tool_ok,
+                RequestedWork::Ambiguous => false,
+            };
+            if matched {
+                RunEnding::Succeeded
+            } else {
+                RunEnding::Warned
+            }
+        }
+        other => other,
+    }
 }
 
 /// A cheap before/after witness of actual workspace changes. It covers files the
@@ -1431,9 +1552,9 @@ fn opencode_event(
                 .and_then(Value::as_str)
             {
                 state.final_text = Some(text.to_owned());
-                // The official 2.1.4 final text event is the completion fact for a
-                // final assistant message; a text inside an open tool is not.
-                state.terminal = true;
+                // Only a text after the last tool and with no open call is a
+                // completion; a later tool start resets this.
+                state.terminal = state.open.is_empty();
                 let _ = transcript.append(&Record::native_text(text));
             }
         }
@@ -1505,6 +1626,7 @@ fn start_named(
         return;
     }
     *tool_index += 1;
+    state.terminal = false;
     let index = *tool_index;
     let args = model::excerpt(args, 2000);
     let _ = transcript.append(&Record::tool_call(
@@ -1644,11 +1766,26 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
             // an earlier failed read or write.
             state.checked_empty = true;
         }
-        if !ok && crate::forgejo_tools::is_write_tool(tool) {
-            state.refused_write = Some(format!("{tool}: {outcome}"));
-        }
-        if ok && crate::forgejo_tools::is_write_tool(tool) {
-            state.wrote = true;
+        if crate::forgejo_tools::is_write_tool(tool) {
+            if ok {
+                state.wrote = true;
+                if tool.ends_with(crate::forgejo_tools::COMMENT) {
+                    state.comment_ok = true;
+                } else {
+                    state.pr_ok = true;
+                }
+            } else if record
+                .get("accepted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                // The server accepted the request (2xx) but its reply could not be
+                // read: a real effect may exist, so this is warned/unknown, never a
+                // clean refusal.
+                state.uncertain_write = true;
+            } else {
+                state.refused_write = Some(format!("{tool}: {outcome}"));
+            }
         }
     }
 }
@@ -1760,5 +1897,95 @@ mod tests {
             Some(plan)
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod native_proof_tests {
+    use super::*;
+
+    #[test]
+    fn r1_prose_no_work_without_a_checked_empty_read_is_warned() {
+        let state = NativeState::default();
+        assert_eq!(
+            decide_native_ending(RunEnding::NoWork, RequestedWork::ReadOnly, &state),
+            RunEnding::Warned
+        );
+        let checked = NativeState {
+            checked_empty: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::NoWork, RequestedWork::ReadOnly, &checked),
+            RunEnding::NoWork
+        );
+    }
+
+    #[test]
+    fn r2_pr_and_comment_requests_need_their_own_supervisor_facts() {
+        let local = NativeState {
+            workspace_wrote: true,
+            wrote: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &local),
+            RunEnding::Warned
+        );
+        assert_eq!(
+            requested_work("Open a pull request and comment on the issue.", &[]),
+            RequestedWork::PullRequest
+        );
+        assert_eq!(
+            requested_work("Read the comment on the issue and summarize it.", &[]),
+            RequestedWork::ReadOnly
+        );
+        let comment = NativeState {
+            comment_ok: true,
+            tool_ok: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::Comment, &comment),
+            RunEnding::Succeeded
+        );
+    }
+
+    #[test]
+    fn r7_native_redaction_covers_json_escaped_and_split_secrets() {
+        let secret = Secret::new("sk-runtime-secret-value".to_owned());
+        let escaped = serde_json::to_string(secret.expose()).expect("quoted");
+        let escaped = escaped.trim_matches('"');
+        let mut carry = String::new();
+        let first = redact_native_line(&secret, "prefix sk-runtime-", &mut carry);
+        let second = redact_native_line(&secret, "secret-value suffix", &mut carry);
+        let text = format!("{first}{second}");
+        assert!(!text.contains(secret.expose()), "{text}");
+        let line = redact_native_line(&secret, &format!("value={escaped}"), &mut carry);
+        assert!(!line.contains(escaped), "{line}");
+    }
+
+    #[test]
+    fn r2_read_only_comment_succeeds_from_a_read_fact_and_generic_write_needs_a_witness() {
+        assert_eq!(
+            requested_work("Read the comment on the issue and summarize it.", &[]),
+            RequestedWork::ReadOnly
+        );
+        let read = NativeState {
+            tool_ok: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::ReadOnly, &read),
+            RunEnding::Succeeded
+        );
+        assert_eq!(
+            requested_work("Rename the parser module.", &[]),
+            RequestedWork::GenericWrite
+        );
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &read),
+            RunEnding::Warned
+        );
     }
 }

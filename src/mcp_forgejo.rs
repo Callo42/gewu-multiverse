@@ -61,6 +61,7 @@ pub fn serve(context: &Path) -> i32 {
         &context.join("calls.jsonl"),
         &context.join("writes"),
         &Secret::new(token.trim().to_owned()),
+        None,
     )
 }
 
@@ -124,7 +125,6 @@ pub fn serve_supervised(
     let _ = crate::mode::set_mode(&socket, 0o600);
     for connection in listener.incoming() {
         let Ok(stream) = connection else { continue };
-        let _ = crate::mode::write_private(state_dir.join("connected"), b"1");
         let Ok(input) = stream.try_clone() else {
             continue;
         };
@@ -138,6 +138,7 @@ pub fn serve_supervised(
             &ledger,
             &state,
             &redactor,
+            Some(&state_dir.join("tools-ready-6")),
         );
     }
     0
@@ -192,6 +193,7 @@ fn serve_loop(
     ledger: &Path,
     counter: &Path,
     redactor: &Secret,
+    ready: Option<&Path>,
 ) -> i32 {
     let mut line = String::new();
     loop {
@@ -215,7 +217,22 @@ fn serve_loop(
                 "instructions": instructions()
             }))),
             "ping" => Some(Ok(json!({}))),
-            "tools/list" => Some(Ok(json!({"tools": tool_list()}))),
+            "tools/list" => {
+                let list = tool_list();
+                if let Some(path) = ready {
+                    let names: Vec<&str> = list
+                        .iter()
+                        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                        .collect();
+                    if forgejo_tools::TOOL_NAMES
+                        .iter()
+                        .all(|expected| names.contains(expected))
+                    {
+                        let _ = crate::mode::write_private(path, b"6-tools-ready");
+                    }
+                }
+                Some(Ok(json!({"tools": list})))
+            }
             "tools/call" => Some(call_tool(
                 tools,
                 request.get("params").cloned().unwrap_or(Value::Null),
@@ -303,6 +320,7 @@ fn call_tool(
     if write {
         tools.set_writes(reserved);
     }
+    let accepted = if write { tools.last_accepted() } else { false };
     let (ok, text, action, url) = match &result {
         Ok(reply) => (true, reply.text.clone(), reply.action, reply.url.clone()),
         Err(error) => (false, error.clone(), None, None),
@@ -319,6 +337,7 @@ fn call_tool(
         "action": action.map(|text| redactor.redact(text)),
         "url": url.as_deref().map(|text| redactor.redact(text)),
         "write": write,
+        "accepted": accepted,
     });
     let mut file = std::fs::OpenOptions::new()
         .create(true)

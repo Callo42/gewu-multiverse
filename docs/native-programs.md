@@ -48,13 +48,15 @@ The key file is mode 0600 under the run's private tree and is removed with that 
 
 ## Forgejo tools
 
-When the agent has its own Forgejo token and at least one clone, the supervisor starts
-a minimal stdio MCP server with `--mcp-forgejo <context>`. It exposes exactly the six
-existing product tools: list assigned issues, read an issue/PR, comment, list own PRs,
-open a PR, update own PR. It reads only that run's token and workspace. Its write
-counter is persisted, so restarting the MCP process cannot reset the eight-write
-bound. Its per-run ledger is the supervisor's record of what was read/written; outcome
-mapping uses that ledger and the native tool events, not the model's prose.
+When the agent has its own Forgejo token and at least one clone, the supervisor owns a
+minimal per-run MCP server. Its state and counter live outside every native-writable
+root; the native program receives a thin relay over a run-private socket. It exposes
+exactly the six existing product tools: list assigned issues, read an issue/PR,
+comment, list own PRs, open a PR, update own PR. It reads only that run's token and
+workspace. The write reservation is persisted before a request can take effect, so a
+restart, malformed reply or persistence failure cannot reset or undercount the
+eight-write bound. The supervisor ledger is the record of what was read or written;
+native outcomes require the matching terminal and work facts, not prose alone.
 
 ## Confinement
 

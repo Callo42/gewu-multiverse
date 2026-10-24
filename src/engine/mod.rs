@@ -2256,6 +2256,22 @@ impl EngineApi for Engine {
                     .flatten()
                     .is_some();
                 let inherited_key = credentials::model_key(&inner.credentials, &name).ok();
+                if program.is_native()
+                    && !explicit_key
+                    && let Some(key) = inherited_key.as_ref()
+                {
+                    credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.expose(),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "the program change was not saved: the current model key for `{name}` could not be saved ({error})"
+                        )
+                    })?;
+                }
                 let Some(saved) = inner.settings.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
@@ -2294,17 +2310,6 @@ impl EngineApi for Engine {
                     saved.codex_sandbox.clear();
                 } else if saved.codex_sandbox.is_empty() {
                     saved.codex_sandbox = "native".to_owned();
-                }
-                if program.is_native()
-                    && !explicit_key
-                    && let Some(key) = inherited_key.as_ref()
-                {
-                    let _ = credentials::record_secret(
-                        &inner.credentials,
-                        Some("model_keys"),
-                        &name,
-                        key.expose(),
-                    );
                 }
                 inner.save_settings()?;
                 inner.agents[index].last_error = None;
