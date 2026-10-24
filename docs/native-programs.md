@@ -65,8 +65,10 @@ applies it to the real native executable through `--confined-program`; the nativ
 process and every inherited helper stay under it. If the ruleset is unavailable,
 partial, or not fully enforced, the run fails instead of falling back to an
 unconfined start. The allow-list includes the workspace, the native program's private
-home/config/tmp, the installed program, the exact product helper and the run's
-askpass file. It does not include the user's real home, other agents' workspaces, the
+home/config/tmp and the installed program. The native program receives no Forgejo
+askpass file: its Git smart-HTTP requests use a fixed-target loopback transport
+owned by the supervisor, which adds the agent's existing credential only toward
+the configured Forgejo origin. It does not include the user's real home, other agents' workspaces, the
 product's state/credential roots, or global native stores.
 
 Codex has its own sandbox. Its default remains native. An agent may opt in, by a
