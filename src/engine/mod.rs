@@ -1639,6 +1639,85 @@ impl Inner {
         }
     }
 
+    /// Probe Codex's own bundled bubblewrap before a default-sandbox Start. Codex
+    /// 0.164 does not emit a native event when this setup fails, so Start would
+    /// otherwise show only a later downstream refusal. The probe uses no secrets
+    /// and inherits the product's existing outer Landlock.
+    fn codex_sandbox_block(&self, agent: &AgentRuntime) -> Option<String> {
+        let saved = self.settings.agent(&agent.name)?;
+        if saved.harness() != Program::Codex || saved.codex_sandbox == "full-access" {
+            return None;
+        }
+        let installed = harness::installed(&self.options.data_root, Program::Codex)?;
+        let bwrap = installed.root.join("codex-resources").join("bwrap");
+        if !bwrap.is_file() {
+            return Some(
+                "Codex's native sandbox helper is missing from this installation".to_owned(),
+            );
+        }
+        let mut child = match std::process::Command::new(&bwrap)
+            .args([
+                "--unshare-user",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "/bin/true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return Some(format!(
+                    "the native sandbox boundary cannot start ({error})"
+                ));
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(
+                        "the native sandbox preflight did not finish within 2 seconds".to_owned(),
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(format!(
+                        "the native sandbox preflight could not be read ({error})"
+                    ));
+                }
+            }
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        if status.is_some_and(|status| status.success()) {
+            return None;
+        }
+        let detail = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("the native sandbox boundary refused its probe")
+            .trim();
+        Some(format!(
+            "the native sandbox boundary is unavailable ({detail}); choose this agent's explicit compatibility mode only if you intend to remove Codex's own sandbox while the product file boundary remains"
+        ))
+    }
+
     /// Why one agent's selected program/connection cannot start, if it cannot.
     fn program_block(&self, agent: &AgentRuntime) -> Option<String> {
         let saved = self.settings.agent(&agent.name)?;
@@ -2640,7 +2719,10 @@ impl EngineApi for Engine {
                     inner.agents[index].session = SessionState::Idle;
                     inner.agents[index].next_at = None;
                 }
-                if let Some(reason) = inner.program_block(&inner.agents[index]) {
+                if let Some(reason) = inner
+                    .program_block(&inner.agents[index])
+                    .or_else(|| inner.codex_sandbox_block(&inner.agents[index]))
+                {
                     inner.agents[index].session = SessionState::Blocked {
                         reason: reason.clone(),
                     };
