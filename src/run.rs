@@ -1308,6 +1308,50 @@ pub struct RunStopped {
     pub reason: String,
 }
 
+/// The unforgeable token that permits constructing a terminal record. The type is
+/// public only because it appears in a public record variant; its field is private
+/// and only the owner can make one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EndingSeal {
+    _private: (),
+}
+
+impl EndingSeal {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Test-only terminal record construction. Integration tests are outside the owner
+/// module; this helper exists only in debug builds and is not part of the release
+/// surface.
+#[cfg(debug_assertions)]
+pub fn ensure_terminal_for_test(
+    run_dir: &Path,
+    outcome: RunOutcome,
+    reason: Option<String>,
+) -> Result<(), String> {
+    ensure_terminal_record(run_dir, outcome, reason)
+}
+
+#[cfg(debug_assertions)]
+pub fn terminal_record_for_test(
+    run_id: &str,
+    outcome: RunOutcome,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    reason: Option<String>,
+) -> Record {
+    Record::run_finished(
+        run_id,
+        outcome,
+        exit_code,
+        duration_ms,
+        reason,
+        EndingSeal::new(),
+    )
+}
+
 /// The durable first-ending fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1559,6 +1603,7 @@ fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> i
                 RunOutcome::Stopped,
                 Some(reason.to_owned()),
                 0,
+                EndingSeal::new(),
             )
             .map(|_| ())
         }
@@ -1598,7 +1643,7 @@ fn ensure_terminal_record(
     reason: Option<String>,
 ) -> Result<(), String> {
     let run_id = run_id_of(run_dir)?;
-    transcript::record_outcome_if_missing(run_dir, run_id, outcome, reason, 0)
+    transcript::record_outcome_if_missing(run_dir, run_id, outcome, reason, 0, EndingSeal::new())
         .map(|_| ())
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
@@ -1663,6 +1708,7 @@ fn write_terminal_replacing(
         None,
         0,
         Some(reason.to_owned()),
+        EndingSeal::new(),
     ));
     let mut text = String::new();
     for record in &records {
@@ -1717,10 +1763,22 @@ pub fn request_stop(
     Ok(ending)
 }
 
-/// Force a run handle after its polite grace. The fact was pinned before the first
-/// request; this must never be called as a first signal.
-pub fn request_force(handle: &mut dyn RunningSession) {
+/// Force a run handle after its polite grace. Private: the public request is
+/// `request_force_stop`, which also consults the fact.
+fn force_handle(handle: &mut dyn RunningSession) {
     handle.signal(true);
+}
+
+/// Request the force step after a stop has already been requested.
+pub fn request_force_stop(
+    handle: &mut dyn RunningSession,
+    run_dir: &Path,
+    run_id: &str,
+    _reason: &str,
+) -> Result<(), String> {
+    pin_first_ending(run_dir, run_id, FirstEnding::Stop)?;
+    force_handle(handle);
+    Ok(())
 }
 
 /// The owner's stop-and-reap sequence for a child that must be stopped even when the
@@ -1742,9 +1800,23 @@ pub fn stop_uncertain(
     reason
 }
 
+/// Request a stop, then wait for the handle to end before it is dropped.
+pub fn request_stop_and_wait(
+    handle: &mut dyn RunningSession,
+    run_dir: &Path,
+    run_id: &str,
+    proposed: FirstEnding,
+    _reason: &str,
+    grace: Duration,
+) -> Result<(), String> {
+    pin_first_ending(run_dir, run_id, proposed)?;
+    stop_and_wait(handle, grace);
+    Ok(())
+}
+
 /// Stop one session handle politely, then by force, and wait for its status so the
 /// child is reaped before the handle is dropped.
-pub fn stop_and_wait(handle: &mut dyn RunningSession, grace: Duration) {
+fn stop_and_wait(handle: &mut dyn RunningSession, grace: Duration) {
     if handle.try_status().is_some() {
         return;
     }
@@ -1771,7 +1843,7 @@ fn wait_session_status(handle: &mut dyn RunningSession, limit: Duration) -> bool
 
 /// The owner's raw process-group signal. Every run/child group signal uses this
 /// function; adapters outside `run.rs` call it instead of `killpg`.
-pub fn signal_run_group(pid: u32, force: bool) {
+pub(crate) fn adapter_signal_run_group(pid: u32, force: bool) {
     let signal = if force {
         nix::sys::signal::Signal::SIGKILL
     } else {
@@ -1783,13 +1855,13 @@ pub fn signal_run_group(pid: u32, force: bool) {
 /// Signal a starting child's group by the pid the job reported. The job owns the
 /// wait and reaps it when it returns.
 pub fn signal_starting_group(pid: u32, force: bool) {
-    signal_run_group(pid, force);
+    adapter_signal_run_group(pid, force);
 }
 
 /// Settle a run whose self-written terminal record may already exist. The caller
 /// supplies the durable first-ending fact; the owner performs the reap, the one
 /// terminal write and the handle release.
-pub fn settle_ending(
+pub fn request_finish(
     run_dir: &Path,
     pgid: u32,
     outcome: RunOutcome,
@@ -1807,7 +1879,17 @@ pub fn recover_ending(run_dir: &Path, grace: Duration) -> Result<bool, String> {
 }
 
 /// Write the one failed ending for a run that could not start a child.
-pub fn write_failed_ending(run_dir: &Path, run_id: &str, reason: &str) -> Result<(), String> {
+pub fn request_failed_finish(run_dir: &Path, run_id: &str, reason: &str) -> Result<(), String> {
+    // A Terminal fact written earlier must already have its terminal record. If it
+    // does not, the records contradict each other: refuse to invent a Failed ending
+    // and leave explicit uncertainty instead.
+    if recorded_first_ending(run_dir)? == Some(FirstEnding::Terminal)
+        && !terminal_recorded(run_dir)?
+    {
+        let uncertainty = "the run's first ending is terminal, but its terminal record is missing; the failed writer cannot invent an ending";
+        let _ = record_ending_uncertainty(run_dir, run_id, uncertainty);
+        return Err(uncertainty.to_owned());
+    }
     if pin_first_ending(run_dir, run_id, FirstEnding::Terminal)? == FirstEnding::Stop {
         // The stop already owns the one ending. The failed spawn path must not add
         // a second terminal after the fact.
@@ -1817,7 +1899,7 @@ pub fn write_failed_ending(run_dir: &Path, run_id: &str, reason: &str) -> Result
 }
 
 /// Write the run process's own terminal ending and pin the Terminal fact first.
-pub fn write_natural_ending(
+pub fn request_natural_finish(
     run_dir: &Path,
     run_id: &str,
     outcome: RunOutcome,
@@ -1848,6 +1930,7 @@ pub fn write_natural_ending(
             exit_code,
             duration_ms,
             reason,
+            EndingSeal::new(),
         ))
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
@@ -3447,6 +3530,7 @@ mod stop_record_tests {
                 None,
                 10,
                 Some(reason.to_owned()),
+                EndingSeal::new(),
             ))
             .expect("terminal record");
         run
@@ -3810,7 +3894,7 @@ mod stop_record_tests {
         fs::create_dir_all(&run).expect("run dir");
         let run_id = "run-1700000200000-0001";
         ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("stop fact");
-        write_natural_ending(
+        request_natural_finish(
             &run,
             run_id,
             RunOutcome::Succeeded,
@@ -3823,7 +3907,7 @@ mod stop_record_tests {
             transcript::terminal_record(&run).is_none(),
             "a Stop fact was followed by a natural terminal"
         );
-        settle_ending(
+        request_finish(
             &run,
             4_000_030,
             RunOutcome::Stopped,
@@ -3847,13 +3931,31 @@ mod stop_record_tests {
     }
 
     #[test]
+    fn a_failed_writer_after_a_terminal_fact_without_terminal_is_uncertain() {
+        let root = scratch("failed-after-terminal-missing");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Terminal).expect("terminal fact");
+        let error = request_failed_finish(&run, run_id, "the child never started")
+            .expect_err("a failed terminal cannot be invented");
+        assert!(
+            error.contains("uncertain") || error.contains("missing"),
+            "{error}"
+        );
+        assert!(transcript::terminal_record(&run).is_none());
+        assert!(ending_uncertainty(&run).expect("read").is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_failed_writer_after_a_stop_fact_adds_no_terminal() {
         let root = scratch("failed-after-stop");
         let run = root.join("run-1700000200000-0001");
         fs::create_dir_all(&run).expect("run dir");
         let run_id = "run-1700000200000-0001";
         ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("stop fact");
-        write_failed_ending(&run, run_id, "the child never started")
+        request_failed_finish(&run, run_id, "the child never started")
             .expect("the failed writer returns without a terminal");
         assert!(
             transcript::terminal_record(&run).is_none(),

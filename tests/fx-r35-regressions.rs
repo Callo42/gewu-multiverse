@@ -192,7 +192,7 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
     wait_for_shell(&run_dir, pgid);
     stop_group(pgid);
     wait_child(&mut supervisor);
-    let settled = run::settle_ending(
+    let settled = run::request_finish(
         &run_dir,
         pgid,
         run::RunOutcome::Stopped,
@@ -322,7 +322,7 @@ fn a_killed_product_reopen_reaps_the_real_sleeping_child_and_records_its_ending(
     );
     stop_group(next_pgid);
     wait_child(&mut next_supervisor);
-    let _ = run::settle_ending(
+    let _ = run::request_finish(
         &next,
         next_pgid,
         run::RunOutcome::Stopped,
@@ -814,12 +814,10 @@ fn a_terminal_outcome_does_not_clear_unverified_capability_evidence() {
             "/tmp",
         ))
         .expect("typed started");
-    transcript::record_outcome_if_missing(
+    run::ensure_terminal_for_test(
         &run_dir,
-        "run-1700000100009-0001",
         run::RunOutcome::Succeeded,
         Some("the supervisor ended".to_owned()),
-        0,
     )
     .expect("typed ending");
     // An unrelated live process must stay untouched while the capability evidence is

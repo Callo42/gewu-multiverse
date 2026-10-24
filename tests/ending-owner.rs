@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 const ENDING_TOKENS: &[&str] = &[
     "Record::RunFinished {",
-    "Record::run_finished(",
+    "gewu_multiverse::run::terminal_record_for_test(",
     "\"run-stopped.json\"",
     "\"first-ending.json\"",
     "\"ending-uncertain.json\"",
@@ -34,11 +34,20 @@ const ENDING_TOKENS: &[&str] = &[
     "stop_running_session",
 ];
 
-const SIGNAL_TOKENS: &[&str] = &["signal_group(", "killpg(", ".handle.signal("];
+const SIGNAL_TOKENS: &[&str] = &[
+    "signal_group(",
+    "killpg(",
+    "nix::sys::signal::kill",
+    ".handle.signal(",
+];
 
 /// Server/installer process groups, not run endings. They may use the raw signal
 /// primitive on their own children; ending tokens are still banned in them.
-const NON_RUN_PROCESS_FILES: &[&str] = &["src/bundled_forgejo/mod.rs", "src/installer.rs"];
+const NON_RUN_PROCESS_FILES: &[&str] = &[
+    "src/bundled_forgejo/mod.rs",
+    "src/installer.rs",
+    "src/editor.rs",
+];
 
 fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -151,15 +160,15 @@ fn the_owner_exposes_the_ending_requests() {
     for token in [
         "pub fn prepare_ending",
         "pub fn request_stop",
-        "pub fn request_force",
+        "pub fn request_force_stop",
         "pub fn stop_uncertain",
-        "pub fn stop_and_wait",
-        "pub fn settle_ending",
+        "pub fn request_stop_and_wait",
+        "pub fn request_finish",
         "pub fn recover_ending",
-        "pub fn write_natural_ending",
-        "pub fn write_failed_ending",
-        "pub fn signal_run_group",
+        "pub fn request_natural_finish",
+        "pub fn request_failed_finish",
         "pub fn signal_starting_group",
+        "pub(crate) fn adapter_signal_run_group",
     ] {
         assert!(text.contains(token), "the owner lacks `{token}`");
     }

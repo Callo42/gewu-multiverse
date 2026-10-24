@@ -359,6 +359,10 @@ pub enum Record {
         duration_ms: u64,
         /// Why it ended that way, when there is a reason to give.
         reason: Option<String>,
+        /// Owner-only construction token. It is not serialized and carries no data;
+        /// its private field makes a terminal record impossible to build elsewhere.
+        #[serde(skip)]
+        _ending_seal: crate::run::EndingSeal,
     },
 }
 
@@ -655,6 +659,7 @@ impl Record {
         exit_code: Option<i32>,
         duration_ms: u64,
         reason: Option<String>,
+        _ending_seal: crate::run::EndingSeal,
     ) -> Self {
         Record::RunFinished {
             ts: stamp(),
@@ -663,6 +668,7 @@ impl Record {
             exit_code,
             duration_ms,
             reason,
+            _ending_seal,
         }
     }
 
@@ -869,6 +875,7 @@ pub fn record_outcome_if_missing(
     outcome: RunOutcome,
     reason: Option<String>,
     duration_ms: u64,
+    _ending_seal: crate::run::EndingSeal,
 ) -> io::Result<(RunOutcome, Option<String>, u64)> {
     let existing = terminal_record_checked(run_dir)?;
     if existing.is_none() {
@@ -879,6 +886,7 @@ pub fn record_outcome_if_missing(
             None,
             duration_ms,
             reason.clone(),
+            _ending_seal,
         ))?;
     }
     Ok(match existing {
@@ -1017,7 +1025,7 @@ mod tests {
             ),
             Record::model_call_failed("run-1", 2, "bad_key", "the endpoint refused the key"),
             Record::child_exit(Some(0), None),
-            Record::run_finished("run-1", RunOutcome::Succeeded, Some(0), 42, None),
+            crate::run::terminal_record_for_test("run-1", RunOutcome::Succeeded, Some(0), 42, None),
         ];
         {
             let mut transcript = Transcript::open(&dir).expect("opened");
@@ -1038,7 +1046,7 @@ mod tests {
             .append(&Record::run_started("run-1", "a", 1, "/w"))
             .expect("appended");
         transcript
-            .append(&Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1",
                 RunOutcome::Failed,
                 Some(1),
@@ -1098,7 +1106,7 @@ mod tests {
 
         let mut transcript = Transcript::open(&dir).expect("opened again");
         transcript
-            .append(&Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1",
                 RunOutcome::Succeeded,
                 Some(0),
@@ -1140,7 +1148,7 @@ mod tests {
             .append(&Record::run_started("run-1", "a", 1, "/w"))
             .expect("appended");
         transcript
-            .append(&Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1",
                 RunOutcome::TimedOut,
                 None,

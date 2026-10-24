@@ -2344,7 +2344,7 @@ fn the_readable_transcript_is_human_and_the_jsonl_stays() {
         ))
         .expect("started");
     transcript
-        .append(&gewu_multiverse::transcript::Record::run_finished(
+        .append(&gewu_multiverse::run::terminal_record_for_test(
             run_id,
             gewu_multiverse::run::RunOutcome::Succeeded,
             Some(0),

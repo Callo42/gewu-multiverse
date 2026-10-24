@@ -275,11 +275,17 @@ The owner consults the durable fact it returns: a natural or failed writer that 
 evidence is installed with an atomic no-clobber link, so the first evidence survives
 concurrent writers.
 
-`tests/ending-owner.rs` scans every production `src` file except `src/run.rs` (the
-owner) and `src/transcript.rs` (the record storage primitive), strips tests and
-comments, and rejects typed terminal constructions, literal ending file names,
-low-level settlement calls and raw run signals. It also feeds deliberately bypassing
-source fixtures through the same check.
+`Record::RunFinished` carries a private `EndingSeal` field; only the owner can make
+one, so a terminal record cannot be constructed or appended outside `run.rs` even
+through a type alias. `Record::run_finished` and `Record::record_outcome_if_missing`
+require that seal. `tests/compile-fail.rs` compiles source probes against the library
+and requires them to fail (type-alias construction, low-level names, force API).
+
+`tests/ending-owner.rs` remains as the secondary whole-source scan. It covers every
+production `src` file except `src/run.rs` (the owner) and `src/transcript.rs` (the
+record storage primitive), strips tests and comments, and rejects typed terminal
+constructions, literal ending file names, low-level settlement calls and raw run
+signals. It also feeds deliberately bypassing source fixtures through the same check.
 
 The fact is trusted only when it names this exact run and agrees with its records. A
 missing/corrupt terminal under a persisted `terminal` fact, a foreign `run_id`, an

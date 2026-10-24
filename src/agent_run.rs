@@ -2069,7 +2069,7 @@ pub fn execute(run_dir: &Path) -> RunEnd {
             RunEnding::Warned => RunOutcome::Warned,
         }
     };
-    if let Err(error) = crate::run::write_natural_ending(
+    if let Err(error) = crate::run::request_natural_finish(
         run_dir,
         &plan.run_id,
         ending,

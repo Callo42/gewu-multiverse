@@ -299,7 +299,7 @@ impl SessionSpawner for RealSpawner {
                     let recorded =
                         write_pid(&run_dir, pid).and_then(|()| write_pgid(&run_dir, pid));
                     if let Err(reason) = recorded {
-                        crate::run::signal_run_group(pid, true);
+                        crate::run::adapter_signal_run_group(pid, true);
                         let _ = child.wait();
                         let _ = ready_tx.send(Err(reason));
                         return;
@@ -369,14 +369,14 @@ impl RunningSession for HostedSession {
     }
 
     fn signal(&mut self, force: bool) {
-        crate::run::signal_run_group(self.pid, force);
+        crate::run::adapter_signal_run_group(self.pid, force);
     }
 }
 
 impl Drop for HostedSession {
     fn drop(&mut self) {
         if self.exited.is_none() {
-            crate::run::signal_run_group(self.pid, true);
+            crate::run::adapter_signal_run_group(self.pid, true);
         }
     }
 }

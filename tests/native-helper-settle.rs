@@ -82,7 +82,7 @@ fn normal_settle_closes_a_setsid_helper_before_clearing_records() {
         .trim()
         .parse()
         .expect("helper pid number");
-    let settled = gewu_multiverse::run::settle_ending(
+    let settled = gewu_multiverse::run::request_finish(
         &dir,
         leader_pid,
         gewu_multiverse::run::RunOutcome::Stopped,

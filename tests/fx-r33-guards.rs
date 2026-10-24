@@ -854,7 +854,7 @@ fn the_card_summary_prefers_the_newest_run_that_did_work() {
         ))
         .expect("the comment record");
     transcript
-        .append(&Record::run_finished(
+        .append(&gewu_multiverse::run::terminal_record_for_test(
             "run-1700000000000-0001",
             RunOutcome::Succeeded,
             Some(0),
@@ -866,7 +866,7 @@ fn the_card_summary_prefers_the_newest_run_that_did_work() {
     fs::create_dir_all(&newer).expect("the newer run");
     let mut transcript = transcript::Transcript::open(&newer).expect("the newer transcript");
     transcript
-        .append(&Record::run_finished(
+        .append(&gewu_multiverse::run::terminal_record_for_test(
             "run-1700000000000-0002",
             RunOutcome::NoWork,
             Some(0),

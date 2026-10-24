@@ -1280,7 +1280,14 @@ impl Inner {
                     }
                 }
             } else if run.stop_deadline.is_some_and(|deadline| now >= deadline) {
-                run::request_force(run.handle.as_mut());
+                if let Some(run_id) = run_id_in(&run.run_dir) {
+                    let _ = run::request_force_stop(
+                        run.handle.as_mut(),
+                        &run.run_dir,
+                        run_id,
+                        "the run reached its force deadline",
+                    );
+                }
                 run.stop_deadline = Some(now + Duration::from_secs(1));
             }
             if let Some(status) = run.handle.try_status() {
@@ -1400,7 +1407,7 @@ impl Inner {
                 }
             }
             let stop_reason = if stop_wins { reason.clone() } else { None };
-            let settled = run::settle_ending(
+            let settled = run::request_finish(
                 &run_dir,
                 pid,
                 outcome,
@@ -3172,13 +3179,39 @@ impl EngineApi for Engine {
                         }
                     }
                     if !uncertain {
-                        run::stop_and_wait(run.handle.as_mut(), Duration::from_millis(500));
-                        let first_ending = run.first_ending.unwrap_or(run::FirstEnding::Stop);
-                        settled_runs.push((
-                            run.run_dir.clone(),
-                            run.handle.pid(),
-                            Some(first_ending),
-                        ));
+                        let proposed = run.first_ending.unwrap_or(run::FirstEnding::Stop);
+                        let result = match run_id.as_deref() {
+                            Some(run_id) => run::request_stop_and_wait(
+                                run.handle.as_mut(),
+                                &run.run_dir,
+                                run_id,
+                                proposed,
+                                "the run was stopped when the program closed",
+                                Duration::from_millis(500),
+                            ),
+                            None => Err("the run directory has no run id".to_owned()),
+                        };
+                        match result {
+                            Ok(()) => {
+                                let first_ending =
+                                    run.first_ending.unwrap_or(run::FirstEnding::Stop);
+                                settled_runs.push((
+                                    run.run_dir.clone(),
+                                    run.handle.pid(),
+                                    Some(first_ending),
+                                ));
+                            }
+                            Err(error) => {
+                                let reason = run::stop_uncertain(
+                                    run.handle.as_mut(),
+                                    &run.run_dir,
+                                    run_id.as_deref().unwrap_or("the run"),
+                                    &error,
+                                    Duration::from_millis(500),
+                                );
+                                first_ending_errors.push(format!("`{}`: {reason}", agent.name));
+                            }
+                        }
                     }
                 }
                 if let Some(pid) = agent.starting_pid.take() {
@@ -3218,7 +3251,7 @@ impl EngineApi for Engine {
         // The run gets a durable ending before its handles go; if either step fails
         // the handles stay for the next open, which reports and retries them.
         for (run_dir, pid, first_ending) in settled_runs {
-            let _ = run::settle_ending(
+            let _ = run::request_finish(
                 &run_dir,
                 pid,
                 run::RunOutcome::Stopped,
@@ -4094,7 +4127,7 @@ fn session_job(
                     return;
                 }
             };
-            let _ = run::settle_ending(
+            let _ = run::request_finish(
                 &request.run_dir,
                 pid,
                 run::RunOutcome::Stopped,
@@ -4155,7 +4188,7 @@ fn session_job(
             } else {
                 "the run was stopped before it became current"
             };
-            match run::settle_ending(
+            match run::request_finish(
                 &request.run_dir,
                 pid,
                 run::RunOutcome::Stopped,
@@ -4217,7 +4250,7 @@ fn session_job(
         Err(reason) => {
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
-            let _ = run::write_failed_ending(&request.run_dir, &request.run_id, &reason);
+            let _ = run::request_failed_finish(&request.run_dir, &request.run_id, &reason);
             let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];
             finish_session(
@@ -5123,7 +5156,7 @@ mod tests {
             ))
             .expect("the comment record");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0001",
                 run::RunOutcome::Succeeded,
                 Some(0),
@@ -5136,7 +5169,7 @@ mod tests {
         fs::create_dir_all(&newer).expect("the newer run");
         let mut transcript = crate::transcript::Transcript::open(&newer).expect("transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0002",
                 run::RunOutcome::NoWork,
                 Some(0),
@@ -5244,7 +5277,7 @@ mod tests {
             ))
             .expect("the old comment");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0007",
                 run::RunOutcome::Warned,
                 Some(0),
@@ -5511,7 +5544,7 @@ mod tests {
         fs::create_dir_all(&run_dir).expect("the run directory");
         let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-no-work",
                 run::RunOutcome::NoWork,
                 Some(0),
@@ -5643,7 +5676,7 @@ mod tests {
         let mut transcript =
             crate::transcript::Transcript::open(run_dir).expect("the run transcript");
         transcript
-            .append_durable(&crate::transcript::Record::run_finished(
+            .append_durable(&crate::run::terminal_record_for_test(
                 run_id,
                 outcome,
                 None,
@@ -7160,7 +7193,7 @@ mod tests {
         fs::create_dir_all(&run_dir).expect("the run directory");
         let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0001",
                 crate::run::RunOutcome::Failed,
                 Some(1),
@@ -7250,7 +7283,7 @@ mod tests {
         fs::create_dir_all(&run_dir).expect("the run directory");
         let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0001",
                 crate::run::RunOutcome::NoWork,
                 Some(0),
@@ -7269,7 +7302,7 @@ mod tests {
         let mut transcript =
             crate::transcript::Transcript::open(&refused_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0002",
                 crate::run::RunOutcome::Refused,
                 Some(0),
@@ -7286,7 +7319,7 @@ mod tests {
         let mut transcript =
             crate::transcript::Transcript::open(&warned_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0003",
                 crate::run::RunOutcome::Warned,
                 Some(0),
