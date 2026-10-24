@@ -247,7 +247,24 @@ recovery itself had to reap a left-over group or close a run that wrote none, it
 writes `run-stopped.json` with that ending. A failure at either write keeps the handles and is
 reported, so a later `Start` retries instead of trusting an absent record. The same
 ordering settles a normal `s` stop or a run ended by `q`; an interrupted program leaves
-either handles that the next open can still verify or an ending it can trust. If a
+either handles that the next open can still verify or an ending it can trust. A run the
+engine ended for its own reason also gets `run-stopped.json`: a normal stop, a deadline
+timeout, and a deadline failure that keeps the harness's last reported cause. The marker
+is written even when the reap cannot be verified, with that uncertainty in its sentence,
+and the terminal ending waits for a verified reap. A run's own terminal record written
+before a stop wins: the stop changes only the agent's desired state, writes no stop
+marker and adds no second ending. A stop requested while the run had no ending wins;
+if the child manages to write one during the grace window, the stop terminal replaces
+it so the run still has exactly one terminal outcome. The first-ending fact is
+write-once: a second Stop or a program shutdown during the first stop's grace cannot
+re-sample it and hand the run to a later child ending.
+The native supervisor writes `native-progress.json` whenever its per-harness outcome
+model changes (waiting, retrying, failed, succeeded), so a cause the harness already
+emitted survives the engine killing the child at its deadline. A failed tool is
+persisted there as a warning, never as the session cause: a deadline with only a tool
+warning stays `timed_out` and the stop record names the warning. Text is bound to the
+attempt that produced it; a failed or retried attempt's partial text is never
+committed by a later terminal success. If a
 process survives the reap, the sentence is kept and drawn on the agent's card; a known
 live process is `live leftover`, a live process whose ownership is unproven is
 `unverified leftover`, and a run that left no ownership record (or whose record/ending

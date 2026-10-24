@@ -170,6 +170,57 @@ impl RunPlan {
     }
 }
 
+/// The native program's immutable run facts, written before the run starts.
+pub const NATIVE_PLAN_FILE: &str = "native.json";
+
+/// The native child's positive process identity, written as soon as it exists.
+pub const NATIVE_IDENTITY_FILE: &str = "native.identity";
+
+/// The non-secret facts of one native run. The program, version, connection,
+/// model and explicit Codex sandbox are frozen here; a later settings save cannot
+/// change what an active or finished run did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePlan {
+    /// The program id (`pi`, `codex`, `dsh`, `opencode`).
+    pub harness: String,
+    /// The actual program version.
+    pub version: String,
+    /// The executable.
+    pub program: PathBuf,
+    /// The program's product-owned install root (read/exec handled separately).
+    pub install_root: PathBuf,
+    /// `chat-completions`, `responses` or `anthropic-messages`.
+    pub protocol: String,
+    /// API base URL.
+    pub base_url: String,
+    /// Model id.
+    pub model: String,
+    /// `native` for the program's own sandbox, `full-access` for the explicit
+    /// Codex compatibility choice inside the product Landlock.
+    #[serde(default)]
+    pub codex_sandbox: String,
+}
+
+impl NativePlan {
+    /// Write the plan at 0600.
+    pub fn write(&self, run_dir: &Path) -> io::Result<()> {
+        let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        crate::mode::write_private(run_dir.join(NATIVE_PLAN_FILE), text.as_bytes())
+    }
+
+    /// Read the plan, or `None` for a built-in run.
+    pub fn read(run_dir: &Path) -> io::Result<Option<Self>> {
+        match fs::read_to_string(run_dir.join(NATIVE_PLAN_FILE)) {
+            Ok(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(io::Error::other),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// The plan file's name.
 pub const PLAN_FILE: &str = "plan.json";
 
@@ -232,6 +283,17 @@ pub fn parse_steps(text: &str) -> Vec<String> {
 }
 
 /// How a run ended.
+/// Which ending happened first for a run: its own terminal record, or the first
+/// engine stop/deadline/shutdown request. It is recorded once, when the first ending
+/// occurs, and is never re-sampled by a later Stop, shutdown, settle or reopen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstEnding {
+    /// The run wrote its own terminal record before any engine stop was requested.
+    Terminal,
+    /// An engine stop, deadline or shutdown was requested while no terminal existed.
+    Stop,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
@@ -1171,6 +1233,53 @@ pub const SHELL_CAPABILITY_FILE: &str = "shell.capability";
 /// The marker written when a run's left-over group was stopped by a later start.
 pub const STOPPED_FILE: &str = "run-stopped.json";
 
+/// The native supervisor's latest failure-model state, beside the run's records.
+///
+/// It is written on every change and read by the engine when it has to end a run
+/// from its own deadline: the last cause the harness emitted must survive the
+/// child being killed, so a failing run is not recorded as only `timed_out`.
+pub const NATIVE_PROGRESS_FILE: &str = "native-progress.json";
+
+/// One native run's last emitted failure/progress cause.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeProgress {
+    /// `running`, `waiting`, `retrying`, `failed` or `succeeded`.
+    pub state: String,
+    /// The last emitted cause, in the harness's own words.
+    pub cause: String,
+    /// Whether the cause came from a terminal harness event.
+    pub terminal: bool,
+    /// The first failed tool's diagnostic, kept as a warning. It is never a
+    /// session-level or deadline failure cause.
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
+/// Record the native supervisor's latest cause for a deadline or stop ending.
+pub fn write_native_progress(
+    run_dir: &Path,
+    state: &str,
+    cause: &str,
+    terminal: bool,
+    warning: Option<&str>,
+) -> io::Result<()> {
+    let progress = NativeProgress {
+        state: state.to_owned(),
+        cause: cause.to_owned(),
+        terminal,
+        warning: warning.map(str::to_owned),
+    };
+    let text = serde_json::to_string_pretty(&progress).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(NATIVE_PROGRESS_FILE), text.as_bytes())
+}
+
+/// Read the native supervisor's latest cause, if it left one.
+pub fn native_progress(run_dir: &Path) -> Option<NativeProgress> {
+    let text = fs::read_to_string(run_dir.join(NATIVE_PROGRESS_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// One left-over process group's ending, written by the program that stopped it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1192,14 +1301,7 @@ pub struct RunStopped {
 /// last and committed to disk, so a later open that finds it also has the marker;
 /// an interrupted pair is retried from the still-present handles.
 pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
-    let record = RunStopped {
-        ts: crate::time::rfc3339(now_unix_ms()),
-        run_id: run_id.to_owned(),
-        pgid,
-        reason: reason.to_owned(),
-    };
-    let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
-    crate::mode::write_private(run_dir.join(STOPPED_FILE), text.as_bytes())?;
+    write_stop_marker(run_dir, run_id, pgid, reason)?;
     transcript::record_outcome_if_missing(
         run_dir,
         run_id,
@@ -1208,6 +1310,19 @@ pub fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) 
         0,
     )
     .map(|_| ())
+}
+
+/// Write only the stop marker, not a terminal record. A stop that cannot yet be
+/// verified still gets a truthful marker; the terminal record waits for cleanup.
+fn write_stop_marker(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> io::Result<()> {
+    let record = RunStopped {
+        ts: crate::time::rfc3339(now_unix_ms()),
+        run_id: run_id.to_owned(),
+        pgid,
+        reason: reason.to_owned(),
+    };
+    let text = serde_json::to_string_pretty(&record).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(STOPPED_FILE), text.as_bytes())
 }
 
 /// The run id a run directory's name carries.
@@ -1235,12 +1350,64 @@ pub fn ensure_terminal_record(
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
 
+/// Whether this run has a terminal record, without turning an unreadable
+/// transcript into "no ending".
+pub fn terminal_recorded(run_dir: &Path) -> Result<bool, String> {
+    transcript::terminal_record_checked(run_dir)
+        .map(|record| record.is_some())
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))
+}
+
+/// Write exactly one terminal record, replacing any earlier terminal record.
+///
+/// The transcript is append-only for normal records, but a stop that won the race
+/// against a child's just-written ending must not leave two terminal outcomes. The
+/// rewrite removes only `run_finished` records, preserves every other record in
+/// order, writes one new terminal ending, and installs the file atomically at
+/// 0600. It is called only after the child has been stopped, so no writer races it.
+fn write_terminal_replacing(
+    run_dir: &Path,
+    run_id: &str,
+    outcome: RunOutcome,
+    reason: &str,
+) -> Result<(), String> {
+    let mut records = match transcript::read_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?
+    {
+        Some(file) => file.records,
+        None => Vec::new(),
+    };
+    records.retain(|record| !matches!(record, Record::RunFinished { .. }));
+    records.push(Record::run_finished(
+        run_id,
+        outcome,
+        None,
+        0,
+        Some(reason.to_owned()),
+    ));
+    let mut text = String::new();
+    for record in &records {
+        text.push_str(
+            &serde_json::to_string(record)
+                .map_err(|error| format!("the run's ending cannot be recorded: {error}"))?,
+        );
+        text.push('\n');
+    }
+    crate::mode::write_private(run_dir.join(transcript::TRANSCRIPT_FILE), text.as_bytes())
+        .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
+}
+
 /// Settle one finished run at the engine's boundary.
 ///
 /// First the recorded group is stopped (or found already gone); then, and only
 /// then, the run's ending is written durably; only after both have succeeded are the
 /// identity handles removed. Any error keeps the handles and reaches the card, so
 /// `Start` retries rather than running beside an unproven leftover.
+///
+/// A run the engine stopped (stopped, timed out, or failed at its deadline) also
+/// gets a stop marker. The marker is written even when the reap cannot be verified,
+/// with that uncertainty in its sentence; the terminal record waits for a verified
+/// reap so a later retry can still decide it.
 pub fn settle_run(
     run_dir: &Path,
     pgid: u32,
@@ -1248,11 +1415,97 @@ pub fn settle_run(
     reason: Option<String>,
     grace: std::time::Duration,
 ) -> Result<bool, String> {
-    let reaped = reap_process_group(pgid, run_dir, grace).map_err(categorize_cleanup)?;
-    ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
-    // `reap_process_group` only returns Ok when no unverified member survives, and
-    // it writes its own run_stopped ending when it had to signal a group.
-    clear_process_records(run_dir);
+    let stop = (outcome == RunOutcome::Stopped).then(|| {
+        reason
+            .clone()
+            .unwrap_or_else(|| "the run was stopped on request".to_owned())
+    });
+    let first_ending = if terminal_recorded(run_dir).unwrap_or(true) {
+        FirstEnding::Terminal
+    } else {
+        FirstEnding::Stop
+    };
+    settle_run_with_stop(run_dir, pgid, outcome, reason, grace, stop, first_ending)
+}
+
+/// [`settle_run`] with the engine's own stop reason and the write-once first-ending
+/// fact.
+///
+/// `FirstEnding::Terminal` means the run ended first: the existing terminal record is
+/// its one outcome and no stop marker is written. `FirstEnding::Stop` means the
+/// engine's stop was requested while no terminal existed; if the child managed to
+/// write one during the grace window, the stop record replaces it so the run still
+/// has exactly one terminal outcome. A later Stop, shutdown, settle, reap or reopen
+/// cannot change this fact.
+pub fn settle_run_with_stop(
+    run_dir: &Path,
+    pgid: u32,
+    outcome: RunOutcome,
+    reason: Option<String>,
+    grace: std::time::Duration,
+    stop: Option<String>,
+    first_ending: FirstEnding,
+) -> Result<bool, String> {
+    let run_id = run_id_of(run_dir).map_err(categorize_cleanup)?;
+    let existing = transcript::terminal_record_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
+    if stop.is_some() && first_ending == FirstEnding::Terminal && existing.is_some() {
+        // The run ended first. The Stop is only a desired-state change: keep the one
+        // ending, write no stop marker, and still verify the group is gone.
+        let reaped = reap(run_dir, pgid, grace)?;
+        clear_process_records(run_dir);
+        return Ok(reaped);
+    }
+    let reaped = reap(run_dir, pgid, grace);
+    let mut stop_sentence = None;
+    if let Some(stop_reason) = stop {
+        let mut sentence = stop_reason;
+        if let Err(error) = &reaped {
+            sentence.push_str(&format!(
+                "; its process group could not be verified as stopped: {}",
+                categorize_cleanup(error.clone())
+            ));
+        }
+        write_stop_marker(run_dir, run_id, pgid, &sentence)
+            .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+        stop_sentence = Some(sentence);
+    }
+    match reaped {
+        Ok(reaped) => {
+            match stop_sentence {
+                Some(sentence) => {
+                    write_terminal_replacing(run_dir, run_id, outcome, &sentence)
+                        .map_err(categorize_cleanup)?;
+                }
+                None => {
+                    ensure_terminal_record(run_dir, outcome, reason).map_err(categorize_cleanup)?;
+                }
+            }
+            // `reap_process_group` only returns Ok when no unverified member survives,
+            // and it writes its own run_stopped ending when it had to signal a group.
+            clear_process_records(run_dir);
+            Ok(reaped)
+        }
+        Err(error) => {
+            // The stop happened, but its cleanup is unverified. Write the truthful
+            // terminal ending anyway (with that uncertainty in the sentence) while
+            // keeping every handle, so a later Start retries the cleanup and still
+            // finds an outcome and reason.
+            if let Some(sentence) = stop_sentence.as_deref() {
+                write_terminal_replacing(run_dir, run_id, outcome, sentence)
+                    .map_err(categorize_cleanup)?;
+            }
+            Err(categorize_cleanup(error))
+        }
+    }
+}
+
+fn reap(run_dir: &Path, pgid: u32, grace: std::time::Duration) -> Result<bool, String> {
+    let mut reaped = reap_process_group(pgid, run_dir, grace)?;
+    // A native helper may have called setsid and therefore not be in the leader's
+    // group. Its inherited capability is the ownership proof; enumerate and close
+    // every such group before the identities are removed.
+    reaped |= reap_capability_groups(run_dir, grace)?;
     Ok(reaped)
 }
 
@@ -1398,6 +1651,54 @@ pub fn write_shell_record(run_dir: &Path, pid: u32, _pgid: u32) -> io::Result<()
         run_dir.join(SHELL_PGID_FILE),
         live_group.to_string().as_bytes(),
     )
+}
+
+/// Record a native child's positive identity as soon as the child exists.
+///
+/// The native CLI is not the product's shell and may close inherited descriptors,
+/// so its boot/start identity is the durable handle a later open uses after the
+/// product run process is gone. The record is written by the run process before any
+/// native output is consumed.
+pub fn write_native_identity(run_dir: &Path, pid: u32) -> io::Result<()> {
+    let (group, identity) = process_identity(pid)?
+        .ok_or_else(|| io::Error::other("the native program's live identity cannot be read"))?;
+    let line = format!("{pid} {group} {} {}\n", identity.boot, identity.start);
+    crate::mode::write_private(run_dir.join(NATIVE_IDENTITY_FILE), line.as_bytes())
+}
+
+#[derive(Debug, Clone)]
+struct NativeRecord {
+    pid: u32,
+    pgid: u32,
+    identity: ProcessIdentity,
+}
+
+fn read_native_record(run_dir: &Path) -> Option<NativeRecord> {
+    let text = fs::read_to_string(run_dir.join(NATIVE_IDENTITY_FILE)).ok()?;
+    let mut fields = text.split_whitespace();
+    Some(NativeRecord {
+        pid: fields.next()?.parse().ok()?,
+        pgid: fields.next()?.parse().ok()?,
+        identity: ProcessIdentity {
+            boot: fields.next()?.to_owned(),
+            start: fields.next()?.parse().ok()?,
+        },
+    })
+}
+
+/// Whether the native identity names the same live process in the same group.
+fn native_identity_is_live(run_dir: &Path, pgid: u32) -> io::Result<bool> {
+    let Some(record) = read_native_record(run_dir) else {
+        return Ok(false);
+    };
+    if record.pgid != pgid {
+        return Ok(false);
+    }
+    let Some((_, live_group, start)) = process_facts(record.pid)? else {
+        return Ok(false);
+    };
+    let boot = boot_id()?;
+    Ok(live_group == pgid && ProcessIdentity { boot, start } == record.identity)
 }
 
 /// Create the run's anonymous ownership capability and record its object.
@@ -1602,6 +1903,7 @@ pub fn clear_process_records(run_dir: &Path) {
         SHELL_PGID_FILE,
         SHELL_IDENTITY_FILE,
         SHELL_CAPABILITY_FILE,
+        NATIVE_IDENTITY_FILE,
     ] {
         let _ = fs::remove_file(run_dir.join(name));
     }
@@ -1624,7 +1926,10 @@ pub fn recorded_group(run_dir: &Path) -> Option<(u32, u32)> {
     if let Some(pgid) = read_number(run_dir, SHELL_PGID_FILE) {
         return Some((pgid, pgid));
     }
-    read_shell_record(run_dir).map(|record| (record.pid, record.pgid))
+    if let Some(record) = read_shell_record(run_dir) {
+        return Some((record.pid, record.pgid));
+    }
+    read_native_record(run_dir).map(|record| (record.pid, record.pgid))
 }
 
 /// Every process in a recorded group, read from the kernel's `stat` only. No
@@ -1686,6 +1991,7 @@ fn live_run_pids(pgid: u32, run_dir: &Path) -> Result<Vec<u32>, String> {
     }
     if shell_identity_is_live(run_dir, pgid).map_err(|error| error.to_string())?
         || group_holds_capability(pgid, run_dir)?
+        || native_identity_is_live(run_dir, pgid).map_err(|error| error.to_string())?
     {
         return Ok(members);
     }
@@ -1766,6 +2072,7 @@ fn process_records_readable(run_dir: &Path) -> Result<(), String> {
         SHELL_PGID_FILE,
         SHELL_IDENTITY_FILE,
         SHELL_CAPABILITY_FILE,
+        NATIVE_IDENTITY_FILE,
         PLAN_FILE,
         crate::transcript::TRANSCRIPT_FILE,
     ] {
@@ -2023,6 +2330,7 @@ fn run_predates_boot(run_dir: &Path) -> bool {
         crate::transcript::TRANSCRIPT_FILE,
         SHELL_IDENTITY_FILE,
         SHELL_CAPABILITY_FILE,
+        NATIVE_IDENTITY_FILE,
     ] {
         let Ok(metadata) = fs::metadata(run_dir.join(name)) else {
             continue;
@@ -2078,6 +2386,30 @@ fn categorize_cleanup(reason: String) -> String {
     } else {
         format!("cleanup unverified: {reason}")
     }
+}
+
+/// Close every live group that still holds this run's inherited capability.
+///
+/// The capability is kernel-owned and cannot be copied into the run by name. A
+/// group is accepted only after `capability_group` has verified the descriptor
+/// (dev/ino/token) of a live member; `reap_process_group` then applies the same
+/// pidfd/boot/start ownership checks as the leader path.
+fn reap_capability_groups(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
+    let mut seen = Vec::new();
+    let mut reaped = false;
+    for _ in 0..32 {
+        let Some(group) = capability_group(run_dir)? else {
+            return Ok(reaped);
+        };
+        if seen.contains(&group) {
+            return Err(format!(
+                "live leftover: capability-holding group {group} survived reaping"
+            ));
+        }
+        seen.push(group);
+        reaped |= reap_process_group(group, run_dir, grace)?;
+    }
+    Err("live leftover: too many capability-holding groups survived reaping".to_owned())
 }
 
 fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
@@ -2162,7 +2494,8 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
         clear_process_records(run_dir);
         return Ok(false);
     };
-    let reaped = reap_process_group(pgid, run_dir, grace)?;
+    let mut reaped = reap_process_group(pgid, run_dir, grace)?;
+    reaped |= reap_capability_groups(run_dir, grace)?;
     if !reaped && unverified_group(pgid)? {
         // A live group whose ownership cannot be established is not touched, but
         // it is not hidden either: the open reports it, the card names it and
@@ -2339,6 +2672,25 @@ pub fn readable_transcript(run_dir: &Path) -> String {
             } => out.push_str(&format!(
                 "{ts}  bounds: {max_turns} turns, {timeout_secs} s, model {model}\n"
             )),
+            Record::NativeStarted {
+                ts,
+                harness,
+                version,
+                protocol,
+                base_url,
+                model,
+                codex_sandbox,
+                ..
+            } => out.push_str(&format!(
+                "{ts}  native program: {harness} {version}, {protocol} at {base_url}, model {model}{}\n",
+                codex_sandbox
+                    .as_deref()
+                    .map(|mode| format!(", Codex sandbox {mode}"))
+                    .unwrap_or_default()
+            )),
+            Record::NativeText { ts, text } => {
+                out.push_str(&format!("{ts}  native: {}\n", bounded(text, 4000)));
+            }
             Record::ModelReply {
                 ts,
                 turn,
@@ -2554,5 +2906,253 @@ mod review3_identity_tests {
         }
         assert!(ended, "the verified process was not signalled");
         let _ = fs::remove_dir_all(&run_dir);
+    }
+}
+
+#[cfg(test)]
+mod stop_record_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "gewu-stop-record-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("scratch root");
+        root
+    }
+
+    fn run_with_terminal(root: &Path, outcome: RunOutcome, reason: &str) -> PathBuf {
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let mut transcript = transcript::Transcript::open(&run).expect("transcript");
+        transcript
+            .append_durable(&Record::run_finished(
+                "run-1700000200000-0001",
+                outcome,
+                None,
+                10,
+                Some(reason.to_owned()),
+            ))
+            .expect("terminal record");
+        run
+    }
+
+    fn stop_reason(run: &Path) -> String {
+        let text = fs::read_to_string(run.join(STOPPED_FILE)).expect("run-stopped.json");
+        let record: RunStopped = serde_json::from_str(&text).expect("stop record JSON");
+        record.reason
+    }
+
+    fn terminal(run: &Path) -> Record {
+        transcript::terminal_record(run).expect("terminal record")
+    }
+
+    #[test]
+    fn a_timed_out_run_records_the_stop_and_keeps_the_last_cause() {
+        let root = scratch("timeout");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let reason = "the run reached its time limit and was stopped; last reported cause: the native provider reported 500: synthetic status 500";
+        let settled = settle_run_with_stop(
+            &run,
+            4_000_000,
+            RunOutcome::TimedOut,
+            Some(reason.to_owned()),
+            Duration::from_millis(50),
+            Some(reason.to_owned()),
+            FirstEnding::Stop,
+        )
+        .expect("the timeout settles");
+        assert!(!settled);
+        let marker = stop_reason(&run);
+        assert!(marker.contains("time limit"), "{marker}");
+        assert!(marker.contains("synthetic status 500"), "{marker}");
+        match terminal(&run) {
+            Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "timed_out");
+                assert!(reason.contains("synthetic status 500"), "{reason}");
+            }
+            other => panic!("the timeout did not write one ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_terminal_record_that_predates_the_stop_keeps_the_one_outcome() {
+        let root = scratch("finish-then-stop");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Failed,
+            "the native provider reported AUTH: 401 unauthorized",
+        );
+        settle_run_with_stop(
+            &run,
+            4_000_001,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(50),
+            Some("the run was stopped on request".to_owned()),
+            FirstEnding::Terminal,
+        )
+        .expect("the stop settles");
+        assert!(
+            !run.join(STOPPED_FILE).exists(),
+            "a stop after the run's ending wrote a false stop record"
+        );
+        match terminal(&run) {
+            Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "failed");
+                assert!(reason.contains("401 unauthorized"), "{reason}");
+            }
+            other => panic!("the earlier ending was replaced: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stop_that_wins_replaces_a_child_ending_written_after_the_signal() {
+        let root = scratch("stop-then-finish");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the run finished while the stop was in flight",
+        );
+        settle_run_with_stop(
+            &run,
+            4_000_002,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(50),
+            Some("the run was stopped on request".to_owned()),
+            FirstEnding::Stop,
+        )
+        .expect("the stop settles");
+        let marker = stop_reason(&run);
+        assert!(marker.contains("stopped on request"), "{marker}");
+        let records = transcript::read(&run).expect("transcript").records;
+        let terminals: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::RunFinished { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 1, "the run has more than one ending");
+        match terminals[0] {
+            Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "stopped");
+                assert!(reason.contains("stopped on request"), "{reason}");
+            }
+            other => panic!("the stop did not own the one ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recovery_stop_keeps_the_existing_single_ending() {
+        let root = scratch("recovery-existing");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the run finished before the reopen",
+        );
+        write_run_stopped(
+            &run,
+            "run-1700000200000-0001",
+            4_000_003,
+            "an earlier start's leftover group was stopped",
+        )
+        .expect("the recovery stop record");
+        let records = transcript::read(&run).expect("transcript").records;
+        let terminals: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::RunFinished { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 1, "recovery wrote a second ending");
+        match terminals[0] {
+            Record::RunFinished { outcome, .. } => assert_eq!(outcome, "succeeded"),
+            other => panic!("unexpected ending: {other:?}"),
+        }
+        assert!(
+            run.join(STOPPED_FILE).is_file(),
+            "the cleanup was not recorded"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_reap_still_writes_a_truthful_stop_marker() {
+        let root = scratch("reap-failure");
+        let run = root.join("run-1700000200000-0003");
+        fs::create_dir_all(&run).expect("run dir");
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("unrelated group starts");
+        let pid = child.id();
+        fs::write(run.join("session.pid"), pid.to_string()).expect("session pid");
+        fs::write(run.join("session.pgid"), pid.to_string()).expect("session pgid");
+        std::thread::sleep(Duration::from_millis(50));
+        let error = settle_run_with_stop(
+            &run,
+            pid,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(80),
+            Some("the run was stopped on request".to_owned()),
+            FirstEnding::Stop,
+        )
+        .expect_err("an unverified group cannot be claimed stopped");
+        assert!(
+            error.contains("unverified") || error.contains("cannot be verified"),
+            "the reap failure was not named: {error}"
+        );
+        let marker = stop_reason(&run);
+        assert!(marker.contains("stopped on request"), "{marker}");
+        assert!(
+            marker.contains("could not be verified as stopped"),
+            "the stop marker hid the failed reap: {marker}"
+        );
+        match transcript::terminal_record(&run) {
+            Some(Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            }) => {
+                assert_eq!(outcome, "stopped");
+                assert!(
+                    reason.contains("could not be verified as stopped"),
+                    "the terminal ending hid the failed reap: {reason}"
+                );
+            }
+            other => panic!("the unverified stop wrote no truthful ending: {other:?}"),
+        }
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
     }
 }

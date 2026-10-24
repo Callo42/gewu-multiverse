@@ -17,7 +17,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-use crate::run::{RunForgejo, RunForgejoRepository, RunPlan, write_forgejo_context};
+use crate::run::{NativePlan, RunForgejo, RunForgejoRepository, RunPlan, write_forgejo_context};
 use crate::workspace::{self, GitCredential, GitIdentity, Prepared};
 
 /// One repository a session may use, as the run's context records it.
@@ -71,6 +71,31 @@ pub struct SessionRequest {
     pub confinement: crate::confinement::Method,
     /// The directories the confined shell must not see.
     pub hide: Vec<PathBuf>,
+    /// The native program this run launches, when it is not the built-in loop.
+    pub native: Option<NativeRequest>,
+}
+
+/// The immutable native program facts carried from the agent's settings into a run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRequest {
+    /// Program id.
+    pub harness: String,
+    /// Actual installed version.
+    pub version: String,
+    /// Executable.
+    pub program: PathBuf,
+    /// Product-owned install root.
+    pub install_root: PathBuf,
+    /// Connection protocol.
+    pub protocol: String,
+    /// API base URL.
+    pub base_url: String,
+    /// Model id.
+    pub model: String,
+    /// Explicit Codex sandbox choice (`native` or `full-access`).
+    #[serde(default)]
+    pub codex_sandbox: String,
 }
 
 /// A session whose slow work is done and whose plan is on disk.
@@ -218,6 +243,21 @@ impl SessionSpawner for RealSpawner {
         if !context.repositories.is_empty() {
             crate::run::write_forgejo_context(&request.run_dir, &context).map_err(|error| {
                 format!("the session's Forgejo context cannot be written: {error}")
+            })?;
+        }
+        if let Some(native) = request.native.as_ref() {
+            let plan = NativePlan {
+                harness: native.harness.clone(),
+                version: native.version.clone(),
+                program: native.program.clone(),
+                install_root: native.install_root.clone(),
+                protocol: native.protocol.clone(),
+                base_url: native.base_url.clone(),
+                model: native.model.clone(),
+                codex_sandbox: native.codex_sandbox.clone(),
+            };
+            plan.write(&request.run_dir).map_err(|error| {
+                format!("the session's native program plan cannot be written: {error}")
             })?;
         }
         Ok(PreparedSession {

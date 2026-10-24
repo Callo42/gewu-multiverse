@@ -127,6 +127,19 @@ fn view(count: usize) -> BoardView {
                 no_assigned_work: false,
                 last_work_result: Some(format!("did run {number}")),
                 last_result_is_work: true,
+                program: "builtin".to_owned(),
+                program_label: "built-in engine".to_owned(),
+                unknown_program: None,
+                program_installed: true,
+                program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                protocol: "chat-completions".to_owned(),
+                base_url: "https://model.example/v1".to_owned(),
+                model: "demo-model".to_owned(),
+                key_present: true,
+                program_error: None,
+                active_program: None,
+                next_program: None,
+                codex_sandbox: None,
             }
         })
         .collect();
@@ -146,9 +159,12 @@ fn view(count: usize) -> BoardView {
             admin_login_kept: false,
         },
         agents,
+        programs: Vec::new(),
         endpoint: EndpointView {
             configured: true,
             url: "https://model.example/v1/chat/completions".to_owned(),
+            base_url: "https://model.example/v1".to_owned(),
+            protocol: "chat-completions".to_owned(),
             model: "demo-model".to_owned(),
             key_present: true,
             test: EndpointTest::NotRun,

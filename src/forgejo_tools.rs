@@ -113,6 +113,7 @@ pub struct ForgejoTools {
     agent: String,
     token: Secret,
     writes: Cell<u32>,
+    accepted: Cell<bool>,
 }
 
 impl std::fmt::Debug for ForgejoTools {
@@ -135,18 +136,42 @@ impl ForgejoTools {
         agent: impl Into<String>,
         token: Secret,
     ) -> Self {
+        Self::new_with_writes(config, workspace, agent, token, 0)
+    }
+
+    /// Build the tools with the writes already made by an earlier MCP server of the
+    /// same run, so restarting the bridge cannot reset the eight-write bound.
+    pub fn new_with_writes(
+        config: RunForgejo,
+        workspace: impl Into<PathBuf>,
+        agent: impl Into<String>,
+        token: Secret,
+        writes: u32,
+    ) -> Self {
         Self {
             config,
             workspace: workspace.into(),
             agent: agent.into(),
             token,
-            writes: Cell::new(0),
+            writes: Cell::new(writes),
+            accepted: Cell::new(false),
         }
     }
 
     /// How many writes this run has made.
     pub fn writes(&self) -> u32 {
         self.writes.get()
+    }
+
+    /// Keep the internal count at or above the supervisor's reserved count.
+    pub fn set_writes(&self, writes: u32) {
+        self.writes.set(writes);
+    }
+
+    /// Whether the most recent write request reached a 2xx response, even if its
+    /// body could not be read as the expected shape.
+    pub fn last_accepted(&self) -> bool {
+        self.accepted.get()
     }
 
     /// Count a write the instance accepted, whether or not its reply parsed.
@@ -156,6 +181,7 @@ impl ForgejoTools {
     /// run's writes (B2). A 4xx/5xx refusal never reaches here.
     fn note_accepted(&self, client: &ForgejoClient) {
         if client.last_2xx() {
+            self.accepted.set(true);
             self.writes.set(self.writes.get().saturating_add(1));
         }
     }
@@ -321,6 +347,7 @@ impl ForgejoTools {
                 "the arguments are not a JSON object; call `{name}` with the declared schema"
             )));
         }
+        self.accepted.set(false);
         if is_write_tool(name) && self.writes.get() >= WRITE_BOUND {
             return Err(sentence(format!(
                 "the per-run Forgejo write bound of {WRITE_BOUND} is reached; this run can still read Forgejo, but no further comment or pull request will be written"
@@ -870,6 +897,22 @@ pub fn undeclared(name: &str, forgejo_declared: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restarted_bridge_starts_from_the_persisted_write_count() {
+        let tools = ForgejoTools::new_with_writes(
+            crate::run::RunForgejo {
+                url: "http://127.0.0.1:1".to_owned(),
+                login: "gewu-agent-1".to_owned(),
+                repositories: Vec::new(),
+            },
+            "/tmp/workspace",
+            "agent-1",
+            Secret::new("dummy"),
+            7,
+        );
+        assert_eq!(tools.writes(), 7);
+    }
 
     #[test]
     fn a_sentence_has_no_newline_and_is_bounded() {

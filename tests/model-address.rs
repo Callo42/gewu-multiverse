@@ -98,6 +98,7 @@ fn a_timeout_says_how_long_it_waited() {
     let stub = Stub::start(vec![StubReply {
         status: 200,
         body: "{}".to_owned(),
+        content_type: None,
         retry_after_secs: None,
         delay: Duration::from_secs(3),
     }]);

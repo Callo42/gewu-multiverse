@@ -98,6 +98,14 @@ pub fn blocked_words(reason: &str) -> &'static str {
         "live leftover"
     } else if reason.contains("instruction") {
         "needs an instruction"
+    } else if reason.contains("unknown saved program") {
+        "unknown saved program"
+    } else if reason.contains("not installed") {
+        "program not installed"
+    } else if reason.contains("model key") {
+        "needs a model key"
+    } else if reason.contains("connection and model") {
+        "choose connection and model"
     } else if reason.contains("model") || reason.contains("endpoint") || reason.contains("key") {
         "needs a model"
     } else if reason.contains("account") {
@@ -871,6 +879,19 @@ mod tests {
             no_assigned_work: false,
             last_work_result: None,
             last_result_is_work: false,
+            program: "builtin".to_owned(),
+            program_label: "built-in engine".to_owned(),
+            unknown_program: None,
+            program_installed: true,
+            program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            protocol: "chat-completions".to_owned(),
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            model: "lab-chat-1".to_owned(),
+            key_present: true,
+            program_error: None,
+            active_program: None,
+            next_program: None,
+            codex_sandbox: None,
         }
     }
 
@@ -972,6 +993,19 @@ mod tests {
             "needs an instruction"
         );
         assert_eq!(blocked_words("needs a model"), "needs a model");
+        assert_eq!(blocked_words("needs a model key"), "needs a model key");
+        assert_eq!(
+            blocked_words("choose this agent's connection and model"),
+            "choose connection and model"
+        );
+        assert_eq!(
+            blocked_words("Codex is not installed"),
+            "program not installed"
+        );
+        assert_eq!(
+            blocked_words("unknown saved program `potato`"),
+            "unknown saved program"
+        );
         assert_eq!(blocked_words("waiting for Forgejo"), "waiting for Forgejo");
         assert_eq!(blocked_words("account not ready"), "account not ready");
         assert_eq!(blocked_words("something else"), "needs help");
