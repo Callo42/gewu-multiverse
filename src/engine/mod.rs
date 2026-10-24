@@ -536,6 +536,8 @@ struct AgentRuntime {
     provision_retry_at: Option<Instant>,
     removal_pending: bool,
     removal_retry_at: Option<Instant>,
+    /// The Forgejo login/tokens were already cancelled but the local removal failed.
+    identity_cancelled: bool,
 }
 
 /// The bundled Forgejo's engine state.
@@ -971,6 +973,7 @@ impl AgentRuntime {
             provision_retry_at: None,
             removal_pending: false,
             removal_retry_at: None,
+            identity_cancelled: false,
         }
     }
 
@@ -2904,7 +2907,7 @@ impl EngineApi for Engine {
                     inner.agents[index].removal_pending = false;
                     inner.agents[index].removal_retry_at = None;
                     return Err(format!(
-                        "`{name}` was stopped, but the removal could not be saved; it was not removed ({error})"
+                        "`{name}` was stopped, but the removal could not be saved and the stopped state was not saved; it will start again the next time the program opens ({error})"
                     ));
                 }
                 inner.agents[index].removal_pending = true;
@@ -2916,6 +2919,14 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                if inner.agents[index].identity_cancelled {
+                    let reason = "its Forgejo sign-in and tokens were already cancelled; Remove can be retried";
+                    inner.agents[index].session = SessionState::Blocked {
+                        reason: reason.to_owned(),
+                    };
+                    inner.note(format!("not started — {reason}"));
+                    return Ok(());
+                }
                 // A cleanup that failed at open or at a run boundary is retried
                 // before any replacement run. Until it succeeds, Start reports the
                 // reason and does not start; once the old group is gone, the
@@ -4385,10 +4396,21 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                         inner.note(removed_note(&name));
                     }
                     Err(error) => {
+                        let reason = format!(
+                            "`{name}`'s Forgejo sign-in and tokens were already cancelled, but the removal could not be saved; it is still on the board and Remove can be retried ({error})"
+                        );
                         inner.agents[index].removal_pending = false;
                         inner.agents[index].removal_retry_at =
                             Some(Instant::now() + PROVISION_RETRY);
-                        inner.note(format!("`{name}` was removed, but {error}"));
+                        inner.agents[index].login = None;
+                        inner.agents[index].identity_cancelled = true;
+                        inner.agents[index].provisioning = Provisioning::Failed {
+                            reason: reason.clone(),
+                        };
+                        inner.agents[index].session = SessionState::Blocked {
+                            reason: reason.clone(),
+                        };
+                        inner.note(reason);
                     }
                 }
             }
@@ -7671,6 +7693,90 @@ mod tests {
             "the agent was removed anyway"
         );
         assert_eq!(engine.board().agents[0].desired, Desired::Stopped);
+    }
+
+    #[test]
+    fn f4_a_failed_removal_save_blocks_and_a_retry_completes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f4-removal");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents[0].login = None;
+        }
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only settings");
+        remove_agent_job(Arc::clone(&engine.inner), "agent-1".to_owned());
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("writable settings");
+        {
+            let inner = lock_inner(&engine.inner);
+            assert_eq!(inner.agents.len(), 1);
+            assert!(inner.agents[0].identity_cancelled);
+            assert!(matches!(
+                inner.agents[0].session,
+                SessionState::Blocked { .. }
+            ));
+            assert!(
+                inner
+                    .notice
+                    .as_deref()
+                    .is_some_and(|note| note.contains("already cancelled"))
+            );
+        }
+        assert!(
+            engine
+                .send(Command::Start {
+                    name: "agent-1".to_owned()
+                })
+                .is_ok()
+        );
+        assert_eq!(fake.counts().1, 0, "a blocked cancelled identity started");
+        remove_agent_job(Arc::clone(&engine.inner), "agent-1".to_owned());
+        {
+            let inner = lock_inner(&engine.inner);
+            assert!(
+                inner.agents.is_empty(),
+                "the retry did not complete the removal"
+            );
+        }
+    }
+
+    #[test]
+    fn f5_a_failed_remove_save_says_the_stop_will_not_survive_reopen() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f5-remove-reopen");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only settings");
+        let result = engine.send(Command::RemoveAgent {
+            name: "agent-1".to_owned(),
+        });
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("writable settings");
+        let error = result.expect_err("the failed removal was reported as success");
+        assert!(
+            error.contains("will start again the next time the program opens"),
+            "{error}"
+        );
+        drop(engine);
+        let persisted = settings::Settings::load(&settings_file).expect("load");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut reopened =
+            open_test_engine(&root, persisted, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut reopened, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
     }
 
     #[test]
