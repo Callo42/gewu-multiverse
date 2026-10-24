@@ -741,3 +741,79 @@ fn every_harness_engine_deadline_writes_a_stop_record() {
         let _ = fs::remove_dir_all(&scratch.0);
     }
 }
+
+fn terminal_records(run_dir: &Path) -> Vec<Record> {
+    transcript::read(run_dir)
+        .expect("the run transcript reads")
+        .records
+        .into_iter()
+        .filter(|record| matches!(record, Record::RunFinished { .. }))
+        .collect()
+}
+
+#[test]
+#[ignore = "live Forgejo + pinned Pi: run with GEWU_FORGEJO_BINARY=... GEWU_PRODUCT_BINARY=... GEWU_PROOF_ROOT=..."]
+fn a_stop_after_the_runs_terminal_record_does_not_replace_it() {
+    for harness in ["pi", "opencode"] {
+        let (scratch, layout, mut engine, protocol) = open_engine_for(
+            &format!("finish-then-stop-{harness}"),
+            harness,
+            Duration::from_secs(30),
+        );
+        let probe = format!("proof-finish-then-stop-{harness}");
+        let run_dir = start_agent(
+            &mut engine,
+            &layout,
+            "agent-1",
+            &probe,
+            &protocol,
+            serde_json::json!({"scenario": "ok", "text": "probe ok"}),
+        );
+        // Wait for the child to write its own ending without ticking the engine. The
+        // engine still holds the run as running, exactly the Main journey's race.
+        let start = Instant::now();
+        while terminal_records(&run_dir).is_empty() && start.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = terminal_records(&run_dir);
+        assert_eq!(
+            before.len(),
+            1,
+            "{harness} did not write exactly one ending"
+        );
+        let before_outcome = match &before[0] {
+            Record::RunFinished { outcome, .. } => outcome.clone(),
+            other => panic!("unexpected ending: {other:?}"),
+        };
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop");
+        let (same_dir, record) =
+            wait_terminal_for(&mut engine, &layout, "agent-1", Duration::from_secs(60));
+        assert_eq!(same_dir, run_dir);
+        match &record {
+            Record::RunFinished { outcome, .. } => {
+                assert_eq!(
+                    *outcome, before_outcome,
+                    "{harness}: the stop replaced the run's outcome"
+                );
+            }
+            other => panic!("{harness}: no terminal record: {other:?}"),
+        }
+        let after = terminal_records(&run_dir);
+        assert_eq!(
+            after.len(),
+            1,
+            "{harness}: the stop appended a second ending: {after:?}"
+        );
+        assert!(
+            !run_dir.join(run::STOPPED_FILE).is_file(),
+            "{harness}: a stop after the ending wrote a false stop record"
+        );
+        eprintln!("finish-then-stop {harness}: {record:?}");
+        drop(engine);
+        let _ = fs::remove_dir_all(&scratch.0);
+    }
+}

@@ -1339,60 +1339,50 @@ pub fn ensure_terminal_record(
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
 
-/// A sentence naming an ending the supervisor wrote before the stop was settled.
-fn prior_terminal_note(run_dir: &Path) -> String {
-    let Ok(Some(Record::RunFinished {
-        outcome, reason, ..
-    })) = transcript::terminal_record_checked(run_dir)
-    else {
-        return String::new();
-    };
-    if outcome == RunOutcome::Stopped.as_str() || outcome == RunOutcome::TimedOut.as_str() {
-        return String::new();
-    }
-    match reason {
-        Some(reason) if !reason.trim().is_empty() => {
-            format!("; before the stop the run recorded {outcome}: {reason}")
-        }
-        _ => format!("; before the stop the run recorded {outcome}"),
-    }
+/// Whether this run has a terminal record, without turning an unreadable
+/// transcript into "no ending".
+pub fn terminal_recorded(run_dir: &Path) -> Result<bool, String> {
+    transcript::terminal_record_checked(run_dir)
+        .map(|record| record.is_some())
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))
 }
 
-/// Write the stop ending as the last terminal record.
+/// Write exactly one terminal record, replacing any earlier terminal record.
 ///
-/// A run child can write its own ending just before the engine's stop reaches it.
-/// The stop is the ending the product caused, so it is written last and keeps the
-/// earlier outcome and reason in its sentence; it is never silently kept (which
-/// would show a failure for a stopped run) or lost (which would leave the stop
-/// without a cause). A retry that finds the same stop outcome keeps the record.
-fn reconcile_stop_terminal(
+/// The transcript is append-only for normal records, but a stop that won the race
+/// against a child's just-written ending must not leave two terminal outcomes. The
+/// rewrite removes only `run_finished` records, preserves every other record in
+/// order, writes one new terminal ending, and installs the file atomically at
+/// 0600. It is called only after the child has been stopped, so no writer races it.
+fn write_terminal_replacing(
     run_dir: &Path,
     run_id: &str,
     outcome: RunOutcome,
-    sentence: &str,
+    reason: &str,
 ) -> Result<(), String> {
-    let existing = transcript::terminal_record_checked(run_dir)
-        .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
-    if let Some(Record::RunFinished {
-        outcome: prior,
-        reason: prior_reason,
-        ..
-    }) = &existing
-        && prior == outcome.as_str()
-        && prior_reason.as_deref() == Some(sentence)
+    let mut records = match transcript::read_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?
     {
-        return Ok(());
+        Some(file) => file.records,
+        None => Vec::new(),
+    };
+    records.retain(|record| !matches!(record, Record::RunFinished { .. }));
+    records.push(Record::run_finished(
+        run_id,
+        outcome,
+        None,
+        0,
+        Some(reason.to_owned()),
+    ));
+    let mut text = String::new();
+    for record in &records {
+        text.push_str(
+            &serde_json::to_string(record)
+                .map_err(|error| format!("the run's ending cannot be recorded: {error}"))?,
+        );
+        text.push('\n');
     }
-    let mut transcript = transcript::Transcript::open(run_dir)
-        .map_err(|error| format!("the run's ending cannot be recorded: {error}"))?;
-    transcript
-        .append_durable(&Record::run_finished(
-            run_id,
-            outcome,
-            None,
-            0,
-            Some(sentence.to_owned()),
-        ))
+    crate::mode::write_private(run_dir.join(transcript::TRANSCRIPT_FILE), text.as_bytes())
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
 
@@ -1419,14 +1409,26 @@ pub fn settle_run(
             .clone()
             .unwrap_or_else(|| "the run was stopped on request".to_owned())
     });
-    settle_run_with_stop(run_dir, pgid, outcome, reason, grace, stop)
+    let terminal_before_stop = terminal_recorded(run_dir).unwrap_or(false);
+    settle_run_with_stop(
+        run_dir,
+        pgid,
+        outcome,
+        reason,
+        grace,
+        stop,
+        terminal_before_stop,
+    )
 }
 
-/// [`settle_run`] with the engine's own stop reason.
+/// [`settle_run`] with the engine's own stop reason and whether the run had
+/// already written its terminal record when the stop was requested.
 ///
-/// Pass `Some(reason)` whenever the engine is why the run ended, even when the
-/// terminal outcome is `TimedOut` or `Failed` (a deadline failure). Pass `None` for
-/// an ending the run produced itself.
+/// A stop that arrives after the run's own ending changes only the agent's desired
+/// state: the existing terminal record is the run's one outcome and no stop marker
+/// is written. A stop that was requested while the run had no ending wins; if the
+/// child manages to write an ending during the grace window, the stop record
+/// replaces it so the run still has exactly one terminal outcome.
 pub fn settle_run_with_stop(
     run_dir: &Path,
     pgid: u32,
@@ -1434,19 +1436,22 @@ pub fn settle_run_with_stop(
     reason: Option<String>,
     grace: std::time::Duration,
     stop: Option<String>,
+    terminal_before_stop: bool,
 ) -> Result<bool, String> {
     let run_id = run_id_of(run_dir).map_err(categorize_cleanup)?;
-    let reaped = (|| {
-        let mut reaped = reap_process_group(pgid, run_dir, grace)?;
-        // A native helper may have called setsid and therefore not be in the leader's
-        // group. Its inherited capability is the ownership proof; enumerate and close
-        // every such group before the identities are removed.
-        reaped |= reap_capability_groups(run_dir, grace)?;
-        Ok::<bool, String>(reaped)
-    })();
+    let existing = transcript::terminal_record_checked(run_dir)
+        .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
+    if stop.is_some() && terminal_before_stop && existing.is_some() {
+        // The run ended first. The Stop is only a desired-state change: keep the one
+        // ending, write no stop marker, and still verify the group is gone.
+        let reaped = reap(run_dir, pgid, grace)?;
+        clear_process_records(run_dir);
+        return Ok(reaped);
+    }
+    let reaped = reap(run_dir, pgid, grace);
     let mut stop_sentence = None;
     if let Some(stop_reason) = stop {
-        let mut sentence = format!("{stop_reason}{}", prior_terminal_note(run_dir));
+        let mut sentence = stop_reason;
         if let Err(error) = &reaped {
             sentence.push_str(&format!(
                 "; its process group could not be verified as stopped: {}",
@@ -1461,7 +1466,7 @@ pub fn settle_run_with_stop(
         Ok(reaped) => {
             match stop_sentence {
                 Some(sentence) => {
-                    reconcile_stop_terminal(run_dir, run_id, outcome, &sentence)
+                    write_terminal_replacing(run_dir, run_id, outcome, &sentence)
                         .map_err(categorize_cleanup)?;
                 }
                 None => {
@@ -1479,12 +1484,21 @@ pub fn settle_run_with_stop(
             // keeping every handle, so a later Start retries the cleanup and still
             // finds an outcome and reason.
             if let Some(sentence) = stop_sentence.as_deref() {
-                reconcile_stop_terminal(run_dir, run_id, outcome, sentence)
+                write_terminal_replacing(run_dir, run_id, outcome, sentence)
                     .map_err(categorize_cleanup)?;
             }
             Err(categorize_cleanup(error))
         }
     }
+}
+
+fn reap(run_dir: &Path, pgid: u32, grace: std::time::Duration) -> Result<bool, String> {
+    let mut reaped = reap_process_group(pgid, run_dir, grace)?;
+    // A native helper may have called setsid and therefore not be in the leader's
+    // group. Its inherited capability is the ownership proof; enumerate and close
+    // every such group before the identities are removed.
+    reaped |= reap_capability_groups(run_dir, grace)?;
+    Ok(reaped)
 }
 
 fn read_number(run_dir: &Path, name: &str) -> Option<u32> {
@@ -2936,11 +2950,8 @@ mod stop_record_tests {
     #[test]
     fn a_timed_out_run_records_the_stop_and_keeps_the_last_cause() {
         let root = scratch("timeout");
-        let run = run_with_terminal(
-            &root,
-            RunOutcome::Failed,
-            "the native provider reported 500: synthetic status 500",
-        );
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
         let reason = "the run reached its time limit and was stopped; last reported cause: the native provider reported 500: synthetic status 500";
         let settled = settle_run_with_stop(
             &run,
@@ -2949,16 +2960,13 @@ mod stop_record_tests {
             Some(reason.to_owned()),
             Duration::from_millis(50),
             Some(reason.to_owned()),
+            false,
         )
         .expect("the timeout settles");
         assert!(!settled);
         let marker = stop_reason(&run);
         assert!(marker.contains("time limit"), "{marker}");
         assert!(marker.contains("synthetic status 500"), "{marker}");
-        assert!(
-            marker.contains("before the stop the run recorded failed"),
-            "the earlier terminal record was not reconciled: {marker}"
-        );
         match terminal(&run) {
             Record::RunFinished {
                 outcome,
@@ -2968,14 +2976,14 @@ mod stop_record_tests {
                 assert_eq!(outcome, "timed_out");
                 assert!(reason.contains("synthetic status 500"), "{reason}");
             }
-            other => panic!("the timeout did not end last: {other:?}"),
+            other => panic!("the timeout did not write one ending: {other:?}"),
         }
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn a_stop_after_a_run_wrote_its_own_ending_is_reconciled() {
-        let root = scratch("reconcile");
+    fn a_terminal_record_that_predates_the_stop_keeps_the_one_outcome() {
+        let root = scratch("finish-then-stop");
         let run = run_with_terminal(
             &root,
             RunOutcome::Failed,
@@ -2988,23 +2996,96 @@ mod stop_record_tests {
             Some("the run was stopped on request".to_owned()),
             Duration::from_millis(50),
             Some("the run was stopped on request".to_owned()),
+            true,
         )
         .expect("the stop settles");
-        let marker = stop_reason(&run);
-        assert!(marker.contains("before the stop"), "{marker}");
-        assert!(marker.contains("401 unauthorized"), "{marker}");
+        assert!(
+            !run.join(STOPPED_FILE).exists(),
+            "a stop after the run's ending wrote a false stop record"
+        );
         match terminal(&run) {
             Record::RunFinished {
                 outcome,
                 reason: Some(reason),
                 ..
             } => {
-                assert_eq!(outcome, "stopped");
-                assert!(reason.contains("before the stop"), "{reason}");
+                assert_eq!(outcome, "failed");
                 assert!(reason.contains("401 unauthorized"), "{reason}");
             }
-            other => panic!("the stop did not end last: {other:?}"),
+            other => panic!("the earlier ending was replaced: {other:?}"),
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stop_that_wins_replaces_a_child_ending_written_after_the_signal() {
+        let root = scratch("stop-then-finish");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the run finished while the stop was in flight",
+        );
+        settle_run_with_stop(
+            &run,
+            4_000_002,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(50),
+            Some("the run was stopped on request".to_owned()),
+            false,
+        )
+        .expect("the stop settles");
+        let marker = stop_reason(&run);
+        assert!(marker.contains("stopped on request"), "{marker}");
+        let records = transcript::read(&run).expect("transcript").records;
+        let terminals: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::RunFinished { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 1, "the run has more than one ending");
+        match terminals[0] {
+            Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "stopped");
+                assert!(reason.contains("stopped on request"), "{reason}");
+            }
+            other => panic!("the stop did not own the one ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recovery_stop_keeps_the_existing_single_ending() {
+        let root = scratch("recovery-existing");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Succeeded,
+            "the run finished before the reopen",
+        );
+        write_run_stopped(
+            &run,
+            "run-1700000200000-0001",
+            4_000_003,
+            "an earlier start's leftover group was stopped",
+        )
+        .expect("the recovery stop record");
+        let records = transcript::read(&run).expect("transcript").records;
+        let terminals: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::RunFinished { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 1, "recovery wrote a second ending");
+        match terminals[0] {
+            Record::RunFinished { outcome, .. } => assert_eq!(outcome, "succeeded"),
+            other => panic!("unexpected ending: {other:?}"),
+        }
+        assert!(
+            run.join(STOPPED_FILE).is_file(),
+            "the cleanup was not recorded"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -3032,6 +3113,7 @@ mod stop_record_tests {
             Some("the run was stopped on request".to_owned()),
             Duration::from_millis(80),
             Some("the run was stopped on request".to_owned()),
+            false,
         )
         .expect_err("an unverified group cannot be claimed stopped");
         assert!(
