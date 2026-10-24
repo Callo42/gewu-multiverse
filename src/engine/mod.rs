@@ -5875,7 +5875,11 @@ mod tests {
         wait_started(&fake, 1);
         let run_dir = fake.last_run_dir().expect("the run directory");
         let pid = fake.live()[0];
-        fs::create_dir(run_dir.join(run::FIRST_ENDING_FILE)).expect("the obstructed fact");
+        fs::write(
+            run_dir.join(run::FIRST_ENDING_FILE),
+            r#"{"ts":"2026-10-24T17:00:00.000Z","run_id":"run-9999999999999-9999","ending":"stop"}"#,
+        )
+        .expect("the foreign fact");
         let error = engine
             .send(Command::Stop {
                 name: "agent-1".to_owned(),
@@ -5900,7 +5904,11 @@ mod tests {
         wait_started(&fake, 1);
         let run_dir = fake.last_run_dir().expect("the run directory");
         let pid = fake.live()[0];
-        fs::create_dir(run_dir.join(run::FIRST_ENDING_FILE)).expect("the obstructed fact");
+        fs::write(
+            run_dir.join(run::FIRST_ENDING_FILE),
+            r#"{"ts":"2026-10-24T17:00:00.000Z","run_id":"run-9999999999999-9999","ending":"stop"}"#,
+        )
+        .expect("the foreign fact");
         tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
         assert!(
             fake.is_live(pid),
