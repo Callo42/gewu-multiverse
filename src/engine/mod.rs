@@ -456,7 +456,7 @@ fn acquire_lock(data_root: &Path) -> Result<Flock<File>, String> {
 struct RunningState {
     run_dir: PathBuf,
     started: Instant,
-    handle: run::RunHandle,
+    run: run::StartedRun,
     stopping: bool,
     stop_deadline: Option<Instant>,
     stop_requested: bool,
@@ -1137,7 +1137,7 @@ impl Engine {
         pids.extend(inner.forgejo.helper_pids.iter().copied());
         for agent in &inner.agents {
             if let Some(run) = agent.running.as_ref() {
-                pids.push(run.handle.pid());
+                pids.push(run.run.pid());
             }
             if let Some(pid) = agent.starting_pid {
                 pids.push(pid);
@@ -1256,11 +1256,7 @@ impl Inner {
             if !run.stopping {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
                     let proposed = proposed_first_ending(run);
-                    let requested = run_id_in(&run.run_dir)
-                        .ok_or_else(|| "the run directory has no run id".to_owned())
-                        .and_then(|run_id| {
-                            run::request_stop(&mut run.handle, &run.run_dir, run_id, proposed)
-                        });
+                    let requested = run.run.request_stop(proposed);
                     match requested {
                         Ok(ending) => {
                             run.first_ending = Some(ending);
@@ -1279,17 +1275,10 @@ impl Inner {
                     }
                 }
             } else if run.stop_deadline.is_some_and(|deadline| now >= deadline) {
-                if let Some(run_id) = run_id_in(&run.run_dir) {
-                    let _ = run::request_force_stop(
-                        &mut run.handle,
-                        &run.run_dir,
-                        run_id,
-                        "the run reached its force deadline",
-                    );
-                }
+                let _ = run.run.request_force("the run reached its force deadline");
                 run.stop_deadline = Some(now + Duration::from_secs(1));
             }
-            if let Some(status) = run.handle.try_status() {
+            if let Some(status) = run.run.try_status() {
                 let engine_stopped = desired == Desired::Stopped || run.stop_requested;
                 let timed_out = run.timed_out;
                 let first_ending = run.first_ending;
@@ -1357,7 +1346,7 @@ impl Inner {
                     end,
                     run.started,
                     run.run_dir.clone(),
-                    run.handle.pid(),
+                    run.run.pid(),
                     stop_wins,
                     progress,
                     first_ending,
@@ -3037,11 +3026,7 @@ impl EngineApi for Engine {
             for agent in &mut inner.agents {
                 if let Some(run) = agent.running.as_mut() {
                     let proposed = proposed_first_ending(run);
-                    let requested = run_id_in(&run.run_dir)
-                        .ok_or_else(|| "the run directory has no run id".to_owned())
-                        .and_then(|run_id| {
-                            run::request_stop(&mut run.handle, &run.run_dir, run_id, proposed)
-                        });
+                    let requested = run.run.request_stop(proposed);
                     match requested {
                         Ok(ending) => {
                             run.first_ending = Some(ending);
@@ -3092,14 +3077,14 @@ impl EngineApi for Engine {
                 let mut inner = lock_inner(&self.inner);
                 for agent in &mut inner.agents {
                     if let Some(run) = agent.running.as_mut() {
-                        if run.handle.try_status().is_some() {
+                        if run.run.try_status().is_some() {
                             settled_runs.push((
                                 run.run_dir.clone(),
-                                run.handle.pid(),
+                                run.run.pid(),
                                 run.first_ending,
                             ));
                             if let Some(run_id) = run_id_in(&run.run_dir) {
-                                crate::confinement::remove_run_temp(run.handle.pid(), run_id);
+                                crate::confinement::remove_run_temp(run.run.pid(), run_id);
                             }
                             agent.running = None;
                         } else {
@@ -3165,13 +3150,8 @@ impl EngineApi for Engine {
                         {
                             Ok(ending) => run.first_ending = Some(ending),
                             Err(error) => {
-                                let reason = run::stop_uncertain(
-                                    &mut run.handle,
-                                    &run.run_dir,
-                                    run_id.as_deref().unwrap_or("the run"),
-                                    &error,
-                                    Duration::from_millis(500),
-                                );
+                                let reason =
+                                    run.run.stop_uncertain(&error, Duration::from_millis(500));
                                 first_ending_errors.push(format!("`{}`: {reason}", agent.name));
                                 uncertain = true;
                             }
@@ -3179,35 +3159,24 @@ impl EngineApi for Engine {
                     }
                     if !uncertain {
                         let proposed = run.first_ending.unwrap_or(run::FirstEnding::Stop);
-                        let result = match run_id.as_deref() {
-                            Some(run_id) => run::request_stop_and_wait(
-                                &mut run.handle,
-                                &run.run_dir,
-                                run_id,
-                                proposed,
-                                "the run was stopped when the program closed",
-                                Duration::from_millis(500),
-                            ),
-                            None => Err("the run directory has no run id".to_owned()),
-                        };
+                        let result = run.run.request_stop_and_wait(
+                            proposed,
+                            "the run was stopped when the program closed",
+                            Duration::from_millis(500),
+                        );
                         match result {
                             Ok(()) => {
                                 let first_ending =
                                     run.first_ending.unwrap_or(run::FirstEnding::Stop);
                                 settled_runs.push((
                                     run.run_dir.clone(),
-                                    run.handle.pid(),
+                                    run.run.pid(),
                                     Some(first_ending),
                                 ));
                             }
                             Err(error) => {
-                                let reason = run::stop_uncertain(
-                                    &mut run.handle,
-                                    &run.run_dir,
-                                    run_id.as_deref().unwrap_or("the run"),
-                                    &error,
-                                    Duration::from_millis(500),
-                                );
+                                let reason =
+                                    run.run.stop_uncertain(&error, Duration::from_millis(500));
                                 first_ending_errors.push(format!("`{}`: {reason}", agent.name));
                             }
                         }
@@ -3538,12 +3507,10 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
         agent.starting = false;
     }
     if let Some(run) = agent.running.as_mut() {
-        let run_id =
-            run_id_in(&run.run_dir).ok_or_else(|| "the run directory has no run id".to_owned())?;
         // The owner records the fact, then sends the polite signal. A fact failure
         // marks the ending uncertain and sends no signal.
         let proposed = proposed_first_ending(run);
-        let ending = run::request_stop(&mut run.handle, &run.run_dir, run_id, proposed)?;
+        let ending = run.run.request_stop(proposed)?;
         run.first_ending = Some(ending);
         run.stopping = true;
         run.stop_requested = true;
@@ -4040,7 +4007,7 @@ fn session_job(
             return;
         }
     }
-    let mut prepared = match prepared {
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(reason) => {
             let now = clock.now();
@@ -4072,9 +4039,6 @@ fn session_job(
             return;
         }
     };
-    // The run is about to be spawned: the prepared-run guard must not write a
-    // cancellation ending. The child/handle path owns the ending from here.
-    prepared.guard.disarm();
     // Spawn without the state lock. The spawner reports the pid as soon as the child
     // exists, so a shutdown during a spawner's own wait can signal it. Recording the
     // pid takes the lock only for the short store.
@@ -4086,7 +4050,9 @@ fn session_job(
             guard.agents[index].starting_pid = Some(pid);
         }
     };
-    let spawned = spawner.spawn_with(&prepared, &mut on_spawn);
+    let started = prepared.guard.start(|run_dir, workspace, _owner_on_spawn| {
+        spawner.spawn_with(run_dir, workspace, &mut on_spawn)
+    });
     let now = clock.now();
     let mut guard = lock_inner(&inner);
     let Some(index) = guard.agent_index(&request.agent) else {
@@ -4096,41 +4062,30 @@ fn session_job(
         // fails, the handles stay for the next open, which scans every agent
         // directory on disk, not only the current settings.
         drop(guard);
-        if let Ok(handle) = spawned {
-            let mut handle = run::adopt_session(handle);
-            let pid = handle.pid();
+        if let Ok(mut started) = started {
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending =
-                match run::request_stop(&mut handle, &request.run_dir, &request.run_id, proposed) {
-                    Ok(first_ending) => first_ending,
-                    Err(error) => {
-                        // The child still has to be stopped, but without a valid fact
-                        // this is an uncertain ending, not a clean stop.
-                        let reason = run::stop_uncertain(
-                            &mut handle,
-                            &request.run_dir,
-                            &request.run_id,
-                            &error,
-                            Duration::from_secs(1),
-                        );
-                        let mut guard = lock_inner(&inner);
-                        if let Some(index) = guard.agent_index(&request.agent) {
-                            guard.agents[index].leftover = Some(reason.clone());
-                            guard.agents[index].leftover_targets =
-                                vec![RecoveryTarget::Run(request.run_dir.clone())];
-                            guard.agents[index].session = SessionState::Blocked { reason };
-                            guard.agents[index].next_at = None;
-                        }
-                        return;
+            let first_ending = match started.request_stop(proposed) {
+                Ok(first_ending) => first_ending,
+                Err(error) => {
+                    // The child still has to be stopped, but without a valid fact
+                    // this is an uncertain ending, not a clean stop.
+                    let reason = started.stop_uncertain(&error, Duration::from_secs(1));
+                    let mut guard = lock_inner(&inner);
+                    if let Some(index) = guard.agent_index(&request.agent) {
+                        guard.agents[index].leftover = Some(reason.clone());
+                        guard.agents[index].leftover_targets =
+                            vec![RecoveryTarget::Run(request.run_dir.clone())];
+                        guard.agents[index].session = SessionState::Blocked { reason };
+                        guard.agents[index].next_at = None;
                     }
-                };
-            let _ = run::request_finish(
-                &request.run_dir,
-                pid,
+                    return;
+                }
+            };
+            let _ = started.request_finish(
                 run::RunOutcome::Stopped,
                 Some("the run was called off when its agent was removed".to_owned()),
                 Duration::from_secs(1),
@@ -4149,46 +4104,35 @@ fn session_job(
         guard.agents[index].starting_pid = None;
         let stopping = guard.stopping;
         drop(guard);
-        if let Ok(handle) = spawned {
-            let mut handle = run::adopt_session(handle);
+        if let Ok(mut started) = started {
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
-            let pid = handle.pid();
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending =
-                match run::request_stop(&mut handle, &request.run_dir, &request.run_id, proposed) {
-                    Ok(first_ending) => first_ending,
-                    Err(error) => {
-                        let reason = run::stop_uncertain(
-                            &mut handle,
-                            &request.run_dir,
-                            &request.run_id,
-                            &error,
-                            Duration::from_secs(1),
-                        );
-                        let mut guard = lock_inner(&inner);
-                        if let Some(index) = guard.agent_index(&request.agent) {
-                            guard.agents[index].leftover = Some(reason.clone());
-                            guard.agents[index].leftover_targets =
-                                vec![RecoveryTarget::Run(request.run_dir.clone())];
-                            guard.agents[index].session = SessionState::Blocked { reason };
-                            guard.agents[index].next_at = None;
-                        }
-                        return;
+            let first_ending = match started.request_stop(proposed) {
+                Ok(first_ending) => first_ending,
+                Err(error) => {
+                    let reason = started.stop_uncertain(&error, Duration::from_secs(1));
+                    let mut guard = lock_inner(&inner);
+                    if let Some(index) = guard.agent_index(&request.agent) {
+                        guard.agents[index].leftover = Some(reason.clone());
+                        guard.agents[index].leftover_targets =
+                            vec![RecoveryTarget::Run(request.run_dir.clone())];
+                        guard.agents[index].session = SessionState::Blocked { reason };
+                        guard.agents[index].next_at = None;
                     }
-                };
+                    return;
+                }
+            };
             let reason = if stopping {
                 "the run was stopped when the program closed"
             } else {
                 "the run was stopped before it became current"
             };
-            match run::request_finish(
-                &request.run_dir,
-                pid,
+            match started.request_finish(
                 run::RunOutcome::Stopped,
                 Some(reason.to_owned()),
                 Duration::from_secs(1),
@@ -4210,16 +4154,16 @@ fn session_job(
         }
         return;
     }
-    let started = guard.agents[index].starting_since.unwrap_or(now);
-    match spawned {
-        Ok(handle) => {
-            let _pid = handle.pid();
+    let started_at = guard.agents[index].starting_since.unwrap_or(now);
+    match started {
+        Ok(started) => {
+            let _pid = started.pid();
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
             guard.agents[index].running = Some(RunningState {
                 run_dir: request.run_dir.clone(),
-                started,
-                handle: run::adopt_session(handle),
+                started: started_at,
+                run: started,
                 stopping: false,
                 stop_deadline: None,
                 stop_requested: false,
@@ -4255,7 +4199,7 @@ fn session_job(
                 agent,
                 SessionEnd::Failed { reason },
                 now,
-                started,
+                started_at,
                 &state_root,
                 Some(&request.run_dir),
             );
@@ -6704,7 +6648,8 @@ mod tests {
             &self,
             request: &crate::engine::session::SessionRequest,
         ) -> Result<crate::engine::session::PreparedSession, String> {
-            let guard = crate::run::PreparedRun::create(&request.run_dir, &request.run_id)?;
+            let guard =
+                crate::run::Owner::prepare(&request.run_dir, &request.run_id, &request.workspace)?;
             Ok(crate::engine::session::PreparedSession {
                 run_dir: request.run_dir.clone(),
                 workspace: request.workspace.clone(),
@@ -6713,7 +6658,8 @@ mod tests {
         }
         fn spawn_with(
             &self,
-            prepared: &crate::engine::session::PreparedSession,
+            run_dir: &std::path::Path,
+            workspace: &std::path::Path,
             on_spawn: &mut dyn FnMut(u32),
         ) -> Result<Box<dyn crate::engine::session::RunningSession>, String> {
             use std::os::unix::process::CommandExt;
@@ -6727,27 +6673,26 @@ mod tests {
                 .map_err(|error| format!("the real child cannot start: {error}"))?;
             let pid = child.id();
             crate::mode::write_private(
-                prepared.run_dir.join(crate::engine::session::PID_FILE),
+                run_dir.join(crate::engine::session::PID_FILE),
                 pid.to_string().as_bytes(),
             )
             .map_err(|error| format!("the pid cannot be written: {error}"))?;
             crate::mode::write_private(
-                prepared.run_dir.join(crate::run::PGID_FILE),
+                run_dir.join(crate::run::PGID_FILE),
                 pid.to_string().as_bytes(),
             )
             .map_err(|error| format!("the group cannot be written: {error}"))?;
-            let mut transcript = crate::transcript::Transcript::open(&prepared.run_dir)
+            let mut transcript = crate::transcript::Transcript::open(&run_dir)
                 .map_err(|error| format!("the transcript cannot open: {error}"))?;
             transcript
                 .append(&crate::transcript::Record::run_started(
-                    prepared
-                        .run_dir
+                    run_dir
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("run"),
                     "agent-1",
                     pid,
-                    &prepared.workspace.display().to_string(),
+                    &workspace.display().to_string(),
                 ))
                 .map_err(|error| format!("the start record cannot be written: {error}"))?;
             on_spawn(pid);
@@ -7056,6 +7001,36 @@ mod tests {
     }
 
     #[test]
+    fn a_spawn_error_leaves_an_ending() {
+        let root = scratch_root("engine-spawn-error-ending");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_spawn("the session process could not be started: fixture");
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut run_dir = None;
+        while Instant::now() < deadline {
+            run_dir = fake.last_run_dir();
+            if run_dir
+                .as_ref()
+                .is_some_and(|dir| crate::transcript::terminal_record(dir).is_some())
+            {
+                break;
+            }
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let run_dir = run_dir.expect("the run directory");
+        assert!(
+            crate::transcript::terminal_record(&run_dir).is_some(),
+            "a spawn error left no ending"
+        );
+        assert!(fake.live().is_empty());
+    }
+
+    #[test]
     fn a_prepare_error_after_the_run_directory_gets_an_ending() {
         let root = scratch_root("engine-prepare-error-ending");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
@@ -7124,6 +7099,35 @@ mod tests {
             _ => panic!("not a terminal"),
         }
         assert!(run_dir.join(run::STOPPED_FILE).is_file());
+    }
+
+    #[test]
+    fn a_spawn_error_after_the_pid_is_reported_still_gets_an_ending() {
+        let root = scratch_root("engine-spawn-error-after-pid");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_spawn_after_block("the child could not be handed over");
+        let (pid_rx, release) = fake.block_next_spawn();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _pid = pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake reported the child");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents.clear();
+        }
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::transcript::terminal_record(&run_dir).is_some(),
+            "a spawn error after the pid report left no ending"
+        );
     }
 
     #[test]

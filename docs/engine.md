@@ -268,8 +268,9 @@ polite/force signals, writes the stop and terminal records, settles and releases
 identity handles, performs reopen recovery, and records uncertainty. Engine callers
 only request an ending (`prepare_ending`, `request_stop`, `request_force_stop`,
 `stop_uncertain`, `request_stop_and_wait`, `request_finish`, `recover_ending`,
-`request_natural_finish`, `request_failed_finish`, A prepared run is an owner `PreparedRun` guard: the owner creates the directory and
-the guard's `Drop` records a prepared-run ending if it is dropped before `disarm`.
+`request_natural_finish`, `request_failed_finish`. A prepared run is an owner
+`run::ending::PreparedRun`: only `Owner::prepare` creates the directory, only
+`start`/`cancel` consume it, and `Drop` records a prepared-run ending if neither did.
 `request_cancel_prepared`);
 they never write an ending record or signal a run handle directly.
 

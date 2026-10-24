@@ -143,6 +143,14 @@ fn low_level_owner_names_are_private() {
         "pub fn bypass() { let _ = gewu_multiverse::run::request_force; }",
     );
     must_fail(
+        "PreparedRun::create",
+        "pub fn bypass() { let _ = gewu_multiverse::run::PreparedRun::create; }",
+    );
+    must_fail(
+        "PreparedRun::disarm",
+        "pub fn bypass() { let _ = gewu_multiverse::run::PreparedRun::disarm; }",
+    );
+    must_fail(
         "settle_ending",
         "pub fn bypass() { let _ = gewu_multiverse::run::settle_ending; }",
     );

@@ -1314,20 +1314,6 @@ pub struct RunHandle {
     inner: Box<dyn RunningSession>,
 }
 
-mod handle {
-    use super::{RunHandle, RunningSession};
-
-    pub(super) fn new(inner: Box<dyn RunningSession>) -> RunHandle {
-        RunHandle { inner }
-    }
-}
-
-/// Adopt a spawned session into the owner's handle. This is an owner request, not a
-/// public constructor; the handle's signal method remains private.
-pub(crate) fn adopt_session(inner: Box<dyn RunningSession>) -> RunHandle {
-    handle::new(inner)
-}
-
 impl RunHandle {
     /// The child's pid / process-group id.
     pub fn pid(&self) -> u32 {
@@ -1842,52 +1828,19 @@ pub fn stop_uncertain(
     reason
 }
 
-/// A run directory owned by the owner from the moment it exists. Dropping an armed
-/// guard records a prepared-run ending; disarming it just before spawn hands the run
-/// to the child/handle path.
-pub struct PreparedRun {
-    run_dir: std::path::PathBuf,
-    run_id: String,
-    armed: bool,
+/// Create the prepared directory at 0700; the private module's Owner is the only
+/// constructor exposed to callers.
+fn prepare_started_dir(run_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(run_dir)
+        .map_err(|error| format!("{} cannot be created: {error}", run_dir.display()))?;
+    crate::mode::set_mode(run_dir, crate::mode::PRIVATE_DIR_MODE)
+        .map_err(|error| format!("{} cannot be restricted: {error}", run_dir.display()))
 }
 
-impl PreparedRun {
-    /// Create (or reuse) a prepared run directory at 0700.
-    pub fn create(run_dir: &Path, run_id: &str) -> Result<Self, String> {
-        std::fs::create_dir_all(run_dir)
-            .map_err(|error| format!("{} cannot be created: {error}", run_dir.display()))?;
-        crate::mode::set_mode(run_dir, crate::mode::PRIVATE_DIR_MODE)
-            .map_err(|error| format!("{} cannot be restricted: {error}", run_dir.display()))?;
-        Ok(Self {
-            run_dir: run_dir.to_path_buf(),
-            run_id: run_id.to_owned(),
-            armed: true,
-        })
-    }
+mod ending;
+pub use ending::{Owner, PreparedRun, StartedRun};
 
-    /// The directory this guard owns.
-    pub fn run_dir(&self) -> &Path {
-        &self.run_dir
-    }
-
-    /// Hand the run to the child path: no prepared-run ending is written.
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PreparedRun {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = request_cancel_prepared(
-                &self.run_dir,
-                &self.run_id,
-                "the prepared run was dropped before it was spawned",
-            );
-        }
-    }
-}
-
+/// The old PreparedRun block is replaced by `ending::PreparedRun`.
 /// Cancel a run that exists only as a prepared directory, before any child exists.
 /// This is the startup-cancellation owner path: it writes exactly one stopped
 /// terminal and stop record, or explicit uncertainty, with no process handle.

@@ -104,7 +104,7 @@ pub struct PreparedSession {
     pub run_dir: PathBuf,
     /// The agent's workspace.
     pub workspace: PathBuf,
-    /// Owner guard for the prepared run; disarmed just before spawn.
+    /// Owner guard for the prepared run; consumed by the owner's start/cancel/drop.
     pub guard: crate::run::PreparedRun,
 }
 
@@ -139,12 +139,13 @@ pub trait SessionSpawner: Send + Sync {
     /// that pid so `shutdown` can signal a spawn that has not returned yet.
     fn spawn_with(
         &self,
-        prepared: &PreparedSession,
+        run_dir: &Path,
+        workspace: &Path,
         on_spawn: &mut dyn FnMut(u32),
     ) -> Result<Box<dyn RunningSession>, String>;
     /// Start the prepared run when the caller does not need the pid early.
     fn spawn(&self, prepared: &PreparedSession) -> Result<Box<dyn RunningSession>, String> {
-        self.spawn_with(prepared, &mut |_pid| {})
+        self.spawn_with(&prepared.run_dir, &prepared.workspace, &mut |_pid| {})
     }
 }
 
@@ -164,7 +165,8 @@ impl RealSpawner {
 
 impl SessionSpawner for RealSpawner {
     fn prepare(&self, request: &SessionRequest) -> Result<PreparedSession, String> {
-        let guard = crate::run::PreparedRun::create(&request.run_dir, &request.run_id)?;
+        let guard =
+            crate::run::Owner::prepare(&request.run_dir, &request.run_id, &request.workspace)?;
         crate::mode::hold_dir_private_below(&request.state_root, &request.run_dir).map_err(
             |error| {
                 format!(
@@ -270,7 +272,8 @@ impl SessionSpawner for RealSpawner {
 
     fn spawn_with(
         &self,
-        prepared: &PreparedSession,
+        run_dir: &Path,
+        workspace: &Path,
         on_spawn: &mut dyn FnMut(u32),
     ) -> Result<Box<dyn RunningSession>, String> {
         // The run process asks the kernel to signal it when its *parent thread* goes
@@ -281,8 +284,8 @@ impl SessionSpawner for RealSpawner {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (status_tx, status_rx) = std::sync::mpsc::channel();
         let binary = self.binary.clone();
-        let run_dir = prepared.run_dir.clone();
-        let workspace = prepared.workspace.clone();
+        let run_dir = run_dir.to_path_buf();
+        let workspace = workspace.to_path_buf();
         std::thread::spawn(move || {
             let child = Command::new(&binary)
                 .arg("--run-agent")
@@ -402,6 +405,7 @@ struct FakeInner {
     prepare_failure: Option<String>,
     prepare_failure_after_dir: Option<String>,
     spawn_failure: Option<String>,
+    spawn_failure_after_block: Option<String>,
     block_next_spawn: Option<(std::sync::mpsc::Sender<u32>, std::sync::mpsc::Receiver<()>)>,
     block_next_prepare: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
@@ -478,6 +482,14 @@ impl FakeSpawner {
             .prepare_failure_after_dir = Some(reason.to_owned());
     }
 
+    /// Make the next spawn report a pid, wait for the release, then fail.
+    pub fn fail_spawn_after_block(&self, reason: &str) {
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .spawn_failure_after_block = Some(reason.to_owned());
+    }
+
     /// Make the next spawn fail before a child exists.
     pub fn fail_spawn(&self, reason: &str) {
         self.inner
@@ -538,7 +550,8 @@ impl SessionSpawner for FakeSpawner {
         if let Some(reason) = inner.prepare_failure.take() {
             return Err(reason);
         }
-        let guard = crate::run::PreparedRun::create(&request.run_dir, &request.run_id)?;
+        let guard =
+            crate::run::Owner::prepare(&request.run_dir, &request.run_id, &request.workspace)?;
         let plan = RunPlan {
             run_id: request.run_id.clone(),
             agent: request.agent.clone(),
@@ -598,10 +611,11 @@ impl SessionSpawner for FakeSpawner {
 
     fn spawn_with(
         &self,
-        _prepared: &PreparedSession,
+        _run_dir: &Path,
+        _workspace: &Path,
         on_spawn: &mut dyn FnMut(u32),
     ) -> Result<Box<dyn RunningSession>, String> {
-        let (pid, block) = {
+        let (pid, block, after_block_failure) = {
             let mut inner = self.inner.lock().expect("the fake is not poisoned");
             if let Some(reason) = inner.spawn_failure.take() {
                 return Err(reason);
@@ -614,7 +628,11 @@ impl SessionSpawner for FakeSpawner {
                 .clone()
                 .unwrap_or_else(|| "fake".to_owned());
             inner.starts.push(agent);
-            (pid, inner.block_next_spawn.take())
+            (
+                pid,
+                inner.block_next_spawn.take(),
+                inner.spawn_failure_after_block.take(),
+            )
         };
         // The pid is reported before the optional wait: a shutdown during the wait
         // must be able to name the child the fake is holding.
@@ -622,6 +640,9 @@ impl SessionSpawner for FakeSpawner {
         if let Some((reported, release)) = block {
             let _ = reported.send(pid);
             let _ = release.recv();
+        }
+        if let Some(reason) = after_block_failure {
+            return Err(reason);
         }
         Ok(Box::new(FakeHandle {
             inner: Arc::clone(&self.inner),
