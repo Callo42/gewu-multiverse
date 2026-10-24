@@ -742,6 +742,19 @@ impl Inner {
         self.settings.save(&self.settings_path)
     }
 
+    /// Apply one settings command to a copy, persist the copy, and only then make it
+    /// live. A failed validation or save leaves the in-memory settings untouched.
+    fn commit_settings<F>(&mut self, change: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut settings::Settings) -> Result<(), String>,
+    {
+        let mut next = self.settings.clone();
+        change(&mut next)?;
+        next.save(&self.settings_path)?;
+        self.settings = next;
+        Ok(())
+    }
+
     fn agent_index(&self, name: &str) -> Option<usize> {
         self.agents.iter().position(|agent| agent.name == name)
     }
@@ -809,12 +822,17 @@ impl Inner {
         self.note(format!("Runs are not confined on this computer — {reason}"));
     }
 
-    /// The saved choice for one agent, kept in step with the settings.
-    fn set_desired(&mut self, index: usize, desired: Desired) {
+    /// The saved choice for one agent, committed through the settings helper.
+    fn set_desired(&mut self, index: usize, desired: Desired) -> Result<(), String> {
+        let name = self.agents[index].name.clone();
+        self.commit_settings(|settings| {
+            if let Some(saved) = settings.agent_mut(&name) {
+                saved.set_desired(desired);
+            }
+            Ok(())
+        })?;
         self.agents[index].desired = desired;
-        if let Some(saved) = self.settings.agent_mut(&self.agents[index].name) {
-            saved.set_desired(desired);
-        }
+        Ok(())
     }
 }
 
@@ -1942,25 +1960,26 @@ impl Inner {
             .collect()
     }
 
-    /// Give a newly created agent the installation's default program. A fresh
-    /// installation is Pi (set by `Settings::load`); an existing file without a
-    /// default leaves the built-in engine. A native default snapshots the current
-    /// connection once.
-    fn assign_new_agent_program(&mut self, name: &str) -> Result<(), String> {
-        let program = self
-            .settings
+    /// Give a newly created agent the installation's default program on a settings
+    /// copy. The caller commits the copy and writes the returned inherited key.
+    fn assign_new_agent_program(
+        &self,
+        settings: &mut settings::Settings,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        let program = settings
             .default_harness
             .as_deref()
             .and_then(Program::parse)
             .unwrap_or(Program::Builtin);
-        let endpoint = self.settings.endpoint.clone();
+        let endpoint = settings.endpoint.clone();
         let key = credentials::model_key(&self.credentials, name).ok();
         let explicit_key = credentials::agent_model_key(&self.credentials, name)
             .ok()
             .flatten()
             .is_some();
-        let Some(agent) = self.settings.agent_mut(name) else {
-            return Ok(());
+        let Some(agent) = settings.agent_mut(name) else {
+            return Ok(None);
         };
         agent.set_harness(program);
         if program.is_native() && agent.provider.is_none() && endpoint.configured() {
@@ -1973,23 +1992,11 @@ impl Inner {
         if program == Program::Codex {
             agent.codex_sandbox = "native".to_owned();
         }
-        if program.is_native()
-            && !explicit_key
-            && let Some(key) = key
-        {
-            credentials::record_secret(
-                &self.credentials,
-                Some("model_keys"),
-                name,
-                key.expose(),
-            )
-            .map_err(|error| {
-                format!(
-                    "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
-                )
-            })?;
+        if program.is_native() && !explicit_key {
+            Ok(key.map(|key| key.expose().to_owned()))
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
     /// The immutable program facts of the newest run, when there is one.
@@ -2442,22 +2449,26 @@ impl EngineApi for Engine {
         }
         match command {
             Command::AcknowledgeTerms => {
-                inner.settings.terms_acknowledged = true;
-                inner.settings.terms_version = TERMS_VERSION;
-                inner.save_settings()?;
+                inner.commit_settings(|settings| {
+                    settings.terms_acknowledged = true;
+                    settings.terms_version = TERMS_VERSION;
+                    Ok(())
+                })?;
                 inner.note("the terms are recorded");
                 Ok(())
             }
             Command::SetEndpoint { url, model, key } => {
                 let url = url.trim().to_owned();
                 let model = model.trim().to_owned();
-                inner.settings.endpoint.url = url;
-                inner.settings.endpoint.model = model;
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                     credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
                         .map_err(|error| format!("the model key could not be kept: {error}"))?;
                 }
-                inner.save_settings()?;
+                inner.commit_settings(|settings| {
+                    settings.endpoint.url = url;
+                    settings.endpoint.model = model;
+                    Ok(())
+                })?;
                 inner.endpoint_test = EndpointTest::NotRun;
                 inner.note("your model is saved");
                 Ok(())
@@ -2481,15 +2492,17 @@ impl EngineApi for Engine {
                         "the built-in engine needs a Chat Completions connection".to_owned()
                     );
                 }
-                inner.settings.endpoint.url.clear();
-                inner.settings.endpoint.base_url = base;
-                inner.settings.endpoint.protocol = protocol.id().to_owned();
-                inner.settings.endpoint.model = model;
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                     credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
                         .map_err(|error| format!("the model key could not be kept: {error}"))?;
                 }
-                inner.save_settings()?;
+                inner.commit_settings(|settings| {
+                    settings.endpoint.url.clear();
+                    settings.endpoint.base_url = base;
+                    settings.endpoint.protocol = protocol.id().to_owned();
+                    settings.endpoint.model = model;
+                    Ok(())
+                })?;
                 inner.endpoint_test = EndpointTest::NotRun;
                 inner.note("the default connection is saved");
                 Ok(())
@@ -2512,7 +2525,8 @@ impl EngineApi for Engine {
                     .is_some();
                 let inherited_key = credentials::model_key(&inner.credentials, &name).ok();
                 let settings_before = inner.settings.clone();
-                let Some(saved) = inner.settings.agent_mut(&name) else {
+                let mut next = inner.settings.clone();
+                let Some(saved) = next.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
                 let requested = protocol.as_deref().and_then(Protocol::parse);
@@ -2521,12 +2535,15 @@ impl EngineApi for Engine {
                 {
                     return Err(error);
                 }
+                if program.is_native() && saved.provider.is_none() && !endpoint.configured() {
+                    return Err(
+                        "set the default connection first, then choose this agent's program"
+                            .to_owned(),
+                    );
+                }
                 saved.set_harness(program);
                 if program.is_native() {
                     if saved.provider.is_none() {
-                        if !endpoint.configured() {
-                            return Err("set the default connection first, then choose this agent's program".to_owned());
-                        }
                         saved.provider = Some(settings::AgentProvider {
                             base_url: endpoint.base_url(),
                             protocol: endpoint.protocol().id().to_owned(),
@@ -2551,12 +2568,12 @@ impl EngineApi for Engine {
                 } else if saved.codex_sandbox.is_empty() {
                     saved.codex_sandbox = "native".to_owned();
                 }
-                if let Err(error) = inner.save_settings() {
-                    inner.settings = settings_before;
+                if let Err(error) = next.save(&inner.settings_path) {
                     return Err(format!(
                         "the program change was not saved; the previous selection was restored ({error})"
                     ));
                 }
+                inner.settings = next;
                 if program.is_native()
                     && !explicit_key
                     && let Some(key) = inherited_key.as_ref()
@@ -2602,7 +2619,8 @@ impl EngineApi for Engine {
                     return Err(format!("there is no agent named `{name}`"));
                 };
                 let settings_before = inner.settings.clone();
-                let Some(saved) = inner.settings.agent_mut(&name) else {
+                let mut next = inner.settings.clone();
+                let Some(saved) = next.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
                 saved.provider = Some(settings::AgentProvider {
@@ -2610,12 +2628,12 @@ impl EngineApi for Engine {
                     protocol: protocol.id().to_owned(),
                     model,
                 });
-                if let Err(error) = inner.save_settings() {
-                    inner.settings = settings_before;
+                if let Err(error) = next.save(&inner.settings_path) {
                     return Err(format!(
                         "the model change was not saved; the previous selection was restored ({error})"
                     ));
                 }
+                inner.settings = next;
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                     if let Err(error) = credentials::record_secret(
                         &inner.credentials,
@@ -2649,20 +2667,20 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
-                let settings_before = inner.settings.clone();
-                let Some(saved) = inner.settings.agent_mut(&name) else {
+                let mut next = inner.settings.clone();
+                let Some(saved) = next.agent_mut(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
                 if saved.harness() != Program::Codex {
                     return Err("the sandbox choice applies only to Codex".to_owned());
                 }
                 saved.codex_sandbox = mode.to_owned();
-                if let Err(error) = inner.save_settings() {
-                    inner.settings = settings_before;
+                if let Err(error) = next.save(&inner.settings_path) {
                     return Err(format!(
                         "the sandbox choice was not saved; the previous selection was restored ({error})"
                     ));
                 }
+                inner.settings = next;
                 inner.agents[index].last_error = None;
                 inner.note(format!(
                     "`{name}`'s Codex sandbox is saved for its next run"
@@ -2789,17 +2807,41 @@ impl EngineApi for Engine {
                 if count > MAX_AGENTS {
                     return Err(format!("at most {MAX_AGENTS} agents can be made"));
                 }
+                let settings_before = inner.settings.clone();
+                let mut next = inner.settings.clone();
+                let mut keys: Vec<(String, String)> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
                 for number in 1..=count {
                     let name = format!("agent-{number}");
-                    if inner.settings.agent(&name).is_none() {
-                        inner.settings.add_agent(&name, Desired::Stopped)?;
-                        inner.assign_new_agent_program(&name)?;
+                    if next.agent(&name).is_none() {
+                        next.add_agent(&name, Desired::Stopped)?;
+                        if let Some(key) = inner.assign_new_agent_program(&mut next, &name)? {
+                            keys.push((name.clone(), key));
+                        }
                         ensure_agent_paths(&inner.options.layout, &name)?;
-                        let runtime = AgentRuntime::load(&inner, &name);
-                        inner.agents.push(runtime);
+                        names.push(name);
                     }
                 }
-                inner.save_settings()?;
+                next.save(&inner.settings_path)?;
+                inner.settings = next;
+                for (name, key) in keys {
+                    if let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        &key,
+                    ) {
+                        inner.settings = settings_before;
+                        let _ = inner.save_settings();
+                        return Err(format!(
+                            "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
+                        ));
+                    }
+                }
+                for name in names {
+                    let runtime = AgentRuntime::load(&inner, &name);
+                    inner.agents.push(runtime);
+                }
                 // A new workspace is a new bound tree; re-run the layout decision so
                 // a workspace that cannot be confined takes the claim off the board
                 // now (B9-R-R).
@@ -2809,13 +2851,30 @@ impl EngineApi for Engine {
                 Ok(())
             }
             Command::AddAgent => {
-                let name = inner.settings.allocate_agent_name()?;
-                inner.settings.add_agent(&name, Desired::Stopped)?;
-                inner.assign_new_agent_program(&name)?;
+                let settings_before = inner.settings.clone();
+                let mut next = inner.settings.clone();
+                let name = next.allocate_agent_name()?;
+                next.add_agent(&name, Desired::Stopped)?;
+                let key = inner.assign_new_agent_program(&mut next, &name)?;
                 ensure_agent_paths(&inner.options.layout, &name)?;
+                next.save(&inner.settings_path)?;
+                inner.settings = next;
+                if let Some(key) = key
+                    && let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        &key,
+                    )
+                {
+                    inner.settings = settings_before;
+                    let _ = inner.save_settings();
+                    return Err(format!(
+                        "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
+                    ));
+                }
                 let runtime = AgentRuntime::load(&inner, &name);
                 inner.agents.push(runtime);
-                inner.save_settings()?;
                 inner.refresh_confinement();
                 inner.note(format!("`{name}` was added"));
                 Ok(())
@@ -2826,10 +2885,9 @@ impl EngineApi for Engine {
                 };
                 let grace = inner.options.stop_grace;
                 stop_agent(&mut inner.agents[index], grace)?;
-                inner.set_desired(index, Desired::Stopped);
+                inner.set_desired(index, Desired::Stopped)?;
                 inner.agents[index].removal_pending = true;
                 inner.agents[index].removal_retry_at = None;
-                inner.save_settings()?;
                 inner.note(format!("`{name}` is being removed"));
                 Ok(())
             }
@@ -2879,7 +2937,7 @@ impl EngineApi for Engine {
                     inner.note(format!("not started — {reason}"));
                     return Ok(());
                 }
-                inner.set_desired(index, Desired::Started);
+                inner.set_desired(index, Desired::Started)?;
                 let agent = &mut inner.agents[index];
                 agent.sessions_since_start = 0;
                 agent.session_number = 0;
@@ -2891,7 +2949,6 @@ impl EngineApi for Engine {
                         reason: "needs an instruction".to_owned(),
                     };
                 }
-                inner.save_settings()?;
                 inner.note(if no_instruction {
                     "not started — write an instruction first".to_owned()
                 } else {
@@ -2905,8 +2962,7 @@ impl EngineApi for Engine {
                 };
                 let grace = inner.options.stop_grace;
                 stop_agent(&mut inner.agents[index], grace)?;
-                inner.set_desired(index, Desired::Stopped);
-                inner.save_settings()?;
+                inner.set_desired(index, Desired::Stopped)?;
                 inner.note(format!("`{name}` stopped"));
                 Ok(())
             }
@@ -4287,12 +4343,20 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
         };
         match result {
             Ok(()) => {
-                inner.agents.remove(index);
-                inner.settings.remove_agent(&name);
-                if let Err(error) = inner.save_settings() {
-                    inner.note(format!("`{name}` was removed, but {error}"));
-                } else {
-                    inner.note(removed_note(&name));
+                match inner.commit_settings(|settings| {
+                    settings.remove_agent(&name);
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        inner.agents.remove(index);
+                        inner.note(removed_note(&name));
+                    }
+                    Err(error) => {
+                        inner.agents[index].removal_pending = false;
+                        inner.agents[index].removal_retry_at =
+                            Some(Instant::now() + PROVISION_RETRY);
+                        inner.note(format!("`{name}` was removed, but {error}"));
+                    }
                 }
             }
             Err(_reason) => {
@@ -7488,6 +7552,75 @@ mod tests {
             "the board can stay stale for {REPOSITORY_REFRESH:?}"
         );
     }
+    #[test]
+    fn f1_a_failed_program_choice_is_not_persisted_by_the_next_save() {
+        let root = scratch_root("engine-f1-program-rollback");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        settings.endpoint.url.clear();
+        settings.endpoint.model.clear();
+        settings
+            .save(&settings::path_in(&root))
+            .expect("the cleared endpoint saves");
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        assert_eq!(engine.board().agents[0].program, "builtin");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "codex".to_owned(),
+            protocol: Some("chat-completions".to_owned()),
+        });
+        assert!(result.is_err(), "the unconfigured program choice succeeded");
+        assert_eq!(engine.board().agents[0].program, "builtin");
+        engine
+            .send(Command::SetEndpoint {
+                url: "http://127.0.0.1:9/v1/chat/completions".to_owned(),
+                model: "fixture".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("the later endpoint save");
+        assert_eq!(
+            engine.board().agents[0].program,
+            "builtin",
+            "the next save persisted the rejected program"
+        );
+    }
+
+    #[test]
+    fn a_failed_endpoint_key_leaves_the_live_endpoint_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-endpoint-key-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let before = engine.board().endpoint.clone();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+            .expect("the root becomes read-only");
+        let result = engine.send(Command::SetEndpoint {
+            url: "http://127.0.0.1:9/v1/chat/completions".to_owned(),
+            model: "new-model".to_owned(),
+            key: Some("new-key".to_owned()),
+        });
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("the root is writable again");
+        assert!(result.is_err(), "the failed key was reported as success");
+        assert_eq!(engine.board().endpoint.url, before.url);
+        assert_eq!(engine.board().endpoint.model, before.model);
+    }
+
     #[test]
     fn c5_a_settings_save_failure_restores_the_prior_program_selection() {
         use std::os::unix::fs::PermissionsExt;
