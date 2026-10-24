@@ -4026,6 +4026,12 @@ fn session_job(
     {
         let mut guard = lock_inner(&inner);
         let Some(index) = guard.agent_index(&request.agent) else {
+            drop(guard);
+            let _ = run::request_cancel_prepared(
+                &request.run_dir,
+                &request.run_id,
+                "the run was called off before it became current",
+            );
             return;
         };
         if guard.stopping
@@ -4033,8 +4039,15 @@ fn session_job(
             || guard.agents[index].desired != Desired::Started
             || !guard.agents[index].starting
         {
+            let reason = if guard.stopping {
+                "the run was stopped when the program closed"
+            } else {
+                "the run was called off before it became current"
+            };
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            drop(guard);
+            let _ = run::request_cancel_prepared(&request.run_dir, &request.run_id, reason);
             return;
         }
     }
@@ -4050,8 +4063,15 @@ fn session_job(
                 || guard.generation != generation
                 || guard.agents[index].desired != Desired::Started
             {
+                let reason = if guard.stopping {
+                    "the run was stopped when the program closed"
+                } else {
+                    "the run was called off before it became current"
+                };
                 guard.agents[index].starting = false;
                 guard.agents[index].starting_pid = None;
+                drop(guard);
+                let _ = run::request_cancel_prepared(&request.run_dir, &request.run_id, reason);
                 return;
             }
             guard.agents[index].starting = false;
@@ -6977,6 +6997,76 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn a_stop_during_prepare_records_a_no_child_ending() {
+        let root = scratch_root("engine-stop-before-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (prepared_rx, release) = fake.block_next_prepare();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        prepared_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session prepared its run directory");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop before spawn");
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let terminal = crate::transcript::terminal_record(&run_dir)
+            .expect("a prepared run cancelled before spawn has no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        assert!(fake.live().is_empty(), "a child was spawned after the stop");
+    }
+
+    #[test]
+    fn a_shutdown_during_prepare_records_a_no_child_ending() {
+        let root = scratch_root("engine-shutdown-before-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (prepared_rx, release) = fake.block_next_prepare();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        prepared_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session prepared its run directory");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        std::thread::scope(|scope| {
+            let shutdown = scope.spawn(|| engine.shutdown(Duration::ZERO));
+            let _ = release.send(());
+            shutdown.join().expect("shutdown");
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let terminal = crate::transcript::terminal_record(&run_dir)
+            .expect("a prepared run shut down before spawn has no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        assert!(fake.live().is_empty(), "a child was spawned after shutdown");
     }
 
     #[test]

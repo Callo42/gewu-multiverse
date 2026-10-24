@@ -1315,8 +1315,9 @@ pub struct RunHandle {
 }
 
 impl RunHandle {
-    /// Adopt a spawned session into the owner's handle.
-    pub fn new(inner: Box<dyn RunningSession>) -> Self {
+    /// Adopt a spawned session into the owner's handle. Crate-private: external
+    /// callers cannot make a handle to signal.
+    pub(crate) fn new(inner: Box<dyn RunningSession>) -> Self {
         Self { inner }
     }
 
@@ -1338,7 +1339,7 @@ impl RunHandle {
 /// The unforgeable token that permits constructing a terminal record. The type is
 /// public only because it appears in a public record variant; its field is private
 /// and only the owner can make one.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndingSeal {
     _private: (),
 }
@@ -1347,6 +1348,12 @@ impl EndingSeal {
     fn new() -> Self {
         Self { _private: () }
     }
+}
+
+/// Deserialization only: an old transcript's terminal record has no seal. It cannot
+/// be used to construct a new one outside the owner's storage path.
+pub(crate) fn seal_from_storage() -> EndingSeal {
+    EndingSeal::new()
 }
 
 /// Test-only terminal record construction. Integration tests are outside the owner
@@ -1827,6 +1834,29 @@ pub fn stop_uncertain(
     reason
 }
 
+/// Cancel a run that exists only as a prepared directory, before any child exists.
+/// This is the startup-cancellation owner path: it writes exactly one stopped
+/// terminal and stop record, or explicit uncertainty, with no process handle.
+pub fn request_cancel_prepared(run_dir: &Path, run_id: &str, reason: &str) -> Result<(), String> {
+    if !run_dir.is_dir() {
+        return Ok(());
+    }
+    let ending = pin_first_ending(run_dir, run_id, FirstEnding::Stop)?;
+    if ending == FirstEnding::Terminal {
+        if terminal_recorded(run_dir)? {
+            return Ok(());
+        }
+        let error = "the prepared run's first ending is terminal, but its terminal record is missing; the ending is uncertain";
+        let _ = record_ending_uncertainty(run_dir, run_id, error);
+        return Err(error.to_owned());
+    }
+    let sentence = format!("{reason}; no child was started");
+    write_stop_marker(run_dir, run_id, 0, &sentence)
+        .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
+    write_terminal_replacing(run_dir, run_id, RunOutcome::Stopped, &sentence)
+        .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
+}
+
 /// Request a stop, then wait for the handle to end before it is dropped.
 pub fn request_stop_and_wait(
     handle: &mut RunHandle,
@@ -1881,7 +1911,7 @@ pub(crate) fn adapter_signal_run_group(pid: u32, force: bool) {
 
 /// Signal a starting child's group by the pid the job reported. The job owns the
 /// wait and reaps it when it returns.
-pub fn signal_starting_group(pid: u32, force: bool) {
+pub(crate) fn signal_starting_group(pid: u32, force: bool) {
     adapter_signal_run_group(pid, force);
 }
 
@@ -3954,6 +3984,22 @@ mod stop_record_tests {
             Record::RunFinished { outcome, .. } => assert_eq!(outcome, "stopped"),
             other => panic!("unexpected ending: {other:?}"),
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_prepared_run_cancelled_before_spawn_gets_one_stopped_ending() {
+        let root = scratch("cancel-prepared");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        request_cancel_prepared(&run, "run-1700000200000-0001", "the run was called off")
+            .expect("cancel the prepared run");
+        assert!(run.join(STOPPED_FILE).is_file());
+        let terminal = transcript::terminal_record(&run).expect("terminal");
+        assert!(matches!(
+            terminal,
+            Record::RunFinished { ref outcome, .. } if outcome == "stopped"
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 

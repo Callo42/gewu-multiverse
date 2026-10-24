@@ -98,6 +98,22 @@ pub fn bypass() {
 }
 
 #[test]
+fn the_seal_cannot_be_defaulted_or_reconstructed() {
+    must_fail(
+        "EndingSeal::default",
+        "pub fn bypass() { let _ = gewu_multiverse::run::EndingSeal::default(); }",
+    );
+    must_fail(
+        "seal_from_storage",
+        "pub fn bypass() { let _ = gewu_multiverse::run::seal_from_storage(); }",
+    );
+    must_fail(
+        "signal_starting_group",
+        "pub fn bypass() { let _ = gewu_multiverse::run::signal_starting_group; }",
+    );
+}
+
+#[test]
 fn the_run_handle_cannot_be_signalled_outside_the_owner() {
     must_fail(
         "RunHandle::signal",

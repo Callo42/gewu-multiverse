@@ -268,7 +268,7 @@ polite/force signals, writes the stop and terminal records, settles and releases
 identity handles, performs reopen recovery, and records uncertainty. Engine callers
 only request an ending (`prepare_ending`, `request_stop`, `request_force_stop`,
 `stop_uncertain`, `request_stop_and_wait`, `request_finish`, `recover_ending`,
-`request_natural_finish`, `request_failed_finish`);
+`request_natural_finish`, `request_failed_finish`, `request_cancel_prepared`);
 they never write an ending record or signal a run handle directly.
 
 The run process handle is an owner type with a private inner handle and a private
@@ -279,7 +279,8 @@ concurrent writers.
 
 `Record::RunFinished` carries a private `EndingSeal` field; only the owner can make
 one, so a terminal record cannot be constructed or appended outside `run.rs` even
-through a type alias. `Record::run_finished` and `Record::record_outcome_if_missing`
+through a type alias. `EndingSeal` deliberately has no `Default`; the only storage
+path is `seal_from_storage`, used by serde when reading old records. `Record::run_finished` and `Record::record_outcome_if_missing`
 require that seal. `tests/compile-fail.rs` compiles source probes against the library
 and requires them to fail (type-alias construction, low-level names, force API).
 

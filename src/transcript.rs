@@ -361,7 +361,7 @@ pub enum Record {
         reason: Option<String>,
         /// Owner-only construction token. It is not serialized and carries no data;
         /// its private field makes a terminal record impossible to build elsewhere.
-        #[serde(skip)]
+        #[serde(skip, default = "crate::run::seal_from_storage")]
         _ending_seal: crate::run::EndingSeal,
     },
 }

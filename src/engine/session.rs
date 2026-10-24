@@ -400,6 +400,7 @@ struct FakeInner {
     prepare_failure: Option<String>,
     spawn_failure: Option<String>,
     block_next_spawn: Option<(std::sync::mpsc::Sender<u32>, std::sync::mpsc::Receiver<()>)>,
+    block_next_prepare: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 impl FakeSpawner {
@@ -472,6 +473,20 @@ impl FakeSpawner {
             .lock()
             .expect("the fake is not poisoned")
             .spawn_failure = Some(reason.to_owned());
+    }
+
+    /// Make the next prepare report that the run directory exists and then wait for
+    /// a release before returning. Returns the start report and release sender.
+    pub fn block_next_prepare(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .block_next_prepare = Some((started_tx, release_rx));
+        (started_rx, release_tx)
     }
 
     /// Make the next spawn report its pid and then wait for a release before it
@@ -551,6 +566,11 @@ impl SessionSpawner for FakeSpawner {
         inner.last_prepared = Some(request.agent.clone());
         inner.last_run_dir = Some(request.run_dir.clone());
         inner.last_repositories = request.repositories.clone();
+        if let Some((started, release)) = inner.block_next_prepare.take() {
+            drop(inner);
+            let _ = started.send(());
+            let _ = release.recv();
+        }
         Ok(PreparedSession {
             run_dir: request.run_dir.clone(),
             workspace: request.workspace.clone(),
