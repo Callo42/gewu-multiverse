@@ -263,6 +263,14 @@ to a later child ending. Recovery uses it too: a persisted `stop` replaces a chi
 post-stop ending with one `stopped` terminal plus the stop record, while a persisted
 `terminal` keeps the child's ending and writes no stop record.
 
+One owner in `run.rs` performs every ending operation: it pins the fact, sends the
+polite/force signals, writes the stop and terminal records, settles and releases the
+identity handles, performs reopen recovery, and records uncertainty. Engine callers
+only request an ending (`request_stop`, `stop_uncertain`, `settle_ending`,
+`recover_ending`, `write_natural_ending`, `write_failed_ending`); they never write an
+ending record or signal a run handle directly. `tests/ending-owner.rs` mechanically
+rejects any such write or signal in production code outside the owner.
+
 The fact is trusted only when it names this exact run and agrees with its records. A
 missing/corrupt terminal under a persisted `terminal` fact, a foreign `run_id`, an
 unreadable fact, or a fact that cannot be written before a governed signal is an

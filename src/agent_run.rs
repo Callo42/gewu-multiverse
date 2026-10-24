@@ -2059,22 +2059,24 @@ pub fn execute(run_dir: &Path) -> RunEnd {
     // read it as the proof that the run finished, and only then remove the run's
     // process handles. A write that fails is said in the log; the engine sees the
     // process end, finds no terminal record and writes (or reports) one itself.
-    if let Err(error) = transcript.append_durable(&Record::run_finished(
+    let ending = if !end.is_success() {
+        RunOutcome::Failed
+    } else {
+        match end.ending {
+            RunEnding::Succeeded => RunOutcome::Succeeded,
+            RunEnding::Refused => RunOutcome::Refused,
+            RunEnding::NoWork => RunOutcome::NoWork,
+            RunEnding::Warned => RunOutcome::Warned,
+        }
+    };
+    if let Err(error) = crate::run::write_natural_ending(
+        run_dir,
         &plan.run_id,
-        if !end.is_success() {
-            RunOutcome::Failed
-        } else {
-            match end.ending {
-                RunEnding::Succeeded => RunOutcome::Succeeded,
-                RunEnding::Refused => RunOutcome::Refused,
-                RunEnding::NoWork => RunOutcome::NoWork,
-                RunEnding::Warned => RunOutcome::Warned,
-            }
-        },
+        ending,
         Some(end.exit_code),
         started.elapsed().as_millis() as u64,
         end.reason.clone(),
-    )) {
+    ) {
         log.line(&format!(
             "the run's ending cannot be recorded durably: {error}"
         ));
