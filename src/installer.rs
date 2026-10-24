@@ -171,7 +171,10 @@ pub fn install(
         .map_err(|error| format!("the install stage cannot be created: {error}"))?;
     let _ = crate::mode::set_mode(&stage, crate::mode::PRIVATE_DIR_MODE);
     if let Err(error) = write_owner(&stage, program, &token) {
-        let _ = remove_owned_stage(&stage, program, &token);
+        // The marker could not be written, so this empty directory is not yet an
+        // owned stage. `remove_dir` refuses a non-empty directory, which is exactly
+        // the safe bound here.
+        let _ = fs::remove_dir(&stage);
         return Err(error);
     }
 
