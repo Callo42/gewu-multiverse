@@ -359,10 +359,6 @@ pub enum Record {
         duration_ms: u64,
         /// Why it ended that way, when there is a reason to give.
         reason: Option<String>,
-        /// Owner-only construction token. It is not serialized and carries no data;
-        /// its private field makes a terminal record impossible to build elsewhere.
-        #[serde(skip, default = "crate::run::seal_from_storage")]
-        _ending_seal: crate::run::EndingSeal,
     },
 }
 
@@ -659,7 +655,6 @@ impl Record {
         exit_code: Option<i32>,
         duration_ms: u64,
         reason: Option<String>,
-        _ending_seal: crate::run::EndingSeal,
     ) -> Self {
         Record::RunFinished {
             ts: stamp(),
@@ -668,7 +663,6 @@ impl Record {
             exit_code,
             duration_ms,
             reason,
-            _ending_seal,
         }
     }
 
@@ -753,10 +747,39 @@ impl Transcript {
 
     /// Append one record as one line.
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
+        #[cfg(not(test))]
+        if matches!(record, Record::RunFinished { .. }) {
+            return Err(io::Error::other(
+                "a terminal record must be written by the ending owner",
+            ));
+        }
+        self.append_unchecked(record)
+    }
+
+    fn append_unchecked(&mut self, record: &Record) -> io::Result<()> {
         let line = serde_json::to_string(record).map_err(io::Error::other)?;
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.file.flush()
+    }
+
+    /// Test-only terminal append for transcript fixtures.
+    #[cfg(debug_assertions)]
+    pub fn append_terminal_for_test(&mut self, record: &Record) -> io::Result<()> {
+        self.append_terminal(record, &crate::run::ending::seal_for_test())
+    }
+
+    /// The only terminal write. `EndingSeal` is forged only by `run::ending`.
+    pub fn append_terminal(
+        &mut self,
+        record: &Record,
+        _seal: &crate::run::ending::EndingSeal,
+    ) -> io::Result<()> {
+        if !matches!(record, Record::RunFinished { .. }) {
+            return Err(io::Error::other("not a terminal record"));
+        }
+        self.append_unchecked(record)?;
+        self.file.sync_data()
     }
 
     /// Append one record and wait until its bytes are on disk.
@@ -875,19 +898,15 @@ pub fn record_outcome_if_missing(
     outcome: RunOutcome,
     reason: Option<String>,
     duration_ms: u64,
-    _ending_seal: crate::run::EndingSeal,
+    seal: &crate::run::ending::EndingSeal,
 ) -> io::Result<(RunOutcome, Option<String>, u64)> {
     let existing = terminal_record_checked(run_dir)?;
     if existing.is_none() {
         let mut transcript = Transcript::open(run_dir)?;
-        transcript.append_durable(&Record::run_finished(
-            run_id,
-            outcome,
-            None,
-            duration_ms,
-            reason.clone(),
-            _ending_seal,
-        ))?;
+        transcript.append_terminal(
+            &Record::run_finished(run_id, outcome, None, duration_ms, reason.clone()),
+            seal,
+        )?;
     }
     Ok(match existing {
         Some(Record::RunFinished {

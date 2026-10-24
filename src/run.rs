@@ -1330,26 +1330,6 @@ impl RunHandle {
     }
 }
 
-/// The unforgeable token that permits constructing a terminal record. The type is
-/// public only because it appears in a public record variant; its field is private
-/// and only the owner can make one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EndingSeal {
-    _private: (),
-}
-
-impl EndingSeal {
-    fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
-/// Storage-only deserialization default. It cannot construct a terminal record
-/// itself; the text guard rejects calls outside the owner/storage modules.
-pub(crate) fn seal_from_storage() -> EndingSeal {
-    EndingSeal::new()
-}
-
 /// Test-only terminal record construction. Integration tests are outside the owner
 /// module; this helper exists only in debug builds and is not part of the release
 /// surface.
@@ -1370,14 +1350,7 @@ pub fn terminal_record_for_test(
     duration_ms: u64,
     reason: Option<String>,
 ) -> Record {
-    Record::run_finished(
-        run_id,
-        outcome,
-        exit_code,
-        duration_ms,
-        reason,
-        EndingSeal::new(),
-    )
+    Record::run_finished(run_id, outcome, exit_code, duration_ms, reason)
 }
 
 /// The durable first-ending fact.
@@ -1608,8 +1581,14 @@ fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> i
     match fact {
         Some(FirstEnding::Stop) => {
             write_stop_marker(run_dir, run_id, pgid, reason)?;
-            write_terminal_replacing(run_dir, run_id, RunOutcome::Stopped, reason)
-                .map_err(io::Error::other)
+            write_terminal_replacing(
+                run_dir,
+                run_id,
+                RunOutcome::Stopped,
+                reason,
+                &ending::seal(),
+            )
+            .map_err(io::Error::other)
         }
         Some(FirstEnding::Terminal) => {
             let terminal =
@@ -1631,7 +1610,7 @@ fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> i
                 RunOutcome::Stopped,
                 Some(reason.to_owned()),
                 0,
-                EndingSeal::new(),
+                &ending::seal(),
             )
             .map(|_| ())
         }
@@ -1671,7 +1650,7 @@ fn ensure_terminal_record(
     reason: Option<String>,
 ) -> Result<(), String> {
     let run_id = run_id_of(run_dir)?;
-    transcript::record_outcome_if_missing(run_dir, run_id, outcome, reason, 0, EndingSeal::new())
+    transcript::record_outcome_if_missing(run_dir, run_id, outcome, reason, 0, &ending::seal())
         .map(|_| ())
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
@@ -1722,6 +1701,7 @@ fn write_terminal_replacing(
     run_id: &str,
     outcome: RunOutcome,
     reason: &str,
+    _seal: &ending::EndingSeal,
 ) -> Result<(), String> {
     let mut records = match transcript::read_checked(run_dir)
         .map_err(|error| format!("the run's ending cannot be read: {error}"))?
@@ -1736,7 +1716,6 @@ fn write_terminal_replacing(
         None,
         0,
         Some(reason.to_owned()),
-        EndingSeal::new(),
     ));
     let mut text = String::new();
     for record in &records {
@@ -1837,7 +1816,7 @@ fn prepare_started_dir(run_dir: &Path) -> Result<(), String> {
         .map_err(|error| format!("{} cannot be restricted: {error}", run_dir.display()))
 }
 
-mod ending;
+pub mod ending;
 pub use ending::{Owner, PreparedRun, StartedRun};
 
 /// The old PreparedRun block is replaced by `ending::PreparedRun`.
@@ -1860,8 +1839,14 @@ pub fn request_cancel_prepared(run_dir: &Path, run_id: &str, reason: &str) -> Re
     let sentence = format!("{reason}; no child was started");
     write_stop_marker(run_dir, run_id, 0, &sentence)
         .map_err(|error| format!("the run's stop record cannot be written: {error}"))?;
-    write_terminal_replacing(run_dir, run_id, RunOutcome::Stopped, &sentence)
-        .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
+    write_terminal_replacing(
+        run_dir,
+        run_id,
+        RunOutcome::Stopped,
+        &sentence,
+        &ending::seal(),
+    )
+    .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
 
 /// Request a stop, then wait for the handle to end before it is dropped.
@@ -1988,14 +1973,10 @@ pub fn request_natural_finish(
     let mut transcript = transcript::Transcript::open(run_dir)
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))?;
     transcript
-        .append_durable(&Record::run_finished(
-            run_id,
-            outcome,
-            exit_code,
-            duration_ms,
-            reason,
-            EndingSeal::new(),
-        ))
+        .append_terminal(
+            &Record::run_finished(run_id, outcome, exit_code, duration_ms, reason),
+            &ending::seal(),
+        )
         .map_err(|error| format!("the run's ending cannot be recorded: {error}"))
 }
 
@@ -2075,7 +2056,7 @@ fn settle_run_with_stop(
         Ok(reaped) => {
             match stop_sentence {
                 Some(sentence) => {
-                    write_terminal_replacing(run_dir, run_id, outcome, &sentence)
+                    write_terminal_replacing(run_dir, run_id, outcome, &sentence, &ending::seal())
                         .map_err(categorize_cleanup)?;
                 }
                 None => {
@@ -2093,7 +2074,7 @@ fn settle_run_with_stop(
             // keeping every handle, so a later Start retries the cleanup and still
             // finds an outcome and reason.
             if let Some(sentence) = stop_sentence.as_deref() {
-                write_terminal_replacing(run_dir, run_id, outcome, sentence)
+                write_terminal_replacing(run_dir, run_id, outcome, sentence, &ending::seal())
                     .map_err(categorize_cleanup)?;
             }
             Err(categorize_cleanup(error))
@@ -3588,14 +3569,16 @@ mod stop_record_tests {
         fs::create_dir_all(&run).expect("run dir");
         let mut transcript = transcript::Transcript::open(&run).expect("transcript");
         transcript
-            .append_durable(&Record::run_finished(
-                "run-1700000200000-0001",
-                outcome,
-                None,
-                10,
-                Some(reason.to_owned()),
-                EndingSeal::new(),
-            ))
+            .append_terminal(
+                &Record::run_finished(
+                    "run-1700000200000-0001",
+                    outcome,
+                    None,
+                    10,
+                    Some(reason.to_owned()),
+                ),
+                &ending::seal(),
+            )
             .expect("terminal record");
         run
     }
@@ -3991,6 +3974,28 @@ mod stop_record_tests {
             Record::RunFinished { outcome, .. } => assert_eq!(outcome, "stopped"),
             other => panic!("unexpected ending: {other:?}"),
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_panicking_spawn_still_records_the_prepared_ending() {
+        let root = scratch("panicking-spawn");
+        let run = root.join("run-1700000200000-0001");
+        let guard =
+            ending::Owner::prepare(&run, "run-1700000200000-0001", &root).expect("prepare the run");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = guard.start(|_, _, _| panic!("fixture spawn panic"));
+        }));
+        assert!(result.is_err(), "the fixture did not panic");
+        assert!(
+            run.join(STOPPED_FILE).is_file(),
+            "no stop record after the panic"
+        );
+        let terminal = transcript::terminal_record(&run).expect("no terminal after the panic");
+        assert!(matches!(
+            terminal,
+            Record::RunFinished { ref outcome, .. } if outcome == "stopped"
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -12,6 +12,22 @@ use super::{
 /// The only way to create a run directory.
 pub struct Owner;
 
+/// The unforgeable authority for a terminal write. It has no public constructor;
+/// only this module can make one.
+pub struct EndingSeal {
+    _private: (),
+}
+
+pub(super) fn seal() -> EndingSeal {
+    EndingSeal { _private: () }
+}
+
+/// Test-only authority for integration tests that build a transcript by hand.
+#[cfg(debug_assertions)]
+pub fn seal_for_test() -> EndingSeal {
+    EndingSeal { _private: () }
+}
+
 /// A prepared run that has not started a child.
 pub struct PreparedRun {
     run_dir: PathBuf,
@@ -45,20 +61,25 @@ impl PreparedRun {
     where
         F: FnOnce(&Path, &Path, &mut dyn FnMut(u32)) -> Result<Box<dyn RunningSession>, String>,
     {
-        self.armed = false;
         let mut spawned = |pid: u32| {
             // The engine records the pid in its own callback; this owner call is a
             // no-op, kept so the closure shape is explicit.
             let _ = pid;
         };
+        // Keep `armed` true through the fallible call. A panic unwinds through Drop,
+        // which records the prepared-run ending. Only the two normal results clear it.
         match spawn(&self.run_dir, &self.workspace, &mut spawned) {
-            Ok(inner) => Ok(StartedRun {
-                handle: RunHandle { inner },
-                run_dir: self.run_dir.clone(),
-                run_id: self.run_id.clone(),
-            }),
+            Ok(inner) => {
+                self.armed = false;
+                Ok(StartedRun {
+                    handle: RunHandle { inner },
+                    run_dir: self.run_dir.clone(),
+                    run_id: self.run_id.clone(),
+                })
+            }
             Err(reason) => {
                 let _ = request_failed_finish(&self.run_dir, &self.run_id, &reason);
+                self.armed = false;
                 Err(reason)
             }
         }

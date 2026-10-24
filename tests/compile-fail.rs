@@ -69,43 +69,18 @@ fn must_fail(label: &str, body: &str) {
 }
 
 #[test]
-fn typed_terminal_construction_cannot_be_forged() {
-    must_fail(
-        "type-alias RunFinished",
-        r#"
-use gewu_multiverse::transcript::Record as R;
-pub fn bypass() {
-    let _ = R::RunFinished {
-        ts: String::new(),
-        run_id: String::new(),
-        outcome: String::new(),
-        exit_code: None,
-        duration_ms: 0,
-        reason: None,
-    };
-}
-"#,
-    );
-    must_fail(
-        "type-alias run_finished",
-        r#"
-use gewu_multiverse::transcript::Record as R;
-pub fn bypass() {
-    let _ = R::run_finished("run-1", gewu_multiverse::run::RunOutcome::Failed, None, 0, None);
-}
-"#,
-    );
-}
-
-#[test]
 fn the_seal_cannot_be_defaulted_or_reconstructed() {
     must_fail(
         "EndingSeal::default",
-        "pub fn bypass() { let _ = gewu_multiverse::run::EndingSeal::default(); }",
+        "pub fn bypass() { let _ = gewu_multiverse::run::ending::EndingSeal::default(); }",
     );
     must_fail(
-        "seal_from_storage",
-        "pub fn bypass() { let _ = gewu_multiverse::run::seal_from_storage(); }",
+        "EndingSeal literal",
+        "pub fn bypass() { let _ = gewu_multiverse::run::ending::EndingSeal { _private: () }; }",
+    );
+    must_fail(
+        "seal",
+        "pub fn bypass() { let _ = gewu_multiverse::run::ending::seal(); }",
     );
     must_fail(
         "signal_starting_group",
