@@ -890,8 +890,50 @@ fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
     if imperative_comment {
         return RequestedWork::Comment;
     }
-    if read_prefix && !changes && !update_pr && !open_pr {
-        return if forgejo {
+    let compound_action = read_prefix
+        && [" and ", " then ", " and then "]
+            .iter()
+            .any(|joiner| lower.contains(joiner))
+        && tokens.iter().any(|word| {
+            matches!(
+                *word,
+                "change"
+                    | "refactor"
+                    | "rename"
+                    | "rewrite"
+                    | "implement"
+                    | "modify"
+                    | "update"
+                    | "fix"
+                    | "create"
+                    | "delete"
+                    | "remove"
+                    | "add"
+                    | "write"
+                    | "edit"
+                    | "apply"
+                    | "close"
+                    | "reopen"
+                    | "comment"
+                    | "push"
+            )
+        });
+    if read_prefix && !compound_action && !update_pr && !open_pr {
+        let local_read = [
+            "file",
+            "code",
+            "source",
+            "local",
+            "repository",
+            "readme",
+            "module",
+            "function",
+        ]
+        .iter()
+        .any(|word| tokens.contains(word));
+        let forgejo_noun =
+            forgejo || (tokens.contains(&"comment") || tokens.contains(&"pr")) && !local_read;
+        return if forgejo_noun {
             RequestedWork::ForgejoRead
         } else {
             RequestedWork::ReadOnly
@@ -2208,5 +2250,40 @@ mod native_proof_tests {
         assert!(first.is_empty());
         let combined = format!("{first}{second}");
         assert!(!combined.contains(secret.expose()));
+    }
+    #[test]
+    fn c2_nominal_update_and_close_words_are_reads_not_writes() {
+        assert_eq!(
+            requested_work("Read the update.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the close event.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the PR.", &[]),
+            RequestedWork::ForgejoRead
+        );
+        assert_eq!(
+            requested_work("Read the comment.", &[]),
+            RequestedWork::ForgejoRead
+        );
+        assert_eq!(
+            requested_work("Read the code comment in src/main.rs.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the local repository README.", &[]),
+            RequestedWork::ReadOnly
+        );
+        assert_eq!(
+            requested_work("Read the issue and fix the parser.", &[]),
+            RequestedWork::GenericWrite
+        );
+        assert_eq!(
+            requested_work("Review and change the form.", &[]),
+            RequestedWork::GenericWrite
+        );
     }
 }

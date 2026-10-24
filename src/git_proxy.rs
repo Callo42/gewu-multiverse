@@ -271,15 +271,17 @@ fn decode_chunked(input: &[u8]) -> Option<(Vec<u8>, usize)> {
                 at = trailer_end + 2;
             }
         }
-        if input.len() < at + size + 2 {
+        let body_end = at.checked_add(size)?;
+        let framed_end = body_end.checked_add(2)?;
+        if input.len() < framed_end {
             return None;
         }
-        out.extend_from_slice(&input[at..at + size]);
-        at += size;
-        if &input[at..at + 2] != b"\r\n" {
+        out.extend_from_slice(&input[at..body_end]);
+        at = body_end;
+        if &input[at..framed_end] != b"\r\n" {
             return None;
         }
-        at += 2;
+        at = framed_end;
     }
 }
 
@@ -432,6 +434,15 @@ mod boundary_tests {
             assert!(fixed_route(path, &repos(), "POST").is_none(), "{path}");
         }
     }
+    #[test]
+    fn oversized_chunks_are_refused_without_overflow_or_panic() {
+        assert!(decode_chunked(b"7fffffffffffffff\r\n").is_none());
+        assert!(decode_chunked(b"ffffffffffffffff\r\n").is_none());
+        let (decoded, used) = decode_chunked(b"3\r\nabc\r\n0\r\n\r\n").expect("ordinary chunk");
+        assert_eq!(decoded, b"abc");
+        assert!(used > 0);
+    }
+
     #[test]
     fn ambiguous_request_framing_is_rejected() {
         assert!(
