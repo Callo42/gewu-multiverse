@@ -152,6 +152,10 @@ pub trait SessionSpawner: Send + Sync {
 /// The real spawner: git in the agent's workspace and the product's own run binary.
 pub struct RealSpawner {
     binary: PathBuf,
+    #[cfg(test)]
+    ready_timeout: std::time::Duration,
+    #[cfg(test)]
+    report_delay: std::time::Duration,
 }
 
 impl RealSpawner {
@@ -159,7 +163,24 @@ impl RealSpawner {
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
+            #[cfg(test)]
+            ready_timeout: std::time::Duration::from_secs(30),
+            #[cfg(test)]
+            report_delay: std::time::Duration::ZERO,
         }
+    }
+
+    /// Test-only timing: how long `spawn_with` waits, and how long the host thread
+    /// delays its pid report after creating the child.
+    #[cfg(test)]
+    pub fn with_test_timing(
+        mut self,
+        ready_timeout: std::time::Duration,
+        report_delay: std::time::Duration,
+    ) -> Self {
+        self.ready_timeout = ready_timeout;
+        self.report_delay = report_delay;
+        self
     }
 }
 
@@ -283,6 +304,14 @@ impl SessionSpawner for RealSpawner {
         // life of the run, and the engine talks to the child through a channel.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (status_tx, status_rx) = std::sync::mpsc::channel();
+        #[cfg(test)]
+        let ready_timeout = self.ready_timeout;
+        #[cfg(not(test))]
+        let ready_timeout = std::time::Duration::from_secs(30);
+        #[cfg(test)]
+        let report_delay = self.report_delay;
+        #[cfg(not(test))]
+        let report_delay = std::time::Duration::ZERO;
         let binary = self.binary.clone();
         let run_dir = run_dir.to_path_buf();
         let workspace = workspace.to_path_buf();
@@ -309,7 +338,17 @@ impl SessionSpawner for RealSpawner {
                         let _ = ready_tx.send(Err(reason));
                         return;
                     }
-                    let _ = ready_tx.send(Ok(pid));
+                    if !report_delay.is_zero() {
+                        std::thread::sleep(report_delay);
+                    }
+                    if ready_tx.send(Ok(pid)).is_err() {
+                        // Nobody owns the handoff: the engine gave up before this
+                        // report. Stop and reap the child; keep the pid/pgid identity
+                        // handles for a later open to recover.
+                        crate::run::adapter_signal_run_group(pid, true);
+                        let _ = child.wait();
+                        return;
+                    }
                     let status = child.wait();
                     // The pid/group records are identity handles, not transient
                     // bookkeeping. They stay until the engine has written a durable
@@ -326,7 +365,7 @@ impl SessionSpawner for RealSpawner {
                 }
             }
         });
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        match ready_rx.recv_timeout(ready_timeout) {
             Ok(Ok(pid)) => {
                 // The child exists and its pid record is written; report it before
                 // this function returns so a shutdown can signal it during any wait.
@@ -338,7 +377,12 @@ impl SessionSpawner for RealSpawner {
                 }))
             }
             Ok(Err(reason)) => Err(reason),
-            Err(_) => Err("the session process did not start within 30 s".to_owned()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err("the session process did not start within 30 s".to_owned())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the session process ended before it reported its pid".to_owned())
+            }
         }
     }
 }
@@ -692,4 +736,66 @@ pub fn exit_code(status: ExitStatus) -> Option<i32> {
     status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_abandoned_start_stops_the_child_the_host_later_reports() {
+        let root = std::env::temp_dir().join(format!(
+            "gewu-abandoned-start-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let run_dir = root.join("state").join("agent").join("run-1");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script = root.join("sleeper.sh");
+        fs::write(&script, "#!/bin/sh\nexec /bin/sleep 5\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("mode");
+        let spawner = RealSpawner::new(&script).with_test_timing(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(200),
+        );
+        let guard =
+            crate::run::Owner::prepare(&run_dir, "run-1", &workspace).expect("prepare the run");
+        let started = guard.start(&mut |_| {}, |run_dir, workspace, on_spawn| {
+            spawner.spawn_with(run_dir, workspace, on_spawn)
+        });
+        assert!(started.is_err(), "the abandoned start reported success");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !run_dir.join(PID_FILE).is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid: u32 = fs::read_to_string(run_dir.join(PID_FILE))
+            .expect("the host reported its pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while crate::run::process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !crate::run::process_alive(pid),
+            "the abandoned child survived"
+        );
+        assert!(
+            run_dir.join(PGID_FILE).is_file(),
+            "the identity handles were removed"
+        );
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("no ending");
+        assert!(matches!(
+            terminal,
+            crate::transcript::Record::RunFinished { ref outcome, .. } if outcome == "failed"
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
 }
