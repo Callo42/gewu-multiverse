@@ -98,6 +98,25 @@ pub fn bypass() {
 }
 
 #[test]
+fn the_run_handle_cannot_be_signalled_outside_the_owner() {
+    must_fail(
+        "RunHandle::signal",
+        r#"
+struct H;
+impl gewu_multiverse::engine::session::RunningSession for H {
+    fn pid(&self) -> u32 { 1 }
+    fn try_status(&mut self) -> Option<std::process::ExitStatus> { None }
+    fn signal(&mut self, _force: bool) {}
+}
+pub fn bypass() {
+    let mut handle = gewu_multiverse::run::RunHandle::new(Box::new(H));
+    handle.signal(true);
+}
+"#,
+    );
+}
+
+#[test]
 fn low_level_owner_names_are_private() {
     must_fail(
         "settle_run_with_stop",

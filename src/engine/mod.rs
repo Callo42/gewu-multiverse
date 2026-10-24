@@ -50,8 +50,7 @@ use self::clock::{RealClock, SharedClock};
 #[cfg(test)]
 use self::session::FakeSpawner;
 use self::session::{
-    NativeRequest, PreparedSession, RealSpawner, RunningSession, SessionRepository, SessionRequest,
-    SessionSpawner,
+    NativeRequest, PreparedSession, RealSpawner, SessionRepository, SessionRequest, SessionSpawner,
 };
 use self::settings::{AgentSettings, MAX_AGENTS, Settings};
 
@@ -457,7 +456,7 @@ fn acquire_lock(data_root: &Path) -> Result<Flock<File>, String> {
 struct RunningState {
     run_dir: PathBuf,
     started: Instant,
-    handle: Box<dyn RunningSession>,
+    handle: run::RunHandle,
     stopping: bool,
     stop_deadline: Option<Instant>,
     stop_requested: bool,
@@ -1260,7 +1259,7 @@ impl Inner {
                     let requested = run_id_in(&run.run_dir)
                         .ok_or_else(|| "the run directory has no run id".to_owned())
                         .and_then(|run_id| {
-                            run::request_stop(run.handle.as_mut(), &run.run_dir, run_id, proposed)
+                            run::request_stop(&mut run.handle, &run.run_dir, run_id, proposed)
                         });
                     match requested {
                         Ok(ending) => {
@@ -1282,7 +1281,7 @@ impl Inner {
             } else if run.stop_deadline.is_some_and(|deadline| now >= deadline) {
                 if let Some(run_id) = run_id_in(&run.run_dir) {
                     let _ = run::request_force_stop(
-                        run.handle.as_mut(),
+                        &mut run.handle,
                         &run.run_dir,
                         run_id,
                         "the run reached its force deadline",
@@ -3041,7 +3040,7 @@ impl EngineApi for Engine {
                     let requested = run_id_in(&run.run_dir)
                         .ok_or_else(|| "the run directory has no run id".to_owned())
                         .and_then(|run_id| {
-                            run::request_stop(run.handle.as_mut(), &run.run_dir, run_id, proposed)
+                            run::request_stop(&mut run.handle, &run.run_dir, run_id, proposed)
                         });
                     match requested {
                         Ok(ending) => {
@@ -3167,7 +3166,7 @@ impl EngineApi for Engine {
                             Ok(ending) => run.first_ending = Some(ending),
                             Err(error) => {
                                 let reason = run::stop_uncertain(
-                                    run.handle.as_mut(),
+                                    &mut run.handle,
                                     &run.run_dir,
                                     run_id.as_deref().unwrap_or("the run"),
                                     &error,
@@ -3182,7 +3181,7 @@ impl EngineApi for Engine {
                         let proposed = run.first_ending.unwrap_or(run::FirstEnding::Stop);
                         let result = match run_id.as_deref() {
                             Some(run_id) => run::request_stop_and_wait(
-                                run.handle.as_mut(),
+                                &mut run.handle,
                                 &run.run_dir,
                                 run_id,
                                 proposed,
@@ -3203,7 +3202,7 @@ impl EngineApi for Engine {
                             }
                             Err(error) => {
                                 let reason = run::stop_uncertain(
-                                    run.handle.as_mut(),
+                                    &mut run.handle,
                                     &run.run_dir,
                                     run_id.as_deref().unwrap_or("the run"),
                                     &error,
@@ -3544,7 +3543,7 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
         // The owner records the fact, then sends the polite signal. A fact failure
         // marks the ending uncertain and sends no signal.
         let proposed = proposed_first_ending(run);
-        let ending = run::request_stop(run.handle.as_mut(), &run.run_dir, run_id, proposed)?;
+        let ending = run::request_stop(&mut run.handle, &run.run_dir, run_id, proposed)?;
         run.first_ending = Some(ending);
         run.stopping = true;
         run.stop_requested = true;
@@ -4092,41 +4091,38 @@ fn session_job(
         // fails, the handles stay for the next open, which scans every agent
         // directory on disk, not only the current settings.
         drop(guard);
-        if let Ok(mut handle) = spawned {
+        if let Ok(handle) = spawned {
+            let mut handle = run::RunHandle::new(handle);
             let pid = handle.pid();
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending = match run::request_stop(
-                handle.as_mut(),
-                &request.run_dir,
-                &request.run_id,
-                proposed,
-            ) {
-                Ok(first_ending) => first_ending,
-                Err(error) => {
-                    // The child still has to be stopped, but without a valid fact
-                    // this is an uncertain ending, not a clean stop.
-                    let reason = run::stop_uncertain(
-                        handle.as_mut(),
-                        &request.run_dir,
-                        &request.run_id,
-                        &error,
-                        Duration::from_secs(1),
-                    );
-                    let mut guard = lock_inner(&inner);
-                    if let Some(index) = guard.agent_index(&request.agent) {
-                        guard.agents[index].leftover = Some(reason.clone());
-                        guard.agents[index].leftover_targets =
-                            vec![RecoveryTarget::Run(request.run_dir.clone())];
-                        guard.agents[index].session = SessionState::Blocked { reason };
-                        guard.agents[index].next_at = None;
+            let first_ending =
+                match run::request_stop(&mut handle, &request.run_dir, &request.run_id, proposed) {
+                    Ok(first_ending) => first_ending,
+                    Err(error) => {
+                        // The child still has to be stopped, but without a valid fact
+                        // this is an uncertain ending, not a clean stop.
+                        let reason = run::stop_uncertain(
+                            &mut handle,
+                            &request.run_dir,
+                            &request.run_id,
+                            &error,
+                            Duration::from_secs(1),
+                        );
+                        let mut guard = lock_inner(&inner);
+                        if let Some(index) = guard.agent_index(&request.agent) {
+                            guard.agents[index].leftover = Some(reason.clone());
+                            guard.agents[index].leftover_targets =
+                                vec![RecoveryTarget::Run(request.run_dir.clone())];
+                            guard.agents[index].session = SessionState::Blocked { reason };
+                            guard.agents[index].next_at = None;
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
             let _ = run::request_finish(
                 &request.run_dir,
                 pid,
@@ -4148,7 +4144,8 @@ fn session_job(
         guard.agents[index].starting_pid = None;
         let stopping = guard.stopping;
         drop(guard);
-        if let Ok(mut handle) = spawned {
+        if let Ok(handle) = spawned {
+            let mut handle = run::RunHandle::new(handle);
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
             let pid = handle.pid();
@@ -4157,32 +4154,28 @@ fn session_job(
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending = match run::request_stop(
-                handle.as_mut(),
-                &request.run_dir,
-                &request.run_id,
-                proposed,
-            ) {
-                Ok(first_ending) => first_ending,
-                Err(error) => {
-                    let reason = run::stop_uncertain(
-                        handle.as_mut(),
-                        &request.run_dir,
-                        &request.run_id,
-                        &error,
-                        Duration::from_secs(1),
-                    );
-                    let mut guard = lock_inner(&inner);
-                    if let Some(index) = guard.agent_index(&request.agent) {
-                        guard.agents[index].leftover = Some(reason.clone());
-                        guard.agents[index].leftover_targets =
-                            vec![RecoveryTarget::Run(request.run_dir.clone())];
-                        guard.agents[index].session = SessionState::Blocked { reason };
-                        guard.agents[index].next_at = None;
+            let first_ending =
+                match run::request_stop(&mut handle, &request.run_dir, &request.run_id, proposed) {
+                    Ok(first_ending) => first_ending,
+                    Err(error) => {
+                        let reason = run::stop_uncertain(
+                            &mut handle,
+                            &request.run_dir,
+                            &request.run_id,
+                            &error,
+                            Duration::from_secs(1),
+                        );
+                        let mut guard = lock_inner(&inner);
+                        if let Some(index) = guard.agent_index(&request.agent) {
+                            guard.agents[index].leftover = Some(reason.clone());
+                            guard.agents[index].leftover_targets =
+                                vec![RecoveryTarget::Run(request.run_dir.clone())];
+                            guard.agents[index].session = SessionState::Blocked { reason };
+                            guard.agents[index].next_at = None;
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
             let reason = if stopping {
                 "the run was stopped when the program closed"
             } else {
@@ -4221,7 +4214,7 @@ fn session_job(
             guard.agents[index].running = Some(RunningState {
                 run_dir: request.run_dir.clone(),
                 started,
-                handle,
+                handle: run::RunHandle::new(handle),
                 stopping: false,
                 stop_deadline: None,
                 stop_requested: false,
@@ -6695,7 +6688,7 @@ mod tests {
     impl Drop for RealChild {
         fn drop(&mut self) {
             if self.exited.is_none() {
-                self.signal(true);
+                crate::engine::session::RunningSession::signal(self, true);
                 let _ = self.child.wait();
             }
         }

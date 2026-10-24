@@ -266,11 +266,13 @@ post-stop ending with one `stopped` terminal plus the stop record, while a persi
 One owner in `run.rs` performs every ending operation: it pins the fact, sends the
 polite/force signals, writes the stop and terminal records, settles and releases the
 identity handles, performs reopen recovery, and records uncertainty. Engine callers
-only request an ending (`prepare_ending`, `request_stop`, `stop_uncertain`,
-`settle_ending`, `recover_ending`, `write_natural_ending`, `write_failed_ending`);
+only request an ending (`prepare_ending`, `request_stop`, `request_force_stop`,
+`stop_uncertain`, `request_stop_and_wait`, `request_finish`, `recover_ending`,
+`request_natural_finish`, `request_failed_finish`);
 they never write an ending record or signal a run handle directly.
 
-The owner consults the durable fact it returns: a natural or failed writer that sees
+The run process handle is an owner type with a private inner handle and a private
+`signal` method. The owner consults the durable fact it returns: a natural or failed writer that sees
 `stop` already won adds no terminal; only a `terminal` fact writes one. Uncertainty
 evidence is installed with an atomic no-clobber link, so the first evidence survives
 concurrent writers.

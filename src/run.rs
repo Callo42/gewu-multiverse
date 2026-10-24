@@ -1308,6 +1308,33 @@ pub struct RunStopped {
     pub reason: String,
 }
 
+/// The owner's run-process handle. The inner handle is private, so no module outside
+/// `run.rs` can call its `signal` method; callers can only read pid/status.
+pub struct RunHandle {
+    inner: Box<dyn RunningSession>,
+}
+
+impl RunHandle {
+    /// Adopt a spawned session into the owner's handle.
+    pub fn new(inner: Box<dyn RunningSession>) -> Self {
+        Self { inner }
+    }
+
+    /// The child's pid / process-group id.
+    pub fn pid(&self) -> u32 {
+        self.inner.pid()
+    }
+
+    /// The exit status, when the child has ended.
+    pub fn try_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.inner.try_status()
+    }
+
+    fn signal(&mut self, force: bool) {
+        self.inner.signal(force);
+    }
+}
+
 /// The unforgeable token that permits constructing a terminal record. The type is
 /// public only because it appears in a public record variant; its field is private
 /// and only the owner can make one.
@@ -1753,7 +1780,7 @@ fn pin_first_ending(
 /// This is the only place a live run handle is signalled politely. The caller owns
 /// the handle's state; the owner owns the ordering and the signal.
 pub fn request_stop(
-    handle: &mut dyn RunningSession,
+    handle: &mut RunHandle,
     run_dir: &Path,
     run_id: &str,
     proposed: FirstEnding,
@@ -1765,13 +1792,13 @@ pub fn request_stop(
 
 /// Force a run handle after its polite grace. Private: the public request is
 /// `request_force_stop`, which also consults the fact.
-fn force_handle(handle: &mut dyn RunningSession) {
+fn force_handle(handle: &mut RunHandle) {
     handle.signal(true);
 }
 
 /// Request the force step after a stop has already been requested.
 pub fn request_force_stop(
-    handle: &mut dyn RunningSession,
+    handle: &mut RunHandle,
     run_dir: &Path,
     run_id: &str,
     _reason: &str,
@@ -1785,7 +1812,7 @@ pub fn request_force_stop(
 /// fact could not be established. The uncertainty evidence is written first, then
 /// the child is stopped politely and by force and waited for.
 pub fn stop_uncertain(
-    handle: &mut dyn RunningSession,
+    handle: &mut RunHandle,
     run_dir: &Path,
     run_id: &str,
     error: &str,
@@ -1802,7 +1829,7 @@ pub fn stop_uncertain(
 
 /// Request a stop, then wait for the handle to end before it is dropped.
 pub fn request_stop_and_wait(
-    handle: &mut dyn RunningSession,
+    handle: &mut RunHandle,
     run_dir: &Path,
     run_id: &str,
     proposed: FirstEnding,
@@ -1816,7 +1843,7 @@ pub fn request_stop_and_wait(
 
 /// Stop one session handle politely, then by force, and wait for its status so the
 /// child is reaped before the handle is dropped.
-fn stop_and_wait(handle: &mut dyn RunningSession, grace: Duration) {
+fn stop_and_wait(handle: &mut RunHandle, grace: Duration) {
     if handle.try_status().is_some() {
         return;
     }
@@ -1828,7 +1855,7 @@ fn stop_and_wait(handle: &mut dyn RunningSession, grace: Duration) {
     let _ = wait_session_status(handle, Duration::from_secs(1));
 }
 
-fn wait_session_status(handle: &mut dyn RunningSession, limit: Duration) -> bool {
+fn wait_session_status(handle: &mut RunHandle, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
     loop {
         if handle.try_status().is_some() {
