@@ -924,9 +924,7 @@ fn provider_detail_after_status(text: &str, code: u16) -> Option<String> {
     let marker = format!("HTTP {code}");
     let rest = text.split(&marker).nth(1)?;
     let rest = rest.strip_prefix(')').unwrap_or(rest);
-    let rest = rest
-        .trim_start_matches([':', ' ', '—', '-'])
-        .trim();
+    let rest = rest.trim_start_matches([':', ' ', '—', '-']).trim();
     if rest.is_empty() {
         return None;
     }
