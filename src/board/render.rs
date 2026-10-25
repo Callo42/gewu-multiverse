@@ -13,6 +13,7 @@ use crate::board::{Board, Screen};
 use crate::engine_api::{
     AgentView, EndpointTest, ForgejoState, ForgejoView, Provisioning, SessionEnd, SessionState,
 };
+use crate::harness::Program;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -966,14 +967,32 @@ fn started_agent_names(board: &Board) -> Vec<&str> {
 /// what stops and the reopen sentence instead of losing them (F-13).
 fn quit_warning_text(board: &Board, width: u16, budget: u16) -> String {
     let started = started_agent_names(board);
-    if started.is_empty() {
+    let installing: Vec<&str> = board
+        .view
+        .programs
+        .iter()
+        .filter(|program| program.installing.is_some())
+        .map(|program| program.label.as_str())
+        .collect();
+    if started.is_empty() && installing.is_empty() {
         return "quit stops Forgejo; it starts again on reopen — q again quits".to_owned();
     }
-    let names = join_names(&started);
-    let line = if started.len() == 1 {
-        format!("quit stops {names} and Forgejo; they start again on reopen — q again quits")
+    let line = if installing.is_empty() {
+        let names = join_names(&started);
+        if started.len() == 1 {
+            format!("quit stops {names} and Forgejo; they start again on reopen — q again quits")
+        } else {
+            format!("quit stops {names}, and Forgejo; they start again on reopen — q again quits")
+        }
     } else {
-        format!("quit stops {names}, and Forgejo; they start again on reopen — q again quits")
+        let installs = join_names(&installing);
+        let cancel = format!("cancels installing {installs}");
+        if started.is_empty() {
+            format!("quit {cancel}; the previous version is kept — q again quits")
+        } else {
+            let names = join_names(&started);
+            format!("quit stops {names} and {cancel}; q again quits")
+        }
     };
     if text_util::wrap(&line, width.saturating_sub(2) as usize).len() as u16 <= budget {
         return line;
@@ -983,10 +1002,20 @@ fn quit_warning_text(board: &Board, width: u16, budget: u16) -> String {
     } else {
         "agents"
     };
-    format!(
-        "quit stops {} {noun} and Forgejo; they start again on reopen — q again quits",
-        started.len()
-    )
+    if started.is_empty() {
+        format!(
+            "quit cancels {} install{}; the previous version is kept — q again quits",
+            installing.len(),
+            if installing.len() == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "quit stops {} {noun} and cancels {} install{}; q again quits",
+            started.len(),
+            installing.len(),
+            if installing.len() == 1 { "" } else { "s" }
+        )
+    }
 }
 
 /// How many rows the footer really needs. It is the single count both the
@@ -2439,7 +2468,14 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
 }
 
 fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
-    draw_outer(buf, area, "Your model");
+    let title = match board.model_agent.as_deref() {
+        Some(name) => format!("{name}'s model"),
+        None => match board.model_origin {
+            crate::board::ModelOrigin::Board => "Shared model".to_owned(),
+            crate::board::ModelOrigin::FirstRun => "Your model".to_owned(),
+        },
+    };
+    draw_outer(buf, area, &title);
     let inner = inner(area);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(2);
@@ -2498,7 +2534,10 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
                 form,
                 form.x + 2,
                 y,
-                "for example https://model.example/v1/chat/completions",
+                &text_util::ellipsize(
+                    "for example https://model.example/v1",
+                    form.width.saturating_sub(4) as usize,
+                ),
                 theme::fg(theme::MUTED),
             );
             y += 1;
@@ -2507,7 +2546,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
             y += field_gap;
         }
     }
-    let test = if board.model_test_visible() {
+    let test = if board.model_agent.is_none() && board.model_test_visible() {
         board.view.endpoint.test.clone()
     } else {
         EndpointTest::NotRun
@@ -2537,6 +2576,8 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     }
     let actions = if board.model_editing {
         "⏎ next field   ctrl-u clear   ↑↓ field   esc cancel"
+    } else if board.model_agent.is_some() {
+        "e edit   ↑↓ field   ⏎ save   ctrl-u clear   esc back   Start is the test"
     } else {
         "e edit   ↑↓ field   t test   ⏎ next   ctrl-u clear   esc back"
     };
@@ -2566,7 +2607,13 @@ fn field_text(board: &Board, index: usize, editing: bool) -> String {
         // One mask length in every state: the saved key and the key being edited
         // are both eight bullets, and an empty field is empty — no stray dash
         // (W67-13, F-15).
-        if raw.is_empty() && !board.view.endpoint.key_present {
+        let key_present = board
+            .model_agent
+            .as_deref()
+            .and_then(|name| board.view.agents.iter().find(|agent| agent.name == name))
+            .map(|agent| agent.key_present)
+            .unwrap_or(board.view.endpoint.key_present);
+        if raw.is_empty() && !key_present {
             String::new()
         } else {
             "••••••••".to_owned()
@@ -2754,7 +2801,8 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         draw_home(board, buf, area, false);
         return;
     };
-    draw_outer(buf, area, &agent.name);
+    let agent_title = format!("{} · {}", agent.name, agent.program_label);
+    draw_outer(buf, area, &agent_title);
     let inner = inner(area);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(3);
@@ -3171,23 +3219,9 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             &keys,
             theme::bold(theme::AMBER),
         );
-    } else if text_util::width(
-        "s start/stop   e instruction   l log   t transcript   j raw   d remove   esc back",
-    ) <= inner.width.saturating_sub(2) as usize
-    {
-        let line =
-            "s start/stop   e instruction   l log   t transcript   j raw   d remove   esc back";
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            actions_y,
-            line,
-            theme::fg(theme::MUTED),
-        );
     } else {
-        let line1 = "s start/stop   e instruction   l log   t transcript";
-        let line2 = "j raw transcript   d remove   esc back";
+        let line1 = "s start/stop  e instruction  p program  m model";
+        let line2 = "l log  t transcript  j raw  d remove  esc back";
         text_util::put(
             buf,
             inner,
@@ -3384,6 +3418,255 @@ fn draw_instruction_rows(
                 theme::card(theme::FG, true),
             );
         }
+    }
+}
+
+fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
+    draw_outer(buf, area, "Agent program");
+    let inner = inner(area);
+    let mut y = inner.y + 1;
+    if let Some(unknown) = board.program_unknown.as_ref() {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            &text_util::ellipsize(
+                &format!("saved program `{unknown}` is not one this product knows"),
+                inner.width.saturating_sub(2) as usize,
+            ),
+            theme::fg(theme::RED),
+        );
+        y += 1;
+    }
+    for index in 0..5 {
+        let program = if index == 0 {
+            Program::Builtin
+        } else {
+            crate::harness::NATIVE_PROGRAMS
+                .get(index - 1)
+                .copied()
+                .unwrap_or(Program::Builtin)
+        };
+        let selected = index == board.program_index && board.program_unknown.is_none();
+        let marker = if selected { "▸ " } else { "  " };
+        let installed = board
+            .view
+            .programs
+            .iter()
+            .find(|view| view.id == program.id());
+        let state = if !program.is_native() {
+            "always ready".to_owned()
+        } else if installed.is_some_and(|view| view.installing.is_some()) {
+            "installing".to_owned()
+        } else if let Some(view) = installed.filter(|view| view.installed) {
+            view.installed_version
+                .clone()
+                .unwrap_or_else(|| view.version.clone())
+        } else {
+            "not installed".to_owned()
+        };
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            &text_util::ellipsize(
+                &format!("{marker}{} · {state}", program.label()),
+                inner.width.saturating_sub(2) as usize,
+            ),
+            if selected {
+                theme::bold(theme::ACCENT)
+            } else {
+                theme::fg(theme::MUTED)
+            },
+        );
+        y += 1;
+    }
+    y += 1;
+    let program = if board.program_index == 0 {
+        Program::Builtin
+    } else {
+        crate::harness::NATIVE_PROGRAMS
+            .get(board.program_index - 1)
+            .copied()
+            .unwrap_or(Program::Builtin)
+    };
+    let protocol = board.program_protocol;
+    text_util::put(
+        buf,
+        inner,
+        inner.x + 1,
+        y,
+        &format!("connection: {}", protocol.label()),
+        theme::fg(theme::FG),
+    );
+    y += 1;
+    let supported = program.supported_protocols();
+    if supported.len() > 1 {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            "←→ change connection",
+            theme::fg(theme::MUTED),
+        );
+    } else if program.is_native() {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            "this program uses this connection",
+            theme::fg(theme::MUTED),
+        );
+    }
+    y += 1;
+    if program == Program::Codex {
+        let sandbox = board
+            .view
+            .agents
+            .iter()
+            .find(|agent| agent.name == board.agent_name)
+            .and_then(|agent| agent.codex_sandbox.clone())
+            .unwrap_or_else(|| "native".to_owned());
+        let text = if sandbox == "full-access" {
+            "Codex sandbox: removed (product Landlock only) · f return to default"
+        } else {
+            "Codex sandbox: its own default · f opt in to removing it"
+        };
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            &text_util::ellipsize_words(text, inner.width.saturating_sub(2) as usize),
+            theme::fg(theme::AMBER),
+        );
+        y += 1;
+    }
+    if let Some(view) = board
+        .view
+        .programs
+        .iter()
+        .find(|view| view.id == program.id())
+    {
+        let detail = match (&view.error, view.installing) {
+            (Some(error), _) => format!("✗ {}", status::plain(error)),
+            (None, Some(Some(percent))) => match view.installing_phase.as_deref() {
+                Some(phase) => format!("◐ {phase} — {percent}%"),
+                None => format!("◐ installing — {percent}%"),
+            },
+            (None, Some(None)) => match view.installing_phase.as_deref() {
+                Some(phase) => format!("◐ {phase}…"),
+                None => "◐ installing…".to_owned(),
+            },
+            (None, None) => format!(
+                "{} · {} · about {} MB{}",
+                view.version,
+                view.license,
+                view.download_mb,
+                view.prerequisite
+                    .as_deref()
+                    .map(|needed| format!(" · needs {needed}"))
+                    .unwrap_or_default()
+            ),
+        };
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            &text_util::ellipsize_words(&detail, inner.width.saturating_sub(2) as usize),
+            theme::fg(theme::MUTED),
+        );
+        y += 1;
+    }
+    if let Some(agent) = board
+        .view
+        .agents
+        .iter()
+        .find(|agent| agent.name == board.agent_name)
+    {
+        let describe = |view: &crate::engine_api::RunProgramView| {
+            let host = view
+                .base_url
+                .split("://")
+                .nth(1)
+                .unwrap_or(&view.base_url)
+                .trim_end_matches('/');
+            let sandbox = view
+                .codex_sandbox
+                .as_deref()
+                .map(|mode| format!(" sandbox={mode}"))
+                .unwrap_or_default();
+            format!(
+                "{} {} ·{} · {} · {} @ {}",
+                view.label, view.version, sandbox, view.protocol, view.model, host
+            )
+        };
+        let active = agent
+            .active_program
+            .as_ref()
+            .map(describe)
+            .unwrap_or_else(|| "no run yet".to_owned());
+        let next = agent
+            .next_program
+            .as_ref()
+            .map(describe)
+            .unwrap_or_else(|| "not chosen".to_owned());
+        let active_word = if matches!(agent.session, SessionState::Running { .. }) {
+            "active"
+        } else {
+            "latest"
+        };
+        let width = inner.width.saturating_sub(2) as usize;
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y,
+            &text_util::ellipsize_words(&format!("{active_word}: {active}"), width),
+            theme::fg(theme::MUTED),
+        );
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            y + 1,
+            &text_util::ellipsize_words(&format!("next: {next}"), width),
+            theme::fg(theme::MUTED),
+        );
+    }
+    let installing = board
+        .view
+        .programs
+        .iter()
+        .find(|view| view.id == program.id())
+        .is_some_and(|view| view.installing.is_some());
+    let actions = if installing {
+        "↑↓ program   i cancel install   esc back"
+    } else {
+        "↑↓ program   ←→ connection   ⏎ use   i install   esc back"
+    };
+    text_util::put(
+        buf,
+        inner,
+        inner.x + 1,
+        inner.bottom().saturating_sub(2),
+        &text_util::ellipsize_words(actions, inner.width.saturating_sub(2) as usize),
+        theme::fg(theme::MUTED),
+    );
+    if let Some(notice) = board.notice() {
+        text_util::put(
+            buf,
+            inner,
+            inner.x + 1,
+            inner.bottom().saturating_sub(1),
+            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
+            theme::bold(theme::AMBER),
+        );
     }
 }
 
@@ -3690,13 +3973,13 @@ fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
         ("", "+ add     − remove   f Forgejo"),
         ("", "m model   ? help   q quit"),
         ("agent", "s start/stop   e instruction   l log"),
-        ("", "t transcript   j raw   d remove   esc back"),
+        ("", "t transcript   j raw   d remove"),
+        ("", "p program   m model   esc back"),
+        ("program", "↑↓ program   ←→ connection   ⏎ use   i install"),
         (
             "model",
-            "e edit   t test   ⏎ next   ctrl-u clear   esc back",
+            "e edit   t test   ⏎ save   ctrl-u clear   esc back",
         ),
-        ("Forgejo", "p password   esc back"),
-        ("first run", "y agree   n leave"),
     ];
     let line_count = lines.len() as u16;
     let spacing = if line_count > 1 {
@@ -3790,6 +4073,7 @@ pub fn draw(board: &mut Board, frame: &mut Frame) {
         Screen::Build => draw_build_picture(board, buf, area),
         Screen::Home => draw_home(board, buf, area, false),
         Screen::Agent => draw_agent(board, buf, area),
+        Screen::Program => draw_program(board, buf, area),
         Screen::Forgejo => draw_forgejo(board, buf, area),
         Screen::Help => draw_help(board, buf, area),
         Screen::Upgrade => draw_upgrade(board, buf, area),
@@ -3869,5 +4153,105 @@ mod tests {
             assert!(!face.word.is_empty());
             assert!(matches!(face.symbol, '●' | '◐' | '○'));
         }
+    }
+}
+
+#[cfg(test)]
+mod program_view_tests {
+    use super::*;
+    use crate::board::FakeEngine;
+    use crate::engine_api::{Command, EngineApi, RunProgramView};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn a_full_access_active_run_stays_visible_beside_a_native_next_at_narrow_widths() {
+        for width in [72_u16, 80] {
+            let mut engine = FakeEngine::new();
+            engine.send(Command::AcknowledgeTerms).expect("terms");
+            engine
+                .send(Command::SetEndpoint {
+                    url: "https://model.example/v1/chat/completions".to_owned(),
+                    model: "demo-model".to_owned(),
+                    key: Some("demo-key".to_owned()),
+                })
+                .expect("endpoint");
+            engine
+                .send(Command::CreateAgents { count: 1 })
+                .expect("agents");
+            let mut board = Board::new(engine);
+            board.screen = Screen::Program;
+            board.agent_name = "agent-1".to_owned();
+            board.view.agents[0].active_program = Some(RunProgramView {
+                program: "codex".to_owned(),
+                label: "Codex".to_owned(),
+                version: "0.164.0".to_owned(),
+                protocol: "responses".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                model: "active-model".to_owned(),
+                codex_sandbox: Some("full-access".to_owned()),
+            });
+            board.view.agents[0].next_program = Some(RunProgramView {
+                program: "codex".to_owned(),
+                label: "Codex".to_owned(),
+                version: "0.164.0".to_owned(),
+                protocol: "responses".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                model: "next-model".to_owned(),
+                codex_sandbox: Some("native".to_owned()),
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("terminal");
+            terminal.draw(|frame| board.draw(frame)).expect("draw");
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..24 {
+                for x in 0..width {
+                    text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+                }
+                text.push('\n');
+            }
+            assert!(
+                text.contains("sandbox=full-access"),
+                "the active full-access fact was lost at {width} columns: {text}"
+            );
+            assert!(
+                text.contains("sandbox=native") && text.contains("next:"),
+                "the next native sandbox was lost at {width} columns: {text}"
+            );
+        }
+    }
+    #[test]
+    fn an_unknown_saved_program_is_shown_and_not_preselected() {
+        let mut engine = FakeEngine::new();
+        engine.send(Command::AcknowledgeTerms).expect("terms");
+        engine
+            .send(Command::SetEndpoint {
+                url: "https://model.example/v1/chat/completions".to_owned(),
+                model: "demo-model".to_owned(),
+                key: Some("demo-key".to_owned()),
+            })
+            .expect("endpoint");
+        engine
+            .send(Command::CreateAgents { count: 1 })
+            .expect("agents");
+        let mut board = Board::new(engine);
+        board.screen = Screen::Program;
+        board.agent_name = "agent-1".to_owned();
+        board.view.agents[0].unknown_program = Some("potato".to_owned());
+        board.view.agents[0].program_label = "unknown program `potato`".to_owned();
+        board.program_unknown = Some("potato".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| board.draw(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                text.push_str(buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("potato"), "{text}");
+        assert!(text.contains("not one this product knows"), "{text}");
+        assert!(!text.contains("▸ built-in engine"), "{text}");
     }
 }

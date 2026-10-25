@@ -1597,6 +1597,19 @@ fn random_hex(bytes: usize) -> Result<String, String> {
     Ok(hex(&buffer))
 }
 
+/// Signal one of the bundled server's process groups. This is the server/harness
+/// process adapter, not a run-ending signal.
+pub(crate) fn signal_process_group(pid: u32, force: bool) {
+    signal_group(
+        pid,
+        if force {
+            nix::sys::signal::Signal::SIGKILL
+        } else {
+            nix::sys::signal::Signal::SIGTERM
+        },
+    );
+}
+
 fn signal_group(pid: u32, signal: nix::sys::signal::Signal) {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;

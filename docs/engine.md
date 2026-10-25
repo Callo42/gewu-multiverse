@@ -247,7 +247,66 @@ recovery itself had to reap a left-over group or close a run that wrote none, it
 writes `run-stopped.json` with that ending. A failure at either write keeps the handles and is
 reported, so a later `Start` retries instead of trusting an absent record. The same
 ordering settles a normal `s` stop or a run ended by `q`; an interrupted program leaves
-either handles that the next open can still verify or an ending it can trust. If a
+either handles that the next open can still verify or an ending it can trust. A run the
+engine ended for its own reason also gets `run-stopped.json`: a normal stop, a deadline
+timeout, and a deadline failure that keeps the harness's last reported cause. The marker
+is written even when the reap cannot be verified, with that uncertainty in its sentence,
+and the terminal ending waits for a verified reap. A run's own terminal record written
+before a stop wins: the stop changes only the agent's desired state, writes no stop
+marker and adds no second ending. A stop requested while the run had no ending wins;
+if the child manages to write one during the grace window, the stop terminal replaces
+it so the run still has exactly one terminal outcome. The first-ending fact is
+write-once and is persisted at `first-ending.json` in the run's private directory
+before the first stop, deadline or shutdown signal. A second Stop, a program shutdown,
+settle, reap or reopen reads that file; it cannot re-sample the fact or hand the run
+to a later child ending. Recovery uses it too: a persisted `stop` replaces a child's
+post-stop ending with one `stopped` terminal plus the stop record, while a persisted
+`terminal` keeps the child's ending and writes no stop record.
+
+One owner in `run.rs` performs every ending operation: it pins the fact, sends the
+polite/force signals, writes the stop and terminal records, settles and releases the
+identity handles, performs reopen recovery, and records uncertainty. Engine callers
+only request an ending (`prepare_ending`, `request_stop`, `request_force_stop`,
+`stop_uncertain`, `request_stop_and_wait`, `request_finish`, `recover_ending`,
+`request_natural_finish`, `request_failed_finish`. A prepared run is an owner
+`run::ending::PreparedRun`: only `Owner::prepare` creates the directory, only
+`start`/`cancel` consume it, and `Drop` records a prepared-run ending if neither did.
+`request_cancel_prepared`);
+they never write an ending record or signal a run handle directly.
+
+The run process handle is an owner type with a private inner handle and a private
+`signal` method. The owner consults the durable fact it returns: a natural or failed writer that sees
+`stop` already won adds no terminal; only a `terminal` fact writes one. Uncertainty
+evidence is installed with an atomic no-clobber link, so the first evidence survives
+concurrent writers.
+
+`Record::RunFinished` carries a private `EndingSeal` field; only the owner can make
+one, so a terminal record cannot be constructed or appended outside `run.rs` even
+through a type alias. `EndingSeal` deliberately has no `Default`; the only storage
+path is `seal_from_storage`, used by serde when reading old records. `Record::run_finished` and `Record::record_outcome_if_missing`
+require that seal. `tests/compile-fail.rs` compiles source probes against the library
+and requires them to fail (type-alias construction, low-level names, force API).
+
+`tests/ending-owner.rs` remains as the secondary whole-source scan. It covers every
+production `src` file except `src/run.rs` (the owner) and `src/transcript.rs` (the
+record storage primitive), strips tests and comments, and rejects typed terminal
+constructions, literal ending file names, low-level settlement calls and raw run
+signals. It also feeds deliberately bypassing source fixtures through the same check.
+
+The fact is trusted only when it names this exact run and agrees with its records. A
+missing/corrupt terminal under a persisted `terminal` fact, a foreign `run_id`, an
+unreadable fact, or a fact that cannot be written before a governed signal is an
+uncertain ending: the product writes `ending-uncertain.json` with the evidence, keeps
+the handles and blocks dependent actions. It never falls back to a clean `stopped` or
+`terminal` outcome. A cleanup stop that must still end a live child records that
+uncertainty before the stop and does not settle the run cleanly.
+The native supervisor writes `native-progress.json` whenever its per-harness outcome
+model changes (waiting, retrying, failed, succeeded), so a cause the harness already
+emitted survives the engine killing the child at its deadline. A failed tool is
+persisted there as a warning, never as the session cause: a deadline with only a tool
+warning stays `timed_out` and the stop record names the warning. Text is bound to the
+attempt that produced it; a failed or retried attempt's partial text is never
+committed by a later terminal success. If a
 process survives the reap, the sentence is kept and drawn on the agent's card; a known
 live process is `live leftover`, a live process whose ownership is unproven is
 `unverified leftover`, and a run that left no ownership record (or whose record/ending

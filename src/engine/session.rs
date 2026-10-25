@@ -17,7 +17,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-use crate::run::{RunForgejo, RunForgejoRepository, RunPlan, write_forgejo_context};
+use crate::run::{NativePlan, RunForgejo, RunForgejoRepository, RunPlan, write_forgejo_context};
 use crate::workspace::{self, GitCredential, GitIdentity, Prepared};
 
 /// One repository a session may use, as the run's context records it.
@@ -71,15 +71,41 @@ pub struct SessionRequest {
     pub confinement: crate::confinement::Method,
     /// The directories the confined shell must not see.
     pub hide: Vec<PathBuf>,
+    /// The native program this run launches, when it is not the built-in loop.
+    pub native: Option<NativeRequest>,
+}
+
+/// The immutable native program facts carried from the agent's settings into a run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRequest {
+    /// Program id.
+    pub harness: String,
+    /// Actual installed version.
+    pub version: String,
+    /// Executable.
+    pub program: PathBuf,
+    /// Product-owned install root.
+    pub install_root: PathBuf,
+    /// Connection protocol.
+    pub protocol: String,
+    /// API base URL.
+    pub base_url: String,
+    /// Model id.
+    pub model: String,
+    /// Explicit Codex sandbox choice (`native` or `full-access`).
+    #[serde(default)]
+    pub codex_sandbox: String,
 }
 
 /// A session whose slow work is done and whose plan is on disk.
-#[derive(Debug, Clone)]
 pub struct PreparedSession {
     /// The run's record directory.
     pub run_dir: PathBuf,
     /// The agent's workspace.
     pub workspace: PathBuf,
+    /// Owner guard for the prepared run; consumed by the owner's start/cancel/drop.
+    pub guard: crate::run::PreparedRun,
 }
 
 /// The name of the pid file inside a run's record directory.
@@ -113,18 +139,23 @@ pub trait SessionSpawner: Send + Sync {
     /// that pid so `shutdown` can signal a spawn that has not returned yet.
     fn spawn_with(
         &self,
-        prepared: &PreparedSession,
+        run_dir: &Path,
+        workspace: &Path,
         on_spawn: &mut dyn FnMut(u32),
     ) -> Result<Box<dyn RunningSession>, String>;
     /// Start the prepared run when the caller does not need the pid early.
     fn spawn(&self, prepared: &PreparedSession) -> Result<Box<dyn RunningSession>, String> {
-        self.spawn_with(prepared, &mut |_pid| {})
+        self.spawn_with(&prepared.run_dir, &prepared.workspace, &mut |_pid| {})
     }
 }
 
 /// The real spawner: git in the agent's workspace and the product's own run binary.
 pub struct RealSpawner {
     binary: PathBuf,
+    #[cfg(test)]
+    ready_timeout: std::time::Duration,
+    #[cfg(test)]
+    report_delay: std::time::Duration,
 }
 
 impl RealSpawner {
@@ -132,13 +163,31 @@ impl RealSpawner {
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
+            #[cfg(test)]
+            ready_timeout: std::time::Duration::from_secs(30),
+            #[cfg(test)]
+            report_delay: std::time::Duration::ZERO,
         }
+    }
+
+    /// Test-only timing: how long `spawn_with` waits, and how long the host thread
+    /// delays its pid report after creating the child.
+    #[cfg(test)]
+    pub fn with_test_timing(
+        mut self,
+        ready_timeout: std::time::Duration,
+        report_delay: std::time::Duration,
+    ) -> Self {
+        self.ready_timeout = ready_timeout;
+        self.report_delay = report_delay;
+        self
     }
 }
 
 impl SessionSpawner for RealSpawner {
     fn prepare(&self, request: &SessionRequest) -> Result<PreparedSession, String> {
-        ensure_run_dir(&request.run_dir)?;
+        let guard =
+            crate::run::Owner::prepare(&request.run_dir, &request.run_id, &request.workspace)?;
         crate::mode::hold_dir_private_below(&request.state_root, &request.run_dir).map_err(
             |error| {
                 format!(
@@ -220,15 +269,32 @@ impl SessionSpawner for RealSpawner {
                 format!("the session's Forgejo context cannot be written: {error}")
             })?;
         }
+        if let Some(native) = request.native.as_ref() {
+            let plan = NativePlan {
+                harness: native.harness.clone(),
+                version: native.version.clone(),
+                program: native.program.clone(),
+                install_root: native.install_root.clone(),
+                protocol: native.protocol.clone(),
+                base_url: native.base_url.clone(),
+                model: native.model.clone(),
+                codex_sandbox: native.codex_sandbox.clone(),
+            };
+            plan.write(&request.run_dir).map_err(|error| {
+                format!("the session's native program plan cannot be written: {error}")
+            })?;
+        }
         Ok(PreparedSession {
             run_dir: request.run_dir.clone(),
             workspace: request.workspace.clone(),
+            guard,
         })
     }
 
     fn spawn_with(
         &self,
-        prepared: &PreparedSession,
+        run_dir: &Path,
+        workspace: &Path,
         on_spawn: &mut dyn FnMut(u32),
     ) -> Result<Box<dyn RunningSession>, String> {
         // The run process asks the kernel to signal it when its *parent thread* goes
@@ -238,9 +304,17 @@ impl SessionSpawner for RealSpawner {
         // life of the run, and the engine talks to the child through a channel.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (status_tx, status_rx) = std::sync::mpsc::channel();
+        #[cfg(test)]
+        let ready_timeout = self.ready_timeout;
+        #[cfg(not(test))]
+        let ready_timeout = std::time::Duration::from_secs(30);
+        #[cfg(test)]
+        let report_delay = self.report_delay;
+        #[cfg(not(test))]
+        let report_delay = std::time::Duration::ZERO;
         let binary = self.binary.clone();
-        let run_dir = prepared.run_dir.clone();
-        let workspace = prepared.workspace.clone();
+        let run_dir = run_dir.to_path_buf();
+        let workspace = workspace.to_path_buf();
         std::thread::spawn(move || {
             let child = Command::new(&binary)
                 .arg("--run-agent")
@@ -259,19 +333,26 @@ impl SessionSpawner for RealSpawner {
                     let recorded =
                         write_pid(&run_dir, pid).and_then(|()| write_pgid(&run_dir, pid));
                     if let Err(reason) = recorded {
-                        let _ = nix::sys::signal::killpg(
-                            nix::unistd::Pid::from_raw(pid as i32),
-                            nix::sys::signal::Signal::SIGKILL,
-                        );
+                        crate::run::adapter_signal_run_group(pid, true);
                         let _ = child.wait();
                         let _ = ready_tx.send(Err(reason));
                         return;
                     }
-                    let _ = ready_tx.send(Ok(pid));
+                    if !report_delay.is_zero() {
+                        std::thread::sleep(report_delay);
+                    }
+                    if ready_tx.send(Ok(pid)).is_err() {
+                        // Nobody owns the handoff: the engine gave up before this
+                        // report. Stop and reap the child; keep the pid/pgid identity
+                        // handles for a later open to recover.
+                        crate::run::adapter_signal_run_group(pid, true);
+                        let _ = child.wait();
+                        return;
+                    }
                     let status = child.wait();
                     // The pid/group records are identity handles, not transient
                     // bookkeeping. They stay until the engine has written a durable
-                    // ending and verified cleanup (`run::settle_run`), or until a
+                    // ending and verified cleanup (`run::settle_ending`), or until a
                     // later open does the same. Removing them here lost the only
                     // recovery handle of a run whose supervisor wrote no shell
                     // record, even though its ending had not been recorded yet.
@@ -284,7 +365,7 @@ impl SessionSpawner for RealSpawner {
                 }
             }
         });
-        match ready_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        match ready_rx.recv_timeout(ready_timeout) {
             Ok(Ok(pid)) => {
                 // The child exists and its pid record is written; report it before
                 // this function returns so a shutdown can signal it during any wait.
@@ -296,7 +377,12 @@ impl SessionSpawner for RealSpawner {
                 }))
             }
             Ok(Err(reason)) => Err(reason),
-            Err(_) => Err("the session process did not start within 30 s".to_owned()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err("the session process did not start within 30 s".to_owned())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the session process ended before it reported its pid".to_owned())
+            }
         }
     }
 }
@@ -332,19 +418,14 @@ impl RunningSession for HostedSession {
     }
 
     fn signal(&mut self, force: bool) {
-        let signal = if force {
-            nix::sys::signal::Signal::SIGKILL
-        } else {
-            nix::sys::signal::Signal::SIGTERM
-        };
-        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(self.pid as i32), signal);
+        crate::run::adapter_signal_run_group(self.pid, force);
     }
 }
 
 impl Drop for HostedSession {
     fn drop(&mut self) {
         if self.exited.is_none() {
-            self.signal(true);
+            crate::run::adapter_signal_run_group(self.pid, true);
         }
     }
 }
@@ -366,8 +447,11 @@ struct FakeInner {
     last_run_dir: Option<PathBuf>,
     last_repositories: Vec<SessionRepository>,
     prepare_failure: Option<String>,
+    prepare_failure_after_dir: Option<String>,
     spawn_failure: Option<String>,
+    spawn_failure_after_block: Option<String>,
     block_next_spawn: Option<(std::sync::mpsc::Sender<u32>, std::sync::mpsc::Receiver<()>)>,
+    block_next_prepare: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 impl FakeSpawner {
@@ -434,12 +518,42 @@ impl FakeSpawner {
             .prepare_failure = Some(reason.to_owned());
     }
 
+    /// Make the next `prepare` fail after it created the run directory.
+    pub fn fail_prepare_after_dir(&self, reason: &str) {
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .prepare_failure_after_dir = Some(reason.to_owned());
+    }
+
+    /// Make the next spawn report a pid, wait for the release, then fail.
+    pub fn fail_spawn_after_block(&self, reason: &str) {
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .spawn_failure_after_block = Some(reason.to_owned());
+    }
+
     /// Make the next spawn fail before a child exists.
     pub fn fail_spawn(&self, reason: &str) {
         self.inner
             .lock()
             .expect("the fake is not poisoned")
             .spawn_failure = Some(reason.to_owned());
+    }
+
+    /// Make the next prepare report that the run directory exists and then wait for
+    /// a release before returning. Returns the start report and release sender.
+    pub fn block_next_prepare(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.inner
+            .lock()
+            .expect("the fake is not poisoned")
+            .block_next_prepare = Some((started_tx, release_rx));
+        (started_rx, release_tx)
     }
 
     /// Make the next spawn report its pid and then wait for a release before it
@@ -480,7 +594,8 @@ impl SessionSpawner for FakeSpawner {
         if let Some(reason) = inner.prepare_failure.take() {
             return Err(reason);
         }
-        ensure_run_dir(&request.run_dir)?;
+        let guard =
+            crate::run::Owner::prepare(&request.run_dir, &request.run_id, &request.workspace)?;
         let plan = RunPlan {
             run_id: request.run_id.clone(),
             agent: request.agent.clone(),
@@ -519,18 +634,32 @@ impl SessionSpawner for FakeSpawner {
         inner.last_prepared = Some(request.agent.clone());
         inner.last_run_dir = Some(request.run_dir.clone());
         inner.last_repositories = request.repositories.clone();
+        let after_dir_failure = inner.prepare_failure_after_dir.take();
+        if let Some((started, release)) = inner.block_next_prepare.take() {
+            drop(inner);
+            let _ = started.send(());
+            let _ = release.recv();
+            if let Some(reason) = after_dir_failure {
+                return Err(reason);
+            }
+        } else if let Some(reason) = after_dir_failure {
+            drop(inner);
+            return Err(reason);
+        }
         Ok(PreparedSession {
             run_dir: request.run_dir.clone(),
             workspace: request.workspace.clone(),
+            guard,
         })
     }
 
     fn spawn_with(
         &self,
-        _prepared: &PreparedSession,
+        _run_dir: &Path,
+        _workspace: &Path,
         on_spawn: &mut dyn FnMut(u32),
     ) -> Result<Box<dyn RunningSession>, String> {
-        let (pid, block) = {
+        let (pid, block, after_block_failure) = {
             let mut inner = self.inner.lock().expect("the fake is not poisoned");
             if let Some(reason) = inner.spawn_failure.take() {
                 return Err(reason);
@@ -543,7 +672,11 @@ impl SessionSpawner for FakeSpawner {
                 .clone()
                 .unwrap_or_else(|| "fake".to_owned());
             inner.starts.push(agent);
-            (pid, inner.block_next_spawn.take())
+            (
+                pid,
+                inner.block_next_spawn.take(),
+                inner.spawn_failure_after_block.take(),
+            )
         };
         // The pid is reported before the optional wait: a shutdown during the wait
         // must be able to name the child the fake is holding.
@@ -551,6 +684,9 @@ impl SessionSpawner for FakeSpawner {
         if let Some((reported, release)) = block {
             let _ = reported.send(pid);
             let _ = release.recv();
+        }
+        if let Some(reason) = after_block_failure {
+            return Err(reason);
         }
         Ok(Box::new(FakeHandle {
             inner: Arc::clone(&self.inner),
@@ -595,17 +731,71 @@ fn write_pgid(run_dir: &Path, pgid: u32) -> Result<(), String> {
         .map_err(|error| format!("the session's process-group record cannot be written: {error}"))
 }
 
-/// Ensure one run's directory exists at 0700.
-pub(crate) fn ensure_run_dir(run_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(run_dir)
-        .map_err(|error| format!("{} cannot be created: {error}", run_dir.display()))?;
-    crate::mode::set_mode(run_dir, crate::mode::PRIVATE_DIR_MODE)
-        .map_err(|error| format!("{} cannot be restricted: {error}", run_dir.display()))
-}
-
 /// The exit code of a status, when it has one; a signal is reported as 128+signal.
 pub fn exit_code(status: ExitStatus) -> Option<i32> {
     status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn an_abandoned_start_stops_the_child_the_host_later_reports() {
+        let root = std::env::temp_dir().join(format!(
+            "gewu-abandoned-start-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let run_dir = root.join("state").join("agent").join("run-1");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script = root.join("sleeper.sh");
+        fs::write(&script, "#!/bin/sh\nexec /bin/sleep 5\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("mode");
+        let spawner = RealSpawner::new(&script).with_test_timing(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(200),
+        );
+        let guard =
+            crate::run::Owner::prepare(&run_dir, "run-1", &workspace).expect("prepare the run");
+        let started = guard.start(&mut |_| {}, |run_dir, workspace, on_spawn| {
+            spawner.spawn_with(run_dir, workspace, on_spawn)
+        });
+        assert!(started.is_err(), "the abandoned start reported success");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !run_dir.join(PID_FILE).is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid: u32 = fs::read_to_string(run_dir.join(PID_FILE))
+            .expect("the host reported its pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while crate::run::process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !crate::run::process_alive(pid),
+            "the abandoned child survived"
+        );
+        assert!(
+            run_dir.join(PGID_FILE).is_file(),
+            "the identity handles were removed"
+        );
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("no ending");
+        assert!(matches!(
+            terminal,
+            crate::transcript::Record::RunFinished { ref outcome, .. } if outcome == "failed"
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
 }

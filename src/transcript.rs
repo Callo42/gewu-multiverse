@@ -182,6 +182,38 @@ pub enum Record {
         /// The model id the run will ask for.
         model: String,
     },
+    /// A native agent program was started. It records the immutable actual program,
+    /// version, connection and model of this run, before any native output arrives.
+    NativeStarted {
+        /// When.
+        ts: String,
+        /// The run's identity.
+        run_id: String,
+        /// The agent the run belongs to.
+        agent: String,
+        /// Program id.
+        harness: String,
+        /// Actual program version.
+        version: String,
+        /// Program path.
+        program: String,
+        /// Connection protocol.
+        protocol: String,
+        /// API base URL.
+        base_url: String,
+        /// Model id.
+        model: String,
+        /// The explicit Codex sandbox mode, when the program is Codex.
+        #[serde(default)]
+        codex_sandbox: Option<String>,
+    },
+    /// A text message from the native program, for the readable transcript.
+    NativeText {
+        /// When.
+        ts: String,
+        /// The bounded, redacted text.
+        text: String,
+    },
     /// The model call is in flight.
     ///
     /// Written **before** the request goes out, so a run that is waiting on a slow
@@ -447,6 +479,41 @@ impl Record {
         }
     }
 
+    /// The opening record of a native program run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_started(
+        run_id: &str,
+        agent: &str,
+        harness: &str,
+        version: &str,
+        program: &str,
+        protocol: &str,
+        base_url: &str,
+        model: &str,
+        codex_sandbox: Option<&str>,
+    ) -> Self {
+        Record::NativeStarted {
+            ts: stamp(),
+            run_id: run_id.to_owned(),
+            agent: agent.to_owned(),
+            harness: harness.to_owned(),
+            version: version.to_owned(),
+            program: program.to_owned(),
+            protocol: protocol.to_owned(),
+            base_url: base_url.to_owned(),
+            model: model.to_owned(),
+            codex_sandbox: codex_sandbox.map(str::to_owned),
+        }
+    }
+
+    /// One text message from a native program.
+    pub fn native_text(text: impl Into<String>) -> Self {
+        Record::NativeText {
+            ts: stamp(),
+            text: text.into(),
+        }
+    }
+
     /// The record of a model request about to be sent.
     pub fn model_request(
         run_id: &str,
@@ -609,6 +676,8 @@ impl Record {
             Record::ToolResult { .. } => "tool_result",
             Record::ChildExit { .. } => "child_exit",
             Record::RunLimits { .. } => "run_limits",
+            Record::NativeStarted { .. } => "native_started",
+            Record::NativeText { .. } => "native_text",
             Record::ModelRequestSent { .. } => "model_request_sent",
             Record::ModelRequest { .. } => "model_request",
             Record::ModelReply { .. } => "model_reply",
@@ -629,6 +698,8 @@ impl Record {
             | Record::ToolResult { ts, .. }
             | Record::ChildExit { ts, .. }
             | Record::RunLimits { ts, .. }
+            | Record::NativeStarted { ts, .. }
+            | Record::NativeText { ts, .. }
             | Record::ModelRequestSent { ts, .. }
             | Record::ModelRequest { ts, .. }
             | Record::ModelReply { ts, .. }
@@ -676,10 +747,39 @@ impl Transcript {
 
     /// Append one record as one line.
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
+        #[cfg(not(test))]
+        if matches!(record, Record::RunFinished { .. }) {
+            return Err(io::Error::other(
+                "a terminal record must be written by the ending owner",
+            ));
+        }
+        self.append_unchecked(record)
+    }
+
+    fn append_unchecked(&mut self, record: &Record) -> io::Result<()> {
         let line = serde_json::to_string(record).map_err(io::Error::other)?;
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.file.flush()
+    }
+
+    /// Test-only terminal append for transcript fixtures.
+    #[cfg(debug_assertions)]
+    pub fn append_terminal_for_test(&mut self, record: &Record) -> io::Result<()> {
+        self.append_terminal(record, &crate::run::ending::seal_for_test())
+    }
+
+    /// The only terminal write. `EndingSeal` is forged only by `run::ending`.
+    pub fn append_terminal(
+        &mut self,
+        record: &Record,
+        _seal: &crate::run::ending::EndingSeal,
+    ) -> io::Result<()> {
+        if !matches!(record, Record::RunFinished { .. }) {
+            return Err(io::Error::other("not a terminal record"));
+        }
+        self.append_unchecked(record)?;
+        self.file.sync_data()
     }
 
     /// Append one record and wait until its bytes are on disk.
@@ -798,17 +898,15 @@ pub fn record_outcome_if_missing(
     outcome: RunOutcome,
     reason: Option<String>,
     duration_ms: u64,
+    seal: &crate::run::ending::EndingSeal,
 ) -> io::Result<(RunOutcome, Option<String>, u64)> {
     let existing = terminal_record_checked(run_dir)?;
     if existing.is_none() {
         let mut transcript = Transcript::open(run_dir)?;
-        transcript.append_durable(&Record::run_finished(
-            run_id,
-            outcome,
-            None,
-            duration_ms,
-            reason.clone(),
-        ))?;
+        transcript.append_terminal(
+            &Record::run_finished(run_id, outcome, None, duration_ms, reason.clone()),
+            seal,
+        )?;
     }
     Ok(match existing {
         Some(Record::RunFinished {
@@ -946,7 +1044,7 @@ mod tests {
             ),
             Record::model_call_failed("run-1", 2, "bad_key", "the endpoint refused the key"),
             Record::child_exit(Some(0), None),
-            Record::run_finished("run-1", RunOutcome::Succeeded, Some(0), 42, None),
+            crate::run::terminal_record_for_test("run-1", RunOutcome::Succeeded, Some(0), 42, None),
         ];
         {
             let mut transcript = Transcript::open(&dir).expect("opened");
@@ -967,7 +1065,7 @@ mod tests {
             .append(&Record::run_started("run-1", "a", 1, "/w"))
             .expect("appended");
         transcript
-            .append(&Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1",
                 RunOutcome::Failed,
                 Some(1),
@@ -1027,7 +1125,7 @@ mod tests {
 
         let mut transcript = Transcript::open(&dir).expect("opened again");
         transcript
-            .append(&Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1",
                 RunOutcome::Succeeded,
                 Some(0),
@@ -1069,7 +1167,7 @@ mod tests {
             .append(&Record::run_started("run-1", "a", 1, "/w"))
             .expect("appended");
         transcript
-            .append(&Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1",
                 RunOutcome::TimedOut,
                 None,

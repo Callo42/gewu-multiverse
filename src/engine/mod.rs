@@ -18,7 +18,7 @@ pub mod last_seen;
 pub mod session;
 pub mod settings;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -33,23 +33,24 @@ use crate::bundled_forgejo::{self, PreparedInstance, RunningForgejo};
 use crate::credentials::{self, CredentialsFile, Secret};
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, Provisioning, SessionEnd, SessionState, UpgradeView,
+    ForgejoView, ProgramView, Provisioning, RunProgramView, SessionEnd, SessionState, UpgradeView,
 };
 use crate::forgejo::{DEFAULT_TIMEOUT, ForgejoClient, ForgejoError, Repository};
+use crate::harness::{self, Program, Protocol};
 use crate::identity;
-use crate::mode::{SECRET_FILE_MODE, set_mode};
+use crate::mode::{PRIVATE_DIR_MODE, SECRET_FILE_MODE, set_mode};
 use crate::paths::Layout;
 use crate::run::process_alive;
 use crate::run::{self, LOG_FILE};
 use std::os::unix::process::ExitStatusExt;
 
-use crate::transcript::{self, TRANSCRIPT_FILE};
+use crate::transcript::TRANSCRIPT_FILE;
 
 use self::clock::{RealClock, SharedClock};
 #[cfg(test)]
 use self::session::FakeSpawner;
 use self::session::{
-    PreparedSession, RealSpawner, RunningSession, SessionRepository, SessionRequest, SessionSpawner,
+    NativeRequest, PreparedSession, RealSpawner, SessionRepository, SessionRequest, SessionSpawner,
 };
 use self::settings::{AgentSettings, MAX_AGENTS, Settings};
 
@@ -310,6 +311,10 @@ fn build(
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
     let (_, leftovers) = recover_stale_sessions(&options.layout, options.stop_grace)?;
     remove_stale_run_temps();
+    // A kill between the installer's two directory renames is restored before the
+    // first picture reads the program cards. A live install owns its directory and
+    // is not touched.
+    let install_recovery = harness::recover_pending(&options.data_root);
     let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
     // The recovery result is part of the first picture: Inner::new must receive it
     // before it loads the agent cards, or a failed cleanup is silently dropped and
@@ -322,6 +327,9 @@ fn build(
         leftovers,
     )?;
     inner.upgrade = upgrade;
+    for note in install_recovery {
+        inner.note(note);
+    }
     last_seen::write(options.layout.root(), env!("CARGO_PKG_VERSION"))?;
     // An installation from the old screens may still hold `config.toml`. The new
     // engine does not read it and does not convert it; it says once, on the first
@@ -448,12 +456,29 @@ fn acquire_lock(data_root: &Path) -> Result<Flock<File>, String> {
 struct RunningState {
     run_dir: PathBuf,
     started: Instant,
-    handle: Box<dyn RunningSession>,
+    run: run::StartedRun,
     stopping: bool,
     stop_deadline: Option<Instant>,
     stop_requested: bool,
     timed_out: bool,
+    /// The run's first ending, recorded once when it happens. A later Stop,
+    /// shutdown, settle, reap or reopen never changes it.
+    first_ending: Option<run::FirstEnding>,
+    /// The last failure to persist the first-ending fact, if any. It is retried on
+    /// the next deadline tick; the run is not signalled until the fact is durable.
+    first_ending_error: Option<String>,
 }
+
+/// The facts `poll_agent` hands from the running state to the settle boundary.
+type EndedRun = (
+    SessionEnd,
+    Instant,
+    PathBuf,
+    u32,
+    bool,
+    Option<run::NativeProgress>,
+    Option<run::FirstEnding>,
+);
 
 /// One agent's engine state, beside its saved settings.
 /// A recovery scope whose cleanup failed: one run directory, or an agent
@@ -565,6 +590,17 @@ struct Inner {
     sequence: u64,
     stopping: bool,
     generation: u64,
+    /// Install progress/errors for the Program screen.
+    program_states: HashMap<String, ProgramState>,
+}
+
+#[derive(Default)]
+struct ProgramState {
+    installing: Option<Option<u8>>,
+    phase: Option<harness::InstallPhase>,
+    error: Option<String>,
+    cancel: Option<harness::CancelToken>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Inner {
@@ -663,6 +699,7 @@ impl Inner {
             sequence: 0,
             stopping: false,
             generation: 0,
+            program_states: HashMap::new(),
         };
         // A number this installation has ever used is never reused, even when the
         // agent is gone from the settings. The names on disk are the floor for an
@@ -703,6 +740,19 @@ impl Inner {
 
     fn save_settings(&self) -> Result<(), String> {
         self.settings.save(&self.settings_path)
+    }
+
+    /// Apply one settings command to a copy, persist the copy, and only then make it
+    /// live. A failed validation or save leaves the in-memory settings untouched.
+    fn commit_settings<F>(&mut self, change: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut settings::Settings) -> Result<(), String>,
+    {
+        let mut next = self.settings.clone();
+        change(&mut next)?;
+        next.save(&self.settings_path)?;
+        self.settings = next;
+        Ok(())
     }
 
     fn agent_index(&self, name: &str) -> Option<usize> {
@@ -772,12 +822,17 @@ impl Inner {
         self.note(format!("Runs are not confined on this computer — {reason}"));
     }
 
-    /// The saved choice for one agent, kept in step with the settings.
-    fn set_desired(&mut self, index: usize, desired: Desired) {
+    /// The saved choice for one agent, committed through the settings helper.
+    fn set_desired(&mut self, index: usize, desired: Desired) -> Result<(), String> {
+        let name = self.agents[index].name.clone();
+        self.commit_settings(|settings| {
+            if let Some(saved) = settings.agent_mut(&name) {
+                saved.set_desired(desired);
+            }
+            Ok(())
+        })?;
         self.agents[index].desired = desired;
-        if let Some(saved) = self.settings.agent_mut(&self.agents[index].name) {
-            saved.set_desired(desired);
-        }
+        Ok(())
     }
 }
 
@@ -874,13 +929,25 @@ impl AgentRuntime {
             .is_some_and(|dir| run::says_no_assigned_work(dir, &format!("gewu-{name}")));
         let last_work_result = run::latest_work_result(&runs);
         let last_result_is_work = newest_run.as_deref().is_some_and(run::run_did_work);
+        let removal_reason = removal_marked(&inner.options.layout, name).then(|| {
+            "its Forgejo sign-in and tokens were already cancelled; Remove can be retried"
+                .to_owned()
+        });
+        let provisioning = match &removal_reason {
+            Some(reason) => Provisioning::Failed {
+                reason: reason.clone(),
+            },
+            None => provisioning,
+        };
         Self {
             name: name.to_owned(),
             desired,
             provisioning,
             login,
             email,
-            session: SessionState::Idle,
+            session: removal_reason.map_or(SessionState::Idle, |reason| SessionState::Blocked {
+                reason,
+            }),
             sessions_since_start: 0,
             runs_total: runs.len() as u64,
             session_number: 0,
@@ -975,6 +1042,20 @@ fn end_from_outcome(summary: &run::RunSummary) -> Option<SessionEnd> {
         }),
         run::RunOutcome::TimedOut => Some(SessionEnd::TimedOut),
         run::RunOutcome::Stopped => Some(SessionEnd::Stopped),
+    }
+}
+
+/// The ending already written by a run, as the engine's own session ending.
+fn end_from_terminal_ending(ending: &run::TerminalEnding) -> Option<SessionEnd> {
+    let reason = crate::forgejo_tools::sentence(ending.reason.clone().unwrap_or_default());
+    match ending.outcome {
+        crate::run::RunOutcome::Succeeded => Some(SessionEnd::Succeeded),
+        crate::run::RunOutcome::Refused => Some(SessionEnd::Refused { reason }),
+        crate::run::RunOutcome::NoWork => Some(SessionEnd::NoWork { reason }),
+        crate::run::RunOutcome::Warned => Some(SessionEnd::Warned { reason }),
+        crate::run::RunOutcome::Failed => Some(SessionEnd::Failed { reason }),
+        crate::run::RunOutcome::TimedOut => Some(SessionEnd::TimedOut),
+        crate::run::RunOutcome::Stopped => Some(SessionEnd::Stopped),
     }
 }
 
@@ -1086,7 +1167,7 @@ impl Engine {
         pids.extend(inner.forgejo.helper_pids.iter().copied());
         for agent in &inner.agents {
             if let Some(run) = agent.running.as_ref() {
-                pids.push(run.handle.pid());
+                pids.push(run.run.pid());
             }
             if let Some(pid) = agent.starting_pid {
                 pids.push(pid);
@@ -1200,24 +1281,87 @@ impl Inner {
 
     fn poll_agent(&mut self, index: usize, now: Instant) {
         let desired = self.agents[index].desired;
-        let mut ended: Option<(SessionEnd, Instant, PathBuf, u32)> = None;
+        let mut ended: Option<EndedRun> = None;
         if let Some(run) = self.agents[index].running.as_mut() {
             if !run.stopping {
                 if now.saturating_duration_since(run.started) >= self.options.session_timeout {
-                    run.timed_out = true;
-                    run.stopping = true;
-                    run.stop_deadline = Some(now + self.options.stop_grace);
-                    run.handle.signal(false);
+                    let proposed = proposed_first_ending(run);
+                    let requested = run.run.request_stop(proposed);
+                    match requested {
+                        Ok(ending) => {
+                            run.first_ending = Some(ending);
+                            run.first_ending_error = None;
+                            run.timed_out = true;
+                            run.stopping = true;
+                            run.stop_deadline = Some(now + self.options.stop_grace);
+                        }
+                        Err(error) => {
+                            // The owner recorded the uncertainty; do not signal a run
+                            // whose first ending is not durable.
+                            if run.first_ending_error.is_none() {
+                                run.first_ending_error = Some(error);
+                            }
+                        }
+                    }
                 }
             } else if run.stop_deadline.is_some_and(|deadline| now >= deadline) {
-                run.handle.signal(true);
+                let _ = run.run.request_force("the run reached its force deadline");
                 run.stop_deadline = Some(now + Duration::from_secs(1));
             }
-            if let Some(status) = run.handle.try_status() {
-                let end = if desired == Desired::Stopped || run.stop_requested {
+            if let Some(status) = run.run.try_status() {
+                let engine_stopped = desired == Desired::Stopped || run.stop_requested;
+                let timed_out = run.timed_out;
+                let first_ending = run.first_ending;
+                // A run that had already written its ending when the first stop was
+                // requested won the race. The engine's own stop is authoritative
+                // only when the write-once fact says Stop.
+                let stop_wins = (engine_stopped || timed_out)
+                    && !matches!(first_ending, Some(run::FirstEnding::Terminal));
+                let terminal = run::terminal_ending(&run.run_dir).ok().flatten();
+                let progress = if timed_out && stop_wins {
+                    run::native_progress(&run.run_dir)
+                } else {
+                    None
+                };
+                let deadline_end = || {
+                    // A harness that reported its own failure before the engine's
+                    // deadline is not only "timed out": the last cause survives the
+                    // kill and supplies a failed ending with a reason.
+                    match progress.as_ref() {
+                        Some(progress)
+                            if !progress.cause.trim().is_empty()
+                                && matches!(progress.state.as_str(), "failed" | "retrying") =>
+                        {
+                            SessionEnd::Failed {
+                                reason: crate::forgejo_tools::sentence(format!(
+                                    "the run reached its time limit with a reported failure: {}",
+                                    progress.cause
+                                )),
+                            }
+                        }
+                        _ => SessionEnd::TimedOut,
+                    }
+                };
+                let end = if stop_wins {
+                    if engine_stopped {
+                        SessionEnd::Stopped
+                    } else {
+                        deadline_end()
+                    }
+                } else if let Some(record) = terminal.as_ref() {
+                    end_from_terminal_ending(record).unwrap_or_else(|| {
+                        if status.success() {
+                            session_success_end(&run.run_dir)
+                        } else {
+                            SessionEnd::Failed {
+                                reason: session_failure_reason(&run.run_dir, status),
+                            }
+                        }
+                    })
+                } else if engine_stopped {
                     SessionEnd::Stopped
-                } else if run.timed_out {
-                    SessionEnd::TimedOut
+                } else if timed_out {
+                    deadline_end()
                 } else if status.success() {
                     // Exit 0 is not the whole outcome: the run's own terminal record
                     // says whether its last sentence refused the instruction or found
@@ -1228,23 +1372,86 @@ impl Inner {
                         reason: session_failure_reason(&run.run_dir, status),
                     }
                 };
-                ended = Some((end, run.started, run.run_dir.clone(), run.handle.pid()));
+                ended = Some((
+                    end,
+                    run.started,
+                    run.run_dir.clone(),
+                    run.run.pid(),
+                    stop_wins,
+                    progress,
+                    first_ending,
+                ));
             }
         }
-        if let Some((end, started, run_dir, pid)) = ended {
+        if let Some(agent) = self.agents.get(index)
+            && let Some(error) = agent
+                .running
+                .as_ref()
+                .and_then(|run| run.first_ending_error.clone())
+        {
+            self.note(format!("the deadline stop cannot be recorded: {error}"));
+        }
+        if let Some((mut end, started, run_dir, pid, stop_wins, progress, first_ending)) = ended {
             self.observe_confinement_refusal(&run_dir);
             // A supervisor killed from outside can leave the shell it started in
             // the run's process group. The boundary settles the run in this order:
             // stop or find the group gone, write (or keep) a durable ending, and
             // only then remove the identity handles. An error at either step keeps
             // the handles and is reported on the card; Start retries it (F-02).
-            let (outcome, reason) = outcome_for_end(&end);
-            let settled = run::settle_run(&run_dir, pid, outcome, reason, self.options.stop_grace);
+            let (outcome, mut reason) = outcome_for_end(&end);
+            // The engine's own deadline must carry the last cause the harness
+            // emitted: the child is already gone, so the persisted progress record
+            // is the only surviving source.
+            if let Some(progress) = progress.as_ref() {
+                if !progress.cause.trim().is_empty() {
+                    let base = reason
+                        .clone()
+                        .unwrap_or_else(|| "the run was ended by the product".to_owned());
+                    if !base.contains(&progress.cause) {
+                        reason = Some(format!("{base}; last reported cause: {}", progress.cause));
+                    }
+                }
+                // A failed tool is a warning attached to the run, never a
+                // session-level failure cause: it is named here but cannot turn a
+                // deadline into `failed`.
+                if let Some(warning) = progress.warning.as_deref().filter(|w| !w.trim().is_empty())
+                {
+                    let base = reason
+                        .clone()
+                        .unwrap_or_else(|| "the run was ended by the product".to_owned());
+                    if !base.contains(warning) {
+                        reason = Some(format!("{base}; tool warning: {warning}"));
+                    }
+                }
+            }
+            let stop_reason = if stop_wins { reason.clone() } else { None };
+            let settled = run::request_finish(
+                &run_dir,
+                pid,
+                outcome,
+                reason,
+                self.options.stop_grace,
+                stop_reason,
+                first_ending.unwrap_or(if stop_wins {
+                    run::FirstEnding::Stop
+                } else {
+                    run::FirstEnding::Terminal
+                }),
+            );
             self.agents[index].leftover = settled.err();
             if self.agents[index].leftover.is_some() {
                 self.agents[index].leftover_targets = vec![RecoveryTarget::Run(run_dir.clone())];
             } else {
                 self.agents[index].leftover_targets.clear();
+            }
+            // The settle may have replaced a child's post-stop ending with the
+            // engine's stop ending (or preserved the child's earlier ending). Read
+            // the one terminal record back and use it for the board, so the card and
+            // the transcript cannot disagree.
+            if let Some(record) = run::terminal_ending(&run_dir).ok().flatten()
+                && let Some(actual) = end_from_terminal_ending(&record)
+            {
+                end = actual;
             }
             // A stopped, killed or crashed run gets no chance to run its own
             // destructor: the engine removes its private askpass tree here (F-01).
@@ -1342,8 +1549,8 @@ impl Inner {
                 .clone()
                 .or_else(|| Some("cleanup unverified".to_owned()));
         }
-        if !self.settings.endpoint.configured() || !self.credential_key_present() {
-            return Some("needs a model".to_owned());
+        if let Some(reason) = self.program_block(agent) {
+            return Some(reason);
         }
         if agent.instruction_chars == 0 {
             return Some("needs an instruction".to_owned());
@@ -1438,6 +1645,7 @@ impl Inner {
                     let agent = &self.agents[index];
                     (
                         agent.removal_pending
+                            || removal_marked(&self.options.layout, &agent.name)
                             || agent.provisioning == Provisioning::Ready
                             || agent.provision_inflight
                             || agent
@@ -1470,7 +1678,11 @@ impl Inner {
                 )
             };
             if removal {
-                if self.agents[index].running.is_none() && !self.agents[index].starting && due {
+                if self.agents[index].running.is_none()
+                    && !self.agents[index].starting
+                    && !self.agents[index].provision_inflight
+                    && due
+                {
                     jobs.push(Job::RemoveAgent(name));
                 }
                 continue;
@@ -1527,6 +1739,24 @@ impl Inner {
             }
         }
         let agent = &self.agents[index];
+        let saved_agent = self.settings.agent(&agent_name).cloned()?;
+        let program = saved_agent.harness();
+        let (protocol, base_url, model) = self.connection_for(&saved_agent)?;
+        let native = if program.is_native() {
+            let installed = harness::installed(&self.options.data_root, program)?;
+            Some(NativeRequest {
+                harness: program.id().to_owned(),
+                version: installed.version,
+                program: installed.executable,
+                install_root: installed.root,
+                protocol: protocol.id().to_owned(),
+                base_url: base_url.clone(),
+                model: model.clone(),
+                codex_sandbox: saved_agent.codex_sandbox.clone(),
+            })
+        } else {
+            None
+        };
         self.sequence = self.sequence.saturating_add(1);
         let run_id = run::new_run_id(self.sequence);
         let run_dir = paths.run_dir(&run_id);
@@ -1553,8 +1783,12 @@ impl Inner {
             workspace,
             instruction: paths.instruction().to_path_buf(),
             skills_dir: paths.skills_dir().to_path_buf(),
-            endpoint: self.settings.endpoint.url.clone(),
-            model: self.settings.endpoint.model.clone(),
+            endpoint: if native.is_none() {
+                self.settings.endpoint.chat_url()
+            } else {
+                base_url.clone()
+            },
+            model: model.clone(),
             max_turns: self.settings.endpoint.turns(),
             timeout_secs: self.options.session_timeout.as_secs(),
             credentials: self.credentials.clone(),
@@ -1564,6 +1798,279 @@ impl Inner {
             repositories,
             confinement,
             hide,
+            native,
+        })
+    }
+
+    /// The selected connection for one agent: its explicit provider for a native
+    /// program, or the shared endpoint for the legacy built-in engine.
+    fn connection_for(
+        &self,
+        agent: &settings::AgentSettings,
+    ) -> Option<(Protocol, String, String)> {
+        if agent.harness().is_native() {
+            let provider = agent.provider()?;
+            if !provider.configured() {
+                return None;
+            }
+            Some((
+                provider.protocol(),
+                provider.base_url.trim_end_matches('/').to_owned(),
+                provider.model.clone(),
+            ))
+        } else {
+            if !self.settings.endpoint.configured() {
+                return None;
+            }
+            Some((
+                self.settings.endpoint.protocol(),
+                self.settings.endpoint.base_url(),
+                self.settings.endpoint.model.clone(),
+            ))
+        }
+    }
+
+    /// Probe Codex's own bundled bubblewrap before a default-sandbox Start. Codex
+    /// 0.164 does not emit a native event when this setup fails, so Start would
+    /// otherwise show only a later downstream refusal. The probe uses no secrets
+    /// and inherits the product's existing outer Landlock.
+    fn codex_sandbox_block(&self, agent: &AgentRuntime) -> Option<String> {
+        let saved = self.settings.agent(&agent.name)?;
+        if saved.harness() != Program::Codex || saved.codex_sandbox == "full-access" {
+            return None;
+        }
+        let installed = harness::installed(&self.options.data_root, Program::Codex)?;
+        let bwrap = installed.root.join("codex-resources").join("bwrap");
+        if !bwrap.is_file() {
+            return Some(
+                "Codex's native sandbox helper is missing from this installation".to_owned(),
+            );
+        }
+        let mut child = match std::process::Command::new(&bwrap)
+            .args([
+                "--unshare-user",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "/bin/true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                return Some(format!(
+                    "the native sandbox boundary cannot start ({error})"
+                ));
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(
+                        "the native sandbox preflight did not finish within 2 seconds".to_owned(),
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(format!(
+                        "the native sandbox preflight could not be read ({error})"
+                    ));
+                }
+            }
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        if status.is_some_and(|status| status.success()) {
+            return None;
+        }
+        let detail = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("the native sandbox boundary refused its probe")
+            .trim();
+        Some(format!(
+            "the native sandbox boundary is unavailable ({detail}); choose this agent's explicit compatibility mode only if you intend to remove Codex's own sandbox while the product file boundary remains"
+        ))
+    }
+
+    /// Why one agent's selected program/connection cannot start, if it cannot.
+    fn program_block(&self, agent: &AgentRuntime) -> Option<String> {
+        let saved = self.settings.agent(&agent.name)?;
+        if let Some(unknown) = saved.unknown_harness() {
+            return Some(format!("unknown saved program `{unknown}`"));
+        }
+        let program = saved.harness();
+        if program == Program::Builtin {
+            if !self.settings.endpoint.configured() {
+                return Some("needs a model".to_owned());
+            }
+            if credentials::model_key(&self.credentials, &agent.name).is_err() {
+                return Some("needs a model key".to_owned());
+            }
+            return None;
+        }
+        let Some(installed) = harness::installed(&self.options.data_root, program) else {
+            return Some(format!("{} is not installed", program.label()));
+        };
+        let Some((protocol, _base, model)) = self.connection_for(saved) else {
+            return Some("choose this agent's connection and model".to_owned());
+        };
+        if model.trim().is_empty() {
+            return Some("choose this agent's model".to_owned());
+        }
+        if let Some(error) = harness::compatibility_error(program, protocol) {
+            return Some(error);
+        }
+        if credentials::model_key(&self.credentials, &agent.name).is_err() {
+            return Some("needs a model key".to_owned());
+        }
+        if program == Program::Dsh {
+            if let Some(prerequisite) = program.prerequisite_missing() {
+                return Some(prerequisite.to_owned());
+            }
+        }
+        if installed.program != program {
+            return Some("the installed program is for another program".to_owned());
+        }
+        None
+    }
+
+    /// The installed-state cards for the Program screen.
+    fn program_views(&self) -> Vec<ProgramView> {
+        harness::NATIVE_PROGRAMS
+            .into_iter()
+            .map(|program| {
+                let installed = harness::installed(&self.options.data_root, program);
+                let state = self.program_states.get(program.id());
+                ProgramView {
+                    id: program.id().to_owned(),
+                    label: program.label().to_owned(),
+                    version: program.pinned_version().to_owned(),
+                    installed_version: installed.as_ref().map(|item| item.version.clone()),
+                    installed: installed.is_some(),
+                    license: program.license().to_owned(),
+                    download_mb: program.download_mb(),
+                    prerequisite: program.prerequisite().map(str::to_owned),
+                    installing: state.and_then(|state| state.installing),
+                    installing_phase: state
+                        .and_then(|state| state.phase)
+                        .map(|phase| phase.label().to_owned()),
+                    error: state.and_then(|state| state.error.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Give a newly created agent the installation's default program on a settings
+    /// copy. The caller commits the copy and writes the returned inherited key.
+    fn assign_new_agent_program(
+        &self,
+        settings: &mut settings::Settings,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        let program = settings
+            .default_harness
+            .as_deref()
+            .and_then(Program::parse)
+            .unwrap_or(Program::Builtin);
+        let endpoint = settings.endpoint.clone();
+        let key = credentials::model_key(&self.credentials, name).ok();
+        let explicit_key = credentials::agent_model_key(&self.credentials, name)
+            .ok()
+            .flatten()
+            .is_some();
+        let Some(agent) = settings.agent_mut(name) else {
+            return Ok(None);
+        };
+        agent.set_harness(program);
+        if program.is_native() && agent.provider.is_none() && endpoint.configured() {
+            agent.provider = Some(settings::AgentProvider {
+                base_url: endpoint.base_url(),
+                protocol: endpoint.protocol().id().to_owned(),
+                model: endpoint.model.clone(),
+            });
+        }
+        if program == Program::Codex {
+            agent.codex_sandbox = "native".to_owned();
+        }
+        if program.is_native() && !explicit_key {
+            Ok(key.map(|key| key.expose().to_owned()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The immutable program facts of the newest run, when there is one.
+    fn active_program(&self, agent: &AgentRuntime) -> Option<RunProgramView> {
+        let dir = agent.newest_run.as_deref()?;
+        if let Ok(Some(native)) = crate::run::NativePlan::read(dir) {
+            let program = Program::parse(&native.harness).unwrap_or(Program::Builtin);
+            return Some(RunProgramView {
+                program: native.harness.clone(),
+                label: program.label().to_owned(),
+                version: native.version,
+                protocol: native.protocol,
+                base_url: native.base_url,
+                model: native.model,
+                codex_sandbox: (!native.codex_sandbox.is_empty()).then_some(native.codex_sandbox),
+            });
+        }
+        let plan = run::RunPlan::read(dir).ok()?;
+        Some(RunProgramView {
+            program: "builtin".to_owned(),
+            label: Program::Builtin.label().to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol: Protocol::ChatCompletions.id().to_owned(),
+            base_url: plan.endpoint,
+            model: plan.model,
+            codex_sandbox: None,
+        })
+    }
+
+    /// The saved facts the next run of one agent will use.
+    fn next_program(&self, agent: &AgentRuntime) -> Option<RunProgramView> {
+        let saved = self.settings.agent(&agent.name)?;
+        let program = saved.harness();
+        let (protocol, _, model) = self.connection_for(saved).unwrap_or((
+            Protocol::ChatCompletions,
+            String::new(),
+            String::new(),
+        ));
+        Some(RunProgramView {
+            program: program.id().to_owned(),
+            label: program.label().to_owned(),
+            version: harness::installed(&self.options.data_root, program)
+                .map(|installed| installed.version)
+                .unwrap_or_else(|| "not installed".to_owned()),
+            protocol: protocol.id().to_owned(),
+            base_url: self
+                .connection_for(saved)
+                .map(|(_, base, _)| base)
+                .unwrap_or_default(),
+            model,
+            codex_sandbox: (program == Program::Codex).then(|| {
+                if saved.codex_sandbox == "full-access" {
+                    "full-access".to_owned()
+                } else {
+                    "native".to_owned()
+                }
+            }),
         })
     }
 }
@@ -1580,10 +2087,8 @@ fn session_failure_reason(run_dir: &Path, status: std::process::ExitStatus) -> S
     // failure, a tool's refusal, a declared step's output). The log's last line is
     // the process-exit line the product itself appends, so it is never the reason
     // (W31-7, F3).
-    if let Some(transcript::Record::RunFinished {
-        reason: Some(reason),
-        ..
-    }) = transcript::terminal_record(run_dir)
+    if let Some(ending) = run::terminal_ending(run_dir).ok().flatten()
+        && let Some(reason) = ending.reason
     {
         let reason = crate::forgejo_tools::sentence(reason);
         if !reason.is_empty() {
@@ -1604,15 +2109,12 @@ fn session_failure_reason(run_dir: &Path, status: std::process::ExitStatus) -> S
 
 /// The ending a cleanly exited run recorded for itself.
 fn session_success_end(run_dir: &Path) -> SessionEnd {
-    if let Some(transcript::Record::RunFinished {
-        outcome, reason, ..
-    }) = transcript::terminal_record(run_dir)
-    {
-        let reason = crate::forgejo_tools::sentence(reason.unwrap_or_default());
-        match crate::run::RunOutcome::parse(&outcome) {
-            Some(crate::run::RunOutcome::Refused) => return SessionEnd::Refused { reason },
-            Some(crate::run::RunOutcome::NoWork) => return SessionEnd::NoWork { reason },
-            Some(crate::run::RunOutcome::Warned) => return SessionEnd::Warned { reason },
+    if let Some(ending) = run::terminal_ending(run_dir).ok().flatten() {
+        let reason = crate::forgejo_tools::sentence(ending.reason.unwrap_or_default());
+        match ending.outcome {
+            crate::run::RunOutcome::Refused => return SessionEnd::Refused { reason },
+            crate::run::RunOutcome::NoWork => return SessionEnd::NoWork { reason },
+            crate::run::RunOutcome::Warned => return SessionEnd::Warned { reason },
             _ => {}
         }
     }
@@ -1685,15 +2187,15 @@ fn plain_activity(sentence: &str) -> String {
 
 fn finish_session(
     agent: &mut AgentRuntime,
-    mut end: SessionEnd,
+    end: SessionEnd,
     now: Instant,
     started: Instant,
     state_root: &Path,
     attempt_dir: Option<&Path>,
 ) {
-    if agent.desired == Desired::Stopped {
-        end = SessionEnd::Stopped;
-    }
+    // The run's own ending is used even when the user has just pressed Stop: the
+    // selector already chose Stopped only when the stop genuinely ended the run.
+    // A stop after a terminal record changes the desired state, not this ending.
     let ran = now.saturating_duration_since(started);
     agent.recent.push_back(end.clone());
     while agent.recent.len() > 10 {
@@ -1789,10 +2291,13 @@ impl EngineApi for Engine {
         let endpoint = EndpointView {
             configured: inner.settings.endpoint.configured(),
             url: inner.settings.endpoint.url.clone(),
+            base_url: inner.settings.endpoint.base_url(),
+            protocol: inner.settings.endpoint.protocol().id().to_owned(),
             model: inner.settings.endpoint.model.clone(),
             key_present: inner.credential_key_present(),
             test: inner.endpoint_test.clone(),
         };
+        let programs = inner.program_views();
         // An upgrade whose warnings changed shows them once more before the board;
         // a same-version open keeps the acknowledgement (F-06).
         let terms_acknowledged = inner.settings.terms_acknowledged
@@ -1857,6 +2362,70 @@ impl EngineApi for Engine {
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
                 last_result_is_work: agent.last_result_is_work,
+                program: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| saved.harness().id().to_owned())
+                    .unwrap_or_else(|| "builtin".to_owned()),
+                program_label: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| {
+                        saved
+                            .unknown_harness()
+                            .map(|unknown| format!("unknown program `{unknown}`"))
+                            .unwrap_or_else(|| saved.harness().label().to_owned())
+                    })
+                    .unwrap_or_else(|| Program::Builtin.label().to_owned()),
+                unknown_program: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| saved.unknown_harness()),
+                program_installed: inner
+                    .settings
+                    .agent(&agent.name)
+                    .map(|saved| saved.harness())
+                    .filter(|program| program.is_native())
+                    .map(|program| harness::installed(&inner.options.data_root, program).is_some())
+                    .unwrap_or(true),
+                program_version: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| harness::installed(&inner.options.data_root, saved.harness()))
+                    .map(|installed| installed.version),
+                protocol: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(protocol, _, _)| protocol.id().to_owned())
+                    .unwrap_or_else(|| inner.settings.endpoint.protocol().id().to_owned()),
+                base_url: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(_, base, _)| base)
+                    .unwrap_or_else(|| inner.settings.endpoint.base_url()),
+                model: inner
+                    .settings
+                    .agent(&agent.name)
+                    .and_then(|saved| inner.connection_for(saved))
+                    .map(|(_, _, model)| model)
+                    .unwrap_or_else(|| inner.settings.endpoint.model.clone()),
+                key_present: credentials::model_key(&inner.credentials, &agent.name).is_ok(),
+                program_error: inner.program_block(agent),
+                active_program: inner.active_program(agent),
+                next_program: inner.next_program(agent),
+                codex_sandbox: inner
+                    .settings
+                    .agent(&agent.name)
+                    .filter(|saved| saved.harness() == Program::Codex)
+                    .map(|saved| {
+                        if saved.codex_sandbox == "full-access" {
+                            "full-access".to_owned()
+                        } else {
+                            "native".to_owned()
+                        }
+                    }),
             })
             .collect();
         BoardView {
@@ -1874,6 +2443,7 @@ impl EngineApi for Engine {
             forgejo,
             agents,
             endpoint,
+            programs,
             notice,
             admin_password,
             confined: inner.options.confinement.confined(),
@@ -1896,24 +2466,349 @@ impl EngineApi for Engine {
         }
         match command {
             Command::AcknowledgeTerms => {
-                inner.settings.terms_acknowledged = true;
-                inner.settings.terms_version = TERMS_VERSION;
-                inner.save_settings()?;
+                inner.commit_settings(|settings| {
+                    settings.terms_acknowledged = true;
+                    settings.terms_version = TERMS_VERSION;
+                    Ok(())
+                })?;
                 inner.note("the terms are recorded");
                 Ok(())
             }
             Command::SetEndpoint { url, model, key } => {
                 let url = url.trim().to_owned();
                 let model = model.trim().to_owned();
-                inner.settings.endpoint.url = url;
-                inner.settings.endpoint.model = model;
+                let previous_key = credentials::model_key(&inner.credentials, "").ok();
                 if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                     credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
                         .map_err(|error| format!("the model key could not be kept: {error}"))?;
                 }
-                inner.save_settings()?;
+                if let Err(error) = inner.commit_settings(|settings| {
+                    settings.endpoint.url = url;
+                    settings.endpoint.model = model;
+                    Ok(())
+                }) {
+                    return Err(restore_endpoint_key(&inner, previous_key, error));
+                }
                 inner.endpoint_test = EndpointTest::NotRun;
                 inner.note("your model is saved");
+                Ok(())
+            }
+            Command::SetConnection {
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let model = model.trim().to_owned();
+                let Some(protocol) = Protocol::parse(&protocol) else {
+                    return Err("that connection type is not one this product knows".to_owned());
+                };
+                if base.is_empty() || model.is_empty() {
+                    return Err("the API address and model are both needed".to_owned());
+                }
+                if protocol != Protocol::ChatCompletions {
+                    return Err(
+                        "the built-in engine needs a Chat Completions connection".to_owned()
+                    );
+                }
+                let previous_key = credentials::model_key(&inner.credentials, "").ok();
+                if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+                    credentials::record_secret(&inner.credentials, None, "model_key", key.trim())
+                        .map_err(|error| format!("the model key could not be kept: {error}"))?;
+                }
+                if let Err(error) = inner.commit_settings(|settings| {
+                    settings.endpoint.url.clear();
+                    settings.endpoint.base_url = base;
+                    settings.endpoint.protocol = protocol.id().to_owned();
+                    settings.endpoint.model = model;
+                    Ok(())
+                }) {
+                    return Err(restore_endpoint_key(&inner, previous_key, error));
+                }
+                inner.endpoint_test = EndpointTest::NotRun;
+                inner.note("the default connection is saved");
+                Ok(())
+            }
+            Command::SetAgentProgram {
+                name,
+                program,
+                protocol,
+            } => {
+                let Some(program) = Program::parse(&program) else {
+                    return Err("that program is not one this product knows".to_owned());
+                };
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let endpoint = inner.settings.endpoint.clone();
+                let explicit_key = credentials::agent_model_key(&inner.credentials, &name)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let inherited_key = credentials::model_key(&inner.credentials, &name).ok();
+                let settings_before = inner.settings.clone();
+                let mut next = inner.settings.clone();
+                let Some(saved) = next.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let requested = protocol.as_deref().and_then(Protocol::parse);
+                if let Some(requested) = requested
+                    && let Some(error) = harness::compatibility_error(program, requested)
+                {
+                    return Err(error);
+                }
+                if program.is_native() && saved.provider.is_none() && !endpoint.configured() {
+                    return Err(
+                        "set the default connection first, then choose this agent's program"
+                            .to_owned(),
+                    );
+                }
+                saved.set_harness(program);
+                if program.is_native() {
+                    if saved.provider.is_none() {
+                        saved.provider = Some(settings::AgentProvider {
+                            base_url: endpoint.base_url(),
+                            protocol: endpoint.protocol().id().to_owned(),
+                            model: endpoint.model.clone(),
+                        });
+                    }
+                    let chosen = requested
+                        .or_else(|| {
+                            saved
+                                .provider
+                                .as_ref()
+                                .and_then(|provider| Protocol::parse(&provider.protocol))
+                        })
+                        .filter(|protocol| program.supports(*protocol))
+                        .unwrap_or_else(|| program.supported_protocols()[0]);
+                    if let Some(provider) = saved.provider.as_mut() {
+                        provider.protocol = chosen.id().to_owned();
+                    }
+                }
+                if program != Program::Codex {
+                    saved.codex_sandbox.clear();
+                } else if saved.codex_sandbox.is_empty() {
+                    saved.codex_sandbox = "native".to_owned();
+                }
+                if let Err(error) = next.save(&inner.settings_path) {
+                    return Err(format!(
+                        "the program change was not saved; the previous selection was restored ({error})"
+                    ));
+                }
+                inner.settings = next;
+                if program.is_native()
+                    && !explicit_key
+                    && let Some(key) = inherited_key.as_ref()
+                {
+                    if let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.expose(),
+                    ) {
+                        inner.settings = settings_before;
+                        let restore = inner.save_settings();
+                        return Err(match restore {
+                            Ok(()) => format!(
+                                "the program change was rolled back: the current model key for `{name}` could not be saved ({error})"
+                            ),
+                            Err(restore_error) => format!(
+                                "the program change could not be restored after a key-save failure ({error}); the settings file also failed to restore ({restore_error})"
+                            ),
+                        });
+                    }
+                }
+                inner.agents[index].last_error = None;
+                inner.note(format!("`{name}` now runs with {}", program.label()));
+                Ok(())
+            }
+            Command::SetAgentModel {
+                name,
+                base_url,
+                protocol,
+                model,
+                key,
+            } => {
+                let Some(protocol) = Protocol::parse(&protocol) else {
+                    return Err("that connection type is not one this product knows".to_owned());
+                };
+                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let model = model.trim().to_owned();
+                if base.is_empty() || model.is_empty() {
+                    return Err("the API address and model are both needed".to_owned());
+                }
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let settings_before = inner.settings.clone();
+                let mut next = inner.settings.clone();
+                let Some(saved) = next.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                saved.provider = Some(settings::AgentProvider {
+                    base_url: base,
+                    protocol: protocol.id().to_owned(),
+                    model,
+                });
+                if let Err(error) = next.save(&inner.settings_path) {
+                    return Err(format!(
+                        "the model change was not saved; the previous selection was restored ({error})"
+                    ));
+                }
+                inner.settings = next;
+                if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+                    if let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        key.trim(),
+                    ) {
+                        inner.settings = settings_before;
+                        let restore = inner.save_settings();
+                        return Err(match restore {
+                            Ok(()) => format!(
+                                "the model change was rolled back: the key could not be saved ({error})"
+                            ),
+                            Err(restore_error) => format!(
+                                "the model change could not be restored after a key-save failure ({error}); the settings file also failed to restore ({restore_error})"
+                            ),
+                        });
+                    }
+                }
+                inner.agents[index].last_error = None;
+                inner.note(format!("`{name}`'s connection is saved for its next run"));
+                Ok(())
+            }
+            Command::SetAgentCodexSandbox { name, mode } => {
+                let mode = mode.trim();
+                if mode != "native" && mode != "full-access" {
+                    return Err(
+                        "that Codex sandbox choice is not one this product knows".to_owned()
+                    );
+                }
+                let Some(index) = inner.agent_index(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                let mut next = inner.settings.clone();
+                let Some(saved) = next.agent_mut(&name) else {
+                    return Err(format!("there is no agent named `{name}`"));
+                };
+                if saved.harness() != Program::Codex {
+                    return Err("the sandbox choice applies only to Codex".to_owned());
+                }
+                saved.codex_sandbox = mode.to_owned();
+                if let Err(error) = next.save(&inner.settings_path) {
+                    return Err(format!(
+                        "the sandbox choice was not saved; the previous selection was restored ({error})"
+                    ));
+                }
+                inner.settings = next;
+                inner.agents[index].last_error = None;
+                inner.note(format!(
+                    "`{name}`'s Codex sandbox is saved for its next run"
+                ));
+                Ok(())
+            }
+            Command::InstallProgram { id } => {
+                let Some(program) = Program::parse(&id).filter(|program| program.is_native())
+                else {
+                    return Err("there is no installable program with that name".to_owned());
+                };
+                if inner
+                    .program_states
+                    .get(&id)
+                    .is_some_and(|state| state.installing.is_some())
+                {
+                    inner.note(format!("{} is already installing", program.label()));
+                    return Ok(());
+                }
+                let cancel = harness::CancelToken::new();
+                let state = inner.program_states.entry(id.clone()).or_default();
+                state.installing = Some(None);
+                state.phase = Some(harness::InstallPhase::Preparing);
+                state.error = None;
+                state.cancel = Some(cancel.clone());
+                inner.note(format!("installing {}", program.label()));
+                let inner_arc = Arc::clone(&self.inner);
+                let data_root = inner.options.data_root.clone();
+                drop(inner);
+                let handle = std::thread::spawn(move || {
+                    let result =
+                        harness::install_cancellable(&data_root, program, &cancel, |sample| {
+                            if let Ok(mut inner) = inner_arc.lock()
+                                && let Some(state) = inner.program_states.get_mut(program.id())
+                            {
+                                state.installing = Some(sample.percent);
+                                state.phase = Some(sample.phase);
+                            }
+                        });
+                    if let Ok(mut inner) = inner_arc.lock()
+                        && let Some(state) = inner.program_states.get_mut(program.id())
+                    {
+                        state.installing = None;
+                        state.phase = None;
+                        state.cancel = None;
+                        match result {
+                            Ok(installed) => {
+                                state.error = None;
+                                inner.note(format!(
+                                    "{} {} is installed",
+                                    program.label(),
+                                    installed.version
+                                ));
+                            }
+                            Err(error) if error == harness::INSTALL_CANCELED => {
+                                state.error = None;
+                                inner.note(format!(
+                                    "installing {} was canceled; the previous version is unchanged",
+                                    program.label()
+                                ));
+                            }
+                            Err(error) => {
+                                state.error = Some(crate::forgejo_tools::sentence(error.clone()));
+                                inner.note(format!(
+                                    "{} could not be installed: {error}",
+                                    program.label()
+                                ));
+                            }
+                        }
+                    }
+                });
+                if let Some(state) = lock_inner(&self.inner).program_states.get_mut(&id) {
+                    state.thread = Some(handle);
+                }
+                Ok(())
+            }
+            Command::CancelInstallProgram { id } => {
+                let Some(program) = Program::parse(&id).filter(|program| program.is_native())
+                else {
+                    return Err("there is no installable program with that name".to_owned());
+                };
+                let Some(state) = inner.program_states.get(&id) else {
+                    inner.note(format!("{} is not installing", program.label()));
+                    return Ok(());
+                };
+                if state.installing.is_none() {
+                    inner.note(format!("{} is not installing", program.label()));
+                    return Ok(());
+                }
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+                inner.note(format!(
+                    "canceling the {} install; the previous version stays usable",
+                    program.label()
+                ));
+                Ok(())
+            }
+            Command::TestAgentModel { name } => {
+                if inner.settings.agent(&name).is_none() {
+                    return Err(format!("there is no agent named `{name}`"));
+                }
+                inner.note(
+                    "the selected model was not tested; Start will use the program's own error",
+                );
                 Ok(())
             }
             Command::TestEndpoint => {
@@ -1935,16 +2830,41 @@ impl EngineApi for Engine {
                 if count > MAX_AGENTS {
                     return Err(format!("at most {MAX_AGENTS} agents can be made"));
                 }
+                let settings_before = inner.settings.clone();
+                let mut next = inner.settings.clone();
+                let mut keys: Vec<(String, String)> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
                 for number in 1..=count {
                     let name = format!("agent-{number}");
-                    if inner.settings.agent(&name).is_none() {
-                        inner.settings.add_agent(&name, Desired::Stopped)?;
+                    if next.agent(&name).is_none() {
+                        next.add_agent(&name, Desired::Stopped)?;
+                        if let Some(key) = inner.assign_new_agent_program(&mut next, &name)? {
+                            keys.push((name.clone(), key));
+                        }
                         ensure_agent_paths(&inner.options.layout, &name)?;
-                        let runtime = AgentRuntime::load(&inner, &name);
-                        inner.agents.push(runtime);
+                        names.push(name);
                     }
                 }
-                inner.save_settings()?;
+                next.save(&inner.settings_path)?;
+                inner.settings = next;
+                for (name, key) in keys {
+                    if let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        &key,
+                    ) {
+                        inner.settings = settings_before;
+                        let _ = inner.save_settings();
+                        return Err(format!(
+                            "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
+                        ));
+                    }
+                }
+                for name in names {
+                    let runtime = AgentRuntime::load(&inner, &name);
+                    inner.agents.push(runtime);
+                }
                 // A new workspace is a new bound tree; re-run the layout decision so
                 // a workspace that cannot be confined takes the claim off the board
                 // now (B9-R-R).
@@ -1954,12 +2874,30 @@ impl EngineApi for Engine {
                 Ok(())
             }
             Command::AddAgent => {
-                let name = inner.settings.allocate_agent_name()?;
-                inner.settings.add_agent(&name, Desired::Stopped)?;
+                let settings_before = inner.settings.clone();
+                let mut next = inner.settings.clone();
+                let name = next.allocate_agent_name()?;
+                next.add_agent(&name, Desired::Stopped)?;
+                let key = inner.assign_new_agent_program(&mut next, &name)?;
                 ensure_agent_paths(&inner.options.layout, &name)?;
+                next.save(&inner.settings_path)?;
+                inner.settings = next;
+                if let Some(key) = key
+                    && let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        &key,
+                    )
+                {
+                    inner.settings = settings_before;
+                    let _ = inner.save_settings();
+                    return Err(format!(
+                        "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
+                    ));
+                }
                 let runtime = AgentRuntime::load(&inner, &name);
                 inner.agents.push(runtime);
-                inner.save_settings()?;
                 inner.refresh_confinement();
                 inner.note(format!("`{name}` was added"));
                 Ok(())
@@ -1968,12 +2906,26 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
-                inner.set_desired(index, Desired::Stopped);
+                let grace = inner.options.stop_grace;
+                stop_agent(&mut inner.agents[index], grace)?;
+                // The stop already happened; the runtime must say Stopped even if
+                // the settings file cannot record it, or the scheduler restarts.
+                inner.agents[index].desired = Desired::Stopped;
+                let committed = inner.commit_settings(|settings| {
+                    if let Some(saved) = settings.agent_mut(&name) {
+                        saved.set_desired(Desired::Stopped);
+                    }
+                    Ok(())
+                });
+                if let Err(error) = committed {
+                    inner.agents[index].removal_pending = false;
+                    inner.agents[index].removal_retry_at = None;
+                    return Err(format!(
+                        "`{name}` was stopped, but the removal could not be saved and the stopped state was not saved; it will start again the next time the program opens ({error})"
+                    ));
+                }
                 inner.agents[index].removal_pending = true;
                 inner.agents[index].removal_retry_at = None;
-                let grace = inner.options.stop_grace;
-                stop_agent(&mut inner.agents[index], grace);
-                inner.save_settings()?;
                 inner.note(format!("`{name}` is being removed"));
                 Ok(())
             }
@@ -1981,6 +2933,14 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                if removal_marked(&inner.options.layout, &name) {
+                    let reason = "its Forgejo sign-in and tokens were already cancelled; Remove can be retried";
+                    inner.agents[index].session = SessionState::Blocked {
+                        reason: reason.to_owned(),
+                    };
+                    inner.note(format!("not started — {reason}"));
+                    return Ok(());
+                }
                 // A cleanup that failed at open or at a run boundary is retried
                 // before any replacement run. Until it succeeds, Start reports the
                 // reason and does not start; once the old group is gone, the
@@ -1991,8 +2951,7 @@ impl EngineApi for Engine {
                     for target in &leftover_targets {
                         let result = match target {
                             RecoveryTarget::Run(run_dir) => {
-                                run::reap_leftover_run(run_dir, inner.options.stop_grace)
-                                    .map(|_| ())
+                                run::recover_ending(run_dir, inner.options.stop_grace).map(|_| ())
                             }
                             RecoveryTarget::Agent(agent_dir) => {
                                 recover_agent_directory(agent_dir, inner.options.stop_grace)
@@ -2014,7 +2973,17 @@ impl EngineApi for Engine {
                     inner.agents[index].session = SessionState::Idle;
                     inner.agents[index].next_at = None;
                 }
-                inner.set_desired(index, Desired::Started);
+                if let Some(reason) = inner
+                    .program_block(&inner.agents[index])
+                    .or_else(|| inner.codex_sandbox_block(&inner.agents[index]))
+                {
+                    inner.agents[index].session = SessionState::Blocked {
+                        reason: reason.clone(),
+                    };
+                    inner.note(format!("not started — {reason}"));
+                    return Ok(());
+                }
+                inner.set_desired(index, Desired::Started)?;
                 let agent = &mut inner.agents[index];
                 agent.sessions_since_start = 0;
                 agent.session_number = 0;
@@ -2026,7 +2995,6 @@ impl EngineApi for Engine {
                         reason: "needs an instruction".to_owned(),
                     };
                 }
-                inner.save_settings()?;
                 inner.note(if no_instruction {
                     "not started — write an instruction first".to_owned()
                 } else {
@@ -2038,12 +3006,23 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
-                inner.set_desired(index, Desired::Stopped);
                 let grace = inner.options.stop_grace;
-                stop_agent(&mut inner.agents[index], grace);
-                inner.save_settings()?;
-                inner.note(format!("`{name}` stopped"));
-                Ok(())
+                stop_agent(&mut inner.agents[index], grace)?;
+                inner.agents[index].desired = Desired::Stopped;
+                match inner.commit_settings(|settings| {
+                    if let Some(saved) = settings.agent_mut(&name) {
+                        saved.set_desired(Desired::Stopped);
+                    }
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        inner.note(format!("`{name}` stopped"));
+                        Ok(())
+                    }
+                    Err(error) => Err(format!(
+                        "`{name}` was stopped, but the stopped state could not be saved; it will start again the next time the program opens ({error})"
+                    )),
+                }
             }
             Command::StartForgejo => {
                 if matches!(
@@ -2143,6 +3122,7 @@ impl EngineApi for Engine {
 
     fn shutdown(&mut self, grace: Duration) {
         let started = Instant::now();
+        let mut first_ending_errors: Vec<String> = Vec::new();
         {
             let mut inner = lock_inner(&self.inner);
             if inner.stopping {
@@ -2150,26 +3130,48 @@ impl EngineApi for Engine {
             }
             inner.stopping = true;
             inner.generation = inner.generation.saturating_add(1);
+            for state in inner.program_states.values() {
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+            }
             // Ask every group politely. A start or spawn still in flight records its
             // child's pid, and is signalled again as that pid appears below.
             for agent in &mut inner.agents {
                 if let Some(run) = agent.running.as_mut() {
-                    run.stopping = true;
-                    run.handle.signal(false);
+                    let proposed = proposed_first_ending(run);
+                    let requested = run.run.request_stop(proposed);
+                    match requested {
+                        Ok(ending) => {
+                            run.first_ending = Some(ending);
+                            run.stopping = true;
+                        }
+                        Err(error) => first_ending_errors.push(format!(
+                            "`{}`: the shutdown ending is uncertain: {error}",
+                            agent.name
+                        )),
+                    }
                 }
                 if let Some(pid) = agent.starting_pid {
-                    signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+                    run::request_starting_stop(pid, false, "the starting run was stopped");
                 }
             }
             if let Some(server) = inner.forgejo.child.as_mut() {
-                signal_group(server.pid(), nix::sys::signal::Signal::SIGTERM);
+                bundled_forgejo::signal_process_group(server.pid(), false);
             }
             if let Some(pid) = inner.forgejo.start_pid {
-                signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+                bundled_forgejo::signal_process_group(pid, false);
             }
             for pid in &inner.forgejo.helper_pids {
-                signal_group(*pid, nix::sys::signal::Signal::SIGTERM);
+                bundled_forgejo::signal_process_group(*pid, false);
             }
+        }
+        if !first_ending_errors.is_empty() {
+            let mut inner = lock_inner(&self.inner);
+            for note in first_ending_errors.drain(..) {
+                inner.note(note);
+            }
+            // A failed first attempt is retried before the forced stop below.
         }
         // The bounded hand-over: a start or spawn that is between spawning its child
         // and returning must see the new generation and stop that child itself. The
@@ -2180,18 +3182,23 @@ impl EngineApi for Engine {
         // stopped, a durable ending is written (unless the run wrote one) and only
         // then are the identity handles removed. A run that cannot be settled keeps
         // its handles, so the next open reports the failure and Start retries.
-        let mut settled_runs: Vec<(PathBuf, u32)> = Vec::new();
+        let mut settled_runs: Vec<(PathBuf, u32, Option<run::FirstEnding>)> = Vec::new();
         loop {
             let mut appeared: Vec<u32> = Vec::new();
+            let mut run_appeared: Vec<u32> = Vec::new();
             let mut alive = false;
             {
                 let mut inner = lock_inner(&self.inner);
                 for agent in &mut inner.agents {
                     if let Some(run) = agent.running.as_mut() {
-                        if run.handle.try_status().is_some() {
-                            settled_runs.push((run.run_dir.clone(), run.handle.pid()));
+                        if run.run.try_status().is_some() {
+                            settled_runs.push((
+                                run.run_dir.clone(),
+                                run.run.pid(),
+                                run.first_ending,
+                            ));
                             if let Some(run_id) = run_id_in(&run.run_dir) {
-                                crate::confinement::remove_run_temp(run.handle.pid(), run_id);
+                                crate::confinement::remove_run_temp(run.run.pid(), run_id);
                             }
                             agent.running = None;
                         } else {
@@ -2201,7 +3208,7 @@ impl EngineApi for Engine {
                     if agent.starting {
                         alive = true;
                         if let Some(pid) = agent.starting_pid {
-                            appeared.push(pid);
+                            run_appeared.push(pid);
                         }
                     }
                 }
@@ -2222,10 +3229,16 @@ impl EngineApi for Engine {
                     appeared.push(server.pid());
                 }
             }
+            for pid in run_appeared {
+                if !signalled.contains(&pid) {
+                    signalled.push(pid);
+                    run::request_starting_stop(pid, false, "the starting run was stopped");
+                }
+            }
             for pid in appeared {
                 if !signalled.contains(&pid) {
                     signalled.push(pid);
-                    signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+                    bundled_forgejo::signal_process_group(pid, false);
                 }
             }
             if !alive || started.elapsed() >= grace {
@@ -2240,11 +3253,51 @@ impl EngineApi for Engine {
             let mut inner = lock_inner(&self.inner);
             for agent in &mut inner.agents {
                 if let Some(mut run) = agent.running.take() {
-                    stop_running_session(&mut run.handle, Duration::from_millis(500));
-                    settled_runs.push((run.run_dir.clone(), run.handle.pid()));
+                    let run_id = run_id_in(&run.run_dir).map(str::to_owned);
+                    let mut uncertain = false;
+                    if run.first_ending.is_none() {
+                        let proposed = proposed_first_ending(&run);
+                        match run_id
+                            .as_deref()
+                            .ok_or_else(|| "the run directory has no run id".to_owned())
+                            .and_then(|run_id| run::prepare_ending(&run.run_dir, run_id, proposed))
+                        {
+                            Ok(ending) => run.first_ending = Some(ending),
+                            Err(error) => {
+                                let reason =
+                                    run.run.stop_uncertain(&error, Duration::from_millis(500));
+                                first_ending_errors.push(format!("`{}`: {reason}", agent.name));
+                                uncertain = true;
+                            }
+                        }
+                    }
+                    if !uncertain {
+                        let proposed = run.first_ending.unwrap_or(run::FirstEnding::Stop);
+                        let result = run.run.request_stop_and_wait(
+                            proposed,
+                            "the run was stopped when the program closed",
+                            Duration::from_millis(500),
+                        );
+                        match result {
+                            Ok(()) => {
+                                let first_ending =
+                                    run.first_ending.unwrap_or(run::FirstEnding::Stop);
+                                settled_runs.push((
+                                    run.run_dir.clone(),
+                                    run.run.pid(),
+                                    Some(first_ending),
+                                ));
+                            }
+                            Err(error) => {
+                                let reason =
+                                    run.run.stop_uncertain(&error, Duration::from_millis(500));
+                                first_ending_errors.push(format!("`{}`: {reason}", agent.name));
+                            }
+                        }
+                    }
                 }
                 if let Some(pid) = agent.starting_pid.take() {
-                    signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                    run::request_starting_stop(pid, true, "the starting run was forced");
                 }
                 agent.starting = false;
                 agent.session = SessionState::Idle;
@@ -2257,12 +3310,12 @@ impl EngineApi for Engine {
             if let Some(pid) = inner.forgejo.start_pid.take() {
                 // The job that spawned this child owns its reaping. It has seen the
                 // generation change; this is the last bound if it is still blocked.
-                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                bundled_forgejo::signal_process_group(pid, true);
             }
             for pid in std::mem::take(&mut inner.forgejo.helper_pids) {
                 // The token helper's job owns the wait and reaping; the force below
                 // ends it if it is still in the grace window's shadow.
-                signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+                bundled_forgejo::signal_process_group(pid, true);
             }
             inner.forgejo.state = ForgejoState::Stopped;
             inner.forgejo.admin_token = None;
@@ -2270,16 +3323,24 @@ impl EngineApi for Engine {
             inner.forgejo.start_inflight = false;
             inner.forgejo.provisioned = false;
         }
+        if !first_ending_errors.is_empty() {
+            let mut inner = lock_inner(&self.inner);
+            for note in first_ending_errors.drain(..) {
+                inner.note(note);
+            }
+        }
         // Settle every run whose supervisor this shutdown ended, outside the lock.
         // The run gets a durable ending before its handles go; if either step fails
         // the handles stay for the next open, which reports and retries them.
-        for (run_dir, pid) in settled_runs {
-            let _ = run::settle_run(
+        for (run_dir, pid, first_ending) in settled_runs {
+            let _ = run::request_finish(
                 &run_dir,
                 pid,
                 run::RunOutcome::Stopped,
                 Some("the run was stopped when the program closed".to_owned()),
                 Duration::from_millis(500),
+                Some("the run was stopped when the program closed".to_owned()),
+                first_ending.unwrap_or(run::FirstEnding::Stop),
             );
         }
         // A token helper may have been between "recorded as in flight" and "spawn"
@@ -2294,6 +3355,31 @@ impl EngineApi for Engine {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Cancelled installs clean their own stage. Wait inside the caller's grace so
+        // a quit does not leave a download writing behind the board; a stage that
+        // cannot finish is journaled and recovered on the next open.
+        let install_jobs: Vec<std::thread::JoinHandle<()>> = {
+            let mut inner = lock_inner(&self.inner);
+            for state in inner.program_states.values_mut() {
+                if let Some(cancel) = &state.cancel {
+                    cancel.cancel();
+                }
+            }
+            inner
+                .program_states
+                .values_mut()
+                .filter_map(|state| state.thread.take())
+                .collect()
+        };
+        let install_deadline = Instant::now() + grace.min(Duration::from_secs(2));
+        for handle in install_jobs {
+            while !handle.is_finished() && Instant::now() < install_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
         // A clean exit records the version too, so an installation that is opened and
         // closed many times keeps one current line.
         let root = lock_inner(&self.inner).options.layout.root().to_path_buf();
@@ -2307,39 +3393,6 @@ fn lock_inner(inner: &Arc<Mutex<Inner>>) -> std::sync::MutexGuard<'_, Inner> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
-}
-
-/// Stop one session handle politely, then by force, and wait for its status so the
-/// child is reaped before the handle is dropped.
-fn stop_running_session(run: &mut Box<dyn RunningSession>, grace: Duration) {
-    if run.try_status().is_some() {
-        return;
-    }
-    run.signal(false);
-    if wait_session_status(run, grace) {
-        return;
-    }
-    run.signal(true);
-    let _ = wait_session_status(run, Duration::from_secs(1));
-}
-
-fn wait_session_status(run: &mut Box<dyn RunningSession>, limit: Duration) -> bool {
-    let deadline = Instant::now() + limit;
-    loop {
-        if run.try_status().is_some() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Signal a process group by the pid that leads it. A pid that is already gone is
-/// not an error: the job that owns it reaps it and notices the generation change.
-fn signal_group(pid: u32, signal: nix::sys::signal::Signal) {
-    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
 }
 
 impl Drop for Engine {
@@ -2416,7 +3469,7 @@ fn recover_agent_directory(agent_dir: &Path, grace: Duration) -> Result<(), Stri
                 continue;
             }
         }
-        if let Err(reason) = run::reap_leftover_run(&run_dir, grace) {
+        if let Err(reason) = run::recover_ending(&run_dir, grace) {
             reasons.push(reason);
         }
     }
@@ -2510,7 +3563,7 @@ fn recover_stale_sessions(
             // path; recovery itself runs even when the records are unreadable, so
             // the failure can reach the card.
             let recorded = run::recorded_group(&run_dir);
-            match run::reap_leftover_run(&run_dir, grace) {
+            match run::recover_ending(&run_dir, grace) {
                 Ok(true) => {
                     if let Some((pid, _)) = recorded {
                         stopped.push(pid);
@@ -2546,23 +3599,40 @@ fn ensure_agent_paths(layout: &Layout, name: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn stop_agent(agent: &mut AgentRuntime, grace: Duration) {
-    agent.next_at = None;
-    agent.session = SessionState::Idle;
+/// What the run's own record suggests before the owner pins the fact. This is only
+/// an input to the owner; it never writes or signals.
+fn proposed_first_ending(run: &RunningState) -> run::FirstEnding {
+    run.first_ending.unwrap_or_else(|| {
+        if run::terminal_recorded(&run.run_dir).unwrap_or(true) {
+            run::FirstEnding::Terminal
+        } else {
+            run::FirstEnding::Stop
+        }
+    })
+}
+
+fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
     if agent.starting {
         // The job checks the desired choice after every wait, stops a child it has
         // already spawned, and clears `starting` itself.
         if let Some(pid) = agent.starting_pid {
-            signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+            run::request_starting_stop(pid, false, "the starting run was stopped");
         }
         agent.starting = false;
     }
     if let Some(run) = agent.running.as_mut() {
+        // The owner records the fact, then sends the polite signal. A fact failure
+        // marks the ending uncertain and sends no signal.
+        let proposed = proposed_first_ending(run);
+        let ending = run.run.request_stop(proposed)?;
+        run.first_ending = Some(ending);
         run.stopping = true;
         run.stop_requested = true;
         run.stop_deadline = Some(Instant::now() + grace);
-        run.handle.signal(false);
     }
+    agent.next_at = None;
+    agent.session = SessionState::Idle;
+    Ok(())
 }
 
 // ---- background work -------------------------------------------------------
@@ -2973,6 +4043,14 @@ fn repository_events(before: &[String], after: &[String]) -> Vec<String> {
 }
 
 fn provision_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
+    if let Ok(mut guard) = inner.lock()
+        && removal_marked(&guard.options.layout, &name)
+    {
+        if let Some(index) = guard.agent_index(&name) {
+            guard.agents[index].provision_inflight = false;
+        }
+        return;
+    }
     let (url, token) = match inner.lock() {
         Ok(inner) => (inner.forgejo.url.clone(), inner.forgejo.admin_token.clone()),
         Err(poisoned) => {
@@ -3037,6 +4115,7 @@ fn session_job(
     {
         let mut guard = lock_inner(&inner);
         let Some(index) = guard.agent_index(&request.agent) else {
+            // `prepared` is dropped here; its owner guard records the ending.
             return;
         };
         if guard.stopping
@@ -3046,6 +4125,7 @@ fn session_job(
         {
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            // `prepared` is dropped here; its owner guard records the ending.
             return;
         }
     }
@@ -3092,7 +4172,11 @@ fn session_job(
             guard.agents[index].starting_pid = Some(pid);
         }
     };
-    let spawned = spawner.spawn_with(&prepared, &mut on_spawn);
+    let started = prepared
+        .guard
+        .start(&mut on_spawn, |run_dir, workspace, owner_on_spawn| {
+            spawner.spawn_with(run_dir, workspace, owner_on_spawn)
+        });
     let now = clock.now();
     let mut guard = lock_inner(&inner);
     let Some(index) = guard.agent_index(&request.agent) else {
@@ -3102,15 +4186,35 @@ fn session_job(
         // fails, the handles stay for the next open, which scans every agent
         // directory on disk, not only the current settings.
         drop(guard);
-        if let Ok(mut handle) = spawned {
-            let pid = handle.pid();
-            stop_running_session(&mut handle, Duration::from_secs(1));
-            let _ = run::settle_run(
-                &request.run_dir,
-                pid,
+        if let Ok(mut started) = started {
+            let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
+                run::FirstEnding::Terminal
+            } else {
+                run::FirstEnding::Stop
+            };
+            let first_ending = match started.request_stop(proposed) {
+                Ok(first_ending) => first_ending,
+                Err(error) => {
+                    // The child still has to be stopped, but without a valid fact
+                    // this is an uncertain ending, not a clean stop.
+                    let reason = started.stop_uncertain(&error, Duration::from_secs(1));
+                    let mut guard = lock_inner(&inner);
+                    if let Some(index) = guard.agent_index(&request.agent) {
+                        guard.agents[index].leftover = Some(reason.clone());
+                        guard.agents[index].leftover_targets =
+                            vec![RecoveryTarget::Run(request.run_dir.clone())];
+                        guard.agents[index].session = SessionState::Blocked { reason };
+                        guard.agents[index].next_at = None;
+                    }
+                    return;
+                }
+            };
+            let _ = started.request_finish(
                 run::RunOutcome::Stopped,
                 Some("the run was called off when its agent was removed".to_owned()),
                 Duration::from_secs(1),
+                Some("the run was called off when its agent was removed".to_owned()),
+                first_ending,
             );
         }
         return;
@@ -3124,22 +4228,40 @@ fn session_job(
         guard.agents[index].starting_pid = None;
         let stopping = guard.stopping;
         drop(guard);
-        if let Ok(mut handle) = spawned {
+        if let Ok(mut started) = started {
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
-            let pid = handle.pid();
-            stop_running_session(&mut handle, Duration::from_secs(1));
+            let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
+                run::FirstEnding::Terminal
+            } else {
+                run::FirstEnding::Stop
+            };
+            let first_ending = match started.request_stop(proposed) {
+                Ok(first_ending) => first_ending,
+                Err(error) => {
+                    let reason = started.stop_uncertain(&error, Duration::from_secs(1));
+                    let mut guard = lock_inner(&inner);
+                    if let Some(index) = guard.agent_index(&request.agent) {
+                        guard.agents[index].leftover = Some(reason.clone());
+                        guard.agents[index].leftover_targets =
+                            vec![RecoveryTarget::Run(request.run_dir.clone())];
+                        guard.agents[index].session = SessionState::Blocked { reason };
+                        guard.agents[index].next_at = None;
+                    }
+                    return;
+                }
+            };
             let reason = if stopping {
                 "the run was stopped when the program closed"
             } else {
                 "the run was stopped before it became current"
             };
-            match run::settle_run(
-                &request.run_dir,
-                pid,
+            match started.request_finish(
                 run::RunOutcome::Stopped,
                 Some(reason.to_owned()),
                 Duration::from_secs(1),
+                Some(reason.to_owned()),
+                first_ending,
             ) {
                 Ok(_) => {}
                 Err(reason) => {
@@ -3156,20 +4278,22 @@ fn session_job(
         }
         return;
     }
-    let started = guard.agents[index].starting_since.unwrap_or(now);
-    match spawned {
-        Ok(handle) => {
-            let _pid = handle.pid();
+    let started_at = guard.agents[index].starting_since.unwrap_or(now);
+    match started {
+        Ok(started) => {
+            let _pid = started.pid();
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
             guard.agents[index].running = Some(RunningState {
                 run_dir: request.run_dir.clone(),
-                started,
-                handle,
+                started: started_at,
+                run: started,
                 stopping: false,
                 stop_deadline: None,
                 stop_requested: false,
                 timed_out: false,
+                first_ending: None,
+                first_ending_error: None,
             });
             guard.agents[index].newest_run = Some(request.run_dir.clone());
             guard.agents[index].activity_refresh_at = None;
@@ -3192,20 +4316,14 @@ fn session_job(
         Err(reason) => {
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
-            let _ = transcript::record_outcome_if_missing(
-                &request.run_dir,
-                &request.run_id,
-                run::RunOutcome::Failed,
-                Some(reason.clone()),
-                0,
-            );
+            let _ = run::request_failed_finish(&request.run_dir, &request.run_id, &reason);
             let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];
             finish_session(
                 agent,
                 SessionEnd::Failed { reason },
                 now,
-                started,
+                started_at,
                 &state_root,
                 Some(&request.run_dir),
             );
@@ -3219,6 +4337,24 @@ fn removed_note(name: &str) -> String {
 }
 
 fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
+    let marker = match inner.lock() {
+        Ok(inner) => write_removal_marker(&inner, &name),
+        Err(poisoned) => write_removal_marker(&poisoned.into_inner(), &name),
+    };
+    if let Err(reason) = marker {
+        if let Ok(mut inner) = inner.lock() {
+            if let Some(index) = inner.agent_index(&name) {
+                // Nothing was cancelled or changed. Do not leave a failed
+                // provisioning/blocked state behind: the agent is exactly as it was
+                // before the Remove request, except that it is not auto-retried.
+                inner.agents[index].removal_pending = false;
+                inner.note(format!(
+                    "`{name}` was stopped and left stopped, but it could not be removed: {reason}; its Forgejo sign-in and account were not changed; start it again or retry Remove"
+                ));
+            }
+        }
+        return;
+    }
     let (url, admin_token, credentials, login, token_name) = match inner.lock() {
         Ok(inner) => {
             let Some(index) = inner.agent_index(&name) else {
@@ -3291,12 +4427,31 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
         };
         match result {
             Ok(()) => {
-                inner.agents.remove(index);
-                inner.settings.remove_agent(&name);
-                if let Err(error) = inner.save_settings() {
-                    inner.note(format!("`{name}` was removed, but {error}"));
-                } else {
-                    inner.note(removed_note(&name));
+                match inner.commit_settings(|settings| {
+                    settings.remove_agent(&name);
+                    Ok(())
+                }) {
+                    Ok(()) => {
+                        inner.agents.remove(index);
+                        clear_removal_marker(&inner.options.layout, &name);
+                        inner.note(removed_note(&name));
+                    }
+                    Err(error) => {
+                        let reason = format!(
+                            "`{name}`'s Forgejo sign-in and tokens were already cancelled, but the removal could not be saved; it is still on the board and Remove can be retried ({error})"
+                        );
+                        inner.agents[index].removal_pending = false;
+                        inner.agents[index].removal_retry_at =
+                            Some(Instant::now() + PROVISION_RETRY);
+                        inner.agents[index].login = None;
+                        inner.agents[index].provisioning = Provisioning::Failed {
+                            reason: reason.clone(),
+                        };
+                        inner.agents[index].session = SessionState::Blocked {
+                            reason: reason.clone(),
+                        };
+                        inner.note(reason);
+                    }
                 }
             }
             Err(_reason) => {
@@ -3307,6 +4462,78 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                 ));
             }
         }
+    }
+}
+
+/// Restore the model key after a failed endpoint settings commit. The key was
+/// written before the copy was committed; a settings failure must not pair the old
+/// endpoint with the new provider's key.
+fn restore_endpoint_key(
+    inner: &Inner,
+    previous: Option<credentials::Secret>,
+    error: String,
+) -> String {
+    let restored = match previous {
+        Some(secret) => {
+            credentials::record_secret(&inner.credentials, None, "model_key", secret.expose())
+        }
+        None => credentials::remove_secret(&inner.credentials, None, "model_key"),
+    };
+    match restored {
+        Ok(()) => {
+            format!("the connection was not saved; the previous model key was restored ({error})")
+        }
+        Err(restore_error) => format!(
+            "the connection was not saved; the previous model key could not be restored ({error}); the key restore also failed ({restore_error})"
+        ),
+    }
+}
+
+/// The private, durable record that this agent is being removed. It lives beside
+/// the run records, not in settings, because the failure it must survive is a
+/// settings write failure.
+fn removal_marker_path(layout: &Layout, name: &str) -> Option<PathBuf> {
+    layout
+        .agent(name)
+        .ok()
+        .map(|paths| paths.state_dir().join("removal-pending"))
+}
+
+fn removal_marked(layout: &Layout, name: &str) -> bool {
+    removal_marker_path(layout, name).is_some_and(|path| path.exists())
+}
+
+fn write_removal_marker(inner: &Inner, name: &str) -> Result<PathBuf, String> {
+    let paths = inner
+        .options
+        .layout
+        .agent(name)
+        .map_err(|error| format!("the agent's state directory is not available: {error}"))?;
+    fs::create_dir_all(paths.state_dir()).map_err(|error| {
+        format!(
+            "the removal marker directory {} cannot be created: {error}; nothing was cancelled",
+            paths.state_dir().display()
+        )
+    })?;
+    set_mode(paths.state_dir(), PRIVATE_DIR_MODE).map_err(|error| {
+        format!(
+            "the removal marker directory {} cannot be made private: {error}; nothing was cancelled",
+            paths.state_dir().display()
+        )
+    })?;
+    let marker = paths.state_dir().join("removal-pending");
+    crate::mode::write_private(&marker, b"removal pending\n").map_err(|error| {
+        format!(
+            "the removal could not be recorded at {}: {error}; nothing was cancelled",
+            marker.display()
+        )
+    })?;
+    Ok(marker)
+}
+
+fn clear_removal_marker(layout: &Layout, name: &str) {
+    if let Some(marker) = removal_marker_path(layout, name) {
+        let _ = fs::remove_file(marker);
     }
 }
 
@@ -4104,7 +5331,7 @@ mod tests {
             ))
             .expect("the comment record");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0001",
                 run::RunOutcome::Succeeded,
                 Some(0),
@@ -4117,7 +5344,7 @@ mod tests {
         fs::create_dir_all(&newer).expect("the newer run");
         let mut transcript = crate::transcript::Transcript::open(&newer).expect("transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0002",
                 run::RunOutcome::NoWork,
                 Some(0),
@@ -4225,7 +5452,7 @@ mod tests {
             ))
             .expect("the old comment");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0007",
                 run::RunOutcome::Warned,
                 Some(0),
@@ -4492,7 +5719,7 @@ mod tests {
         fs::create_dir_all(&run_dir).expect("the run directory");
         let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-no-work",
                 run::RunOutcome::NoWork,
                 Some(0),
@@ -4607,10 +5834,460 @@ mod tests {
                 ..
             }
         ));
+        let run_dir = fake.last_run_dir().expect("the timed-out run directory");
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Stop));
+        assert!(
+            run_dir.join(run::STOPPED_FILE).is_file(),
+            "a timed-out run left no stop record"
+        );
         tick(&mut engine, &clock, RESTART_DELAY);
         wait_started(&fake, 2);
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
+    }
+
+    fn write_terminal_record(run_dir: &Path, outcome: run::RunOutcome, reason: &str) {
+        let run_id = run_id_in(run_dir).expect("the run id");
+        let mut transcript =
+            crate::transcript::Transcript::open(run_dir).expect("the run transcript");
+        transcript
+            .append_durable(&crate::run::terminal_record_for_test(
+                run_id,
+                outcome,
+                None,
+                10,
+                Some(reason.to_owned()),
+            ))
+            .expect("the terminal record");
+    }
+
+    fn terminal_outcomes(run_dir: &Path) -> Vec<(String, Option<String>)> {
+        crate::transcript::read(run_dir)
+            .expect("the transcript reads")
+            .records
+            .into_iter()
+            .filter_map(|record| match record {
+                crate::transcript::Record::RunFinished {
+                    outcome, reason, ..
+                } => Some((outcome, reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn first_ending(run_dir: &Path) -> Option<run::FirstEnding> {
+        run::recorded_first_ending(run_dir).expect("the first ending reads")
+    }
+
+    #[test]
+    fn a_natural_finish_persists_terminal_as_the_first_ending() {
+        let root = scratch_root("engine-natural-fact");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert_eq!(
+            first_ending(&run_dir),
+            Some(run::FirstEnding::Terminal),
+            "a natural finish was recorded as an engine stop"
+        );
+        assert!(!run_dir.join(run::STOPPED_FILE).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stop_after_the_runs_ending_keeps_the_one_ending_and_writes_no_stop_record() {
+        let root = scratch_root("engine-finish-then-stop");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        write_terminal_record(
+            &run_dir,
+            run::RunOutcome::Succeeded,
+            "the run finished before the stop",
+        );
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop");
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let board = engine.board();
+        assert_eq!(board.agents[0].recent.last(), Some(&SessionEnd::Succeeded));
+        assert!(
+            !run_dir.join(run::STOPPED_FILE).is_file(),
+            "a late stop wrote a false stop record"
+        );
+        assert_eq!(
+            terminal_outcomes(&run_dir),
+            vec![(
+                "succeeded".to_owned(),
+                Some("the run finished before the stop".to_owned())
+            )],
+            "the stop changed the terminal record"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_stop_after_the_childs_ending_keeps_the_first_stops_stopped() {
+        let root = scratch_root("engine-stop-then-finish");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("first stop");
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Stop));
+        // The child managed to write an ending during the first stop's grace.
+        write_terminal_record(&run_dir, run::RunOutcome::Succeeded, "a post-signal ending");
+        // A second Stop must not re-sample the ordering fact and hand the run to the
+        // child's post-signal ending.
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("second stop");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let board = engine.board();
+        assert_eq!(board.agents[0].recent.last(), Some(&SessionEnd::Stopped));
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        let endings = terminal_outcomes(&run_dir);
+        assert_eq!(
+            endings.len(),
+            1,
+            "the run kept two terminal records: {endings:?}"
+        );
+        assert_eq!(endings[0].0, "stopped");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_crash_after_a_persisted_stop_reopens_as_stopped() {
+        let child_env = "GEWU_CRASH_REOPEN_CHILD";
+        if std::env::var_os(child_env).is_some() {
+            let root =
+                PathBuf::from(std::env::var("GEWU_CRASH_REOPEN_ROOT").expect("the crash root"));
+            let settings = Settings::load(&settings::path_in(&root)).expect("the crash settings");
+            let clock = Arc::new(FakeClock::new());
+            let fake = Arc::new(FakeSpawner::new());
+            let mut engine = open_test_engine(&root, settings, clock, Arc::clone(&fake));
+            tick(&mut engine, &FakeClock::new(), Duration::ZERO);
+            wait_started(&fake, 1);
+            let run_dir = fake.last_run_dir().expect("the crash run directory");
+            engine
+                .send(Command::Stop {
+                    name: "agent-1".to_owned(),
+                })
+                .expect("the first stop");
+            write_terminal_record(
+                &run_dir,
+                run::RunOutcome::Succeeded,
+                "the child finished during the first stop's grace",
+            );
+            assert_eq!(
+                first_ending(&run_dir),
+                Some(run::FirstEnding::Stop),
+                "the first stop was not durable before the crash"
+            );
+            fs::write(
+                root.join("crash-run-dir.txt"),
+                run_dir.display().to_string(),
+            )
+            .expect("the crash run path");
+            // Hard crash: no Drop, no shutdown, no settle.
+            std::process::abort();
+        }
+
+        let root = scratch_root("engine-crash-reopen");
+        write_ready(&root, &[("agent-1", Desired::Started)]);
+        let exe = std::env::current_exe().expect("the test executable");
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("engine::tests::a_crash_after_a_persisted_stop_reopens_as_stopped")
+            .arg("--nocapture")
+            .env(child_env, "1")
+            .env("GEWU_CRASH_REOPEN_ROOT", &root)
+            .status()
+            .expect("the crashing child runs");
+        assert!(!status.success(), "the child did not crash");
+        let run_dir = PathBuf::from(
+            fs::read_to_string(root.join("crash-run-dir.txt")).expect("the crash run path"),
+        );
+        let settings = Settings::load(&settings::path_in(&root)).expect("the reopen settings");
+        let mut reopened = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        tick(&mut reopened, &FakeClock::new(), Duration::ZERO);
+        assert_eq!(
+            first_ending(&run_dir),
+            Some(run::FirstEnding::Stop),
+            "the reopen lost the first-ending fact"
+        );
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        let endings = terminal_outcomes(&run_dir);
+        assert_eq!(endings.len(), 1, "the reopen kept two endings: {endings:?}");
+        assert_eq!(endings[0].0, "stopped");
+        assert!(reopened.board().agents[0].leftover.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_explicit_stop_fact_failure_marks_uncertainty_and_does_not_signal() {
+        let root = scratch_root("engine-stop-uncertain");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        let pid = fake.live()[0];
+        fs::write(
+            run_dir.join(run::FIRST_ENDING_FILE),
+            r#"{"ts":"2026-10-24T17:00:00.000Z","run_id":"run-9999999999999-9999","ending":"stop"}"#,
+        )
+        .expect("the foreign fact");
+        let error = engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect_err("a stop without a durable fact must fail");
+        assert!(error.contains("first ending"), "{error}");
+        assert!(fake.is_live(pid), "the stop signal was sent without a fact");
+        assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
+        drop(engine);
+        assert!(!fake.is_live(pid), "shutdown did not stop the child");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deadline_fact_failure_marks_uncertainty_and_does_not_signal() {
+        let root = scratch_root("engine-deadline-uncertain");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        let pid = fake.live()[0];
+        fs::write(
+            run_dir.join(run::FIRST_ENDING_FILE),
+            r#"{"ts":"2026-10-24T17:00:00.000Z","run_id":"run-9999999999999-9999","ending":"stop"}"#,
+        )
+        .expect("the foreign fact");
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        assert!(
+            fake.is_live(pid),
+            "the deadline signal was sent without a fact"
+        );
+        assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
+        drop(engine);
+        assert!(!fake.is_live(pid), "shutdown did not stop the child");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_shutdown_fact_write_failure_records_uncertainty_and_keeps_handles() {
+        let root = scratch_root("engine-shutdown-uncertain");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        // An obstructed fact path makes every fact write fail while the rest of
+        // the run directory remains writable for the uncertainty evidence.
+        fs::create_dir(run_dir.join(run::FIRST_ENDING_FILE)).expect("the obstructed fact");
+        engine.shutdown(Duration::from_millis(200));
+        assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
+        assert!(
+            !run_dir.join(run::STOPPED_FILE).is_file(),
+            "a clean stop was claimed without a fact"
+        );
+        let error = run::recover_ending(&run_dir, Duration::from_millis(20))
+            .expect_err("the uncertain run must not recover cleanly");
+        assert!(error.contains("uncertain"), "{error}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_shutdown_after_the_childs_ending_keeps_the_first_stops_stopped() {
+        let root = scratch_root("engine-stop-then-shutdown");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("first stop");
+        write_terminal_record(
+            &run_dir,
+            run::RunOutcome::Succeeded,
+            "a post-stop ending before shutdown",
+        );
+        engine.shutdown(Duration::from_millis(200));
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        let endings = terminal_outcomes(&run_dir);
+        assert_eq!(
+            endings.len(),
+            1,
+            "shutdown kept two terminal records: {endings:?}"
+        );
+        assert_eq!(endings[0].0, "stopped");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deadline_after_the_runs_ending_keeps_the_one_succeeded_outcome() {
+        let root = scratch_root("engine-finish-then-deadline");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        write_terminal_record(
+            &run_dir,
+            run::RunOutcome::Succeeded,
+            "the run finished before the deadline",
+        );
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
+        let board = engine.board();
+        assert_eq!(board.agents[0].recent.last(), Some(&SessionEnd::Succeeded));
+        assert!(
+            !run_dir.join(run::STOPPED_FILE).is_file(),
+            "a deadline after the ending wrote a false stop record"
+        );
+        assert_eq!(terminal_outcomes(&run_dir).len(), 1);
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deadline_with_a_failed_tool_stays_timed_out_and_names_the_warning() {
+        let root = scratch_root("engine-deadline-tool-warning");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        run::write_native_progress(
+            &run_dir,
+            "running",
+            "",
+            false,
+            Some("shell: the native tool exited with code 1"),
+        )
+        .expect("the native progress record");
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        let board = engine.board();
+        match board.agents[0].recent.last() {
+            Some(SessionEnd::TimedOut) => {}
+            other => panic!("a failed tool changed the deadline ending: {other:?}"),
+        }
+        let stop: run::RunStopped = serde_json::from_str(
+            &fs::read_to_string(run_dir.join(run::STOPPED_FILE)).expect("stop record"),
+        )
+        .expect("stop record JSON");
+        assert!(
+            stop.reason
+                .contains("tool warning: shell: the native tool exited with code 1"),
+            "{}",
+            stop.reason
+        );
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("terminal record");
+        match terminal {
+            crate::transcript::Record::RunFinished {
+                outcome,
+                reason: Some(reason),
+                ..
+            } => {
+                assert_eq!(outcome, "timed_out");
+                assert!(reason.contains("tool warning"), "{reason}");
+            }
+            other => panic!("unexpected terminal record: {other:?}"),
+        }
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_deadline_keeps_the_native_failure_cause_instead_of_only_timing_out() {
+        let root = scratch_root("engine-deadline-cause");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        run::write_native_progress(
+            &run_dir,
+            "retrying",
+            "the native provider reported: synthetic status 500",
+            false,
+            None,
+        )
+        .expect("the native progress record");
+        tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
+        let board = engine.board();
+        match board.agents[0].recent.last() {
+            Some(SessionEnd::Failed { reason }) => {
+                assert!(reason.contains("500"), "the cause was lost: {reason}");
+            }
+            other => panic!("a failing harness was recorded only as {other:?}"),
+        }
+        let stop: run::RunStopped = serde_json::from_str(
+            &fs::read_to_string(run_dir.join(run::STOPPED_FILE)).expect("stop record"),
+        )
+        .expect("stop record JSON");
+        assert!(stop.reason.contains("500"), "{}", stop.reason);
+        let terminal = crate::transcript::terminal_record(&run_dir).expect("terminal record");
+        assert!(
+            matches!(
+                &terminal,
+                crate::transcript::Record::RunFinished { outcome, .. } if outcome == "failed"
+            ),
+            "the terminal record lost the failure: {terminal:?}"
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5193,7 +6870,7 @@ mod tests {
     impl Drop for RealChild {
         fn drop(&mut self) {
             if self.exited.is_none() {
-                self.signal(true);
+                crate::engine::session::RunningSession::signal(self, true);
                 let _ = self.child.wait();
             }
         }
@@ -5204,15 +6881,18 @@ mod tests {
             &self,
             request: &crate::engine::session::SessionRequest,
         ) -> Result<crate::engine::session::PreparedSession, String> {
-            crate::engine::session::ensure_run_dir(&request.run_dir)?;
+            let guard =
+                crate::run::Owner::prepare(&request.run_dir, &request.run_id, &request.workspace)?;
             Ok(crate::engine::session::PreparedSession {
                 run_dir: request.run_dir.clone(),
                 workspace: request.workspace.clone(),
+                guard,
             })
         }
         fn spawn_with(
             &self,
-            prepared: &crate::engine::session::PreparedSession,
+            run_dir: &std::path::Path,
+            workspace: &std::path::Path,
             on_spawn: &mut dyn FnMut(u32),
         ) -> Result<Box<dyn crate::engine::session::RunningSession>, String> {
             use std::os::unix::process::CommandExt;
@@ -5226,27 +6906,26 @@ mod tests {
                 .map_err(|error| format!("the real child cannot start: {error}"))?;
             let pid = child.id();
             crate::mode::write_private(
-                prepared.run_dir.join(crate::engine::session::PID_FILE),
+                run_dir.join(crate::engine::session::PID_FILE),
                 pid.to_string().as_bytes(),
             )
             .map_err(|error| format!("the pid cannot be written: {error}"))?;
             crate::mode::write_private(
-                prepared.run_dir.join(crate::run::PGID_FILE),
+                run_dir.join(crate::run::PGID_FILE),
                 pid.to_string().as_bytes(),
             )
             .map_err(|error| format!("the group cannot be written: {error}"))?;
-            let mut transcript = crate::transcript::Transcript::open(&prepared.run_dir)
+            let mut transcript = crate::transcript::Transcript::open(run_dir)
                 .map_err(|error| format!("the transcript cannot open: {error}"))?;
             transcript
                 .append(&crate::transcript::Record::run_started(
-                    prepared
-                        .run_dir
+                    run_dir
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("run"),
                     "agent-1",
                     pid,
-                    &prepared.workspace.display().to_string(),
+                    &workspace.display().to_string(),
                 ))
                 .map_err(|error| format!("the start record cannot be written: {error}"))?;
             on_spawn(pid);
@@ -5485,6 +7164,206 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_during_prepare_records_a_no_child_ending() {
+        let root = scratch_root("engine-stop-before-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (prepared_rx, release) = fake.block_next_prepare();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        prepared_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session prepared its run directory");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop before spawn");
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let terminal = crate::transcript::terminal_record(&run_dir)
+            .expect("a prepared run cancelled before spawn has no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        assert!(fake.live().is_empty(), "a child was spawned after the stop");
+    }
+
+    #[test]
+    fn a_shutdown_during_prepare_records_a_no_child_ending() {
+        let root = scratch_root("engine-shutdown-before-spawn");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (prepared_rx, release) = fake.block_next_prepare();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        prepared_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session prepared its run directory");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        std::thread::scope(|scope| {
+            let shutdown = scope.spawn(|| engine.shutdown(Duration::ZERO));
+            let _ = release.send(());
+            shutdown.join().expect("shutdown");
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let terminal = crate::transcript::terminal_record(&run_dir)
+            .expect("a prepared run shut down before spawn has no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        assert!(fake.live().is_empty(), "a child was spawned after shutdown");
+    }
+
+    #[test]
+    fn a_spawn_error_leaves_an_ending() {
+        let root = scratch_root("engine-spawn-error-ending");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_spawn("the session process could not be started: fixture");
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut run_dir = None;
+        while Instant::now() < deadline {
+            run_dir = fake.last_run_dir();
+            if run_dir
+                .as_ref()
+                .is_some_and(|dir| crate::transcript::terminal_record(dir).is_some())
+            {
+                break;
+            }
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let run_dir = run_dir.expect("the run directory");
+        assert!(
+            crate::transcript::terminal_record(&run_dir).is_some(),
+            "a spawn error left no ending"
+        );
+        assert!(fake.live().is_empty());
+    }
+
+    #[test]
+    fn a_prepare_error_after_the_run_directory_gets_an_ending() {
+        let root = scratch_root("engine-prepare-error-ending");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_prepare_after_dir("the workspace could not be prepared");
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut run_dir = None;
+        while Instant::now() < deadline {
+            run_dir = fake.last_run_dir();
+            if run_dir
+                .as_ref()
+                .is_some_and(|dir| crate::transcript::terminal_record(dir).is_some())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let run_dir = run_dir.expect("prepare created a run directory");
+        let terminal =
+            crate::transcript::terminal_record(&run_dir).expect("a failed prepare left no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+        assert!(
+            fake.live().is_empty(),
+            "a child was spawned after the failure"
+        );
+    }
+
+    #[test]
+    fn a_prepare_error_with_the_agent_removed_still_gets_an_ending() {
+        let root = scratch_root("engine-prepare-error-removed");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_prepare_after_dir("the workspace could not be prepared");
+        let (prepared_rx, release) = fake.block_next_prepare();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        prepared_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session prepared its run directory");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents.clear();
+        }
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let terminal = crate::transcript::terminal_record(&run_dir)
+            .expect("a prepare error with the agent removed left no ending");
+        match terminal {
+            crate::transcript::Record::RunFinished { outcome, .. } => {
+                assert_eq!(outcome, "stopped")
+            }
+            _ => panic!("not a terminal"),
+        }
+        assert!(run_dir.join(run::STOPPED_FILE).is_file());
+    }
+
+    #[test]
+    fn a_spawn_error_after_the_pid_is_reported_still_gets_an_ending() {
+        let root = scratch_root("engine-spawn-error-after-pid");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        fake.fail_spawn_after_block("the child could not be handed over");
+        let (pid_rx, release) = fake.block_next_spawn();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _pid = pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake reported the child");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents.clear();
+        }
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::transcript::terminal_record(&run_dir).is_some(),
+            "a spawn error after the pid report left no ending"
+        );
+    }
+
+    #[test]
     fn a_removal_during_spawn_settles_the_child_it_already_created() {
         let root = scratch_root("engine-remove-session-spawn");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
@@ -5526,6 +7405,39 @@ mod tests {
             engine.board().agents.is_empty(),
             "the removed agent came back"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_removal_fact_failure_stops_the_child_but_records_uncertainty() {
+        let root = scratch_root("engine-remove-session-fact-fail");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let (pid_rx, release) = fake.block_next_spawn();
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        let pid = pid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the fake session reached its child");
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        fs::create_dir(run_dir.join(run::FIRST_ENDING_FILE)).expect("the obstructed fact");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            assert!(inner.settings.remove_agent("agent-1"));
+            inner.agents.clear();
+        }
+        let _ = release.send(());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!fake.is_live(pid), "the removed agent's child survived");
+        assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
+        assert!(!run_dir.join(run::STOPPED_FILE).is_file());
+        let error = run::recover_ending(&run_dir, Duration::from_millis(20))
+            .expect_err("the uncertain run must not recover cleanly");
+        assert!(error.contains("uncertain"), "{error}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -5583,6 +7495,13 @@ mod tests {
         let board = engine.board();
         assert!(matches!(board.agents[0].session, SessionState::Idle));
         let run_dir = fake.last_run_dir().expect("the spawned run directory");
+        // `settle_ending` writes the durable ending on the session thread just after
+        // the child is reaped; the liveness check above is not a write barrier.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "shutdown during spawn left no durable ending"
@@ -5651,7 +7570,7 @@ mod tests {
         fs::create_dir_all(&run_dir).expect("the run directory");
         let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0001",
                 crate::run::RunOutcome::Failed,
                 Some(1),
@@ -5741,7 +7660,7 @@ mod tests {
         fs::create_dir_all(&run_dir).expect("the run directory");
         let mut transcript = crate::transcript::Transcript::open(&run_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0001",
                 crate::run::RunOutcome::NoWork,
                 Some(0),
@@ -5760,7 +7679,7 @@ mod tests {
         let mut transcript =
             crate::transcript::Transcript::open(&refused_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0002",
                 crate::run::RunOutcome::Refused,
                 Some(0),
@@ -5777,7 +7696,7 @@ mod tests {
         let mut transcript =
             crate::transcript::Transcript::open(&warned_dir).expect("the transcript");
         transcript
-            .append(&crate::transcript::Record::run_finished(
+            .append(&crate::run::terminal_record_for_test(
                 "run-1700000000000-0003",
                 crate::run::RunOutcome::Warned,
                 Some(0),
@@ -5799,5 +7718,784 @@ mod tests {
             REPOSITORY_REFRESH <= Duration::from_secs(2),
             "the board can stay stale for {REPOSITORY_REFRESH:?}"
         );
+    }
+    #[test]
+    fn f2_a_failed_stop_save_still_stops_and_does_not_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f2-stop-save");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("the settings file is read-only");
+        let result = engine.send(Command::Stop {
+            name: "agent-1".to_owned(),
+        });
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("the settings file is writable again");
+        assert!(result.is_err(), "the failed save was reported as success");
+        assert!(result.unwrap_err().contains("was stopped, but"));
+        for _ in 0..5 {
+            tick(&mut engine, &clock, Duration::from_secs(1));
+        }
+        assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
+        assert!(fake.live().is_empty());
+        assert_eq!(engine.board().agents[0].desired, Desired::Stopped);
+    }
+
+    #[test]
+    fn f2_a_failed_remove_save_still_stops_and_keeps_the_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f2-remove-save");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("the settings file is read-only");
+        let result = engine.send(Command::RemoveAgent {
+            name: "agent-1".to_owned(),
+        });
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("the settings file is writable again");
+        assert!(
+            result.is_err(),
+            "the failed removal was reported as success"
+        );
+        assert!(result.unwrap_err().contains("was stopped, but the removal"));
+        for _ in 0..5 {
+            tick(&mut engine, &clock, Duration::from_secs(1));
+        }
+        assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
+        assert!(fake.live().is_empty());
+        assert_eq!(
+            engine.board().agents.len(),
+            1,
+            "the agent was removed anyway"
+        );
+        assert_eq!(engine.board().agents[0].desired, Desired::Stopped);
+    }
+
+    #[test]
+    fn f4r_a_marked_agent_is_not_scheduled_for_provisioning() {
+        let root = scratch_root("engine-f4r-provision");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        options.forgejo_ready = false;
+        let engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.forgejo.state = ForgejoState::Running;
+            inner.forgejo.provisioned = true;
+            inner.forgejo.admin_token = Some(Secret::new("admin"));
+            inner.agents[0].provisioning = Provisioning::Failed {
+                reason: "cancelled".to_owned(),
+            };
+            inner.agents[0].removal_pending = false;
+        }
+        write_removal_marker(&lock_inner(&engine.inner), "agent-1").expect("marker");
+        let jobs = lock_inner(&engine.inner).due_jobs(Instant::now());
+        assert!(
+            !jobs
+                .iter()
+                .any(|job| matches!(job, Job::ProvisionAgent(name) if name == "agent-1")),
+            "a marked agent was scheduled for provisioning"
+        );
+    }
+
+    #[test]
+    fn f4r_a_reopen_restores_the_marked_block_and_never_provisions() {
+        let root = scratch_root("engine-f4r-reopen");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let layout = Layout::rooted_at(root.clone()).expect("layout");
+        let state_dir = layout
+            .agent("agent-1")
+            .expect("agent paths")
+            .state_dir()
+            .to_path_buf();
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        crate::mode::write_private(state_dir.join("removal-pending"), b"removal pending\n")
+            .expect("marker");
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        options.forgejo_ready = false;
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_for_test(options, Arc::new(FakeClock::new()), fake.clone(), settings)
+            .expect("the engine opens");
+        {
+            let inner = lock_inner(&engine.inner);
+            assert!(matches!(
+                inner.agents[0].session,
+                SessionState::Blocked { .. }
+            ));
+        }
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.forgejo.state = ForgejoState::Running;
+            inner.forgejo.provisioned = true;
+            inner.forgejo.admin_token = Some(Secret::new("admin"));
+            let jobs = inner.due_jobs(Instant::now());
+            assert!(
+                !jobs
+                    .iter()
+                    .any(|job| matches!(job, Job::ProvisionAgent(name) if name == "agent-1")),
+                "a reopened marked agent was scheduled for provisioning"
+            );
+        }
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Start returns without starting");
+        assert_eq!(fake.counts().1, 0, "a reopened marked agent started");
+    }
+
+    #[test]
+    fn f4t_removal_waits_for_an_inflight_provisioning_job() {
+        let root = scratch_root("engine-f4t-serialized-identity");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let engine = open_test_engine(&root, settings, clock, fake);
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents[0].removal_pending = true;
+            inner.agents[0].provision_inflight = true;
+            let jobs = inner.due_jobs(Instant::now());
+            assert!(
+                !jobs
+                    .iter()
+                    .any(|job| matches!(job, Job::RemoveAgent(name) if name == "agent-1")),
+                "removal ran while provisioning owned the identity"
+            );
+            inner.agents[0].provision_inflight = false;
+            let jobs = inner.due_jobs(Instant::now());
+            assert!(
+                jobs.iter()
+                    .any(|job| matches!(job, Job::RemoveAgent(name) if name == "agent-1")),
+                "removal was not queued after provisioning finished"
+            );
+        }
+    }
+
+    #[test]
+    fn f4s_an_active_removal_marker_failure_reports_the_stop() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f4s-active-marker");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let state_dir = Layout::rooted_at(root.clone())
+            .expect("layout")
+            .agent("agent-1")
+            .expect("agent paths")
+            .state_dir()
+            .to_path_buf();
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        let marker = state_dir.join("removal-pending");
+        std::fs::write(&marker, b"blocked\n").expect("marker");
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only marker");
+        engine
+            .send(Command::RemoveAgent {
+                name: "agent-1".to_owned(),
+            })
+            .expect("RemoveAgent");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let note = loop {
+            let inner = lock_inner(&engine.inner);
+            if let Some(note) = inner.notice.clone()
+                && note.contains("could not be removed")
+            {
+                break note;
+            }
+            if Instant::now() >= deadline {
+                panic!("the marker failure was not noted");
+            }
+            drop(inner);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(note.contains("was stopped and left stopped"), "{note}");
+        assert!(
+            note.contains("sign-in and account were not changed"),
+            "{note}"
+        );
+        assert!(note.contains("start it again or retry Remove"), "{note}");
+        let inner = lock_inner(&engine.inner);
+        assert_eq!(inner.agents[0].desired, Desired::Stopped);
+        assert!(inner.agents[0].running.is_none());
+        assert!(!inner.agents[0].removal_pending);
+    }
+
+    #[test]
+    fn f4r_a_marker_write_failure_changes_nothing_and_start_still_runs() {
+        let root = scratch_root("engine-f4r-marker-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents[0].removal_pending = true;
+        }
+        let state_dir = Layout::rooted_at(root.clone())
+            .expect("layout")
+            .agent("agent-1")
+            .expect("agent paths")
+            .state_dir()
+            .to_path_buf();
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir).expect("clear state dir");
+        }
+        std::fs::write(&state_dir, b"not a directory").expect("blocking file");
+        remove_agent_job(Arc::clone(&engine.inner), "agent-1".to_owned());
+        {
+            let inner = lock_inner(&engine.inner);
+            assert_eq!(inner.agents.len(), 1);
+            assert!(!inner.agents[0].removal_pending);
+            assert!(
+                !matches!(inner.agents[0].session, SessionState::Blocked { .. }),
+                "a failed marker write left the agent blocked"
+            );
+            assert!(
+                inner.notice.as_deref().is_some_and(|note| {
+                    note.contains("was stopped and left stopped")
+                        && note.contains("could not be removed")
+                }),
+                "{:?}",
+                inner.notice
+            );
+        }
+        std::fs::remove_file(&state_dir).expect("blocking file");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Start after the failed marker");
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+    }
+
+    #[test]
+    fn f4_a_failed_removal_save_blocks_and_a_retry_completes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f4-removal");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents[0].login = None;
+        }
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only settings");
+        remove_agent_job(Arc::clone(&engine.inner), "agent-1".to_owned());
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("writable settings");
+        {
+            let inner = lock_inner(&engine.inner);
+            assert_eq!(inner.agents.len(), 1);
+            assert!(matches!(
+                inner.agents[0].session,
+                SessionState::Blocked { .. }
+            ));
+            assert!(
+                inner
+                    .notice
+                    .as_deref()
+                    .is_some_and(|note| note.contains("already cancelled"))
+            );
+        }
+        assert!(
+            engine
+                .send(Command::Start {
+                    name: "agent-1".to_owned()
+                })
+                .is_ok()
+        );
+        assert_eq!(fake.counts().1, 0, "a blocked cancelled identity started");
+        remove_agent_job(Arc::clone(&engine.inner), "agent-1".to_owned());
+        {
+            let inner = lock_inner(&engine.inner);
+            assert!(
+                inner.agents.is_empty(),
+                "the retry did not complete the removal"
+            );
+        }
+    }
+
+    #[test]
+    fn f5_a_failed_remove_save_says_the_stop_will_not_survive_reopen() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f5-remove-reopen");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only settings");
+        let result = engine.send(Command::RemoveAgent {
+            name: "agent-1".to_owned(),
+        });
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("writable settings");
+        let error = result.expect_err("the failed removal was reported as success");
+        assert!(
+            error.contains("will start again the next time the program opens"),
+            "{error}"
+        );
+        drop(engine);
+        let persisted = settings::Settings::load(&settings_file).expect("load");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut reopened =
+            open_test_engine(&root, persisted, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut reopened, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+    }
+
+    #[test]
+    fn f2_a_failed_endpoint_commit_restores_the_previous_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f2-endpoint-key");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let layout = Layout::rooted_at(root.clone()).expect("layout");
+        let credentials_path = layout.credentials_file();
+        let before = credentials::model_key(&credentials_path, "")
+            .expect("the previous key")
+            .expose()
+            .to_owned();
+        let settings_file = settings::path_in(&root);
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o400))
+            .expect("the settings file is read-only");
+        let result = engine_send_with_settings(
+            &root,
+            settings,
+            Command::SetEndpoint {
+                url: "http://127.0.0.1:9/v1/chat/completions".to_owned(),
+                model: "new-model".to_owned(),
+                key: Some("new-key".to_owned()),
+            },
+        );
+        std::fs::set_permissions(&settings_file, std::fs::Permissions::from_mode(0o600))
+            .expect("the settings file is writable again");
+        assert!(result.is_err(), "the failed endpoint commit succeeded");
+        let after = credentials::model_key(&credentials_path, "")
+            .expect("the key after rollback")
+            .expose()
+            .to_owned();
+        assert_eq!(after, before, "the new key was left on the old endpoint");
+    }
+
+    fn engine_send_with_settings(
+        root: &Path,
+        settings: Settings,
+        command: Command,
+    ) -> Result<(), String> {
+        let mut options = test_options(root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )?;
+        engine.send(command)
+    }
+
+    #[test]
+    fn f1_a_failed_program_choice_is_not_persisted_by_the_next_save() {
+        let root = scratch_root("engine-f1-program-rollback");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        settings.endpoint.url.clear();
+        settings.endpoint.model.clear();
+        settings
+            .save(&settings::path_in(&root))
+            .expect("the cleared endpoint saves");
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        assert_eq!(engine.board().agents[0].program, "builtin");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "codex".to_owned(),
+            protocol: None,
+        });
+        assert!(result.is_err(), "the unconfigured program choice succeeded");
+        assert_eq!(engine.board().agents[0].program, "builtin");
+        engine
+            .send(Command::SetEndpoint {
+                url: "http://127.0.0.1:9/v1/chat/completions".to_owned(),
+                model: "fixture".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("the later endpoint save");
+        assert_eq!(
+            engine.board().agents[0].program,
+            "builtin",
+            "the next save persisted the rejected program"
+        );
+    }
+
+    #[test]
+    fn a_failed_endpoint_key_leaves_the_live_endpoint_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-endpoint-key-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let before = engine.board().endpoint.clone();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+            .expect("the root becomes read-only");
+        let result = engine.send(Command::SetEndpoint {
+            url: "http://127.0.0.1:9/v1/chat/completions".to_owned(),
+            model: "new-model".to_owned(),
+            key: Some("new-key".to_owned()),
+        });
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("the root is writable again");
+        assert!(result.is_err(), "the failed key was reported as success");
+        assert_eq!(engine.board().endpoint.url, before.url);
+        assert_eq!(engine.board().endpoint.model, before.model);
+    }
+
+    #[test]
+    fn c5_a_settings_save_failure_restores_the_prior_program_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-c5-settings-failure");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "chat-completions".to_owned(),
+                model: "fixture".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("the fixture model saves");
+        let before = engine.board().agents[0].program.clone();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+            .expect("the root becomes read-only");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "pi".to_owned(),
+            protocol: Some("chat-completions".to_owned()),
+        });
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("the root is writable again");
+        assert!(result.is_err(), "the save failure was reported as success");
+        assert_eq!(engine.board().agents[0].program, before);
+    }
+    #[test]
+    fn c6_key_snapshot_write_failure_rolls_back_program_and_other_agents() {
+        let root = scratch_root("engine-c6-key-failure");
+        let settings = write_ready(
+            &root,
+            &[("agent-1", Desired::Stopped), ("agent-2", Desired::Stopped)],
+        );
+        let layout = Layout::rooted_at(root.clone()).expect("layout");
+        let mut options = test_options(&root);
+        options.confinement = crate::confinement::Method::None;
+        let mut engine = open_for_test(
+            options,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            settings,
+        )
+        .expect("the engine opens");
+        let credentials = layout.credentials_file();
+        let mut root: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&credentials).expect("credentials read"))
+                .expect("credentials parse");
+        root.as_table_mut().expect("table").remove("model_keys");
+        crate::mode::write_private(
+            &credentials,
+            toml::to_string_pretty(&root)
+                .expect("credentials serialise")
+                .as_bytes(),
+        )
+        .expect("credentials without per-agent keys");
+        credentials::record_secret(&credentials, None, "model_key", "fixture-default-key")
+            .expect("default key");
+        let before_one = engine.board().agents[0].program.clone();
+        let before_two = engine.board().agents[1].program.clone();
+        let before_provider = engine.inner.lock().expect("inner").settings.agents[0]
+            .provider
+            .clone();
+        let before_other_provider = engine.inner.lock().expect("inner").settings.agents[1]
+            .provider
+            .clone();
+        std::fs::set_permissions(
+            &credentials,
+            std::os::unix::fs::PermissionsExt::from_mode(0o400),
+        )
+        .expect("credentials become read-only");
+        let result = engine.send(Command::SetAgentProgram {
+            name: "agent-1".to_owned(),
+            program: "pi".to_owned(),
+            protocol: Some("chat-completions".to_owned()),
+        });
+        let _ = std::fs::set_permissions(
+            &credentials,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        );
+        assert!(
+            result.is_err(),
+            "key snapshot failure was reported as success"
+        );
+        assert_eq!(engine.board().agents[0].program, before_one);
+        assert_eq!(engine.board().agents[1].program, before_two);
+        assert_eq!(
+            engine.inner.lock().expect("inner").settings.agents[0].provider,
+            before_provider
+        );
+        assert_eq!(
+            engine.inner.lock().expect("inner").settings.agents[1].provider,
+            before_other_provider
+        );
+        let saved = Settings::load(&settings::path_in(layout.root())).expect("durable settings");
+        assert_eq!(saved.agents[0].harness(), Program::Builtin);
+        assert_eq!(saved.agents[0].provider, before_provider);
+        assert_eq!(saved.agents[1].provider, before_other_provider);
+        assert!(
+            credentials::agent_model_key(&credentials, "agent-1")
+                .expect("key read")
+                .is_none(),
+            "an explicit agent key appeared after the failed snapshot"
+        );
+        assert_eq!(
+            credentials::model_key(&credentials, "agent-1")
+                .expect("default key")
+                .expose(),
+            "fixture-default-key"
+        );
+    }
+
+    struct ResetTestArtifact;
+
+    impl Drop for ResetTestArtifact {
+        fn drop(&mut self) {
+            crate::harness::set_test_artifact(None, None);
+        }
+    }
+
+    #[test]
+    fn shutdown_cancels_a_running_install_and_keeps_the_old_version() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_root("engine-install-shutdown");
+        let install = root.join("data/harnesses/pi/1.4.0");
+        fs::create_dir_all(install.join("pi")).expect("the old install");
+        let old_binary = install.join("pi/pi");
+        fs::write(&old_binary, "#!/bin/sh\necho old-pi\n").expect("the old binary");
+        fs::set_permissions(&old_binary, fs::Permissions::from_mode(0o755))
+            .expect("the old binary mode");
+        fs::write(
+            install.join("install.json"),
+            r#"{"program":"pi","version":"1.3.9","sha256":"fixture","license":"MIT","entrypoint":"pi/pi","resources":null,"installed_at":"2026-10-23T00:00:00.000Z"}"#,
+        )
+        .expect("the old record");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("the loopback address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => {
+                        request.extend_from_slice(&buffer[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let body = vec![3u8; 2 * 1024 * 1024];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            for part in body.chunks(4096) {
+                if stream.write_all(part).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let _reset = ResetTestArtifact;
+        crate::harness::set_test_artifact(
+            Some(&format!("http://{address}/package")),
+            Some(&"0".repeat(64)),
+        );
+
+        let mut engine = open_for_test(
+            test_options(&root),
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+            Settings::default(),
+        )
+        .expect("the test engine opens");
+        engine
+            .send(Command::InstallProgram {
+                id: "pi".to_owned(),
+            })
+            .expect("the install starts");
+        let harness_dir = root.join("data/harnesses/pi");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut downloading = false;
+        while Instant::now() < deadline {
+            if let Ok(entries) = fs::read_dir(&harness_dir) {
+                downloading = entries.flatten().any(|entry| {
+                    let stage = entry.path();
+                    stage
+                        .file_name()
+                        .map(|name| name.to_string_lossy().starts_with(".stage-"))
+                        .unwrap_or(false)
+                        && fs::metadata(stage.join("pi.tar.part"))
+                            .map(|metadata| metadata.len() > 0)
+                            .unwrap_or(false)
+                });
+            }
+            if downloading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(downloading, "the install did not reach the download");
+
+        let started = Instant::now();
+        engine.shutdown(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown waited for the whole download"
+        );
+        assert_eq!(
+            fs::read_to_string(&old_binary).expect("the old binary"),
+            "#!/bin/sh\necho old-pi\n"
+        );
+        let stages: Vec<_> = fs::read_dir(&harness_dir)
+            .expect("the harness directory")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".stage-"))
+            .collect();
+        assert!(stages.is_empty(), "a canceled stage survived shutdown");
+    }
+    #[test]
+    fn below_start_block_reasons_never_report_started() {
+        type Mutation = fn(&mut Settings);
+        let cases: [(&str, Mutation); 4] = [
+            ("neg-provider", |settings| settings.endpoint.url.clear()),
+            ("neg-key", |settings| {
+                settings.agents[0].harness = "builtin".to_owned()
+            }),
+            ("neg-program", |settings| {
+                settings.agents[0].harness = "codex".to_owned()
+            }),
+            ("neg-unknown", |settings| {
+                settings.agents[0].harness = "potato".to_owned()
+            }),
+        ];
+        for (name, mutate) in cases {
+            let root = scratch_root(name);
+            let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+            mutate(&mut settings);
+            settings
+                .save(&settings::path_in(
+                    Layout::rooted_at(root.clone())
+                        .expect("the test layout is absolute")
+                        .root(),
+                ))
+                .expect("settings");
+            let clock = Arc::new(FakeClock::new());
+            let fake = Arc::new(FakeSpawner::new());
+            let mut engine = open_test_engine(&root, settings, clock, fake.clone());
+            if name == "neg-key" {
+                let _ = std::fs::remove_file(
+                    Layout::rooted_at(root.clone())
+                        .expect("layout")
+                        .credentials_file(),
+                );
+            }
+            engine
+                .send(Command::Start {
+                    name: "agent-1".to_owned(),
+                })
+                .expect("Start is accepted");
+            assert_eq!(fake.counts().1, 0, "{name} started a session");
+            let board = engine.board();
+            match &board.agents[0].session {
+                SessionState::Blocked { reason } => assert!(
+                    reason.contains("model")
+                        || reason.contains("installed")
+                        || reason.contains("unknown"),
+                    "{name}: {reason}"
+                ),
+                other => panic!("{name}: expected Blocked, got {other:?}"),
+            }
+            if name == "neg-unknown" {
+                assert!(
+                    board.agents[0].program_label.contains("potato"),
+                    "{}",
+                    board.agents[0].program_label
+                );
+            }
+        }
     }
 }

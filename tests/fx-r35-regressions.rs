@@ -192,12 +192,14 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
     wait_for_shell(&run_dir, pgid);
     stop_group(pgid);
     wait_child(&mut supervisor);
-    let settled = run::settle_run(
+    let settled = run::request_finish(
         &run_dir,
         pgid,
         run::RunOutcome::Stopped,
         Some("the run was stopped on request".to_owned()),
         Duration::from_secs(3),
+        Some("the run was stopped on request".to_owned()),
+        run::FirstEnding::Stop,
     )
     .expect("the normal stop settles");
     let _ = settled;
@@ -224,7 +226,7 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
         );
     }
     assert_eq!(
-        run::reap_leftover_run(&run_dir, Duration::from_millis(100)),
+        run::recover_ending(&run_dir, Duration::from_millis(100)),
         Ok(false),
         "a cleanly stopped run was reported as uncertain"
     );
@@ -250,7 +252,7 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
         terminal(&old).is_none(),
         "the control unexpectedly wrote an ending"
     );
-    let error = run::reap_leftover_run(&old, Duration::from_millis(100))
+    let error = run::recover_ending(&old, Duration::from_millis(100))
         .expect_err("an ending-less started run must stay uncertain");
     assert!(
         error.contains("cleanup unverified") && error.contains("cannot be verified"),
@@ -283,7 +285,7 @@ fn a_killed_product_reopen_reaps_the_real_sleeping_child_and_records_its_ending(
         !group_members(pgid).is_empty(),
         "the killed supervisor's shell did not survive; the reopen cannot be proven"
     );
-    let reaped = run::reap_leftover_run(&run_dir, Duration::from_secs(3)).expect("the reopen reap");
+    let reaped = run::recover_ending(&run_dir, Duration::from_secs(3)).expect("the reopen reap");
     assert!(reaped, "the left-over group was not reported as reaped");
     assert!(
         group_members(pgid).is_empty(),
@@ -320,12 +322,14 @@ fn a_killed_product_reopen_reaps_the_real_sleeping_child_and_records_its_ending(
     );
     stop_group(next_pgid);
     wait_child(&mut next_supervisor);
-    let _ = run::settle_run(
+    let _ = run::request_finish(
         &next,
         next_pgid,
         run::RunOutcome::Stopped,
         Some("test cleanup".to_owned()),
         Duration::from_secs(3),
+        Some("test cleanup".to_owned()),
+        run::FirstEnding::Stop,
     );
     let _ = fs::remove_dir_all(&root);
 }
@@ -353,7 +357,7 @@ fn an_interrupted_ending_write_keeps_the_handles_and_is_retried() {
     run::write_shell_record(&run_dir, pid, pid).expect("the shell identity record");
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o555))
         .expect("the run directory becomes read-only");
-    let error = run::reap_leftover_run(&run_dir, Duration::from_millis(300))
+    let error = run::recover_ending(&run_dir, Duration::from_millis(300))
         .expect_err("an ending that cannot be written is a cleanup failure");
     assert!(
         error.contains("cannot be written"),
@@ -373,7 +377,7 @@ fn an_interrupted_ending_write_keeps_the_handles_and_is_retried() {
     );
     fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
         .expect("the run directory is repaired");
-    let retried = run::reap_leftover_run(&run_dir, Duration::from_millis(300))
+    let retried = run::recover_ending(&run_dir, Duration::from_millis(300))
         .expect("the repaired retry writes the ending");
     assert!(!retried, "the second pass reported a live group");
     assert!(
@@ -597,10 +601,26 @@ fn board_view(_run_dir: &Path, outcome: &str, reason: &str) -> BoardView {
             no_assigned_work: false,
             last_work_result: None,
             last_result_is_work: false,
+            program: "builtin".to_owned(),
+            program_label: "built-in engine".to_owned(),
+            unknown_program: None,
+            program_installed: true,
+            program_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            protocol: "chat-completions".to_owned(),
+            base_url: "https://model.example/v1".to_owned(),
+            model: "demo".to_owned(),
+            key_present: true,
+            program_error: None,
+            active_program: None,
+            next_program: None,
+            codex_sandbox: None,
         }],
+        programs: Vec::new(),
         endpoint: gewu_multiverse::engine_api::EndpointView {
             configured: true,
             url: "https://model.example/v1/chat/completions".to_owned(),
+            base_url: "https://model.example/v1".to_owned(),
+            protocol: "chat-completions".to_owned(),
             model: "demo".to_owned(),
             key_present: true,
             test: gewu_multiverse::engine_api::EndpointTest::NotRun,
@@ -794,12 +814,10 @@ fn a_terminal_outcome_does_not_clear_unverified_capability_evidence() {
             "/tmp",
         ))
         .expect("typed started");
-    transcript::record_outcome_if_missing(
+    run::ensure_terminal_for_test(
         &run_dir,
-        "run-1700000100009-0001",
         run::RunOutcome::Succeeded,
         Some("the supervisor ended".to_owned()),
-        0,
     )
     .expect("typed ending");
     // An unrelated live process must stay untouched while the capability evidence is
@@ -813,7 +831,7 @@ fn a_terminal_outcome_does_not_clear_unverified_capability_evidence() {
         .spawn()
         .expect("unrelated child");
     let unrelated_pid = unrelated.id();
-    let result = run::reap_leftover_run(&run_dir, Duration::from_millis(150));
+    let result = run::recover_ending(&run_dir, Duration::from_millis(150));
     let unrelated_alive = unrelated.try_wait().expect("status").is_none();
     let capability_retained = run_dir.join(run::SHELL_CAPABILITY_FILE).is_file();
     let false_marker = run_dir.join(run::STOPPED_FILE).is_file();
