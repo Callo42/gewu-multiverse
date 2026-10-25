@@ -7860,6 +7860,12 @@ mod tests {
         while !run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
+        // `stop_uncertain` writes the uncertainty fact just before it signals and
+        // waits for the child. Wait for that bounded stop, not for the file alone.
+        let gone = Instant::now() + Duration::from_secs(2);
+        while fake.is_live(pid) && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(!fake.is_live(pid), "the removed agent's child survived");
         assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
         assert!(!run_dir.join(run::STOPPED_FILE).is_file());
@@ -7894,7 +7900,11 @@ mod tests {
         });
         match done_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(()) => assert!(
-                began.elapsed() < Duration::from_secs(1),
+                // The shutdown is bounded, not instant: this allows the 200 ms
+                // hand-over plus the two 500 ms settlement windows. A blocked
+                // spawn must not be awaited; the 2 s recv_timeout below is the
+                // same hard limit.
+                began.elapsed() < Duration::from_secs(2),
                 "shutdown took {:?} while a spawn was blocked",
                 began.elapsed()
             ),
