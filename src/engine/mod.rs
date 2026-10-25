@@ -4491,8 +4491,11 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                 // provisioning/blocked state behind: the agent is exactly as it was
                 // before the Remove request, except that it is not auto-retried.
                 inner.agents[index].removal_pending = false;
+                // The notice is bounded at 600 bytes and repeats the marker path in
+                // `reason`. Put the fact a person must act on before that path so a
+                // long state root can shorten the reason but never lose the recovery.
                 inner.note(format!(
-                    "`{name}` was stopped and left stopped, but it could not be removed: {reason}; its Forgejo sign-in and account were not changed; start it again or retry Remove"
+                    "`{name}` was stopped and left stopped, but it could not be removed; its Forgejo sign-in and account were not changed; start it again or retry Remove: {reason}"
                 ));
             }
         }
@@ -8352,9 +8355,8 @@ mod tests {
     fn f4s_an_active_removal_marker_failure_reports_the_stop() {
         use std::os::unix::fs::PermissionsExt;
         // The removal notice repeats the marker path and is capped at 600 bytes by
-        // `forgejo_tools::sentence`. A long TMPDIR would cut the recovery sentence
-        // and this test would read a notice that says less, so own a short root (and
-        // still check every clause of the full notice below).
+        // `forgejo_tools::sentence`. A long state root would cut it short, so own a
+        // short root and still check every clause of the full notice below.
         let root = crate::test_support::short_scratch_root("engine-f4s-active-marker");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
         let clock = Arc::new(FakeClock::new());
@@ -8403,6 +8405,79 @@ mod tests {
             !note.ends_with('…'),
             "the removal notice was cut before its recovery sentence: {note}"
         );
+        let inner = lock_inner(&engine.inner);
+        assert_eq!(inner.agents[0].desired, Desired::Stopped);
+        assert!(inner.agents[0].running.is_none());
+        assert!(!inner.agents[0].removal_pending);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn f4s_a_long_state_root_keeps_the_removal_recovery_clause() {
+        use std::os::unix::fs::PermissionsExt;
+        // The notice repeats the marker path and is capped at 600 bytes by
+        // `forgejo_tools::sentence`. This state root is long enough to reach the
+        // cap, so the recovery clause must come before the repeated path.
+        let root = std::env::temp_dir().join(format!(
+            "gewu-multiverse-test-engine-f4s-long-notice-{}-{}",
+            std::process::id(),
+            "a".repeat(200)
+        ));
+        fs::create_dir_all(&root).expect("the long state root");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let state_dir = Layout::rooted_at(root.clone())
+            .expect("layout")
+            .agent("agent-1")
+            .expect("agent paths")
+            .state_dir()
+            .to_path_buf();
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        let marker = state_dir.join("removal-pending");
+        std::fs::write(&marker, b"blocked\n").expect("marker");
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only marker");
+        engine
+            .send(Command::RemoveAgent {
+                name: "agent-1".to_owned(),
+            })
+            .expect("RemoveAgent");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let note = loop {
+            let inner = lock_inner(&engine.inner);
+            if let Some(note) = inner.notice.clone()
+                && note.contains("could not be removed")
+            {
+                break note;
+            }
+            if Instant::now() >= deadline {
+                panic!("the marker failure was not noted");
+            }
+            drop(inner);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            note.len() <= 600,
+            "the notice exceeded its documented bound: {} bytes",
+            note.len()
+        );
+        assert!(
+            note.ends_with('…'),
+            "the long root did not reach the notice cap: {} bytes: {note}",
+            note.len()
+        );
+        assert!(note.contains("was stopped and left stopped"), "{note}");
+        assert!(
+            note.contains("sign-in and account were not changed"),
+            "{note}"
+        );
+        assert!(note.contains("start it again or retry Remove"), "{note}");
         let inner = lock_inner(&engine.inner);
         assert_eq!(inner.agents[0].desired, Desired::Stopped);
         assert!(inner.agents[0].running.is_none());
