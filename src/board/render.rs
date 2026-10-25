@@ -3831,6 +3831,7 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
         .iter()
         .find(|agent| agent.name == board.agent_name)
     {
+        let narrow = inner.width < 100;
         let describe = |view: &crate::engine_api::RunProgramView| {
             let version = if view.program == "builtin" {
                 "always ready"
@@ -3843,11 +3844,16 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
             };
             // Program and model first; the address is on the model screen. At 72 and
             // 80 columns the old line spent its width on half an address and cut the
-            // model before the person could read it.
-            format!(
-                "{} {} · {} · {}{}",
-                view.label, version, view.protocol, view.model, sandbox
-            )
+            // model before the person could read it. At the 72 floor the version and
+            // protocol step aside so the program, model and opt-out state all stay.
+            if narrow {
+                format!("{} · {}{}", view.label, view.model, sandbox)
+            } else {
+                format!(
+                    "{} {} · {} · {}{}",
+                    view.label, version, view.protocol, view.model, sandbox
+                )
+            }
         };
         let active = agent
             .active_program
