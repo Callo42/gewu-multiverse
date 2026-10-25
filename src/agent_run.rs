@@ -4157,8 +4157,16 @@ mod tests {
         max_turns: u32,
         steps: Vec<String>,
     ) -> RunPlan {
+        // Every test owns the private temporary root its shell makes: the root is
+        // named after the run id, so a fixed id made every test in this module share
+        // one root and one test's cleanup could remove another's askpass file.
+        let run_id = run_dir
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("the run directory is named by its run id")
+            .to_owned();
         let plan = RunPlan {
-            run_id: "run-1".to_owned(),
+            run_id,
             agent: "scribe".to_owned(),
             workspace: config.join("workspace"),
             instruction: config.join("instruction.md"),
@@ -4200,7 +4208,10 @@ mod tests {
     }
 
     fn run_dir(root: &Path) -> PathBuf {
-        let dir = root.join("state").join("scribe").join("run-1");
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let run_id = crate::run::new_run_id(SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1);
+        let dir = root.join("state").join("scribe").join(run_id);
         fs::create_dir_all(&dir).expect("run directory");
         dir
     }

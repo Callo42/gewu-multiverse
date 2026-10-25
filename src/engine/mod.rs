@@ -8351,7 +8351,11 @@ mod tests {
     #[test]
     fn f4s_an_active_removal_marker_failure_reports_the_stop() {
         use std::os::unix::fs::PermissionsExt;
-        let root = scratch_root("engine-f4s-active-marker");
+        // The removal notice repeats the marker path and is capped at 600 bytes by
+        // `forgejo_tools::sentence`. A long TMPDIR would cut the recovery sentence
+        // and this test would read a notice that says less, so own a short root (and
+        // still check every clause of the full notice below).
+        let root = crate::test_support::short_scratch_root("engine-f4s-active-marker");
         let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
         let clock = Arc::new(FakeClock::new());
         let fake = Arc::new(FakeSpawner::new());
@@ -8395,10 +8399,16 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("start it again or retry Remove"), "{note}");
+        assert!(
+            !note.ends_with('…'),
+            "the removal notice was cut before its recovery sentence: {note}"
+        );
         let inner = lock_inner(&engine.inner);
         assert_eq!(inner.agents[0].desired, Desired::Stopped);
         assert!(inner.agents[0].running.is_none());
         assert!(!inner.agents[0].removal_pending);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
