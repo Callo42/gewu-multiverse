@@ -3070,6 +3070,36 @@ struct Shell {
     refused: Option<String>,
 }
 
+// A test-only engine temp root for one shell.
+//
+// `Engine::open` removes `gewu-run-*` entries directly under `TMPDIR` when their
+// pid is not a `--run-agent` process. A shell prepared by a test is not such a
+// process, so a test that wants to keep a live shell while another test opens an
+// engine must put the shell under a root the cleanup does not scan. The override
+// is thread-local: it applies only to the shell the test prepares and never to a
+// product run.
+#[cfg(test)]
+thread_local! {
+    static TEST_ENGINE_TEMP: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `temp` as the engine temp root for shells prepared on this thread.
+#[cfg(test)]
+fn with_test_engine_temp<T>(temp: &Path, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<std::path::PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_ENGINE_TEMP.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let previous = TEST_ENGINE_TEMP.with(|slot| slot.replace(Some(temp.to_path_buf())));
+    let _restore = Restore(previous);
+    f()
+}
+
 impl Shell {
     /// Prepare the shell described by the plan. Nothing is created for an
     /// unconfined plan, so a host without a confinement keeps the old behaviour.
@@ -3109,7 +3139,11 @@ impl Shell {
             refused = Some("the Landlock sandbox is not enforced on this computer".to_owned());
         }
         let mut engine_temp = if method.confined() {
-            crate::confinement::resolved_temp()
+            #[cfg(test)]
+            let test_temp = TEST_ENGINE_TEMP.with(|slot| slot.borrow().clone());
+            #[cfg(not(test))]
+            let test_temp: Option<std::path::PathBuf> = None;
+            test_temp.or_else(crate::confinement::resolved_temp)
         } else {
             None
         };
@@ -4255,7 +4289,14 @@ mod tests {
         );
         plan.confinement = "landlock".to_owned();
         plan.hide = vec![config.clone(), root.join("state")];
-        let shell = Shell::prepare(&plan, &dir).expect("the confined shell prepares");
+        // `Engine::open` removes stale `gewu-run-*` trees directly under TMPDIR.
+        // This test process is not a `--run-agent` owner, so a concurrent engine
+        // would remove a live shell root there. Keep this shell under a private
+        // root that the cleanup does not scan; the assertions below are unchanged.
+        let private_temp = root.join("shell-temp");
+        fs::create_dir_all(&private_temp).expect("the private engine temp root");
+        let shell = with_test_engine_temp(&private_temp, || Shell::prepare(&plan, &dir))
+            .expect("the confined shell prepares");
         let askpass = shell.askpass.as_ref().expect("the run has a login file");
         let temp = shell.temp.as_ref().expect("the run has a private TMPDIR");
         // The file is under TMPDIR, which the Landlock path allows; the path beside
@@ -4281,6 +4322,8 @@ mod tests {
                 shell.hide
             );
         }
+        drop(shell);
+        let _ = fs::remove_dir_all(&private_temp);
     }
 
     #[test]
