@@ -4349,7 +4349,7 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                 // before the Remove request, except that it is not auto-retried.
                 inner.agents[index].removal_pending = false;
                 inner.note(format!(
-                    "`{name}` could not be removed: {reason}; nothing was changed"
+                    "`{name}` was stopped and left stopped, but it could not be removed: {reason}; its Forgejo sign-in and account were not changed; start it again or retry Remove"
                 ));
             }
         }
@@ -7893,6 +7893,59 @@ mod tests {
     }
 
     #[test]
+    fn f4s_an_active_removal_marker_failure_reports_the_stop() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("engine-f4s-active-marker");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let state_dir = Layout::rooted_at(root.clone())
+            .expect("layout")
+            .agent("agent-1")
+            .expect("agent paths")
+            .state_dir()
+            .to_path_buf();
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        let marker = state_dir.join("removal-pending");
+        std::fs::write(&marker, b"blocked\n").expect("marker");
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o400))
+            .expect("read-only marker");
+        engine
+            .send(Command::RemoveAgent {
+                name: "agent-1".to_owned(),
+            })
+            .expect("RemoveAgent");
+        tick(&mut engine, &clock, Duration::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let note = loop {
+            let inner = lock_inner(&engine.inner);
+            if let Some(note) = inner.notice.clone()
+                && note.contains("could not be removed")
+            {
+                break note;
+            }
+            if Instant::now() >= deadline {
+                panic!("the marker failure was not noted");
+            }
+            drop(inner);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(note.contains("was stopped and left stopped"), "{note}");
+        assert!(
+            note.contains("sign-in and account were not changed"),
+            "{note}"
+        );
+        assert!(note.contains("start it again or retry Remove"), "{note}");
+        let inner = lock_inner(&engine.inner);
+        assert_eq!(inner.agents[0].desired, Desired::Stopped);
+        assert!(inner.agents[0].running.is_none());
+        assert!(!inner.agents[0].removal_pending);
+    }
+
+    #[test]
     fn f4r_a_marker_write_failure_changes_nothing_and_start_still_runs() {
         let root = scratch_root("engine-f4r-marker-failure");
         let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
@@ -7923,10 +7976,10 @@ mod tests {
                 "a failed marker write left the agent blocked"
             );
             assert!(
-                inner
-                    .notice
-                    .as_deref()
-                    .is_some_and(|note| note.contains("nothing was changed")),
+                inner.notice.as_deref().is_some_and(|note| {
+                    note.contains("was stopped and left stopped")
+                        && note.contains("could not be removed")
+                }),
                 "{:?}",
                 inner.notice
             );
