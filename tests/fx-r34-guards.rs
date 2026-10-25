@@ -2477,7 +2477,7 @@ fn the_warnings_screen_is_one_compact_numbered_block_with_its_count() {
             "{width}x{height}: the count is not stated:\n{flat}"
         );
         assert!(
-            flat.contains("runs on this computer are confined (Landlock)"),
+            flat.contains("This computer confines runs (Landlock)"),
             "{width}x{height}: the factual confinement line is missing:\n{flat}"
         );
         // The block is compact: no more than one blank row between the numbered

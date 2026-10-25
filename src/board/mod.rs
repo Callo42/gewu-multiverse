@@ -90,6 +90,13 @@ pub struct Board {
     model_focus: usize,
     model_editing: bool,
     model_cursor: usize,
+    /// The protocol shown and saved with the address and model. It is visible on
+    /// this screen because it decides whether the address means `/chat/completions`
+    /// or `/responses`; on a native agent it can be changed with `←→`.
+    model_protocol: crate::harness::Protocol,
+    /// The key field was explicitly cleared. An empty key is then a validation
+    /// error, not "keep the old key".
+    model_key_cleared: bool,
     /// The fields changed since the last test, so a stale `✓` is not shown beside
     /// a value the provider never saw (W67-13).
     model_edited: bool,
@@ -158,6 +165,8 @@ impl Board {
             model_focus: 0,
             model_editing: false,
             model_cursor: 0,
+            model_protocol: Protocol::ChatCompletions,
+            model_key_cleared: false,
             model_edited: false,
             model_origin: ModelOrigin::FirstRun,
             agent_count: 3,
@@ -291,6 +300,9 @@ impl Board {
                 self.model_focus = 0;
                 self.model_editing = false;
                 self.model_edited = false;
+                self.model_key_cleared = false;
+                self.model_protocol = crate::harness::Protocol::parse(&agent.protocol)
+                    .unwrap_or(crate::harness::Protocol::ChatCompletions);
                 self.model_cursor = self.model_fields[0].chars().count();
                 return;
             }
@@ -301,6 +313,9 @@ impl Board {
         self.model_focus = 0;
         self.model_editing = false;
         self.model_edited = false;
+        self.model_key_cleared = false;
+        self.model_protocol = crate::harness::Protocol::parse(&self.view.endpoint.protocol)
+            .unwrap_or(crate::harness::Protocol::ChatCompletions);
         self.model_cursor = self.model_fields[0].chars().count();
     }
 
@@ -325,18 +340,16 @@ impl Board {
 
     fn endpoint_command(&self) -> Command {
         let key = if self.model_fields[2].is_empty() {
-            None
+            if self.model_key_cleared {
+                Some(String::new())
+            } else {
+                None
+            }
         } else {
             Some(self.model_fields[2].clone())
         };
         if let Some(name) = self.model_agent.as_ref() {
-            let protocol = self
-                .view
-                .agents
-                .iter()
-                .find(|agent| &agent.name == name)
-                .and_then(|agent| Protocol::parse(&agent.protocol))
-                .unwrap_or(Protocol::ChatCompletions);
+            let protocol = self.model_protocol;
             let base = self.model_fields[0]
                 .trim()
                 .trim_end_matches('/')
@@ -365,6 +378,11 @@ impl Board {
 
     /// Whether a key would be sent: one typed now, or one already stored.
     fn key_available(&self) -> bool {
+        // A key the person explicitly cleared is empty even when the file still
+        // holds one: the save is where that is caught, not a later generic run.
+        if self.model_key_cleared && self.model_fields[2].trim().is_empty() {
+            return false;
+        }
         if let Some(name) = self.model_agent.as_deref() {
             return !self.model_fields[2].trim().is_empty()
                 || self
@@ -375,6 +393,21 @@ impl Board {
                     .is_some_and(|agent| agent.key_present);
         }
         !self.model_fields[2].trim().is_empty() || self.view.endpoint.key_present
+    }
+
+    /// Whether the typed address is a shape the selected protocol can use. The
+    /// first-run form already refused `/v1` for a completions connection; the
+    /// per-agent form checks the same fact against the protocol it will save.
+    fn address_fits_protocol(&self) -> bool {
+        let url = self.model_fields[0].trim();
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let path = path.trim_end_matches('/');
+        // The per-agent form stores a base address; the program appends its own
+        // route. A full route typed here would be doubled, so refuse every known
+        // one and let the person keep the address the program expects.
+        !path.ends_with("/chat/completions")
+            && !path.ends_with("/responses")
+            && !path.ends_with("/messages")
     }
 
     /// What the person asked for.
@@ -464,6 +497,9 @@ impl Board {
             clear_string(&mut self.model_fields[self.model_focus]);
             self.model_cursor = 0;
             self.model_edited = true;
+            if self.model_focus == 2 {
+                self.model_key_cleared = true;
+            }
             return;
         }
         if self.model_editing {
@@ -485,6 +521,12 @@ impl Board {
             return;
         }
         match key.code {
+            KeyCode::Left if self.model_agent.is_some() && self.model_focus == 0 => {
+                self.cycle_model_protocol(false)
+            }
+            KeyCode::Right if self.model_agent.is_some() && self.model_focus == 0 => {
+                self.cycle_model_protocol(true)
+            }
             KeyCode::Up => {
                 self.model_focus = (self.model_focus + 2) % 3;
                 self.model_cursor = self.model_fields[self.model_focus].chars().count();
@@ -514,6 +556,10 @@ impl Board {
                 // silent continue (W67-1).
                 if self.model_agent.is_none() && !self.address_names_completions() {
                     self.set_notice("✗ wrong address — it should end in /chat/completions");
+                    return;
+                }
+                if self.model_agent.is_some() && !self.address_fits_protocol() {
+                    self.set_notice("✗ the address is for another protocol — change the protocol or the address");
                     return;
                 }
                 if !self.key_available() {
@@ -572,6 +618,37 @@ impl Board {
         }
     }
 
+    /// Cycle the protocol shown on the model screen among the selected program's
+    /// supported protocols. The first-run shared connection is always Chat
+    /// Completions, so this does nothing there.
+    fn cycle_model_protocol(&mut self, forward: bool) {
+        let Some(name) = self.model_agent.as_deref() else {
+            return;
+        };
+        let program = self
+            .view
+            .agents
+            .iter()
+            .find(|agent| agent.name == name)
+            .and_then(|agent| crate::harness::Program::parse(&agent.program))
+            .unwrap_or(crate::harness::Program::Builtin);
+        let supported = program.supported_protocols();
+        if supported.len() < 2 {
+            return;
+        }
+        let at = supported
+            .iter()
+            .position(|protocol| *protocol == self.model_protocol)
+            .unwrap_or(0);
+        let next = if forward {
+            (at + 1) % supported.len()
+        } else {
+            (at + supported.len() - 1) % supported.len()
+        };
+        self.model_protocol = supported[next];
+        self.model_edited = true;
+    }
+
     fn begin_edit(&mut self) {
         self.model_editing = true;
         self.model_cursor = self.model_fields[self.model_focus].chars().count();
@@ -607,11 +684,17 @@ impl Board {
                     self.model_cursor -= 1;
                     remove_char(&mut self.model_fields[self.model_focus], self.model_cursor);
                     self.model_edited = true;
+                    if self.model_focus == 2 {
+                        self.model_key_cleared = true;
+                    }
                 }
             }
             KeyCode::Delete => {
                 remove_char(&mut self.model_fields[self.model_focus], self.model_cursor);
                 self.model_edited = true;
+                if self.model_focus == 2 {
+                    self.model_key_cleared = true;
+                }
             }
             _ => {
                 if let Some(ch) = plain(key) {
@@ -623,6 +706,9 @@ impl Board {
                         );
                         self.model_cursor += 1;
                         self.model_edited = true;
+                        if self.model_focus == 2 {
+                            self.model_key_cleared = false;
+                        }
                     }
                 }
             }

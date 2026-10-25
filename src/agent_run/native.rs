@@ -80,7 +80,7 @@ impl McpServer {
             .arg(&plan.workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("the Forgejo MCP server cannot start: {error}"))?;
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -100,7 +100,15 @@ impl McpServer {
         let mut child = child;
         let _ = child.kill();
         let _ = child.wait();
-        Err("the Forgejo MCP server did not become ready".to_owned())
+        let mut text = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_string(&mut text);
+        }
+        Err(format!(
+            "the Forgejo MCP server did not become ready: {}",
+            text.lines().next().unwrap_or("no diagnostic")
+        ))
     }
 
     fn state(&self) -> &Path {
@@ -1116,6 +1124,17 @@ fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
     RequestedWork::Ambiguous
 }
 
+/// A successful piece of work the product itself observed: an accepted Forgejo
+/// write (the MCP ledger's `ok` result), a Git push proved by the remote-tracking
+/// reflog, or a real workspace change. It outranks the instruction classifier:
+/// whatever the words asked for, real work is not a warning. This is what makes a
+/// successful `forgejo_comment` or a verified push count for every native program,
+/// including an instruction that also asked for something the tools cannot do
+/// (`close the issue`) or that used a nominal change word (`do not change any files`).
+fn observed_work(state: &NativeState) -> bool {
+    state.wrote || state.comment_ok || state.pr_ok || state.pushed || state.workspace_wrote
+}
+
 fn decide_native_ending(
     base: RunEnding,
     requested: RequestedWork,
@@ -1130,6 +1149,12 @@ fn decide_native_ending(
     };
     match base {
         RunEnding::Succeeded => {
+            // A product-observed work fact is enough by itself. The classifier is a
+            // narrow prose heuristic and must never turn a successful comment, pull
+            // request or push into "no matching tool or work fact".
+            if observed_work(state) {
+                return RunEnding::Succeeded;
+            }
             let matched = match requested {
                 RequestedWork::PullRequest => state.pr_ok && state.pushed,
                 RequestedWork::PullRequestUpdate => state.pr_ok && state.pr_updated,
@@ -1968,7 +1993,8 @@ mod native_proof_tests {
         };
         assert_eq!(
             decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &local),
-            RunEnding::Warned
+            RunEnding::Succeeded,
+            "a product-observed workspace write is work even without a push"
         );
         assert_eq!(
             requested_work("Open a pull request and comment on the issue.", &[]),
@@ -2011,6 +2037,55 @@ mod native_proof_tests {
         assert_eq!(
             decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &pushed),
             RunEnding::Succeeded
+        );
+    }
+
+    /// Regression for wave 36 C1: the instruction's prose classifier is not the
+    /// work witness. A successful MCP comment and a verified push are work even when
+    /// the instruction also says `close the issue` (which the tools cannot do) or
+    /// uses a nominal change word like `do not change any files`.
+    #[test]
+    fn c1_a_successful_comment_or_push_is_work_whatever_the_prose_asked() {
+        let close = requested_work(
+            "Look at the issue assigned to you. Comment on it with a plan, add a file, commit and push it, and close the issue.",
+            &[],
+        );
+        assert_eq!(close, RequestedWork::UnsupportedForgejoWrite);
+        let comment = NativeState {
+            comment_ok: true,
+            wrote: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, close, &comment),
+            RunEnding::Succeeded,
+            "a comment the product observed was reported as no work"
+        );
+        let push = NativeState {
+            pushed: true,
+            wrote: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, close, &push),
+            RunEnding::Succeeded,
+            "a verified push was reported as no work"
+        );
+        let do_not_change = requested_work(
+            "Answer every new issue assigned to you. Leave one short, helpful comment. Do not change any files.",
+            &[],
+        );
+        assert_eq!(do_not_change, RequestedWork::GenericWrite);
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, do_not_change, &comment),
+            RunEnding::Succeeded,
+            "the nominal `change` word hid the observed comment"
+        );
+        let no_work = NativeState::default();
+        assert_eq!(
+            decide_native_ending(RunEnding::Succeeded, close, &no_work),
+            RunEnding::Warned,
+            "a run with no observed work was reported as success"
         );
     }
 
@@ -2134,7 +2209,8 @@ mod native_proof_tests {
         );
         assert_eq!(
             decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &updated),
-            RunEnding::Warned
+            RunEnding::Succeeded,
+            "an accepted pull-request write is work"
         );
         let opened = NativeState {
             pr_ok: true,

@@ -984,7 +984,7 @@ fn the_72_column_board_keeps_every_agent_on_the_frame() {
         );
         let mut x: Option<u16> = None;
         let mut last_bottom = 0;
-        for card in &layout.cards {
+        for (index, card) in layout.cards.iter().enumerate() {
             if let Some(expected) = x {
                 assert_eq!(card.rect.x, expected, "the vertical list moves sideways");
             } else {
@@ -995,8 +995,9 @@ fn the_72_column_board_keeps_every_agent_on_the_frame() {
                 "cards overlap in the vertical list"
             );
             last_bottom = card.rect.bottom();
+            let (wire_x, wire_y) = layout.wire_cells[index];
             let below = buffer
-                .cell((card.rect.x + card.rect.width / 2 + 2, card.rect.y - 1))
+                .cell((wire_x, wire_y))
                 .expect("the wire above a card")
                 .symbol();
             assert!(
@@ -1561,8 +1562,8 @@ fn a_successful_runs_own_summary_is_beside_the_tick() {
     press(&mut board, KeyCode::Enter);
     let frame = text(&draw(&mut board, 80, 24));
     assert!(
-        frame.contains("result: I fixed the flaky login test"),
-        "the success has no result row:
+        frame.contains("last work: comment on #1"),
+        "the success has no work row:
 {frame}"
     );
 }
@@ -1685,7 +1686,12 @@ fn the_agent_count_screen_labels_itself_a_preview() {
     let mut board = picker_board();
     assert_eq!(board.screen(), Screen::Picker);
     let frame = text(&draw(&mut board, 80, 24));
-    assert!(frame.contains("preview"), "{frame}");
+    assert!(frame.contains("will create"), "{frame}");
+    assert!(frame.contains("will run at"), "{frame}");
+    assert!(
+        !frame.contains("your login: owner"),
+        "the preview shows a login before the account exists:\n{frame}"
+    );
     assert!(
         !frame.contains("● running"),
         "the preview shows a running server before create:\n{frame}"

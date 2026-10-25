@@ -476,11 +476,14 @@ pub enum ModelError {
     /// The credentials file records no key for this agent.
     #[error("the credentials file records no model key for this agent")]
     MissingKey,
-    /// The endpoint refused the key.
+    /// The endpoint refused the key. The provider's own message is kept, because it
+    /// is the one sentence that tells a mistyped key from a missing permission.
     #[error("the endpoint refused the key (HTTP {status})")]
     BadKey {
         /// The status the endpoint answered with.
         status: u16,
+        /// The provider's own message, bounded to one line, or empty.
+        message: String,
     },
     /// The endpoint's models list answered and does not carry the model. The model id
     /// is the field to correct; the completions path already answered. This sentence
@@ -695,7 +698,10 @@ pub fn chat(
 
     match status {
         401 | 403 => {
-            return Err(ModelError::BadKey { status });
+            return Err(ModelError::BadKey {
+                status,
+                message: provider_message(&redacted_body).unwrap_or_default(),
+            });
         }
         404 => {
             // A 404 is not proof that the model is unknown: it is equally what a base
@@ -875,8 +881,13 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
             "wrong address — it should end in /chat/completions".to_owned()
         }
         ModelError::MissingKey => "the API key is empty".to_owned(),
-        ModelError::BadKey { status } => {
-            format!("the provider refused the API key (HTTP {status})")
+        ModelError::BadKey { status, message } => {
+            let detail = if message.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", whole_message(message, 400))
+            };
+            format!("the provider refused the API key (HTTP {status}){detail} — check the key")
         }
         ModelError::ModelNotFound { status, .. } => {
             format!("no model called {model} at this address (HTTP {status})")
