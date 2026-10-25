@@ -43,19 +43,22 @@ requests are its own. The board shows the whole thing at a glance:
   agent's Program screen (`p`) you can install and select Codex 0.164.0, DeepSeek
   Harness 0.2.1-rc.2 or OpenCode 2.1.4, each from its official pinned package. The
   program owns its model turns, tools, retries, compaction and session; the product
-  owns the run boundary, the Forgejo tools and the record.
+  owns the run boundary, the Forgejo tools and the record. If Codex's own sandbox
+  cannot start on this computer, the Agent screen keeps the cause and names the
+  double-`f` opt-out; the product Landlock boundary stays.
 - **One default connection, and a saved choice per agent.** The first-run model
   address and key are the default. Each agent can save its own compatible
-  provider/protocol/address/model/key; a save is used by that agent's next run, while
-  the running run keeps the exact facts it started with. The board and the agent
+  provider/protocol/address/model/key; the protocol is shown beside the address and
+  model, a save is used by that agent's next run, while the running run keeps the exact
+  facts it started with. The board and the agent
   screen show active and next when they differ.
 - **Migrate only when you choose.** An agent made by an older installation keeps the
   built-in engine. Its instruction, workspace, steps, skills, account and records are
   untouched until you deliberately choose another program.
 - **A card for each agent.** A filled circle means working, a half circle means waiting
   for its next run, an empty ring means stopped or not started. The board card keeps
-  the few words: the agent's name, its Forgejo login, its state, one last line and its
-  run count. `run N` is the total from the run records, so it does not reset when an
+  the few words: the agent's name, its program (`built-in`, `Pi`, `Codex`, `DSH` or
+  `OpenCode`), its Forgejo login, its state, its newest run mark and its run count. `run N` is the total from the run records, so it does not reset when an
   agent starts again or the program reopens. Open it with `⏎` for the Agent screen:
   the last work block (typed, and kept until a later run does new work), the
   instruction's first line, always, and `… (N more lines)` where N counts the
@@ -95,11 +98,12 @@ requests are its own. The board shows the whole thing at a glance:
   whose tool results include a failed command is `⚠` with the command's cause as its
   row. None of those is `✓`. A refused write's
   cause row says `⊘ write refused: …`, matching the strip. The
-  summary line prefers the newest run that did work (`last work: …`); a later no-op's
-  reason is labelled `no work: …`. Started agents keep
+  summary line prefers the newest run that did work (`last work: comment on #2`,
+  `last work: PR #3 open`); a later no-op's reason is labelled `no work: …`. Started agents keep
   a visible idle between runs (the Agent screen says `next run in 5s`; a card's shorter
-  form is `next 5s`); a no-work run's longer back-off says `next run in 20s · no work`
-  (`next 20s·no work` on a card). The selected card is marked `▸`, and
+  form is `next 5s`); a no-work or warned run's longer wait says
+  `next run in 20s · no work` (`next 20s·no work` on a card). A 503 is named as
+  temporary and says it is retrying. The selected card is marked `▸`, and
   a window from 140 to 160 columns uses its width for the repository names and card
   detail; a wider one centres the same picture in 160.
 

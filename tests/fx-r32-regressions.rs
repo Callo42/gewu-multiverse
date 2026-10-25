@@ -187,7 +187,9 @@ fn the_agent_count_screen_labels_itself_a_preview() {
     assert_eq!(board.screen(), Screen::Picker);
     let mut board = board;
     let frame = frame(&mut board, 80, 24);
-    assert!(frame.contains("preview"), "{frame}");
+    assert!(frame.contains("will create"), "{frame}");
+    assert!(frame.contains("will run at"), "{frame}");
+    assert!(!frame.contains("your login: owner"), "{frame}");
     assert!(!frame.contains("● running"), "{frame}");
 }
 

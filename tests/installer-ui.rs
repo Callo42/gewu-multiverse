@@ -60,6 +60,7 @@ fn program(
             _ => 240,
         },
         prerequisite: (id == "dsh").then(|| "Node 24.9+ / npm 11.16+".to_owned()),
+        prerequisite_met: true,
         installing,
         installing_phase: phase.map(str::to_owned),
         error: error.map(str::to_owned),

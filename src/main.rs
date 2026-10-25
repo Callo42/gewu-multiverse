@@ -350,9 +350,16 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
     let layout = layout_for(&cli)?;
     let data_root = bundled_forgejo::data_root().map_err(StartupError::Engine)?;
     let options = EngineOptions::new(layout, data_root).map_err(StartupError::Engine)?;
+    // Open the terminal before the slow recovery, so a killed run's cleanup is
+    // visible as a sentence instead of a blank alternate screen. Only a live earlier
+    // process earns the line; an ordinary open goes straight to the board.
+    let pending = engine::stale_recovery_pending(&options.layout, &options.data_root);
+    let mut screen = Screen::enter()?;
+    if pending {
+        screen.message("stopping the earlier run and Forgejo…")?;
+    }
     let engine = engine::open_with(options).map_err(StartupError::Engine)?;
     let mut board = Board::new(engine);
-    let mut screen = Screen::enter()?;
     let drawn = event_loop(&mut screen, &mut board, Some(&termination));
     // The number of agents whose choice is started *now*, not when the board opened:
     // the person may have started one during this visit.
@@ -798,6 +805,20 @@ impl Screen {
             terminal,
             active: true,
         })
+    }
+
+    /// One sentence on the otherwise blank first screen, before the engine opens.
+    /// It is replaced by the board's first frame; nothing else is drawn.
+    fn message(&mut self, text: &str) -> io::Result<()> {
+        use ratatui::layout::Alignment;
+        use ratatui::text::Line;
+        use ratatui::widgets::Paragraph;
+        self.terminal.draw(|frame| {
+            let area = frame.area();
+            let line = Line::from(text.to_owned()).alignment(Alignment::Center);
+            frame.render_widget(Paragraph::new(line), area);
+        })?;
+        Ok(())
     }
 
     /// Step out of the board: hand the terminal back to the person's own program.

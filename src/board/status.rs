@@ -102,6 +102,10 @@ pub fn blocked_words(reason: &str) -> &'static str {
         "unknown saved program"
     } else if reason.contains("not installed") {
         "program not installed"
+    } else if reason.contains("sandbox") {
+        "Codex sandbox unavailable"
+    } else if reason.contains("node.js") || reason.contains("npm") {
+        "needs Node 24.9+ / npm 11.16+"
     } else if reason.contains("model key") {
         "needs a model key"
     } else if reason.contains("connection and model") {
@@ -590,10 +594,11 @@ pub fn run_result_line(agent: &AgentView) -> Option<String> {
         return None;
     }
     let newest = agent.recent.last()?;
-    if !agent.last_result_is_work
-        && let Some(work) = agent.last_work_result.as_deref()
-    {
-        return Some(format!("last work: {}", first_clause(work)));
+    // The row labelled `last work` carries work, never a warning sentence. The
+    // warning keeps its mark and its own row; the newest work stays here until a
+    // later run does new work (which is exactly what the work block says).
+    if let Some(work) = newest_work_phrase(agent) {
+        return Some(format!("last work: {work}"));
     }
     let result = agent.last_result.as_deref().map(first_clause);
     match newest {
@@ -610,6 +615,114 @@ pub fn run_result_line(agent: &AgentView) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// The newest work word, typed for the card: `comment on #2`, `PR #3 open`, or
+/// `branch fix-greeting`. A read (`issue #N`) is not work and is skipped; the
+/// newest write in the block is the one the line carries.
+pub fn newest_work_phrase(agent: &AgentView) -> Option<String> {
+    for line in agent.last_work.iter().rev() {
+        if line.starts_with("issue #") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("pull request #") {
+            let number = leading_number(rest);
+            return Some(format!("PR #{number} open"));
+        }
+        if let Some(rest) = line.strip_prefix("comment on #") {
+            let number = leading_number(rest);
+            return Some(format!("comment on #{number}"));
+        }
+        if let Some(rest) = line.strip_prefix("branch ") {
+            let branch = rest.split_whitespace().next().unwrap_or(rest);
+            return Some(format!("branch {branch}"));
+        }
+        return Some(line.clone());
+    }
+    None
+}
+
+/// The one line that shows a running agent's exact settings and the saved settings
+/// its next run will use, when they differ. The Program screen has the full facts;
+/// this is the sentence the Agent screen adds so a save during a run is not silent.
+pub fn active_next_line(agent: &AgentView) -> Option<String> {
+    let active = agent.active_program.as_ref()?;
+    let next = agent.next_program.as_ref()?;
+    if active.program == next.program
+        && active.protocol == next.protocol
+        && active.base_url == next.base_url
+        && active.model == next.model
+        && active.codex_sandbox == next.codex_sandbox
+    {
+        return None;
+    }
+    // Every field that differs is carried; a field that is equal is not repeated.
+    // The address is shown as its host, which fits at 72 columns and still names the
+    // one thing that changed for an address-only save.
+    let mut active_parts = vec![active.label.clone()];
+    let mut next_parts = vec![next.label.clone()];
+    if active.base_url != next.base_url {
+        active_parts.push(format!("@{}", host_of(&active.base_url)));
+        next_parts.push(format!("@{}", host_of(&next.base_url)));
+    }
+    if active.protocol != next.protocol {
+        active_parts.push(active.protocol.clone());
+        next_parts.push(next.protocol.clone());
+    }
+    if active.model != next.model {
+        active_parts.push(active.model.clone());
+        next_parts.push(next.model.clone());
+    }
+    if active.codex_sandbox != next.codex_sandbox {
+        active_parts.push(sandbox_word(active.codex_sandbox.as_deref()).to_owned());
+        next_parts.push(sandbox_word(next.codex_sandbox.as_deref()).to_owned());
+    }
+    Some(format!(
+        "active {} · next {}",
+        active_parts.join(" "),
+        next_parts.join(" ")
+    ))
+}
+
+/// The host part of a public base address, without scheme or path.
+pub(crate) fn host_of(base_url: &str) -> &str {
+    base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or(base_url)
+}
+
+/// The short sandbox state used by the active/next line.
+fn sandbox_word(mode: Option<&str>) -> &'static str {
+    match mode {
+        Some("full-access") => "sandbox-off",
+        Some("native") => "sandbox-default",
+        _ => "sandbox-auto",
+    }
+}
+
+/// The short program word a card shows: `built-in`, `Pi`, `Codex`, `DSH`,
+/// `OpenCode`. The saved id is authoritative; the label is the fallback for a value
+/// this build does not know.
+pub fn program_word(agent: &AgentView) -> String {
+    match agent.program.as_str() {
+        "builtin" | "" => "built-in".to_owned(),
+        "pi" => "Pi".to_owned(),
+        "codex" => "Codex".to_owned(),
+        "dsh" => "DSH".to_owned(),
+        "opencode" => "OpenCode".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// The newest finished run's mark, at every card size. It names the evidence, not
+/// just the state: a stopped agent that last warned stays distinguishable from one
+/// that last succeeded.
+pub fn newest_run_mark(agent: &AgentView) -> Option<char> {
+    agent.recent.last().map(|end| session_symbol(end).0)
 }
 
 /// The colour of a run's own result or activity row.
@@ -776,7 +889,27 @@ fn short_failure(reason: &str) -> String {
 /// shortest honest phrase for the transport cases.
 pub fn failure_words(reason: &str) -> String {
     if let Some(code) = http_status_in(reason) {
-        return format!("HTTP {code} from the model");
+        // A status alone is not an error message. Keep the provider's own sentence
+        // and add the one action that follows from each class: a refused key is
+        // checked, a 503 is temporary and is retried. The walkers saw both bodies
+        // dropped, leaving `HTTP 401 from the model` and `HTTP 503` with nothing to
+        // do.
+        if code == 503 || code == 502 || code == 504 {
+            return "the model is temporarily unavailable — retrying".to_owned();
+        }
+        let detail = provider_detail_after_status(reason, code);
+        let mut word = format!("HTTP {code}");
+        match detail {
+            Some(detail) => {
+                word.push_str(": ");
+                word.push_str(&detail);
+            }
+            None => word.push_str(" from the model"),
+        }
+        if matches!(code, 401 | 403) {
+            word.push_str(" — check the key");
+        }
+        return word;
     }
     let lower = reason.to_ascii_lowercase();
     if lower.contains("cannot reach the model") {
@@ -815,6 +948,24 @@ fn http_status_in(text: &str) -> Option<u16> {
         }
     }
     None
+}
+
+/// The provider's own message that follows an HTTP status in a run's reason.
+///
+/// The reason shapes differ by program (`HTTP 401: Incorrect API key provided`,
+/// `the provider answered HTTP 503: ...`, `model_not_found: HTTP 404: ...`); this
+/// takes the text after the status marker, drops punctuation, and keeps one bounded
+/// line. It makes no message up when the harness did not carry one.
+fn provider_detail_after_status(text: &str, code: u16) -> Option<String> {
+    let marker = format!("HTTP {code}");
+    let rest = text.split(&marker).nth(1)?;
+    let rest = rest.strip_prefix(')').unwrap_or(rest);
+    let rest = rest.trim_start_matches([':', ' ', '—', '-']).trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let line = rest.lines().next().unwrap_or(rest).trim();
+    Some(super::text::ellipsize(line, 160))
 }
 
 fn errno_in(text: &str) -> Option<String> {

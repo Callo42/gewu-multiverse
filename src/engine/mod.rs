@@ -347,6 +347,42 @@ fn build(
     Ok(engine)
 }
 
+/// Whether opening this installation will first stop an earlier run or Forgejo.
+///
+/// This is read before the engine is built so the board can say what the wait is
+/// for instead of showing a blank alternate screen. Only live records count: a
+/// stale pid file with no live process is cleanup, not a process being stopped.
+pub fn stale_recovery_pending(layout: &Layout, data_root: &Path) -> bool {
+    let record = bundled_forgejo::InstancePaths::under(data_root)
+        .root
+        .join(bundled_forgejo::PID_FILE);
+    if let Ok(text) = fs::read_to_string(&record)
+        && let Ok(pid) = text.trim().parse::<u32>()
+        && run::process_alive(pid)
+    {
+        return true;
+    }
+    let Ok(agents) = fs::read_dir(layout.state_root()) else {
+        return false;
+    };
+    for agent in agents.flatten() {
+        let Ok(runs) = fs::read_dir(agent.path()) else {
+            continue;
+        };
+        for run_dir in runs.flatten() {
+            if !run_dir.path().is_dir() {
+                continue;
+            }
+            if let Some((pid, _)) = run::recorded_group(&run_dir.path())
+                && run::process_alive(pid)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// What the one upgrade screen should say, when this is the first open by a newer
 /// build. A fresh installation, a same-version open and a downgrade have no screen.
 fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> Option<UpgradeView> {
@@ -536,6 +572,9 @@ struct AgentRuntime {
     provision_retry_at: Option<Instant>,
     removal_pending: bool,
     removal_retry_at: Option<Instant>,
+    /// Why the chosen program cannot start, with the exact action, kept after the
+    /// status line fades. It is the Agent screen's persistent prerequisite line.
+    program_hint: Option<String>,
 }
 
 /// The bundled Forgejo's engine state.
@@ -983,6 +1022,7 @@ impl AgentRuntime {
             provision_retry_at: None,
             removal_pending: false,
             removal_retry_at: None,
+            program_hint: None,
         }
     }
 
@@ -1842,9 +1882,7 @@ impl Inner {
         let installed = harness::installed(&self.options.data_root, Program::Codex)?;
         let bwrap = installed.root.join("codex-resources").join("bwrap");
         if !bwrap.is_file() {
-            return Some(
-                "Codex's native sandbox helper is missing from this installation".to_owned(),
-            );
+            return Some("the native sandbox helper is missing".to_owned());
         }
         let mut child = match std::process::Command::new(&bwrap)
             .args([
@@ -1863,7 +1901,7 @@ impl Inner {
             Ok(child) => child,
             Err(error) => {
                 return Some(format!(
-                    "the native sandbox boundary cannot start ({error})"
+                    "the native sandbox helper could not start: {error}"
                 ));
             }
         };
@@ -1885,7 +1923,7 @@ impl Inner {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Some(format!(
-                        "the native sandbox preflight could not be read ({error})"
+                        "the native sandbox preflight could not be read: {error}"
                     ));
                 }
             }
@@ -1904,9 +1942,7 @@ impl Inner {
             .find(|line| !line.trim().is_empty())
             .unwrap_or("the native sandbox boundary refused its probe")
             .trim();
-        Some(format!(
-            "the native sandbox boundary is unavailable ({detail}); choose this agent's explicit compatibility mode only if you intend to remove Codex's own sandbox while the product file boundary remains"
-        ))
+        Some(detail.to_owned())
     }
 
     /// Why one agent's selected program/connection cannot start, if it cannot.
@@ -1942,7 +1978,7 @@ impl Inner {
         }
         if program == Program::Dsh {
             if let Some(prerequisite) = program.prerequisite_missing() {
-                return Some(prerequisite.to_owned());
+                return Some(prerequisite_action(prerequisite).to_owned());
             }
         }
         if installed.program != program {
@@ -1967,6 +2003,7 @@ impl Inner {
                     license: program.license().to_owned(),
                     download_mb: program.download_mb(),
                     prerequisite: program.prerequisite().map(str::to_owned),
+                    prerequisite_met: program.prerequisite_missing().is_none(),
                     installing: state.and_then(|state| state.installing),
                     installing_phase: state
                         .and_then(|state| state.phase)
@@ -2055,9 +2092,13 @@ impl Inner {
         Some(RunProgramView {
             program: program.id().to_owned(),
             label: program.label().to_owned(),
-            version: harness::installed(&self.options.data_root, program)
-                .map(|installed| installed.version)
-                .unwrap_or_else(|| "not installed".to_owned()),
+            version: if program == Program::Builtin {
+                "always ready".to_owned()
+            } else {
+                harness::installed(&self.options.data_root, program)
+                    .map(|installed| installed.version)
+                    .unwrap_or_else(|| "not installed".to_owned())
+            },
             protocol: protocol.id().to_owned(),
             base_url: self
                 .connection_for(saved)
@@ -2073,6 +2114,23 @@ impl Inner {
             }),
         })
     }
+}
+
+/// The persistent line and exact action for Codex's unavailable own sandbox. The
+/// Program screen removes it with `f` twice; the Agent screen names the same key and
+/// what it gives up so a person does not have to find the hidden escape from the
+/// faded failure alone.
+fn codex_sandbox_action(detail: &str) -> String {
+    format!(
+        "Codex's sandbox cannot start ({detail}) — press f twice: removes Codex's own sandbox, keeps product Landlock"
+    )
+}
+
+/// Why a native program's environment prerequisite cannot be met, with the exact
+/// versions and the key that retries the install. The selected program card already
+/// showed the short `needs` line; this is the action that replaces it on failure.
+fn prerequisite_action(_missing: &str) -> &'static str {
+    "DeepSeek Harness cannot start: install Node.js 24.9+ (npm 11.16+), then press i"
 }
 
 fn backoff_for_restart(failures: u32) -> Duration {
@@ -2257,15 +2315,15 @@ fn finish_session(
         return;
     }
     // A no-work run succeeded at what it was asked to do: it resets the quick-failure
-    // streak and takes the documented 20 s watch interval. Only an actual quick
-    // failure grows the back-off, and a successful work run keeps the existing
-    // good-run interval.
-    let delay = if matches!(end, SessionEnd::NoWork { .. }) {
+    // streak and takes the documented 20 s watch interval. A warned run did not
+    // verify its work, so it takes the same watch interval rather than the five-second
+    // success loop that used to replay a deterministic comment every few seconds.
+    // Only an actual quick failure grows the back-off, and a successful work run
+    // keeps the existing good-run interval.
+    let delay = if matches!(end, SessionEnd::NoWork { .. } | SessionEnd::Warned { .. }) {
         agent.quick_failures = 0;
         NO_WORK_DELAY
-    } else if matches!(end, SessionEnd::Succeeded | SessionEnd::Warned { .. })
-        || ran >= LONG_SESSION
-    {
+    } else if matches!(end, SessionEnd::Succeeded) || ran >= LONG_SESSION {
         agent.quick_failures = 0;
         RESTART_DELAY
     } else {
@@ -2412,7 +2470,9 @@ impl EngineApi for Engine {
                     .map(|(_, _, model)| model)
                     .unwrap_or_else(|| inner.settings.endpoint.model.clone()),
                 key_present: credentials::model_key(&inner.credentials, &agent.name).is_ok(),
-                program_error: inner.program_block(agent),
+                program_error: inner
+                    .program_block(agent)
+                    .or_else(|| agent.program_hint.clone()),
                 active_program: inner.active_program(agent),
                 next_program: inner.next_program(agent),
                 codex_sandbox: inner
@@ -2620,7 +2680,22 @@ impl EngineApi for Engine {
                     }
                 }
                 inner.agents[index].last_error = None;
-                inner.note(format!("`{name}` now runs with {}", program.label()));
+                let hint = if program == Program::Codex {
+                    inner
+                        .codex_sandbox_block(&inner.agents[index])
+                        .map(|detail| codex_sandbox_action(&detail))
+                } else {
+                    None
+                };
+                inner.agents[index].program_hint = hint;
+                if inner.agents[index].running.is_some() {
+                    inner.note(format!(
+                        "`{name}` now runs with {}; this run keeps its settings",
+                        program.label()
+                    ));
+                } else {
+                    inner.note(format!("`{name}` now runs with {}", program.label()));
+                }
                 Ok(())
             }
             Command::SetAgentModel {
@@ -2633,7 +2708,14 @@ impl EngineApi for Engine {
                 let Some(protocol) = Protocol::parse(&protocol) else {
                     return Err("that connection type is not one this product knows".to_owned());
                 };
-                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let base = base_url
+                    .trim()
+                    .trim_end_matches('/')
+                    .trim_end_matches("/chat/completions")
+                    .trim_end_matches("/responses")
+                    .trim_end_matches("/messages")
+                    .trim_end_matches('/')
+                    .to_owned();
                 let model = model.trim().to_owned();
                 if base.is_empty() || model.is_empty() {
                     return Err("the API address and model are both needed".to_owned());
@@ -2641,6 +2723,18 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                let current_program = inner.settings.agent(&name).map(|saved| saved.harness());
+                if let Some(program) = current_program
+                    && let Some(error) = harness::compatibility_error(program, protocol)
+                {
+                    return Err(error);
+                }
+                if key.as_deref().is_some_and(|key| key.trim().is_empty()) {
+                    return Err("the API key is empty; type it, then press ⏎".to_owned());
+                }
+                if key.is_none() && credentials::model_key(&inner.credentials, &name).is_err() {
+                    return Err("the API key is empty; type it, then press ⏎".to_owned());
+                }
                 let settings_before = inner.settings.clone();
                 let mut next = inner.settings.clone();
                 let Some(saved) = next.agent_mut(&name) else {
@@ -2677,7 +2771,27 @@ impl EngineApi for Engine {
                     }
                 }
                 inner.agents[index].last_error = None;
-                inner.note(format!("`{name}`'s connection is saved for its next run"));
+                // A model save is not a program or sandbox change: recompute the
+                // sandbox prerequisite instead of hiding a cause that is still there.
+                let hint = if inner
+                    .settings
+                    .agent(&name)
+                    .is_some_and(|saved| saved.harness() == Program::Codex)
+                {
+                    inner
+                        .codex_sandbox_block(&inner.agents[index])
+                        .map(|detail| codex_sandbox_action(&detail))
+                } else {
+                    None
+                };
+                inner.agents[index].program_hint = hint;
+                if inner.agents[index].running.is_some() {
+                    inner.note(format!(
+                        "`{name}`'s connection is saved for its next run; this run keeps its settings"
+                    ));
+                } else {
+                    inner.note(format!("`{name}`'s connection is saved for its next run"));
+                }
                 Ok(())
             }
             Command::SetAgentCodexSandbox { name, mode } => {
@@ -2705,9 +2819,23 @@ impl EngineApi for Engine {
                 }
                 inner.settings = next;
                 inner.agents[index].last_error = None;
-                inner.note(format!(
-                    "`{name}`'s Codex sandbox is saved for its next run"
-                ));
+                let hint = if mode == "native" {
+                    inner
+                        .codex_sandbox_block(&inner.agents[index])
+                        .map(|detail| codex_sandbox_action(&detail))
+                } else {
+                    None
+                };
+                inner.agents[index].program_hint = hint;
+                if inner.agents[index].running.is_some() {
+                    inner.note(format!(
+                        "`{name}`'s Codex sandbox is saved for its next run; this run keeps its settings"
+                    ));
+                } else {
+                    inner.note(format!(
+                        "`{name}`'s Codex sandbox is saved for its next run"
+                    ));
+                }
                 Ok(())
             }
             Command::InstallProgram { id } => {
@@ -2752,6 +2880,18 @@ impl EngineApi for Engine {
                         match result {
                             Ok(installed) => {
                                 state.error = None;
+                                let names: Vec<String> = inner
+                                    .settings
+                                    .agents
+                                    .iter()
+                                    .filter(|saved| saved.harness() == program)
+                                    .map(|saved| saved.name.clone())
+                                    .collect();
+                                for name in names {
+                                    if let Some(index) = inner.agent_index(&name) {
+                                        inner.agents[index].program_hint = None;
+                                    }
+                                }
                                 inner.note(format!(
                                     "{} {} is installed",
                                     program.label(),
@@ -2973,16 +3113,19 @@ impl EngineApi for Engine {
                     inner.agents[index].session = SessionState::Idle;
                     inner.agents[index].next_at = None;
                 }
+                let sandbox_block = inner.codex_sandbox_block(&inner.agents[index]);
                 if let Some(reason) = inner
                     .program_block(&inner.agents[index])
-                    .or_else(|| inner.codex_sandbox_block(&inner.agents[index]))
+                    .or_else(|| sandbox_block.map(|detail| codex_sandbox_action(&detail)))
                 {
                     inner.agents[index].session = SessionState::Blocked {
                         reason: reason.clone(),
                     };
+                    inner.agents[index].program_hint = Some(reason.clone());
                     inner.note(format!("not started — {reason}"));
                     return Ok(());
                 }
+                inner.agents[index].program_hint = None;
                 inner.set_desired(index, Desired::Started)?;
                 let agent = &mut inner.agents[index];
                 agent.sessions_since_start = 0;
@@ -5157,7 +5300,10 @@ mod tests {
                 "wrong address",
             ),
             (
-                ModelError::BadKey { status: 401 },
+                ModelError::BadKey {
+                    status: 401,
+                    message: "Incorrect API key provided".to_owned(),
+                },
                 "the provider refused the API key",
             ),
             (ModelError::Timeout { secs: 15 }, "no answer within 15 s"),
@@ -5395,8 +5541,8 @@ mod tests {
             frame.push('\n');
         }
         assert!(
-            frame.contains("last work: I fixed the flaky test"),
-            "the card did not keep the work run's summary:\n{frame}"
+            frame.contains("last work: comment on #1"),
+            "the card did not keep the newest work:\n{frame}"
         );
         assert!(
             !frame.contains("result: The review is already addressed"),
@@ -5788,6 +5934,288 @@ mod tests {
         }
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
+    }
+
+    /// Wave 36 C1: a warned run is not a success, so it must not take the five-second
+    /// success loop. It enters the ordinary twenty-second watch interval instead; a
+    /// deterministic script then cannot replay the same comment every few seconds.
+    /// Wave 36 C3: the engine refuses the same empty key the first-run form
+    /// refuses. A UI check is not enough for a command that can be sent directly.
+    #[test]
+    fn an_empty_key_is_not_saved_for_an_agent() {
+        let root = scratch_root("engine-empty-agent-key");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+        credentials::remove_secret(&layout.credentials_file(), None, "model_key")
+            .expect("the shared key is removed");
+        let mut engine = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        let no_key = engine.send(Command::SetAgentModel {
+            name: "agent-1".to_owned(),
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            protocol: "chat-completions".to_owned(),
+            model: "demo".to_owned(),
+            key: None,
+        });
+        assert!(
+            no_key
+                .as_ref()
+                .is_err_and(|error| error.contains("API key is empty")),
+            "a missing key was saved silently: {no_key:?}"
+        );
+        let cleared = engine.send(Command::SetAgentModel {
+            name: "agent-1".to_owned(),
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            protocol: "chat-completions".to_owned(),
+            model: "demo".to_owned(),
+            key: Some(String::new()),
+        });
+        assert!(
+            cleared
+                .as_ref()
+                .is_err_and(|error| error.contains("API key is empty")),
+            "an explicitly empty key was saved silently: {cleared:?}"
+        );
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "chat-completions".to_owned(),
+                model: "demo".to_owned(),
+                key: Some("gw-test-key".to_owned()),
+            })
+            .expect("a present key saves");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Wave 36 C4: a save during a live run names both facts — it applies to the
+    /// next run and the current run keeps the settings it started with.
+    #[test]
+    fn a_save_during_a_run_says_the_run_keeps_its_settings() {
+        let root = scratch_root("engine-save-during-run");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "chat-completions".to_owned(),
+                model: "next-model".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("save during a run");
+        let notice = engine.board().notice.unwrap_or_default();
+        assert!(
+            notice.contains("this run keeps its settings"),
+            "the save did not say the running run keeps its settings: {notice}"
+        );
+        assert!(
+            notice.contains("next run"),
+            "the save did not say when it applies: {notice}"
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_model_save_does_not_hide_a_codex_sandbox_prerequisite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_root("engine-model-save-keeps-hint");
+        let install = harness::install_root(&root.join("data"), Program::Codex);
+        fs::create_dir_all(install.join("bin")).expect("codex bin");
+        fs::create_dir_all(install.join("codex-resources")).expect("codex resources");
+        fs::write(install.join("bin/codex"), b"#!/bin/sh\nexit 0\n").expect("codex");
+        fs::set_permissions(install.join("bin/codex"), fs::Permissions::from_mode(0o755))
+            .expect("codex mode");
+        fs::write(
+            install.join("codex-resources/bwrap"),
+            b"#!/bin/sh\necho 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted' >&2\nexit 1\n",
+        )
+        .expect("bwrap");
+        fs::set_permissions(
+            install.join("codex-resources/bwrap"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("bwrap mode");
+        let record = harness::InstallRecord {
+            program: Program::Codex.id().to_owned(),
+            version: Program::Codex.pinned_version().to_owned(),
+            sha256: "0".repeat(64),
+            license: "Apache-2.0".to_owned(),
+            entrypoint: "bin/codex".to_owned(),
+            resources: Some("codex-resources".to_owned()),
+            installed_at: "2026-10-25T00:00:00Z".to_owned(),
+        };
+        fs::write(
+            harness::record_path(&install),
+            serde_json::to_vec(&record).expect("record json"),
+        )
+        .expect("record");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let saved = settings.agent_mut("agent-1").expect("agent");
+        saved.set_harness(Program::Codex);
+        saved.provider = Some(settings::AgentProvider {
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            protocol: "responses".to_owned(),
+            model: "lab-codex".to_owned(),
+        });
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("start probe");
+        let hint = engine.board().agents[0]
+            .program_error
+            .clone()
+            .unwrap_or_default();
+        assert!(hint.contains("bwrap: loopback"), "{hint}");
+        assert!(hint.contains("press f twice"), "{hint}");
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "responses".to_owned(),
+                model: "next-codex".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("model save");
+        let hint = engine.board().agents[0]
+            .program_error
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            hint.contains("bwrap: loopback") && hint.contains("press f twice"),
+            "a model save hid the still-present sandbox cause: {hint}"
+        );
+        let mut board = Board::new(engine);
+        for _ in 0..2 {
+            if board.screen() == crate::board::Screen::Agent {
+                break;
+            }
+            board.on_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Enter,
+            ));
+        }
+        let backend = ratatui::backend::TestBackend::new(72, 18);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| board.draw(frame))
+            .expect("the frame draws");
+        let mut frame = String::new();
+        let area = terminal.backend().buffer().area;
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                frame.push_str(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((x, y))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" "),
+                );
+            }
+            frame.push('\n');
+        }
+        assert!(frame.contains("bwrap: loopback"), "{frame}");
+        assert!(frame.contains("press f twice"), "{frame}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sandbox_save_during_a_run_says_the_run_keeps_its_settings() {
+        let root = scratch_root("engine-sandbox-save-during-run");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        settings
+            .agent_mut("agent-1")
+            .expect("agent")
+            .set_harness(Program::Builtin);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        engine
+            .send(Command::SetAgentProgram {
+                name: "agent-1".to_owned(),
+                program: "codex".to_owned(),
+                protocol: Some("responses".to_owned()),
+            })
+            .expect("program save during a run");
+        engine
+            .send(Command::SetAgentCodexSandbox {
+                name: "agent-1".to_owned(),
+                mode: "full-access".to_owned(),
+            })
+            .expect("sandbox save during a run");
+        let notice = engine.board().notice.unwrap_or_default();
+        assert!(
+            notice.contains("this run keeps its settings"),
+            "the sandbox save did not say the running run keeps its settings: {notice}"
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_warned_run_waits_the_watch_interval_not_the_success_loop() {
+        let root = scratch_root("engine-warned-wait");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        let run_dir = fake.last_run_dir().expect("the run directory");
+        write_terminal_record(
+            &run_dir,
+            run::RunOutcome::Warned,
+            "the native program finished without verified success",
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert!(
+            matches!(
+                &engine.board().agents[0].session,
+                SessionState::Restarting {
+                    last: SessionEnd::Warned { .. },
+                    ..
+                }
+            ),
+            "the warned run did not schedule a restart: {:?}",
+            engine.board().agents[0].session
+        );
+        let started = fake.counts().1;
+        tick(&mut engine, &clock, Duration::from_secs(4));
+        assert_eq!(
+            fake.counts().1,
+            started,
+            "a warned run restarted in the five-second success loop"
+        );
+        tick(&mut engine, &clock, Duration::from_secs(15));
+        assert_eq!(
+            fake.counts().1,
+            started,
+            "a warned run restarted before the twenty-second watch interval"
+        );
+        tick(&mut engine, &clock, Duration::from_secs(1));
+        wait_started(&fake, started + 1);
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

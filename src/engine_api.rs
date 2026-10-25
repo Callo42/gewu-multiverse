@@ -133,6 +133,9 @@ pub struct ProgramView {
     pub download_mb: u32,
     /// A non-Rust prerequisite sentence, when the program has one.
     pub prerequisite: Option<String>,
+    /// Whether the prerequisite is met on this computer right now. The Program
+    /// screen keeps the exact versions and the `i` action when it is not.
+    pub prerequisite_met: bool,
     /// An install in progress, 0-100 when known.
     pub installing: Option<Option<u8>>,
     /// The current install phase word (`downloading`, `installing packages`, …).
@@ -325,7 +328,7 @@ pub struct BoardView {
     pub confined: bool,
     /// The mechanism this computer really enforces, for the warnings screen's
     /// positive sentence: `Some("Landlock")` reads
-    /// `runs on this computer are confined (Landlock)` (F-06). `None` on a host
+    /// `This computer confines runs (Landlock)` (F-06). `None` on a host
     /// with no mechanism; the negative sentence then comes from `confined`.
     pub confinement: Option<String>,
     /// The one screen shown the first time this build opens an older installation.

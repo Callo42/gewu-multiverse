@@ -55,6 +55,8 @@ and the engine tries a run; `Stop` clears it and ends the run in flight. When a 
 ends, for any reason, and the agent is still started, the next one is scheduled:
 
 - a run that succeeded, or ran at least 60 seconds, waits **5 seconds**;
+- a successful run that found no work, or a warned run, waits the **20 second** watch
+  interval (a warning is not a verified success);
 - a quick failure waits **10 seconds**, doubling with each consecutive quick failure,
   capped at **5 minutes** (10, 20, 40, 80, 160, 300, 300 …).
 

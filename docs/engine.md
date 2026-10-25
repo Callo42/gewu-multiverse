@@ -457,6 +457,9 @@ and the agent is still started, the next one is scheduled:
 - succeeded, or ran at least 60 s: **5 s**, and the quick-failure streak resets;
 - a successful run that found no work: the documented **20 s** watch interval, and the
   quick-failure streak resets too (a no-work success is not a failure);
+- a warned run: the same **20 s** watch interval. A warning is not a verified success,
+  so it never takes the five-second success loop that replayed a deterministic write
+  every few seconds;
 - otherwise: **10 s**, doubling with each consecutive quick failure, capped at
   **5 min** (10, 20, 40, 80, 160, 300, 300 …).
 

@@ -645,7 +645,10 @@ impl EngineApi for FakeEngine {
                     self.agents.push(agent);
                 }
                 self.start_fetching();
-                self.notice = Some(format!("creating {count} agents"));
+                self.notice = Some(format!(
+                    "creating {count} {}",
+                    if count == 1 { "agent" } else { "agents" }
+                ));
             }
             Command::AddAgent => {
                 if self.agents.len() >= MAX_AGENTS {

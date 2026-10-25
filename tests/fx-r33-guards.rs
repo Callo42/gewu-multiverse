@@ -558,7 +558,7 @@ fn the_warnings_screen_names_this_computers_confinement() {
     for (width, height) in [(72, 18), (80, 24)] {
         let page = text(&draw(&mut board, width, height));
         assert!(
-            page.contains("runs on this computer are confined (Landlock)"),
+            page.contains("This computer confines runs (Landlock)"),
             "F-06: no positive confinement line at {width}x{height}:\n{page}"
         );
     }
@@ -882,8 +882,8 @@ fn the_card_summary_prefers_the_newest_run_that_did_work() {
     press(&mut board, KeyCode::Enter);
     let frame = text(&draw(&mut board, 120, 40));
     assert!(
-        frame.contains("last work: I fixed the flaky test"),
-        "F-10: the card did not keep the work run's summary:\n{frame}"
+        frame.contains("last work: comment on #1"),
+        "F-10: the card did not keep the newest work:\n{frame}"
     );
     assert!(
         !frame.contains("result: The review is already addressed"),
