@@ -1580,6 +1580,19 @@ fn write_run_stopped(run_dir: &Path, run_id: &str, pgid: u32, reason: &str) -> i
     };
     match fact {
         Some(FirstEnding::Stop) => {
+            // A run that already wrote a stopped ending has the one outcome the
+            // reopen is owed. Rewriting it changes its timestamp and replaces a
+            // truthful reason with the recovery sentence, so a clean stop looks
+            // as if it had only been closed at reopen. A terminal that is not
+            // stopped was written by the child during the first stop's grace: the
+            // stop still wins and replaces that child ending.
+            let terminal =
+                transcript::terminal_record_checked(run_dir).map_err(io::Error::other)?;
+            if let Some(transcript::Record::RunFinished { outcome, .. }) = terminal.as_ref()
+                && outcome.as_str() == RunOutcome::Stopped.as_str()
+            {
+                return Ok(());
+            }
             write_stop_marker(run_dir, run_id, pgid, reason)?;
             write_terminal_replacing(
                 run_dir,
@@ -3933,6 +3946,48 @@ mod stop_record_tests {
         match terminals[0] {
             Record::RunFinished { outcome, .. } => assert_eq!(outcome, "stopped"),
             other => panic!("the reopen did not write one stopped ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reopen_keeps_an_already_stopped_ending() {
+        let root = scratch("reopen-already-stopped");
+        let run = run_with_terminal(
+            &root,
+            RunOutcome::Stopped,
+            "the run was stopped before it became current",
+        );
+        let run_id = "run-1700000200000-0001";
+        ensure_first_ending(&run, run_id, FirstEnding::Stop).expect("the first ending");
+        let before = terminal(&run);
+        let reaped =
+            reap_leftover_run(&run, Duration::from_millis(20)).expect("the reopen settles the run");
+        assert!(!reaped);
+        let after = terminal(&run);
+        match (&before, &after) {
+            (
+                Record::RunFinished {
+                    ts: before_ts,
+                    reason: before_reason,
+                    ..
+                },
+                Record::RunFinished {
+                    ts: after_ts,
+                    reason: after_reason,
+                    ..
+                },
+            ) => {
+                assert_eq!(
+                    before_ts, after_ts,
+                    "the reopen changed an already stopped ending's timestamp"
+                );
+                assert_eq!(
+                    before_reason, after_reason,
+                    "the reopen rewrote an already stopped ending"
+                );
+            }
+            _ => panic!("the run's one terminal record changed kind"),
         }
         let _ = fs::remove_dir_all(&root);
     }
