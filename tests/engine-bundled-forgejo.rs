@@ -442,6 +442,36 @@ fn wait_engine(
     panic!("timed out waiting for {what}; board: {board:?}");
 }
 
+/// These engine-path cases predate the native programs. A fresh settings file
+/// now defaults to Pi, so state the legacy built-in program explicitly instead of
+/// relying on the old implicit default. This keeps the fixture testing the engine
+/// path it was written for.
+fn choose_builtin(engine: &mut gewu_multiverse::engine::Engine, names: &[&str]) {
+    for name in names {
+        engine
+            .send(Command::SetAgentProgram {
+                name: (*name).to_owned(),
+                program: "builtin".to_owned(),
+                protocol: None,
+            })
+            .expect("the built-in program is selectable");
+    }
+    wait_engine(
+        engine,
+        "the built-in program",
+        Duration::from_secs(30),
+        |engine| {
+            let board = engine.board();
+            names.iter().all(|name| {
+                board
+                    .agents
+                    .iter()
+                    .any(|agent| agent.name == *name && agent.program == "builtin")
+            })
+        },
+    );
+}
+
 /// The live run: install, prepare, start, provision, two agents, one instructed
 /// session that comments, a second session by itself, Stop, RemoveAgent with a 401,
 /// and shutdown with every pid gone.
@@ -584,6 +614,7 @@ fn the_bundled_engine_runs_a_started_agent_until_stopped() {
                     .all(|agent| agent.provisioning == Provisioning::Ready)
         },
     );
+    choose_builtin(&mut engine, &["agent-1", "agent-2"]);
     let board = engine.board();
     assert_eq!(board.agents[0].login, "gewu-agent-1");
     assert_eq!(board.agents[1].login, "gewu-agent-2");
@@ -899,6 +930,7 @@ fn the_first_run_after_a_reopen_has_the_forgejo_tools() {
             board.agents.len() == 1 && board.agents[0].provisioning == Provisioning::Ready
         },
     );
+    choose_builtin(&mut first, &["agent-1"]);
     let instruction = first
         .instruction_path("agent-1")
         .expect("agent-1 has an instruction path");
@@ -1563,6 +1595,7 @@ fn a_confined_agent_pushes_a_branch_and_opens_a_pull_request() {
             board.agents.len() == 1 && board.agents[0].provisioning == Provisioning::Ready
         },
     );
+    choose_builtin(&mut engine, &["agent-1"]);
     fs::write(
         engine
             .instruction_path("agent-1")
@@ -2227,6 +2260,7 @@ fn two_agents_load_a_v0130_shaped_data_directory_for_two_minutes() {
                     .all(|agent| agent.provisioning == Provisioning::Ready)
         },
     );
+    choose_builtin(&mut engine, &["agent-1", "agent-2"]);
     for name in ["agent-1", "agent-2"] {
         fs::write(
             engine.instruction_path(name).expect("the instruction path"),
