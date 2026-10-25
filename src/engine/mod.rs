@@ -5770,6 +5770,24 @@ mod tests {
             .expect("Start");
         tick(&mut engine, &clock, Duration::ZERO);
         wait_started(&fake, 1);
+        // The fake's start report lands before the engine's session job takes
+        // the state lock and installs the new run. Wait for the board state the
+        // assertion is about, not only for the spawner, so a loaded host cannot
+        // expose the previous row between those two steps.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let board = engine.board();
+            if board.agents[0].last_failure.is_none()
+                && matches!(board.agents[0].session, SessionState::Running { .. })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the previous run's failure is still presented beside the new run after 2 s"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert!(
             engine.board().agents[0].last_failure.is_none(),
             "the previous run's failure is still presented beside the new run"
