@@ -181,8 +181,12 @@ One line, no Rust:
 curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
 # Pi is installed by default. Other official programs are explicit:
 sh install.sh --harness pi,codex
-sh install.sh --harness none        # only the built-in engine
+sh install.sh --harness none        # no agent program; a new agent still starts as Pi
 ```
+
+`--harness none` installs no native agent program. A fresh installation still
+defaults a new agent to Pi, which is not installed: its card says Pi is not
+installed until you choose the built-in engine there or install Pi.
 
 The one-liner trusts the TLS connection to GitHub and the repository's release page —
 the checksum detects a damaged download, not a replaced release — and the bundled

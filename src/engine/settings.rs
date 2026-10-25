@@ -415,6 +415,33 @@ mod tests {
         assert_eq!(settings.default_harness.as_deref(), Some("pi"));
     }
 
+    /// The installer's `--harness none` leaves no agent program installed, while a
+    /// fresh settings file still defaults a new agent to Pi. Both public texts must
+    /// say that plainly instead of implying the built-in engine is selected.
+    #[test]
+    fn the_public_install_text_states_the_fresh_pi_default() {
+        let readme = include_str!("../../README.md");
+        let installer = include_str!("../../install.sh");
+        for (name, text) in [("README.md", readme), ("install.sh", installer)] {
+            let flat = text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            assert!(
+                flat.contains("a new agent still starts as pi"),
+                "{name} does not state what --harness none leaves for a new agent"
+            );
+            assert!(
+                !flat.contains("installs only the built-in engine"),
+                "{name} still says --harness none installs only the built-in engine"
+            );
+        }
+        let root = crate::test_support::scratch_root("settings-public-text");
+        let settings = Settings::load(&path_in(&root)).expect("a missing file is fresh");
+        assert_eq!(settings.default_harness.as_deref(), Some("pi"));
+    }
+
     #[test]
     fn the_started_choice_round_trips_through_the_file() {
         let root = crate::test_support::scratch_root("settings-round-trip");
