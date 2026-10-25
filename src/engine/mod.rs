@@ -2771,7 +2771,20 @@ impl EngineApi for Engine {
                     }
                 }
                 inner.agents[index].last_error = None;
-                inner.agents[index].program_hint = None;
+                // A model save is not a program or sandbox change: recompute the
+                // sandbox prerequisite instead of hiding a cause that is still there.
+                let hint = if inner
+                    .settings
+                    .agent(&name)
+                    .is_some_and(|saved| saved.harness() == Program::Codex)
+                {
+                    inner
+                        .codex_sandbox_block(&inner.agents[index])
+                        .map(|detail| codex_sandbox_action(&detail))
+                } else {
+                    None
+                };
+                inner.agents[index].program_hint = hint;
                 if inner.agents[index].running.is_some() {
                     inner.note(format!(
                         "`{name}`'s connection is saved for its next run; this run keeps its settings"
@@ -2814,9 +2827,15 @@ impl EngineApi for Engine {
                     None
                 };
                 inner.agents[index].program_hint = hint;
-                inner.note(format!(
-                    "`{name}`'s Codex sandbox is saved for its next run"
-                ));
+                if inner.agents[index].running.is_some() {
+                    inner.note(format!(
+                        "`{name}`'s Codex sandbox is saved for its next run; this run keeps its settings"
+                    ));
+                } else {
+                    inner.note(format!(
+                        "`{name}`'s Codex sandbox is saved for its next run"
+                    ));
+                }
                 Ok(())
             }
             Command::InstallProgram { id } => {
@@ -6001,6 +6020,150 @@ mod tests {
         assert!(
             notice.contains("next run"),
             "the save did not say when it applies: {notice}"
+        );
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_model_save_does_not_hide_a_codex_sandbox_prerequisite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_root("engine-model-save-keeps-hint");
+        let install = harness::install_root(&root.join("data"), Program::Codex);
+        fs::create_dir_all(install.join("bin")).expect("codex bin");
+        fs::create_dir_all(install.join("codex-resources")).expect("codex resources");
+        fs::write(install.join("bin/codex"), b"#!/bin/sh\nexit 0\n").expect("codex");
+        fs::set_permissions(install.join("bin/codex"), fs::Permissions::from_mode(0o755))
+            .expect("codex mode");
+        fs::write(
+            install.join("codex-resources/bwrap"),
+            b"#!/bin/sh\necho 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted' >&2\nexit 1\n",
+        )
+        .expect("bwrap");
+        fs::set_permissions(
+            install.join("codex-resources/bwrap"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("bwrap mode");
+        let record = harness::InstallRecord {
+            program: Program::Codex.id().to_owned(),
+            version: Program::Codex.pinned_version().to_owned(),
+            sha256: "0".repeat(64),
+            license: "Apache-2.0".to_owned(),
+            entrypoint: "bin/codex".to_owned(),
+            resources: Some("codex-resources".to_owned()),
+            installed_at: "2026-10-25T00:00:00Z".to_owned(),
+        };
+        fs::write(
+            harness::record_path(&install),
+            serde_json::to_vec(&record).expect("record json"),
+        )
+        .expect("record");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let saved = settings.agent_mut("agent-1").expect("agent");
+        saved.set_harness(Program::Codex);
+        saved.provider = Some(settings::AgentProvider {
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            protocol: "responses".to_owned(),
+            model: "lab-codex".to_owned(),
+        });
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("start probe");
+        let hint = engine.board().agents[0]
+            .program_error
+            .clone()
+            .unwrap_or_default();
+        assert!(hint.contains("bwrap: loopback"), "{hint}");
+        assert!(hint.contains("press f twice"), "{hint}");
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "responses".to_owned(),
+                model: "next-codex".to_owned(),
+                key: Some("fixture-key".to_owned()),
+            })
+            .expect("model save");
+        let hint = engine.board().agents[0]
+            .program_error
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            hint.contains("bwrap: loopback") && hint.contains("press f twice"),
+            "a model save hid the still-present sandbox cause: {hint}"
+        );
+        let mut board = Board::new(engine);
+        for _ in 0..2 {
+            if board.screen() == crate::board::Screen::Agent {
+                break;
+            }
+            board.on_key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Enter,
+            ));
+        }
+        let backend = ratatui::backend::TestBackend::new(72, 18);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| board.draw(frame))
+            .expect("the frame draws");
+        let mut frame = String::new();
+        let area = terminal.backend().buffer().area;
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                frame.push_str(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((x, y))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" "),
+                );
+            }
+            frame.push('\n');
+        }
+        assert!(frame.contains("bwrap: loopback"), "{frame}");
+        assert!(frame.contains("press f twice"), "{frame}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_sandbox_save_during_a_run_says_the_run_keeps_its_settings() {
+        let root = scratch_root("engine-sandbox-save-during-run");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        settings
+            .agent_mut("agent-1")
+            .expect("agent")
+            .set_harness(Program::Builtin);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+        engine
+            .send(Command::SetAgentProgram {
+                name: "agent-1".to_owned(),
+                program: "codex".to_owned(),
+                protocol: Some("responses".to_owned()),
+            })
+            .expect("program save during a run");
+        engine
+            .send(Command::SetAgentCodexSandbox {
+                name: "agent-1".to_owned(),
+                mode: "full-access".to_owned(),
+            })
+            .expect("sandbox save during a run");
+        let notice = engine.board().notice.unwrap_or_default();
+        assert!(
+            notice.contains("this run keeps its settings"),
+            "the sandbox save did not say the running run keeps its settings: {notice}"
         );
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);

@@ -462,10 +462,49 @@ fn c4_active_and_next_are_shown_together_when_they_differ() {
     for (width, height) in [(72, 18), (120, 40)] {
         let frame = text(&mut board, width, height);
         assert!(
-            frame.contains("active old-model · next new-model"),
+            frame.contains("active Pi old-model · next Pi new-model"),
             "{width}x{height}: {frame}"
         );
     }
+}
+
+#[test]
+fn c4_an_address_only_change_is_visible_in_the_agent_and_program_facts() {
+    let mut one = agent(1);
+    one.session = SessionState::Running {
+        number: 2,
+        since: SystemTime::now(),
+    };
+    let active = RunProgramView {
+        program: "pi".to_owned(),
+        label: "Pi".to_owned(),
+        version: "1.4.0".to_owned(),
+        protocol: "chat-completions".to_owned(),
+        base_url: "http://127.0.0.1:18889/v1".to_owned(),
+        model: "same-model".to_owned(),
+        codex_sandbox: None,
+    };
+    let next = RunProgramView {
+        base_url: "http://127.0.0.1:18899/v1".to_owned(),
+        ..active.clone()
+    };
+    one.active_program = Some(active);
+    one.next_program = Some(next);
+    let (mut board, _) = board(view(vec![one]));
+    open_agent(&mut board);
+    for (width, height) in [(72, 18), (120, 40)] {
+        let frame = text(&mut board, width, height);
+        assert!(
+            frame.contains("127.0.0.1:18889") && frame.contains("127.0.0.1:18899"),
+            "{width}x{height}: an address-only change is invisible: {frame}"
+        );
+    }
+    press(&mut board, KeyCode::Char('p'));
+    let frame = text(&mut board, 120, 40);
+    assert!(
+        frame.contains("127.0.0.1:18889") && frame.contains("127.0.0.1:18899"),
+        "the wide Program facts lost the address: {frame}"
+    );
 }
 
 #[test]

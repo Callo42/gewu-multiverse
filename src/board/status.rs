@@ -656,16 +656,52 @@ pub fn active_next_line(agent: &AgentView) -> Option<String> {
     {
         return None;
     }
-    if active.program != next.program {
-        return Some(format!("active {} · next {}", active.label, next.label));
+    // Every field that differs is carried; a field that is equal is not repeated.
+    // The address is shown as its host, which fits at 72 columns and still names the
+    // one thing that changed for an address-only save.
+    let mut active_parts = vec![active.label.clone()];
+    let mut next_parts = vec![next.label.clone()];
+    if active.base_url != next.base_url {
+        active_parts.push(format!("@{}", host_of(&active.base_url)));
+        next_parts.push(format!("@{}", host_of(&next.base_url)));
     }
-    if active.model != next.model || active.protocol != next.protocol {
-        return Some(format!(
-            "active {} · next {} ({})",
-            active.model, next.model, next.protocol
-        ));
+    if active.protocol != next.protocol {
+        active_parts.push(active.protocol.clone());
+        next_parts.push(next.protocol.clone());
     }
-    Some(format!("active {} · next {}", active.label, next.label))
+    if active.model != next.model {
+        active_parts.push(active.model.clone());
+        next_parts.push(next.model.clone());
+    }
+    if active.codex_sandbox != next.codex_sandbox {
+        active_parts.push(sandbox_word(active.codex_sandbox.as_deref()).to_owned());
+        next_parts.push(sandbox_word(next.codex_sandbox.as_deref()).to_owned());
+    }
+    Some(format!(
+        "active {} · next {}",
+        active_parts.join(" "),
+        next_parts.join(" ")
+    ))
+}
+
+/// The host part of a public base address, without scheme or path.
+pub(crate) fn host_of(base_url: &str) -> &str {
+    base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or(base_url)
+}
+
+/// The short sandbox state used by the active/next line.
+fn sandbox_word(mode: Option<&str>) -> &'static str {
+    match mode {
+        Some("full-access") => "sandbox-off",
+        Some("native") => "sandbox-default",
+        _ => "sandbox-auto",
+    }
 }
 
 /// The short program word a card shows: `built-in`, `Pi`, `Codex`, `DSH`,

@@ -3849,9 +3849,10 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
             if narrow {
                 format!("{} · {}{}", view.label, view.model, sandbox)
             } else {
+                let host = status::host_of(&view.base_url);
                 format!(
-                    "{} {} · {} · {}{}",
-                    view.label, version, view.protocol, view.model, sandbox
+                    "{} {} · {} · {} @ {}{}",
+                    view.label, version, view.protocol, view.model, host, sandbox
                 )
             }
         };
