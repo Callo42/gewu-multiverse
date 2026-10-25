@@ -1,8 +1,11 @@
 # Native outcome corpus
 
-`native-outcome-corpus.json` is the failure-signal inventory's 88 exact probe
-streams, copied from `input/inventory/evidence/` and annotated with the inventory's
-"correct" outcome/reason. It is generated, not hand-edited:
+`native-outcome-corpus.json` is the failure-signal inventory's 88 probe streams,
+copied from `input/inventory/evidence/` and annotated with the inventory's
+"correct" outcome/reason. The generator replaces the private workspace root with
+`/tmp/fixture` and harness session/thread ids with neutral `session-NNNN` and
+`stream-NNNN` placeholders, so the public fixture keeps the stream shape without
+the private host, task path or ids. It is generated, not hand-edited:
 
 ```sh
 python3 tests/fixtures/generate_outcome_corpus.py /path/to/input/inventory
@@ -17,7 +20,8 @@ tool-failure diagnosis.
 
 The fixture is immutable input: change the parser or the expectations, never the raw
 lines, unless a new inventory is generated and its hash is recorded here and in the
-test.
+test. The generator's path/session sanitization is applied when the fixture is
+written; do not edit the placeholders by hand.
 
 `native-outcome-attempt-cases.json` is the correction-1 edge corpus. It holds
 synthetic streams at the same shared parser for the two reviewed defects and their

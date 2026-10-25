@@ -6,19 +6,78 @@ each probe's exact stdout/stderr lines into one checked-in fixture and adds the
 outcome/reason the inventory's assessment calls correct. The Rust test
 `agent_run::native::corpus_tests` replays every entry through the product parser.
 
+Workspace-private paths and harness session/thread ids are replaced with neutral
+placeholders while the lines are copied, so the public fixture does not carry the
+private host or task. The inventory's SHA-256 still records the exact input.
+
 Run from the repository root:
 
     python3 tests/fixtures/generate_outcome_corpus.py \
         /path/to/input/inventory
 
-The generated file is deterministic: entries are sorted by probe id and the
-inventory's SHA-256 is recorded.
+The generated file is deterministic: entries are sorted by probe id, placeholders
+are assigned in sorted id order, and the inventory's SHA-256 is recorded.
 """
 
 import hashlib
 import json
 import os
+import re
 import sys
+
+# The inventory ran under a private workspace. Keep the shape of the paths (the
+# parser sees a cwd, a workspace and harness files) without the private root. The
+# root is found structurally — the prefix before the inventory's `harness/` or
+# `probes/` directory — so this public script holds no private host or task path.
+PRIVATE_WORKSPACE = re.compile(r'/home/[^\s"\']*?/(?=(?:harness|probes)/)')
+PLACEHOLDER_ROOT = "/tmp/fixture"
+SESSION_ID = re.compile(
+    r"session-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
+ANY_ID = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+)
+
+
+def sanitize_entries(entries):
+    """Replace private paths and session/thread ids in every copied line.
+
+    The mapping is global and sorted, so regenerating the fixture from the same
+    inventory always writes the same bytes. Only the raw stream lines change; the
+    recorded expectations and the inventory SHA-256 do not.
+    """
+    lines = [
+        line
+        for entry in entries
+        for name in ("stdout", "stderr")
+        for line in entry[name]
+    ]
+    session_ids = sorted(
+        {match.group(1) for line in lines for match in SESSION_ID.finditer(line)}
+    )
+    session_map = {
+        uuid: f"session-{index:04d}" for index, uuid in enumerate(session_ids)
+    }
+    other_ids = sorted(
+        {
+            match.group(0)
+            for line in lines
+            for match in ANY_ID.finditer(line)
+            if match.group(0) not in session_map
+        }
+    )
+    stream_map = {uuid: f"stream-{index:04d}" for index, uuid in enumerate(other_ids)}
+
+    def clean(line):
+        line = PRIVATE_WORKSPACE.sub(PLACEHOLDER_ROOT + "/", line)
+        line = SESSION_ID.sub(lambda match: session_map[match.group(1)], line)
+        return ANY_ID.sub(
+            lambda match: stream_map.get(match.group(0), match.group(0)), line
+        )
+
+    for entry in entries:
+        entry["stdout"] = [clean(line) for line in entry["stdout"]]
+        entry["stderr"] = [clean(line) for line in entry["stderr"]]
 
 
 def load_inventory(root):
@@ -201,6 +260,7 @@ def main():
                 "expected": check,
             }
         )
+    sanitize_entries(entries)
     corpus = {
         "source": "Callo42/gewu-multiverse failure-signal inventory",
         "inventory_sha256": digest,
