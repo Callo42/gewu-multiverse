@@ -2160,7 +2160,11 @@ mod tests {
         // the restore mount. The test computes the branch from the path instead of
         // assuming where cargo built it.
         let fixture = fixture("confinement-binary-under-tmp");
-        let exe = std::env::temp_dir().join(format!(
+        // The plan replaces the engine TMPDIR with a private tmpfs, so a binary
+        // there is hidden whatever the system TMPDIR is. The system temp dir is
+        // not always `/tmp` (and then the plan does not hide it), so do not place
+        // the binary there and assume the restore branch was taken.
+        let exe = fixture.temp.join(format!(
             "gewu-product-under-tmp-{}-{}",
             std::process::id(),
             crate::time::now_unix_ms()
