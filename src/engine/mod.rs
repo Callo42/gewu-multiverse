@@ -1678,7 +1678,11 @@ impl Inner {
                 )
             };
             if removal {
-                if self.agents[index].running.is_none() && !self.agents[index].starting && due {
+                if self.agents[index].running.is_none()
+                    && !self.agents[index].starting
+                    && !self.agents[index].provision_inflight
+                    && due
+                {
                     jobs.push(Job::RemoveAgent(name));
                 }
                 continue;
@@ -4340,14 +4344,13 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
     if let Err(reason) = marker {
         if let Ok(mut inner) = inner.lock() {
             if let Some(index) = inner.agent_index(&name) {
+                // Nothing was cancelled or changed. Do not leave a failed
+                // provisioning/blocked state behind: the agent is exactly as it was
+                // before the Remove request, except that it is not auto-retried.
                 inner.agents[index].removal_pending = false;
-                inner.agents[index].provisioning = Provisioning::Failed {
-                    reason: reason.clone(),
-                };
-                inner.agents[index].session = SessionState::Blocked {
-                    reason: reason.clone(),
-                };
-                inner.note(reason);
+                inner.note(format!(
+                    "`{name}` could not be removed: {reason}; nothing was changed"
+                ));
             }
         }
         return;
@@ -7862,18 +7865,44 @@ mod tests {
     }
 
     #[test]
-    fn f4r_a_marker_write_failure_cancels_nothing() {
+    fn f4t_removal_waits_for_an_inflight_provisioning_job() {
+        let root = scratch_root("engine-f4t-serialized-identity");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let engine = open_test_engine(&root, settings, clock, fake);
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents[0].removal_pending = true;
+            inner.agents[0].provision_inflight = true;
+            let jobs = inner.due_jobs(Instant::now());
+            assert!(
+                !jobs
+                    .iter()
+                    .any(|job| matches!(job, Job::RemoveAgent(name) if name == "agent-1")),
+                "removal ran while provisioning owned the identity"
+            );
+            inner.agents[0].provision_inflight = false;
+            let jobs = inner.due_jobs(Instant::now());
+            assert!(
+                jobs.iter()
+                    .any(|job| matches!(job, Job::RemoveAgent(name) if name == "agent-1")),
+                "removal was not queued after provisioning finished"
+            );
+        }
+    }
+
+    #[test]
+    fn f4r_a_marker_write_failure_changes_nothing_and_start_still_runs() {
         let root = scratch_root("engine-f4r-marker-failure");
         let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
-        let mut options = test_options(&root);
-        options.confinement = crate::confinement::Method::None;
-        let engine = open_for_test(
-            options,
-            Arc::new(FakeClock::new()),
-            Arc::new(FakeSpawner::new()),
-            settings,
-        )
-        .expect("the engine opens");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.agents[0].removal_pending = true;
+        }
         let state_dir = Layout::rooted_at(root.clone())
             .expect("layout")
             .agent("agent-1")
@@ -7885,17 +7914,32 @@ mod tests {
         }
         std::fs::write(&state_dir, b"not a directory").expect("blocking file");
         remove_agent_job(Arc::clone(&engine.inner), "agent-1".to_owned());
-        let inner = lock_inner(&engine.inner);
-        assert_eq!(inner.agents.len(), 1);
-        assert!(
-            inner
-                .notice
-                .as_deref()
-                .is_some_and(|note| note.contains("nothing was cancelled")),
-            "{:?}",
-            inner.notice
-        );
-        assert!(!state_dir.join("removal-pending").exists());
+        {
+            let inner = lock_inner(&engine.inner);
+            assert_eq!(inner.agents.len(), 1);
+            assert!(!inner.agents[0].removal_pending);
+            assert!(
+                !matches!(inner.agents[0].session, SessionState::Blocked { .. }),
+                "a failed marker write left the agent blocked"
+            );
+            assert!(
+                inner
+                    .notice
+                    .as_deref()
+                    .is_some_and(|note| note.contains("nothing was changed")),
+                "{:?}",
+                inner.notice
+            );
+        }
+        std::fs::remove_file(&state_dir).expect("blocking file");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("Start after the failed marker");
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
     }
 
     #[test]
