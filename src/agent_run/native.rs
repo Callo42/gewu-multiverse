@@ -2315,10 +2315,11 @@ mod native_proof_tests {
     }
 }
 
-/// Replay the failure-signal inventory's exact probe streams through the same
-/// parser the live supervisor uses. The fixture is generated from the inventory by
-/// `tests/fixtures/generate_outcome_corpus.py`; each entry asserts the inventory's
-/// correct terminal outcome and the truthful part of its reason.
+/// Replay the failure-signal inventory's probe streams through the same parser the
+/// live supervisor uses. The fixture is generated from the inventory by
+/// `tests/fixtures/generate_outcome_corpus.py`, which replaces private roots and
+/// session ids; each entry asserts the inventory's correct terminal outcome and the
+/// truthful part of its reason.
 #[cfg(test)]
 mod corpus_tests {
     use super::*;

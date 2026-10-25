@@ -9,7 +9,8 @@
 #   GEWU_HARNESSES=pi,opencode sh install.sh
 #   INSTALL_DIR=$HOME/bin sh install.sh
 #
-# The default program is Pi. --harness none installs only the built-in engine.
+# The default program is Pi. --harness none installs no agent program.
+# A new agent still starts as Pi (not installed) until the built-in engine is chosen.
 # Ctrl-C during a download, unpack or program install cancels it; the binary that
 # was already installed stays in place.
 #

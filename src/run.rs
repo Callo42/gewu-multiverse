@@ -2400,6 +2400,25 @@ fn process_state_has_ended(state: char) -> bool {
     matches!(state, 'Z' | 'X' | 'x')
 }
 
+/// Whether an `EINVAL` from `pidfd_open` is the already-gone case, not a live
+/// process without an openable handle.
+///
+/// Linux answers `EINVAL` when the struct pid no longer has a task: the member
+/// was reaped between `group_members()` and the open. A failed zero signal or a
+/// gone/ended `/proc/<pid>/stat` is positive absence. A live, unreadable or live-
+/// but-unverifiable process (for example a non-leader thread) keeps the
+/// uncertainty, so the caller still reports it.
+fn pidfd_einval_is_absence(pid: u32) -> bool {
+    if !process_alive(pid) {
+        return true;
+    }
+    match process_facts(pid) {
+        Ok(None) => true,
+        Ok(Some((state, _, _))) => process_state_has_ended(state),
+        Err(_) => false,
+    }
+}
+
 /// The descriptor-read error class a process can produce while it is exiting.
 fn descriptor_error_may_be_exit(error: &io::Error) -> bool {
     matches!(
@@ -2612,10 +2631,60 @@ struct ReapTarget {
     pidfd: OwnedFd,
 }
 
+// A test can name one pid whose pidfd open lands after the member was reaped,
+// inside the gap between `group_members()` and `open_pidfd()`. The test owns
+// the child, so the seam can reap it for real before reporting the kernel's
+// EINVAL for a struct pid with no task.
+#[cfg(test)]
+thread_local! {
+    static PIDFD_REAP_SEAM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct PidfdReapSeam;
+
+#[cfg(test)]
+impl PidfdReapSeam {
+    fn arm(pid: u32) -> Self {
+        PIDFD_REAP_SEAM.with(|seam| seam.set(Some(pid)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PidfdReapSeam {
+    fn drop(&mut self) {
+        PIDFD_REAP_SEAM.with(|seam| seam.set(None));
+    }
+}
+
+#[cfg(test)]
+fn take_reap_seam(pid: u32) -> bool {
+    PIDFD_REAP_SEAM.with(|seam| {
+        if seam.get() != Some(pid) {
+            return false;
+        }
+        seam.set(None);
+        true
+    })
+}
+
 fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
-    let pid = rustix::process::Pid::from_raw(pid as i32)
+    let handle = rustix::process::Pid::from_raw(pid as i32)
         .ok_or_else(|| io::Error::other("the process id is not positive"))?;
-    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+    #[cfg(test)]
+    if take_reap_seam(pid) {
+        // The member was live when `group_members()` listed it. Reap it now,
+        // then answer as a kernel whose struct pid has outlived its task does:
+        // EINVAL, not ESRCH.
+        let raw = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::kill(raw, nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(raw, None);
+        return Err(io::Error::from_raw_os_error(
+            nix::errno::Errno::EINVAL as i32,
+        ));
+    }
+    rustix::process::pidfd_open(handle, rustix::process::PidfdFlags::empty())
         .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
@@ -2790,11 +2859,21 @@ fn observe_run_group(
         let pidfd = match open_pidfd(pid) {
             Ok(pidfd) => pidfd,
             Err(error) => {
-                if error.raw_os_error() != Some(nix::errno::Errno::ESRCH as i32) {
-                    blocked = Some(format!(
-                        "unverified leftover: a live process has no kernel process handle, so it cannot be verified: {error}"
-                    ));
+                let errno = error.raw_os_error();
+                // ESRCH is the ordinary "already gone" answer. Linux also answers
+                // EINVAL when the struct pid has no task left, which is the same
+                // reaped-before-open race. Recheck before calling that a live
+                // process without a handle; a live unverifiable pid keeps the
+                // uncertainty below.
+                if errno == Some(nix::errno::Errno::ESRCH as i32)
+                    || (errno == Some(nix::errno::Errno::EINVAL as i32)
+                        && pidfd_einval_is_absence(pid))
+                {
+                    continue;
                 }
+                blocked = Some(format!(
+                    "unverified leftover: a live process has no kernel process handle, so it cannot be verified: {error}"
+                ));
                 continue;
             }
         };
@@ -3541,6 +3620,64 @@ mod review3_identity_tests {
         }
         assert!(ended, "the verified process was not signalled");
         let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    /// A member listed by `group_members()` can be reaped before its pidfd opens.
+    /// The kernel then reports EINVAL for a struct pid without a task. That is
+    /// absence, not a live process with no handle: recovery must not keep the
+    /// leftover and block Start for a process that no longer exists.
+    #[test]
+    fn a_member_reaped_inside_the_scan_window_is_absent() {
+        let run_dir = crate::test_support::scratch_root("pidfd-reaped-window");
+        let mut child = own_group_process();
+        let pid = child.id();
+        wait_for(pid);
+        let (group, _identity) = process_identity(pid)
+            .expect("identity")
+            .expect("a live identity");
+        let seam = PidfdReapSeam::arm(pid);
+        let mut known = Vec::new();
+        let (targets, blocked) = observe_run_group(group, &run_dir, &mut known);
+        drop(seam);
+        assert!(
+            blocked.is_none(),
+            "a reaped member was called a live leftover: {blocked:?}"
+        );
+        assert!(targets.is_empty(), "a reaped member was selected");
+        assert!(
+            process_facts(pid).expect("the stat is readable").is_none(),
+            "the seam did not leave the member reaped"
+        );
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    /// The other positive absence the EINVAL recheck accepts is a zombie: it has
+    /// ended, and only its parent's reaping is left.
+    #[test]
+    fn a_zombie_is_an_ending_fact_for_the_einval_recheck() {
+        let mut child = own_group_process();
+        let pid = child.id();
+        wait_for(pid);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let mut ended = false;
+        for _ in 0..200 {
+            if matches!(process_facts(pid), Ok(Some((state, _, _))) if process_state_has_ended(state))
+            {
+                ended = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ended, "the child never reached an ended state");
+        assert!(
+            pidfd_einval_is_absence(pid),
+            "a zombie was not a positive ending fact"
+        );
+        let _ = child.wait();
     }
 }
 
