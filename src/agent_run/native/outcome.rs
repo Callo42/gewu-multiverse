@@ -110,7 +110,14 @@ impl ProviderDetail {
 }
 
 fn status_in(text: &str) -> Option<u16> {
-    for needle in ["unexpected status ", "last status: ", "status: ", "HTTP "] {
+    for needle in [
+        "unexpected status ",
+        "last status: ",
+        "status: ",
+        "status_code=",
+        "status=",
+        "HTTP ",
+    ] {
         if let Some(at) = text.find(needle) {
             let rest = &text[at + needle.len()..];
             let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -415,6 +422,43 @@ impl NativeOutcome {
 
     fn clear_waiting(&mut self) {
         self.waiting = None;
+    }
+
+    /// Read a program's own stderr warning for a temporary provider retry.
+    ///
+    /// Codex emits its retry warnings only on stderr when a 503 recovers; its JSON
+    /// stream is silent about the attempt. The warning is the program's own fact, so
+    /// the card can name the temporary condition while the retry is in flight.
+    pub(super) fn observe_retry_text(&mut self, text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        let retrying = lower.contains("retrying sampling request")
+            || lower.contains("temporarily unavailable")
+            || lower.contains("rate limit");
+        let status = status_in(text).or_else(|| {
+            ["503", "502", "504", "429"]
+                .into_iter()
+                .find(|code| lower.contains(code))
+                .and_then(|code| code.parse::<u16>().ok())
+        });
+        let Some(status) = status else {
+            return false;
+        };
+        if !(retrying || matches!(status, 429 | 500 | 502 | 503 | 504)) {
+            return false;
+        }
+        // The diagnostic can be a long tracing line. The status is the fact the
+        // card needs; the program's full sentence is still in the run log.
+        self.observe(NativeEvent::AttemptFailure {
+            detail: ProviderDetail {
+                status: Some(status),
+                kind: None,
+                code: None,
+                message: "the model is temporarily unavailable".to_owned(),
+                url: None,
+            },
+            waiting: true,
+        });
+        true
     }
 
     /// Record one finished tool call and return its diagnostic when it failed.
@@ -1548,6 +1592,19 @@ mod tests {
         let resolution = outcome.finish(None, SupervisorEnd::Deadline);
         assert_eq!(resolution.disposition, Disposition::Failed);
         assert!(resolution.reason.unwrap().contains("Connection failed"));
+    }
+
+    #[test]
+    fn c5_codex_stderr_retry_names_the_503_while_it_waits() {
+        let mut outcome = NativeOutcome::new(Program::Codex);
+        assert!(outcome.observe_retry_text(
+            "2026-10-26T12:09:15Z INFO codex_otel: event.name=\"codex.api_request\" http.response.status_code=503 error.message=\"http 503\" attempt=0"
+        ));
+        let (state, cause, terminal, _) = outcome.progress().expect("progress");
+        assert_eq!(state, "retrying");
+        assert!(cause.contains("503"), "{cause}");
+        assert!(!terminal);
+        assert!(!outcome.observe_retry_text("compiling one harmless file"));
     }
 
     #[test]

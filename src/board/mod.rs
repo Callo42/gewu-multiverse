@@ -110,6 +110,10 @@ pub struct Board {
     program_index: usize,
     /// The connection type selected beside the program.
     program_protocol: Protocol,
+    /// The person changed the connection with ←→ on this Program screen. Until
+    /// then, moving the highlight uses the newly selected program's own default
+    /// instead of carrying the previous program's connection across.
+    program_protocol_chosen: bool,
     /// The saved program value the Program screen must show as an error until
     /// the person explicitly chooses a known one.
     program_unknown: Option<String>,
@@ -175,6 +179,7 @@ impl Board {
             model_agent: None,
             program_index: 0,
             program_protocol: Protocol::ChatCompletions,
+            program_protocol_chosen: false,
             program_unknown: None,
             codex_optin_confirmed: false,
             confirm_remove: None,
@@ -350,12 +355,7 @@ impl Board {
         };
         if let Some(name) = self.model_agent.as_ref() {
             let protocol = self.model_protocol;
-            let base = self.model_fields[0]
-                .trim()
-                .trim_end_matches('/')
-                .trim_end_matches("/chat/completions")
-                .trim_end_matches('/')
-                .to_owned();
+            let base = Self::base_address(&self.model_fields[0]);
             Command::SetAgentModel {
                 name: name.clone(),
                 base_url: base,
@@ -395,19 +395,53 @@ impl Board {
         !self.model_fields[2].trim().is_empty() || self.view.endpoint.key_present
     }
 
-    /// Whether the typed address is a shape the selected protocol can use. The
-    /// first-run form already refused `/v1` for a completions connection; the
-    /// per-agent form checks the same fact against the protocol it will save.
-    fn address_fits_protocol(&self) -> bool {
-        let url = self.model_fields[0].trim();
+    /// The protocol named by a full route at the end of an address, if any.
+    fn address_route(url: &str) -> Option<Protocol> {
         let path = url.split(['?', '#']).next().unwrap_or(url);
         let path = path.trim_end_matches('/');
-        // The per-agent form stores a base address; the program appends its own
-        // route. A full route typed here would be doubled, so refuse every known
-        // one and let the person keep the address the program expects.
-        !path.ends_with("/chat/completions")
-            && !path.ends_with("/responses")
-            && !path.ends_with("/messages")
+        if path.ends_with("/chat/completions") {
+            Some(Protocol::ChatCompletions)
+        } else if path.ends_with("/responses") {
+            Some(Protocol::Responses)
+        } else if path.ends_with("/messages") {
+            Some(Protocol::AnthropicMessages)
+        } else {
+            None
+        }
+    }
+
+    /// The base address a matching full route is reduced to. A base address is
+    /// already what the program needs, so it is unchanged.
+    fn base_address(url: &str) -> String {
+        let trimmed = url.trim().trim_end_matches('/');
+        let path = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+        for route in ["/chat/completions", "/responses", "/messages"] {
+            if path.trim_end_matches('/').ends_with(route) {
+                return path
+                    .trim_end_matches('/')
+                    .trim_end_matches(route)
+                    .to_owned();
+            }
+        }
+        trimmed.to_owned()
+    }
+
+    /// Why the typed address cannot be used with the selected protocol.
+    ///
+    /// A full route is accepted when it names the selected protocol: the base
+    /// address is derived on save. A route belonging to another protocol is named
+    /// as that protocol, not called "another protocol" in the abstract.
+    fn address_problem(&self) -> Option<String> {
+        let url = self.model_fields[0].trim();
+        let route = Self::address_route(url)?;
+        if route == self.model_protocol {
+            return None;
+        }
+        Some(format!(
+            "✗ this address is the {} route — change the protocol to {} or use the base address",
+            route.label(),
+            route.label()
+        ))
     }
 
     /// What the person asked for.
@@ -558,11 +592,14 @@ impl Board {
                     self.set_notice("✗ wrong address — it should end in /chat/completions");
                     return;
                 }
-                if self.model_agent.is_some() && !self.address_fits_protocol() {
-                    self.set_notice("✗ the address is for another protocol — change the protocol or the address");
+                if self.model_agent.is_some()
+                    && let Some(problem) = self.address_problem()
+                {
+                    self.set_notice(problem);
                     return;
                 }
                 if !self.key_available() {
+                    self.model_key_cleared = true;
                     self.set_notice("✗ the API key is empty");
                     return;
                 }
@@ -592,7 +629,24 @@ impl Board {
             }
             _ => match plain(key) {
                 Some('t') if self.model_agent.is_some() => {
-                    self.set_notice("Start uses and reports this agent's own connection");
+                    if !self.endpoint_fields_filled() {
+                        self.set_notice("API address and model needed, then t");
+                    } else if let Some(problem) = self.address_problem() {
+                        self.set_notice(problem);
+                    } else if !self.key_available() {
+                        // The field is cleared too, so the bullets cannot contradict
+                        // the empty-key refusal.
+                        self.model_key_cleared = true;
+                        self.set_notice("✗ the API key is empty");
+                    } else {
+                        self.send(self.endpoint_command());
+                        self.send(Command::TestAgentModel {
+                            name: self.model_agent.clone().unwrap_or_default(),
+                        });
+                        self.notice = None;
+                        self.notice_ticks = 0;
+                        self.model_edited = false;
+                    }
                 }
                 Some('t') => {
                     if !self.endpoint_fields_filled() {
@@ -665,11 +719,13 @@ impl Board {
             KeyCode::Enter => {
                 // `⏎` commits the field and selects the next one without entering
                 // its edit mode, so `t` still tests and a key cannot be overwritten
-                // by the next keystroke (F-05/W67-5).
+                // by the next keystroke (F-05/W67-5). The same key then saves from
+                // the form; say so, because one press used to look like a no-op.
                 self.model_editing = false;
                 if self.model_focus + 1 < 3 {
                     self.next_model_field();
                 }
+                self.set_notice("press ⏎ again to save");
             }
             KeyCode::Esc => self.model_editing = false,
             KeyCode::Left => self.model_cursor = self.model_cursor.saturating_sub(1),
@@ -930,7 +986,7 @@ impl Board {
                             .copied()
                             .unwrap_or(Program::Builtin)
                     };
-                    self.program_protocol = if program.supports(chosen) {
+                    self.program_protocol = if current == program.id() && program.supports(chosen) {
                         chosen
                     } else {
                         program
@@ -939,6 +995,7 @@ impl Board {
                             .copied()
                             .unwrap_or(Protocol::ChatCompletions)
                     };
+                    self.program_protocol_chosen = false;
                     self.codex_optin_confirmed = false;
                     self.screen = Screen::Program;
                 }
@@ -998,6 +1055,14 @@ impl Board {
         }
     }
 
+    fn default_program_protocol(program: Program) -> Protocol {
+        program
+            .supported_protocols()
+            .first()
+            .copied()
+            .unwrap_or(Protocol::ChatCompletions)
+    }
+
     fn cycle_program_protocol(&mut self, forward: bool) {
         let program = self.selected_program();
         let supported = program.supported_protocols();
@@ -1014,6 +1079,7 @@ impl Board {
             (current + supported.len() - 1) % supported.len()
         };
         self.program_protocol = supported[next];
+        self.program_protocol_chosen = true;
     }
 
     fn keys_program(&mut self, key: KeyEvent) {
@@ -1022,24 +1088,30 @@ impl Board {
             KeyCode::Up => {
                 self.program_unknown = None;
                 self.program_index = (self.program_index + 4) % 5;
-                let supported = self.selected_program().supported_protocols();
-                if !supported.contains(&self.program_protocol) {
-                    self.program_protocol = supported
-                        .first()
-                        .copied()
-                        .unwrap_or(Protocol::ChatCompletions);
-                }
+                self.program_protocol = if self.program_protocol_chosen {
+                    let supported = self.selected_program().supported_protocols();
+                    if supported.contains(&self.program_protocol) {
+                        self.program_protocol
+                    } else {
+                        Self::default_program_protocol(self.selected_program())
+                    }
+                } else {
+                    Self::default_program_protocol(self.selected_program())
+                };
             }
             KeyCode::Down => {
                 self.program_unknown = None;
                 self.program_index = (self.program_index + 1) % 5;
-                let supported = self.selected_program().supported_protocols();
-                if !supported.contains(&self.program_protocol) {
-                    self.program_protocol = supported
-                        .first()
-                        .copied()
-                        .unwrap_or(Protocol::ChatCompletions);
-                }
+                self.program_protocol = if self.program_protocol_chosen {
+                    let supported = self.selected_program().supported_protocols();
+                    if supported.contains(&self.program_protocol) {
+                        self.program_protocol
+                    } else {
+                        Self::default_program_protocol(self.selected_program())
+                    }
+                } else {
+                    Self::default_program_protocol(self.selected_program())
+                };
             }
             KeyCode::Left => self.cycle_program_protocol(false),
             KeyCode::Right => self.cycle_program_protocol(true),
@@ -1051,12 +1123,29 @@ impl Board {
                     return;
                 }
                 let program = self.selected_program();
+                if program.is_native() {
+                    let view = self
+                        .view
+                        .programs
+                        .iter()
+                        .find(|view| view.id == program.id());
+                    if view.is_some_and(|view| view.installing.is_some()) {
+                        self.set_notice(format!(
+                            "{} is still installing — its connection will be usable when it finishes",
+                            program.label()
+                        ));
+                        return;
+                    }
+                    if view.is_some_and(|view| !view.installed) {
+                        self.set_notice(format!(
+                            "{} is not installed — press i to install it, then ⏎ use",
+                            program.label()
+                        ));
+                        return;
+                    }
+                }
                 if !program.supports(self.program_protocol) {
-                    self.program_protocol = program
-                        .supported_protocols()
-                        .first()
-                        .copied()
-                        .unwrap_or(Protocol::ChatCompletions);
+                    self.program_protocol = Self::default_program_protocol(program);
                 }
                 self.send(Command::SetAgentProgram {
                     name: self.agent_name.clone(),

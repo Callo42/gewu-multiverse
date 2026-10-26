@@ -33,7 +33,8 @@ use crate::bundled_forgejo::{self, PreparedInstance, RunningForgejo};
 use crate::credentials::{self, CredentialsFile, Secret};
 use crate::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, ProgramView, Provisioning, RunProgramView, SessionEnd, SessionState, UpgradeView,
+    ForgejoView, ProgramView, Provisioning, RunProgramView, SessionEnd, SessionState, UpgradeAgent,
+    UpgradeView,
 };
 use crate::forgejo::{DEFAULT_TIMEOUT, ForgejoClient, ForgejoError, Repository};
 use crate::harness::{self, Program, Protocol};
@@ -315,7 +316,12 @@ fn build(
     // first picture reads the program cards. A live install owns its directory and
     // is not touched.
     let install_recovery = harness::recover_pending(&options.data_root);
-    let upgrade = upgrade_view(&options.layout, &settings, &settings_path);
+    let upgrade = upgrade_view(
+        &options.layout,
+        &settings,
+        &settings_path,
+        &options.data_root,
+    );
     // The recovery result is part of the first picture: Inner::new must receive it
     // before it loads the agent cards, or a failed cleanup is silently dropped and
     // the engine starts a replacement run beside the old process (review-3).
@@ -347,45 +353,91 @@ fn build(
     Ok(engine)
 }
 
+/// What opening this installation will stop before the board can appear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryClaim {
+    /// The agent whose live run will be stopped, when one was found.
+    pub agent: Option<String>,
+    /// The id of that run.
+    pub run_id: Option<String>,
+    /// The bundled Forgejo is also live and will be stopped.
+    pub forgejo: bool,
+}
+
+impl RecoveryClaim {
+    /// The one sentence the opening screen shows. It names the agent and the run,
+    /// not "the earlier run", and still names Forgejo when that is being stopped too.
+    pub fn message(&self) -> String {
+        let run = match (&self.agent, &self.run_id) {
+            (Some(agent), Some(run_id)) => Some(format!("{agent}'s run {run_id}")),
+            (Some(agent), None) => Some(format!("{agent}'s run")),
+            _ => None,
+        };
+        match (run, self.forgejo) {
+            (Some(run), true) => format!("stopping {run} and Forgejo…"),
+            (Some(run), false) => format!("stopping {run}…"),
+            (None, true) => "stopping Forgejo…".to_owned(),
+            (None, false) => String::new(),
+        }
+    }
+}
+
 /// Whether opening this installation will first stop an earlier run or Forgejo.
 ///
 /// This is read before the engine is built so the board can say what the wait is
 /// for instead of showing a blank alternate screen. Only live records count: a
 /// stale pid file with no live process is cleanup, not a process being stopped.
 pub fn stale_recovery_pending(layout: &Layout, data_root: &Path) -> bool {
-    let record = bundled_forgejo::InstancePaths::under(data_root)
-        .root
-        .join(bundled_forgejo::PID_FILE);
-    if let Ok(text) = fs::read_to_string(&record)
-        && let Ok(pid) = text.trim().parse::<u32>()
-        && run::process_alive(pid)
-    {
-        return true;
-    }
-    let Ok(agents) = fs::read_dir(layout.state_root()) else {
-        return false;
-    };
-    for agent in agents.flatten() {
-        let Ok(runs) = fs::read_dir(agent.path()) else {
-            continue;
-        };
-        for run_dir in runs.flatten() {
-            if !run_dir.path().is_dir() {
+    stale_recovery_claim(layout, data_root).is_some()
+}
+
+/// The same check, with the agent and run the opening screen names.
+pub fn stale_recovery_claim(layout: &Layout, data_root: &Path) -> Option<RecoveryClaim> {
+    let mut live_agent = None;
+    let mut live_run = None;
+    if let Ok(agents) = fs::read_dir(layout.state_root()) {
+        'agents: for agent in agents.flatten() {
+            let Ok(runs) = fs::read_dir(agent.path()) else {
                 continue;
-            }
-            if let Some((pid, _)) = run::recorded_group(&run_dir.path())
-                && run::process_alive(pid)
-            {
-                return true;
+            };
+            for run_dir in runs.flatten() {
+                if !run_dir.path().is_dir() {
+                    continue;
+                }
+                if let Some((pid, _)) = run::recorded_group(&run_dir.path())
+                    && run::process_alive(pid)
+                {
+                    live_agent = agent.file_name().to_str().map(str::to_owned);
+                    live_run = run_dir.file_name().to_str().map(str::to_owned);
+                    break 'agents;
+                }
             }
         }
     }
-    false
+    let forgejo = {
+        let record = bundled_forgejo::InstancePaths::under(data_root)
+            .root
+            .join(bundled_forgejo::PID_FILE);
+        fs::read_to_string(&record)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .is_some_and(run::process_alive)
+    };
+    (live_run.is_some() || forgejo).then_some(RecoveryClaim {
+        agent: live_agent,
+        run_id: live_run,
+        forgejo,
+    })
 }
 
 /// What the one upgrade screen should say, when this is the first open by a newer
 /// build. A fresh installation, a same-version open and a downgrade have no screen.
-fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> Option<UpgradeView> {
+fn upgrade_view(
+    layout: &Layout,
+    settings: &Settings,
+    settings_path: &Path,
+    data_root: &Path,
+) -> Option<UpgradeView> {
     // Builds before 0.1.31 wrote no marker at all, so a real upgrade from 0.1.30 has
     // none. An existing installation (its settings file, or the older text screens'
     // config.toml) still deserves the one screen: the installer writes the exact old
@@ -424,6 +476,29 @@ fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> O
             }
         }
     }
+    let kept_agents = settings
+        .agents
+        .iter()
+        .map(|agent| {
+            let program = agent.harness();
+            let provider = agent.provider();
+            UpgradeAgent {
+                name: agent.name.clone(),
+                program: program.label().to_owned(),
+                model: provider
+                    .map(|provider| provider.model.clone())
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| settings.endpoint.model.clone()),
+                protocol: provider
+                    .map(|provider| provider.protocol().label().to_owned())
+                    .unwrap_or_else(|| settings.endpoint.protocol().label().to_owned()),
+            }
+        })
+        .collect();
+    let programs = crate::harness::installed_all(data_root)
+        .into_iter()
+        .filter(|(_, installed)| installed.is_some())
+        .count();
     Some(UpgradeView {
         from_version: from,
         to_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -432,6 +507,8 @@ fn upgrade_view(layout: &Layout, settings: &Settings, settings_path: &Path) -> O
         instructions,
         runs,
         ignored_config: layout.config_file().is_file(),
+        kept_agents,
+        programs,
         // The screen names this build's own release notes, not the list of every
         // release: the person wants the exact version they just opened.
         release_url: format!(
@@ -555,6 +632,8 @@ struct AgentRuntime {
     leftover_targets: Vec<RecoveryTarget>,
     current_tool: Option<String>,
     current_tool_since: Option<SystemTime>,
+    /// A temporary provider failure the live native program is retrying.
+    retrying: Option<String>,
     last_work: Vec<String>,
     no_assigned_work: bool,
     last_work_result: Option<String>,
@@ -618,6 +697,8 @@ struct Inner {
     agents: Vec<AgentRuntime>,
     forgejo: ForgejoRuntime,
     endpoint_test: EndpointTest,
+    /// The newest test of one agent's own saved connection, keyed by agent name.
+    agent_tests: HashMap<String, EndpointTest>,
     notice: Option<String>,
     admin_password_once: Option<String>,
     password_reset_inflight: bool,
@@ -637,6 +718,9 @@ struct Inner {
 struct ProgramState {
     installing: Option<Option<u8>>,
     phase: Option<harness::InstallPhase>,
+    /// When the current install began, so a silent npm step still shows an honest
+    /// elapsed time instead of a frozen phrase.
+    started: Option<Instant>,
     error: Option<String>,
     cancel: Option<harness::CancelToken>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -730,6 +814,7 @@ impl Inner {
             agents: Vec::new(),
             forgejo,
             endpoint_test: EndpointTest::NotRun,
+            agent_tests: HashMap::new(),
             notice: None,
             admin_password_once: None,
             password_reset_inflight: false,
@@ -1005,6 +1090,7 @@ impl AgentRuntime {
             leftover_targets: Vec::new(),
             current_tool: None,
             current_tool_since: None,
+            retrying: None,
             last_work,
             no_assigned_work,
             last_work_result,
@@ -1538,6 +1624,16 @@ impl Inner {
                 if let Some(failure) = run::read_failure(&run_dir) {
                     self.agents[index].last_failure = Some(failure);
                 }
+                // A native program retries a temporary provider failure inside its
+                // own turn. The run is still working, but the card must not stay
+                // silent about a 503 while it waits and retries.
+                self.agents[index].retrying = run::native_progress(&run_dir)
+                    .filter(|progress| {
+                        progress.state == "retrying"
+                            && !progress.terminal
+                            && temporary_model_cause(&progress.cause)
+                    })
+                    .map(|progress| progress.cause);
                 self.observe_confinement_refusal(&run_dir);
                 self.agents[index].activity_refresh_at = Some(now);
             }
@@ -2005,9 +2101,18 @@ impl Inner {
                     prerequisite: program.prerequisite().map(str::to_owned),
                     prerequisite_met: program.prerequisite_missing().is_none(),
                     installing: state.and_then(|state| state.installing),
-                    installing_phase: state
-                        .and_then(|state| state.phase)
-                        .map(|phase| phase.label().to_owned()),
+                    installing_phase: state.and_then(|state| {
+                        let phase = state.phase?;
+                        let elapsed = state
+                            .started
+                            .map(|started| started.elapsed().as_secs())
+                            .unwrap_or(0);
+                        Some(if elapsed > 0 {
+                            format!("{} · {elapsed}s", phase.label())
+                        } else {
+                            phase.label().to_owned()
+                        })
+                    }),
                     error: state.and_then(|state| state.error.clone()),
                 }
             })
@@ -2243,6 +2348,27 @@ fn plain_activity(sentence: &str) -> String {
     sentence.to_owned()
 }
 
+/// Whether a provider cause is a temporary condition the program itself retries.
+/// A refused key or a missing model is not temporary and is never shown with the
+/// retry sentence.
+fn temporary_model_cause(cause: &str) -> bool {
+    let lower = cause.to_ascii_lowercase();
+    if [
+        "temporarily unavailable",
+        "rate limit",
+        "too many requests",
+        "overloaded",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    ["429", "500", "502", "503", "504"]
+        .iter()
+        .any(|code| lower.contains(code))
+}
+
 fn finish_session(
     agent: &mut AgentRuntime,
     end: SessionEnd,
@@ -2272,6 +2398,7 @@ fn finish_session(
     };
     agent.current_tool = None;
     agent.current_tool_since = None;
+    agent.retrying = None;
     // The attempt that just ended owns the failure/activity rows. A prepare or
     // spawn failure has a run directory of its own but never became `newest_run`;
     // reading the previous newest run here showed its old tool failure beside the
@@ -2416,6 +2543,7 @@ impl EngineApi for Engine {
                     .and_then(|since| SystemTime::now().duration_since(since).ok())
                     .map(|elapsed| elapsed.as_secs())
                     .unwrap_or(0),
+                retrying: agent.retrying.clone(),
                 last_work: agent.last_work.clone(),
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
@@ -2470,6 +2598,11 @@ impl EngineApi for Engine {
                     .map(|(_, _, model)| model)
                     .unwrap_or_else(|| inner.settings.endpoint.model.clone()),
                 key_present: credentials::model_key(&inner.credentials, &agent.name).is_ok(),
+                model_test: inner
+                    .agent_tests
+                    .get(&agent.name)
+                    .cloned()
+                    .unwrap_or(EndpointTest::NotRun),
                 program_error: inner
                     .program_block(agent)
                     .or_else(|| agent.program_hint.clone()),
@@ -2680,6 +2813,7 @@ impl EngineApi for Engine {
                     }
                 }
                 inner.agents[index].last_error = None;
+                inner.agent_tests.remove(&name);
                 let hint = if program == Program::Codex {
                     inner
                         .codex_sandbox_block(&inner.agents[index])
@@ -2771,6 +2905,7 @@ impl EngineApi for Engine {
                     }
                 }
                 inner.agents[index].last_error = None;
+                inner.agent_tests.remove(&name);
                 // A model save is not a program or sandbox change: recompute the
                 // sandbox prerequisite instead of hiding a cause that is still there.
                 let hint = if inner
@@ -2855,6 +2990,7 @@ impl EngineApi for Engine {
                 let state = inner.program_states.entry(id.clone()).or_default();
                 state.installing = Some(None);
                 state.phase = Some(harness::InstallPhase::Preparing);
+                state.started = Some(Instant::now());
                 state.error = None;
                 state.cancel = Some(cancel.clone());
                 inner.note(format!("installing {}", program.label()));
@@ -2876,6 +3012,7 @@ impl EngineApi for Engine {
                     {
                         state.installing = None;
                         state.phase = None;
+                        state.started = None;
                         state.cancel = None;
                         match result {
                             Ok(installed) => {
@@ -2899,6 +3036,7 @@ impl EngineApi for Engine {
                                 ));
                             }
                             Err(error) if error == harness::INSTALL_CANCELED => {
+                                state.started = None;
                                 state.error = None;
                                 inner.note(format!(
                                     "installing {} was canceled; the previous version is unchanged",
@@ -2943,12 +3081,56 @@ impl EngineApi for Engine {
                 Ok(())
             }
             Command::TestAgentModel { name } => {
-                if inner.settings.agent(&name).is_none() {
+                let Some(saved) = inner.settings.agent(&name).cloned() else {
                     return Err(format!("there is no agent named `{name}`"));
+                };
+                let protocol = saved
+                    .provider()
+                    .map(|provider| provider.protocol())
+                    .unwrap_or_else(|| inner.settings.endpoint.protocol());
+                let base_url = saved
+                    .provider()
+                    .map(|provider| provider.base_url.clone())
+                    .filter(|base| !base.trim().is_empty())
+                    .unwrap_or_else(|| inner.settings.endpoint.base_url());
+                let model = saved
+                    .provider()
+                    .map(|provider| provider.model.clone())
+                    .filter(|model| !model.trim().is_empty())
+                    .unwrap_or_else(|| inner.settings.endpoint.model.clone());
+                if base_url.trim().is_empty() || model.trim().is_empty() {
+                    return Err("the API address and model are both needed".to_owned());
                 }
-                inner.note(
-                    "the selected model was not tested; Start will use the program's own error",
-                );
+                let key = match credentials::model_key(&inner.credentials, &name) {
+                    Ok(key) => key,
+                    Err(_) => return Err("the API key is empty; type it, then press ⏎".to_owned()),
+                };
+                inner
+                    .agent_tests
+                    .insert(name.clone(), EndpointTest::Running);
+                let inner_arc = Arc::clone(&self.inner);
+                drop(inner);
+                std::thread::spawn(move || {
+                    let result = crate::model::probe_protocol(
+                        &base_url,
+                        protocol,
+                        &model,
+                        &key,
+                        crate::model::PROBE_TIMEOUT,
+                    )
+                    .map_err(|error| plain_endpoint_failure(&error, &model));
+                    if let Ok(mut inner) = inner_arc.lock() {
+                        inner.agent_tests.insert(
+                            name,
+                            match result {
+                                Ok(_) => EndpointTest::Passed {
+                                    answer: "the model answered".to_owned(),
+                                },
+                                Err(reason) => EndpointTest::Failed { reason },
+                            },
+                        );
+                    }
+                });
                 Ok(())
             }
             Command::TestEndpoint => {
@@ -3046,6 +3228,7 @@ impl EngineApi for Engine {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                inner.agent_tests.remove(&name);
                 let grace = inner.options.stop_grace;
                 stop_agent(&mut inner.agents[index], grace)?;
                 // The stop already happened; the runtime must say Stopped even if
@@ -4792,6 +4975,26 @@ mod tests {
     }
 
     #[test]
+    fn c6_the_recovery_claim_names_the_agent_and_the_run() {
+        let claim = RecoveryClaim {
+            agent: Some("agent-2".to_owned()),
+            run_id: Some("run-1700000200000-0007".to_owned()),
+            forgejo: true,
+        };
+        let message = claim.message();
+        assert!(message.contains("agent-2"), "{message}");
+        assert!(message.contains("run-1700000200000-0007"), "{message}");
+        assert!(message.contains("Forgejo"), "{message}");
+        assert!(!message.contains("earlier run"), "{message}");
+        let only_forgejo = RecoveryClaim {
+            agent: None,
+            run_id: None,
+            forgejo: true,
+        };
+        assert_eq!(only_forgejo.message(), "stopping Forgejo…");
+    }
+
+    #[test]
     fn an_earlier_setup_is_left_as_it_was_and_says_so_once() {
         let root = scratch_root("engine-earlier-config");
         let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
@@ -5098,6 +5301,14 @@ mod tests {
         assert_eq!(upgrade.instructions, 2);
         assert_eq!(upgrade.runs, 1);
         assert!(upgrade.ignored_config, "the old config.toml was not named");
+        assert_eq!(
+            upgrade.kept_agents.len(),
+            2,
+            "the kept agents were not named"
+        );
+        assert_eq!(upgrade.kept_agents[0].name, "agent-1");
+        assert!(!upgrade.kept_agents[0].program.is_empty());
+        assert!(!upgrade.kept_agents[0].model.is_empty());
         assert_eq!(
             upgrade.release_url,
             format!(
@@ -6860,6 +7071,98 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn c7_a_silent_package_install_still_shows_an_elapsed_time() {
+        let root = scratch_root("engine-install-elapsed");
+        let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, clock, fake);
+        {
+            let mut inner = lock_inner(&engine.inner);
+            inner.program_states.insert(
+                "dsh".to_owned(),
+                ProgramState {
+                    installing: Some(None),
+                    phase: Some(harness::InstallPhase::InstallingPackages),
+                    started: Some(Instant::now() - Duration::from_secs(12)),
+                    ..ProgramState::default()
+                },
+            );
+        }
+        let board = engine.board();
+        let dsh = board
+            .programs
+            .iter()
+            .find(|program| program.id == "dsh")
+            .expect("the DSH card");
+        let phase = dsh.installing_phase.as_deref().expect("an install phase");
+        assert!(phase.starts_with("installing packages"), "{phase}");
+        assert!(phase.contains("12s") || phase.contains("13s"), "{phase}");
+    }
+
+    #[test]
+    fn c3_the_per_agent_test_uses_that_agents_own_connection() {
+        let root = scratch_root("engine-agent-test");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let stub = crate::test_stub::Stub::start(vec![crate::test_stub::StubReply::status(
+            200,
+            serde_json::json!({
+                "model": "lab-chat-1",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "ok"}
+                }]
+            })
+            .to_string(),
+        )]);
+        let base = stub.url().trim_end_matches("/chat/completions").to_owned();
+        settings.agent_mut("agent-1").expect("agent").provider = Some(settings::AgentProvider {
+            base_url: base,
+            protocol: "chat-completions".to_owned(),
+            model: "lab-chat-1".to_owned(),
+        });
+        settings
+            .save(&settings::path_in(
+                Layout::rooted_at(root.clone())
+                    .expect("the test layout is absolute")
+                    .root(),
+            ))
+            .expect("settings");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, clock, fake);
+        engine
+            .send(Command::TestAgentModel {
+                name: "agent-1".to_owned(),
+            })
+            .expect("test");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match &engine.board().agents[0].model_test {
+                EndpointTest::Passed { answer } => {
+                    assert_eq!(answer, "the model answered");
+                    break;
+                }
+                EndpointTest::Failed { reason } => panic!("the agent test failed: {reason}"),
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the per-agent test did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/v1/chat/completions");
+        assert_eq!(
+            requests[0].header("authorization").as_deref(),
+            Some("Bearer gw-test-key")
+        );
     }
 
     #[test]

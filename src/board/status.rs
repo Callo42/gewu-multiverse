@@ -279,6 +279,36 @@ pub fn agent_face(agent: &AgentView) -> Face {
     }
 }
 
+/// A temporary model failure the running program is retrying.
+///
+/// The run is still `● working`: this line names the provider's condition while the
+/// program's own retry loop waits, before any run-level `✗ failed` exists. It uses
+/// the `◐` waiting mark, never the failure mark, because the condition is temporary
+/// and the outcome is not decided yet.
+pub fn retry_line(agent: &AgentView) -> Option<String> {
+    if !matches!(agent.session, SessionState::Running { .. }) {
+        return None;
+    }
+    let cause = agent.retrying.as_deref()?.trim();
+    if cause.is_empty() {
+        return None;
+    }
+    // The card has one short row. Keep the status the person needs: the HTTP
+    // class and the fact that it is being retried. The full provider sentence is
+    // still in the run reason once the program gives up.
+    let lower = cause.to_ascii_lowercase();
+    let word = if lower.contains("503") {
+        "◐ HTTP 503 — retrying"
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        "◐ rate limited — retrying"
+    } else if lower.contains("502") || lower.contains("504") {
+        "◐ temporary model outage — retrying"
+    } else {
+        "◐ model retrying"
+    };
+    Some(word.to_owned())
+}
+
 /// The newest activity of a running agent, in the card's words, if it has one.
 ///
 /// While a tool call is in flight that is what the card says, with the seconds it has
@@ -997,6 +1027,7 @@ pub const BANNED: [&str; 9] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_api::EndpointTest;
     use std::time::Duration;
 
     fn agent(session: SessionState, desired: Desired) -> AgentView {
@@ -1026,6 +1057,7 @@ mod tests {
             leftover: None,
             current_tool: None,
             current_tool_seconds: 0,
+            retrying: None,
             last_work: Vec::new(),
             no_assigned_work: false,
             last_work_result: None,
@@ -1039,11 +1071,31 @@ mod tests {
             base_url: "http://127.0.0.1:9/v1".to_owned(),
             model: "lab-chat-1".to_owned(),
             key_present: true,
+            model_test: EndpointTest::NotRun,
             program_error: None,
             active_program: None,
             next_program: None,
             codex_sandbox: None,
         }
+    }
+
+    #[test]
+    fn c5_a_retried_503_is_named_without_a_failed_mark() {
+        let mut agent = agent(
+            SessionState::Running {
+                number: 1,
+                since: SystemTime::now(),
+            },
+            Desired::Started,
+        );
+        agent.retrying = Some("the provider answered HTTP 503: temporarily unavailable".to_owned());
+        let line = retry_line(&agent).expect("a retrying line");
+        assert!(line.starts_with('◐'), "{line}");
+        assert!(line.contains("HTTP 503"), "{line}");
+        assert!(line.contains("retrying"), "{line}");
+        assert!(!line.contains('✗'), "{line}");
+        agent.retrying = None;
+        assert!(retry_line(&agent).is_none());
     }
 
     #[test]

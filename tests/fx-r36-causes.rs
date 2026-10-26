@@ -65,6 +65,7 @@ fn agent(number: usize) -> AgentView {
         leftover: None,
         current_tool: None,
         current_tool_seconds: 0,
+        retrying: None,
         last_work: vec![format!("comment on #{number}")],
         no_assigned_work: false,
         last_work_result: Some("I worked on the issue".to_owned()),
@@ -78,6 +79,7 @@ fn agent(number: usize) -> AgentView {
         base_url: "https://model.example/v1".to_owned(),
         model: "demo-model".to_owned(),
         key_present: true,
+        model_test: EndpointTest::NotRun,
         program_error: None,
         active_program: None,
         next_program: None,
@@ -435,6 +437,8 @@ fn c4_last_work_shows_the_newest_work_not_the_run_warning() {
 #[test]
 fn c4_active_and_next_are_shown_together_when_they_differ() {
     let mut one = agent(1);
+    one.program = "pi".to_owned();
+    one.program_label = "Pi".to_owned();
     one.session = SessionState::Running {
         number: 2,
         since: SystemTime::now(),
@@ -471,6 +475,8 @@ fn c4_active_and_next_are_shown_together_when_they_differ() {
 #[test]
 fn c4_an_address_only_change_is_visible_in_the_agent_and_program_facts() {
     let mut one = agent(1);
+    one.program = "pi".to_owned();
+    one.program_label = "Pi".to_owned();
     one.session = SessionState::Running {
         number: 2,
         since: SystemTime::now(),
@@ -502,8 +508,8 @@ fn c4_an_address_only_change_is_visible_in_the_agent_and_program_facts() {
     press(&mut board, KeyCode::Char('p'));
     let frame = text(&mut board, 120, 40);
     assert!(
-        frame.contains("127.0.0.1:18889") && frame.contains("127.0.0.1:18899"),
-        "the wide Program facts lost the address: {frame}"
+        frame.contains("127.0.0.1:18899") && frame.contains("next run: Pi"),
+        "the Program preview lost the saved next address: {frame}"
     );
 }
 
@@ -541,7 +547,7 @@ fn c4_built_in_program_screen_names_the_shared_model_and_keeps_the_saved_one() {
         "{frame}"
     );
     assert!(
-        frame.contains("next: built-in engine always ready"),
+        frame.contains("next run: built-in engine always ready"),
         "{frame}"
     );
     assert!(!frame.contains("built-in engine not installed"), "{frame}");
@@ -588,6 +594,12 @@ fn c4_a_live_earlier_run_makes_the_reopen_say_what_it_is_stopping() {
         gewu_multiverse::engine::stale_recovery_pending(&layout, &data),
         "a live earlier run was not seen before the board opened"
     );
+    let claim = gewu_multiverse::engine::stale_recovery_claim(&layout, &data)
+        .expect("the claim names what is being stopped");
+    assert_eq!(claim.agent.as_deref(), Some("agent-1"));
+    assert_eq!(claim.run_id.as_deref(), Some("run-1"));
+    assert!(claim.message().contains("agent-1"), "{claim:?}");
+    assert!(claim.message().contains("run-1"), "{claim:?}");
     let _ = std::fs::remove_file(run.join("session.pid"));
     let _ = std::fs::remove_file(run.join("session.pgid"));
     assert!(

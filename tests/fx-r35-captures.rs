@@ -76,6 +76,7 @@ fn agent(number: usize, state: State) -> AgentView {
         leftover: None,
         current_tool: None,
         current_tool_seconds: 0,
+        retrying: None,
         last_work: vec![format!("pull request #{}", 20 + number)],
         no_assigned_work: false,
         last_work_result: Some(format!("I opened pull request #{number}")),
@@ -89,6 +90,7 @@ fn agent(number: usize, state: State) -> AgentView {
         base_url: "https://model.example/v1".to_owned(),
         model: "demo-model".to_owned(),
         key_present: true,
+        model_test: EndpointTest::NotRun,
         program_error: None,
         active_program: None,
         next_program: None,
@@ -445,6 +447,8 @@ fn capture_the_version_tag_upgrade_screen() {
             instructions: 2,
             runs: 9,
             ignored_config: false,
+            kept_agents: Vec::new(),
+            programs: 0,
             release_url: format!(
                 "https://github.com/Callo42/gewu-multiverse/releases/tag/v{}",
                 env!("CARGO_PKG_VERSION")

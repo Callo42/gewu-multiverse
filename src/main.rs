@@ -353,10 +353,10 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
     // Open the terminal before the slow recovery, so a killed run's cleanup is
     // visible as a sentence instead of a blank alternate screen. Only a live earlier
     // process earns the line; an ordinary open goes straight to the board.
-    let pending = engine::stale_recovery_pending(&options.layout, &options.data_root);
+    let pending = engine::stale_recovery_claim(&options.layout, &options.data_root);
     let mut screen = Screen::enter()?;
-    if pending {
-        screen.message("stopping the earlier run and Forgejo…")?;
+    if let Some(claim) = pending {
+        screen.message(&claim.message())?;
     }
     let engine = engine::open_with(options).map_err(StartupError::Engine)?;
     let mut board = Board::new(engine);
