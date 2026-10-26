@@ -473,6 +473,13 @@ fn non_success_reason(state: &NativeState, requested: RequestedWork) -> String {
     if state.uncertain_write {
         return "the Forgejo write request was accepted but its result could not be read; the effect is uncertain".to_owned();
     }
+    if observed_work(state) {
+        // The run did record local work, but the requested remote work is not
+        // verified. State that directly; the denial sentences below would
+        // contradict the "workspace changed" clause that precedes this reason.
+        return "the requested remote work was not verified; the local change is recorded"
+            .to_owned();
+    }
     if !state.outcome.saw_tool() && requires_confirmed_tool(requested) {
         // Codex's in-run workspace sandbox can refuse a command without emitting a
         // JSON event at all; the refusal reaches only the model, not this stream.
@@ -2163,6 +2170,18 @@ mod native_proof_tests {
         )
         .expect("reason");
         assert!(local_reason.contains("workspace changed"), "{local_reason}");
+        assert!(
+            local_reason.contains("the requested remote work was not verified"),
+            "{local_reason}"
+        );
+        assert!(
+            !local_reason.contains("no tool call or workspace change"),
+            "{local_reason}"
+        );
+        assert!(
+            !local_reason.contains("no matching tool or work fact"),
+            "{local_reason}"
+        );
         assert_eq!(
             requested_work("Open a pull request and comment on the issue.", &[]),
             RequestedWork::PullRequest

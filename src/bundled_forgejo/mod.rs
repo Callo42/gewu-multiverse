@@ -1095,8 +1095,7 @@ fn forgejo_output_tracked(
     if cancelled() {
         return Err("the start was called off".to_owned());
     }
-    let mut command = Command::new(binary);
-    command
+    let mut child = Command::new(binary)
         .args(args)
         .arg("--config")
         .arg(&paths.app_ini)
@@ -1110,27 +1109,9 @@ fn forgejo_output_tracked(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0);
-    // A helper that was just written and renamed can still be reported ETXTBSY
-    // for a few milliseconds on an overlay filesystem. The executable is already
-    // complete at this path; only the transient exec availability is retried.
-    let mut child = {
-        let mut busy_retries = 0;
-        loop {
-            match command.spawn() {
-                Ok(child) => break child,
-                Err(error)
-                    if error.raw_os_error() == Some(26) && busy_retries < 20 && !cancelled() =>
-                {
-                    busy_retries += 1;
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => {
-                    return Err(format!("the Forgejo command could not be run: {error}"));
-                }
-            }
-        }
-    };
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("the Forgejo command could not be run: {error}"))?;
     on_spawn(child.id());
     // Drain both pipes while the command runs. Waiting without reading stalls a
     // helper whose output is larger than the pipe buffer.

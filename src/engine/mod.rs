@@ -7685,7 +7685,11 @@ mod tests {
                 let _ = report.send(pid);
             }
             if let Some(release) = self.release.lock().expect("release").take() {
-                let _ = release.recv_timeout(Duration::from_secs(5));
+                // The test removes the agent before releasing this boundary. Under
+                // a loaded parallel suite that setup can take longer than five
+                // seconds; a short timeout would let the spawn return as a normal
+                // start and the removal would have no in-flight job to settle.
+                let _ = release.recv_timeout(Duration::from_secs(30));
             }
             Ok(Box::new(RealChild {
                 child,

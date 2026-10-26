@@ -320,6 +320,15 @@ fn sequence(program: &str, issue: u64, scenario: &str, branch: &str) -> Vec<Stub
                 "I could not finish the task. The work is still pending; please check it.",
             ),
         ],
+        "local-only" => vec![
+            command_for(
+                program,
+                &format!(
+                    "cd workspace && git checkout -b {branch} && printf 'local only\n' > {branch}.txt && git add {branch}.txt && git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 commit -m 'local only' -q"
+                ),
+            ),
+            final_for(program, "I made a local commit and stopped."),
+        ],
         "503-recovers" => vec![
             StubReply::status(
                 503,
@@ -414,6 +423,9 @@ fn run_scenario(
         "local-failed-push" => format!(
             "Make a local commit on branch `w37-{program}-local`, then push it. Do not open a pull request."
         ),
+        "local-only" => format!(
+            "Make a local commit on branch `w37-{program}-only` and stop. Do not push or open a pull request."
+        ),
         "503-recovers" => format!(
             "Read issue #{issue} in team/workspace. The model may be temporarily unavailable; if so, retry. Do not change anything."
         ),
@@ -460,7 +472,7 @@ fn run_scenario(
         "no-work" => SessionEnd::NoWork {
             reason: String::new(),
         },
-        "local-failed-push" => SessionEnd::Warned {
+        "local-failed-push" | "local-only" => SessionEnd::Warned {
             reason: String::new(),
         },
         _ => SessionEnd::Succeeded,
@@ -625,6 +637,7 @@ fn wave37_c1_c5_runs() {
             "failing-pr",
             "503-recovers",
             "local-failed-push",
+            "local-only",
         ] {
             if !only.is_empty() && !format!("{program}/{scenario}").contains(&only) {
                 continue;
@@ -633,6 +646,7 @@ fn wave37_c1_c5_runs() {
                 "comment-push" => format!("w37-{program}-comment"),
                 "failing-pr" => format!("w37-{program}-pr"),
                 "local-failed-push" => format!("w37-{program}-local"),
+                "local-only" => format!("w37-{program}-only"),
                 _ => String::new(),
             };
             let replies = sequence(program, issue.number, scenario, &branch);
@@ -674,6 +688,40 @@ fn wave37_c1_c5_runs() {
                             "{program}/{scenario}: no comment result\n{transcript_text}"
                         );
                     }
+                }
+                "local-only" => {
+                    assert_eq!(
+                        observed.outcome, "warned",
+                        "{program}/{scenario}: {}",
+                        observed.reason
+                    );
+                    assert!(
+                        matches!(observed.board, Some(SessionEnd::Warned { .. })),
+                        "{program}/{scenario}: the card mark is {:?}",
+                        observed.board
+                    );
+                    assert!(
+                        observed.reason.contains("workspace changed"),
+                        "{program}/{scenario}: the reason denied the local work: {}",
+                        observed.reason
+                    );
+                    assert!(
+                        observed
+                            .reason
+                            .contains("the requested remote work was not verified"),
+                        "{program}/{scenario}: the reason did not name the missing remote work: {}",
+                        observed.reason
+                    );
+                    assert!(
+                        !observed.reason.contains("no tool call or workspace change")
+                            && !observed.reason.contains("no matching tool or work fact"),
+                        "{program}/{scenario}: the reason denied its recorded work: {}",
+                        observed.reason
+                    );
+                    assert!(
+                        !observed.run_dir.join("push.json").is_file(),
+                        "{program}/{scenario}: a local-only run was recorded as a push"
+                    );
                 }
                 "local-failed-push" => {
                     assert_eq!(
