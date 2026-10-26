@@ -795,6 +795,126 @@ pub fn probe(config: &ModelConfig) -> Result<Reply, ModelError> {
     Ok(exchange.reply)
 }
 
+/// The full route a base address uses for one wire protocol.
+pub fn protocol_endpoint(base: &str, protocol: crate::harness::Protocol) -> String {
+    let base = base.trim().trim_end_matches('/');
+    match protocol {
+        crate::harness::Protocol::ChatCompletions => format!("{base}/chat/completions"),
+        crate::harness::Protocol::Responses => format!("{base}/responses"),
+        crate::harness::Protocol::AnthropicMessages => format!("{base}/messages"),
+    }
+}
+
+/// Test one per-agent connection with the smallest real request its protocol accepts.
+///
+/// The shared first-run form is always Chat Completions and uses [`probe`]. An agent
+/// may have chosen Responses or Anthropic Messages; sending a Chat Completions body
+/// to those routes would test a connection the agent will never use and invent a
+/// failure the provider did not give. The status and the provider's own message are
+/// mapped by the same [`failure_words`] as every other model screen.
+pub fn probe_protocol(
+    base_url: &str,
+    protocol: crate::harness::Protocol,
+    model: &str,
+    api_key: &Secret,
+    timeout: Duration,
+) -> Result<Reply, ModelError> {
+    if protocol == crate::harness::Protocol::ChatCompletions {
+        let config = ModelConfig {
+            endpoint: protocol_endpoint(base_url, protocol),
+            model: model.to_owned(),
+            api_key: api_key.clone(),
+            timeout,
+        };
+        return probe(&config);
+    }
+    let endpoint = protocol_endpoint(base_url, protocol);
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return Err(ModelError::BadUrl {
+            endpoint,
+            problem: "it must start with http:// or https://".to_owned(),
+        });
+    }
+    if api_key.is_empty() {
+        return Err(ModelError::MissingKey);
+    }
+    let body = match protocol {
+        crate::harness::Protocol::Responses => serde_json::json!({
+            "model": model,
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Reply with the single word: ok"}]
+            }],
+            "max_output_tokens": 4,
+            "stream": false,
+        }),
+        crate::harness::Protocol::AnthropicMessages => serde_json::json!({
+            "model": model,
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+        }),
+        crate::harness::Protocol::ChatCompletions => unreachable!("handled above"),
+    };
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut request = agent
+        .post(&endpoint)
+        .header("Content-Type", "application/json");
+    request = match protocol {
+        crate::harness::Protocol::AnthropicMessages => request
+            .header("x-api-key", api_key.expose())
+            .header("anthropic-version", "2023-06-01"),
+        _ => request.header("Authorization", format!("Bearer {}", api_key.expose())),
+    };
+    let response = request.send(body.to_string()).map_err(|error| {
+        let message = api_key.redact(&error.to_string());
+        ModelError::Transport {
+            endpoint: endpoint.clone(),
+            message,
+        }
+    })?;
+    let status = response.status().as_u16();
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|error| ModelError::Transport {
+            endpoint: endpoint.clone(),
+            message: api_key.redact(&format!("the reply body cannot be read: {error}")),
+        })?;
+    let redacted = api_key.redact(&text);
+    match status {
+        200..=299 => Ok(Reply {
+            content: Some("ok".to_owned()),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: None,
+            model: Some(model.to_owned()),
+            body: redacted,
+        }),
+        401 | 403 => Err(ModelError::BadKey {
+            status,
+            message: provider_message(&redacted).unwrap_or_default(),
+        }),
+        429 => Err(ModelError::RateLimited {
+            status,
+            retry_after_secs: None,
+        }),
+        404 => Err(ModelError::RouteNotFound {
+            endpoint,
+            status,
+            message: provider_message(&redacted).unwrap_or_default(),
+        }),
+        status => Err(ModelError::Server {
+            status,
+            message: provider_message(&redacted).unwrap_or_default(),
+        }),
+    }
+}
+
 /// The provider's first clause, bounded and ending at a word boundary.
 ///
 /// A screen shows the provider's own words, but only the first clause: the status is
@@ -929,7 +1049,11 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
             } else {
                 format!(": {}", whole_message(message, 400))
             };
-            format!("the provider answered HTTP {status}{detail}")
+            if matches!(status, 502..=504) {
+                format!("the model is temporarily unavailable (HTTP {status}{detail})")
+            } else {
+                format!("the provider answered HTTP {status}{detail}")
+            }
         }
         ModelError::Timeout { secs } => format!("no answer within {secs} s"),
         ModelError::MalformedReply { .. } => "the model's answer could not be read".to_owned(),
@@ -1477,6 +1601,48 @@ mod tests {
             ..one.clone()
         };
         assert_eq!(two.summary(), "asked for 2 tool calls; 1 token used");
+    }
+
+    #[test]
+    fn f3_a_one_shot_503_does_not_claim_a_live_retry() {
+        let words = failure_words(
+            &ModelError::Server {
+                status: 503,
+                message: "The model is temporarily unavailable. Retry later.".to_owned(),
+            },
+            "example-model",
+        );
+        assert!(words.contains("temporarily unavailable"), "{words}");
+        assert!(words.contains("HTTP 503"), "{words}");
+        assert!(!words.contains("retrying"), "{words}");
+    }
+
+    #[test]
+    fn c2_each_protocol_tests_its_own_route() {
+        for (protocol, path) in [
+            (crate::harness::Protocol::Responses, "/v1/responses"),
+            (crate::harness::Protocol::AnthropicMessages, "/v1/messages"),
+        ] {
+            let stub = Stub::start(vec![StubReply::json("{}")]);
+            let base = stub.url().trim_end_matches("/chat/completions").to_owned();
+            let key = Secret::new("sk-test-key-1234567890");
+            probe_protocol(
+                &base,
+                protocol,
+                "example-model",
+                &key,
+                Duration::from_secs(5),
+            )
+            .unwrap_or_else(|error| panic!("{protocol:?} probe failed: {error}"));
+            let requests = stub.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].path, path);
+            assert!(
+                !requests[0].body.contains("sk-test-key"),
+                "{}",
+                requests[0].body
+            );
+        }
     }
 
     #[test]

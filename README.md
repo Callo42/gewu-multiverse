@@ -95,8 +95,11 @@ requests are its own. The board shows the whole thing at a glance:
   list came back empty and that wrote nothing is `∅ no work`, even when its own
   sentence says everything is done; a check that read its issue and wrote nothing and
   says `nothing new to add` is the same neutral `∅ no work`, not a green tick; one
-  whose tool results include a failed command is `⚠` with the command's cause as its
-  row. None of those is `✓`. A refused write's
+  whose tool results include a failed command but no recorded write is `⚠` with the
+  command's cause as its row. A run that actually pushed, opened a pull request or
+  commented stays `✓` even if a test failed first, reused the branch an interrupted
+  run left, or ended with a sentence claiming failure; the work block keeps the
+  product-observed fact. A refused write's
   cause row says `⊘ write refused: …`, matching the strip. The
   summary line prefers the newest run that did work (`last work: comment on #2`,
   `last work: PR #3 open`); a later no-op's reason is labelled `no work: …`. Started agents keep
@@ -170,7 +173,7 @@ a single-column connector is placed after the label so it never crosses the word
 After an upgrade, the first open shows one screen: the version this installation was,
 the version this is, what was found (settings, agents, instructions and runs), what is
 reused or ignored, one line from this release's notes naming what changed, and the
-release page address for this exact build (`…/releases/tag/v0.1.38`). If the first-run warnings changed since this installation last
+release page address for this exact build (`…/releases/tag/v0.1.39`). If the first-run warnings changed since this installation last
 agreed to them, the screen says so and the next screen shows them again; after they are
 agreed the program returns to the board, never into the first-run model and picker
 flow. The next open goes straight to the board. The installer records the old version before it replaces the binary, and a

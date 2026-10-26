@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gewu_multiverse::agent_run;
 use gewu_multiverse::board::Board;
-use gewu_multiverse::engine_api::{AgentView, BoardView, Command as BoardCommand, EngineApi};
+use gewu_multiverse::engine_api::{
+    AgentView, BoardView, Command as BoardCommand, EndpointTest, EngineApi,
+};
 use gewu_multiverse::mode;
 use gewu_multiverse::run::{self, RunPlan};
 use gewu_multiverse::test_stub::{Stub, StubReply};
@@ -168,6 +170,7 @@ fn board_view(_run_dir: &Path, outcome: &str, reason: &str) -> BoardView {
             leftover: None,
             current_tool: None,
             current_tool_seconds: 0,
+            retrying: None,
             last_work: Vec::new(),
             no_assigned_work: false,
             last_work_result: None,
@@ -181,6 +184,7 @@ fn board_view(_run_dir: &Path, outcome: &str, reason: &str) -> BoardView {
             base_url: "http://127.0.0.1:1/v1".to_owned(),
             model: "example-model".to_owned(),
             key_present: true,
+            model_test: EndpointTest::NotRun,
             program_error: None,
             active_program: None,
             next_program: None,

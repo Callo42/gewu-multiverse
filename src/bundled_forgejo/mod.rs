@@ -1890,8 +1890,17 @@ esac
     /// A plain executable fixture for the command paths.
     fn fake_helper(root: &Path, name: &str, body: &str) -> PathBuf {
         let path = root.join(name);
-        fs::write(&path, body).expect("the fake helper is written");
-        crate::mode::set_mode(&path, 0o755).expect("the fake helper is executable");
+        // Write and close the executable before it appears at the path other
+        // threads may exec. Writing the final inode directly lets a parallel
+        // fork inherit the open writer and makes exec fail with ETXTBSY.
+        let stage = root.join(format!(
+            ".{name}.stage-{}-{}",
+            std::process::id(),
+            crate::time::now_unix_ms()
+        ));
+        fs::write(&stage, body).expect("the fake helper is written");
+        crate::mode::set_mode(&stage, 0o755).expect("the fake helper is executable");
+        fs::rename(&stage, &path).expect("the fake helper is published");
         path
     }
 

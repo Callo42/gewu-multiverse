@@ -211,6 +211,10 @@ pub struct AgentView {
     pub current_tool: Option<String>,
     /// How many seconds that call has been in flight.
     pub current_tool_seconds: u64,
+    /// A temporary model failure the running program is retrying, in the provider's
+    /// own words. It is not a failed run: the card says it is retrying and keeps the
+    /// working state until the program either recovers or gives up.
+    pub retrying: Option<String>,
     /// The last issue, branch, pull request and comment named by the newest run that
     /// did work, at most three short typed lines, for the card's work block. It stays
     /// until a later run does new work.
@@ -243,6 +247,8 @@ pub struct AgentView {
     pub model: String,
     /// Whether a key is available for this agent (its own or the shared one).
     pub key_present: bool,
+    /// The newest per-agent connection test, when one was run on this form.
+    pub model_test: EndpointTest,
     /// Why Start would refuse this agent's program/connection, in one sentence.
     pub program_error: Option<String>,
     /// The actual program facts of the newest run, when it has one.
@@ -251,6 +257,19 @@ pub struct AgentView {
     pub next_program: Option<RunProgramView>,
     /// The selected Codex sandbox mode (`native`/`full-access`), when Codex.
     pub codex_sandbox: Option<String>,
+}
+
+/// One agent's kept program and model, named on the upgrade screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeAgent {
+    /// The agent's name.
+    pub name: String,
+    /// The kept program's display name.
+    pub program: String,
+    /// The kept model id.
+    pub model: String,
+    /// The kept connection type's display name.
+    pub protocol: String,
 }
 
 /// What an older installation looked like when this version first opened it.
@@ -271,6 +290,10 @@ pub struct UpgradeView {
     pub runs: usize,
     /// An old `config.toml` was found and is ignored (never read or converted).
     pub ignored_config: bool,
+    /// The programs and per-agent connections found and kept, in agent order.
+    pub kept_agents: Vec<UpgradeAgent>,
+    /// How many installed programs were found by their install records.
+    pub programs: usize,
     /// The release page address.
     pub release_url: String,
     /// One line from this release's notes naming what changed.

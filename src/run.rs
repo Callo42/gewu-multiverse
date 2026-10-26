@@ -1723,11 +1723,17 @@ fn write_terminal_replacing(
         None => Vec::new(),
     };
     records.retain(|record| !matches!(record, Record::RunFinished { .. }));
+    // A stop is still an elapsed run. The opening record is the only start time
+    // the engine has after the supervisor is gone; never write `0` when it exists.
+    let duration_ms = transcript::first_started_at(run_dir)
+        .and_then(|stamp| crate::time::parse_rfc3339(&stamp))
+        .map(|started| crate::time::now_unix_ms().saturating_sub(started))
+        .unwrap_or(0);
     records.push(Record::run_finished(
         run_id,
         outcome,
         None,
-        0,
+        duration_ms,
         Some(reason.to_owned()),
     ));
     let mut text = String::new();
@@ -3946,6 +3952,44 @@ mod stop_record_tests {
         match terminals[0] {
             Record::RunFinished { outcome, .. } => assert_eq!(outcome, "stopped"),
             other => panic!("the reopen did not write one stopped ending: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stopped_run_keeps_its_real_elapsed_time() {
+        let root = scratch("stop-duration");
+        let run = root.join("run-1700000200000-0001");
+        fs::create_dir_all(&run).expect("run dir");
+        let run_id = "run-1700000200000-0001";
+        let mut transcript = transcript::Transcript::open(&run).expect("transcript");
+        transcript
+            .append(&Record::run_started(
+                run_id,
+                "agent-1",
+                std::process::id(),
+                &run.display().to_string(),
+            ))
+            .expect("started record");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        settle_run_with_stop(
+            &run,
+            4_000_123,
+            RunOutcome::Stopped,
+            Some("the run was stopped on request".to_owned()),
+            Duration::from_millis(20),
+            Some("the run was stopped on request".to_owned()),
+            FirstEnding::Stop,
+        )
+        .expect("the stop settles");
+        match terminal(&run) {
+            Record::RunFinished { duration_ms, .. } => {
+                assert!(
+                    duration_ms >= 20,
+                    "a stopped run wrote duration_ms {duration_ms}"
+                );
+            }
+            other => panic!("no stopped ending: {other:?}"),
         }
         let _ = fs::remove_dir_all(&root);
     }

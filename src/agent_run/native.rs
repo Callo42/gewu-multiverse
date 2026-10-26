@@ -473,6 +473,13 @@ fn non_success_reason(state: &NativeState, requested: RequestedWork) -> String {
     if state.uncertain_write {
         return "the Forgejo write request was accepted but its result could not be read; the effect is uncertain".to_owned();
     }
+    if observed_work(state) {
+        // The run did record local work, but the requested remote work is not
+        // verified. State that directly; the denial sentences below would
+        // contradict the "workspace changed" clause that precedes this reason.
+        return "the requested remote work was not verified; the local change is recorded"
+            .to_owned();
+    }
     if !state.outcome.saw_tool() && requires_confirmed_tool(requested) {
         // Codex's in-run workspace sandbox can refuse a command without emitting a
         // JSON event at all; the refusal reaches only the model, not this stream.
@@ -508,6 +515,21 @@ fn run_reason(
 ) -> Option<String> {
     match ending {
         RunEnding::Succeeded => (!summary.trim().is_empty()).then(|| summary.to_owned()),
+        RunEnding::NoWork => Some(if summary.trim().is_empty() {
+            "there was no assigned work".to_owned()
+        } else {
+            summary.to_owned()
+        }),
+        _ if observed_work(state) => {
+            // The record must never deny work the product itself observed. A
+            // blocked write can still make the run a warning/refusal, but its row
+            // names the work first and the remaining cause after it.
+            Some(format!(
+                "recorded work: {}; {}",
+                observed_work_words(state),
+                non_success_reason(state, requested)
+            ))
+        }
         _ => Some(non_success_reason(state, requested)),
     }
 }
@@ -789,6 +811,12 @@ pub(super) fn run(
                         stderr_lines.push(cleaned.clone());
                     }
                     log.block(&cleaned);
+                    // Codex's JSON stream is silent about a retry that recovers, but
+                    // its own warning names the status. Surface that temporary fact
+                    // while it is happening; it never decides the run's ending.
+                    if state.outcome.observe_retry_text(&cleaned) {
+                        write_progress(shell, &state, &mut progress_written, log);
+                    }
                 }
             }
         }
@@ -1135,26 +1163,46 @@ fn observed_work(state: &NativeState) -> bool {
     state.wrote || state.comment_ok || state.pr_ok || state.pushed || state.workspace_wrote
 }
 
+/// The work facts in the card's own short words, for a reason that must not hide
+/// them behind a later warning.
+fn observed_work_words(state: &NativeState) -> String {
+    let mut words = Vec::new();
+    if state.pr_ok {
+        words.push("pull request opened");
+    }
+    if state.pushed {
+        words.push("branch pushed");
+    }
+    if state.comment_ok {
+        words.push("comment written");
+    }
+    if words.is_empty() && state.workspace_wrote {
+        words.push("workspace changed");
+    }
+    if words.is_empty() {
+        words.push("work recorded");
+    }
+    words.join(", ")
+}
+
 fn decide_native_ending(
     base: RunEnding,
     requested: RequestedWork,
     state: &NativeState,
 ) -> RunEnding {
-    let base = if matches!(base, RunEnding::NoWork)
-        && !(state.checked_empty && !state.wrote && state.failed_call.is_none())
-    {
-        RunEnding::Warned
-    } else {
-        base
-    };
+    // Verified remote work outranks prose and a failed command. A run that opened a
+    // pull request or pushed and commented did work even if it ran a failing test
+    // first, reused a branch left by an interrupted run, or ended with a sentence
+    // that claims failure. A local-only edit or commit is **not** enough: a failed
+    // push or test must stay a warning, and the reason names the local work. A
+    // blocked write is still a refusal: the work is named in its reason, but the
+    // refusal is not hidden.
+    let verified_remote_work = state.pr_ok || state.pushed || state.comment_ok;
+    if verified_remote_work && state.refused_write.is_none() {
+        return RunEnding::Succeeded;
+    }
     match base {
         RunEnding::Succeeded => {
-            // A product-observed work fact is enough by itself. The classifier is a
-            // narrow prose heuristic and must never turn a successful comment, pull
-            // request or push into "no matching tool or work fact".
-            if observed_work(state) {
-                return RunEnding::Succeeded;
-            }
             let matched = match requested {
                 RequestedWork::PullRequest => state.pr_ok && state.pushed,
                 RequestedWork::PullRequestUpdate => state.pr_ok && state.pr_updated,
@@ -1430,6 +1478,12 @@ fn build_launch(
                 copy_tree(skill, &dir.join("skills").join(name))?;
             }
             envs.push(("CODEX_HOME".to_owned(), dir.display().to_string()));
+            // The warning is the only place Codex names a recovered 503; without it
+            // the card would show `working` in silence until the retry finished.
+            envs.push((
+                "RUST_LOG".to_owned(),
+                "codex_core=warn,codex_otel=info".to_owned(),
+            ));
             args.extend([
                 "exec".to_owned(),
                 "--json".to_owned(),
@@ -1855,6 +1909,11 @@ fn write_progress(shell: &Shell, state: &NativeState, last: &mut String, log: &m
         return;
     }
     *last = signature;
+    log.line(&format!(
+        "native progress: {progress_state}{}{}",
+        if cause.is_empty() { "" } else { " — " },
+        cause
+    ));
     if let Err(error) = crate::run::write_native_progress(
         &shell.run_dir,
         &progress_state,
@@ -1968,11 +2027,14 @@ mod native_proof_tests {
     use super::*;
 
     #[test]
-    fn r1_prose_no_work_without_a_checked_empty_read_is_warned() {
+    fn r1_a_read_only_cycle_that_writes_nothing_is_no_work() {
+        // Wave 37 C1: `nothing new to add` is the neutral outcome the README
+        // promises for a check that read its issue and wrote nothing. A missing
+        // empty-list ledger is not evidence that the model's own sentence is false.
         let state = NativeState::default();
         assert_eq!(
             decide_native_ending(RunEnding::NoWork, RequestedWork::ReadOnly, &state),
-            RunEnding::Warned
+            RunEnding::NoWork
         );
         let checked = NativeState {
             checked_empty: true,
@@ -1981,6 +2043,108 @@ mod native_proof_tests {
         assert_eq!(
             decide_native_ending(RunEnding::NoWork, RequestedWork::ReadOnly, &checked),
             RunEnding::NoWork
+        );
+        assert_eq!(
+            run_reason(
+                RunEnding::NoWork,
+                "nothing new to add",
+                &state,
+                RequestedWork::ReadOnly
+            )
+            .as_deref(),
+            Some("nothing new to add")
+        );
+    }
+
+    #[test]
+    fn c1_observed_work_outranks_a_failed_test_and_a_negative_summary() {
+        // The work is the product's own fact. A failing test before the fix and a
+        // final sentence that claims failure cannot turn a pushed branch or an
+        // opened pull request into a warning.
+        let work = NativeState {
+            pushed: true,
+            workspace_wrote: true,
+            first_failure: Some("shell: exit 1 — test failed".to_owned()),
+            failed_call: Some("shell: exit 1 — test failed".to_owned()),
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Warned, RequestedWork::PullRequest, &work),
+            RunEnding::Succeeded
+        );
+        let comment = NativeState {
+            comment_ok: true,
+            wrote: true,
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Refused, RequestedWork::Comment, &comment),
+            RunEnding::Succeeded
+        );
+        // The rejected checkout of a branch an interrupted run left behind is a
+        // failed command, not a failed run, once the retry pushed and opened work.
+        let existing_branch = NativeState {
+            pushed: true,
+            workspace_wrote: true,
+            failed_call: Some(
+                "bash: exit 128 — fatal: a branch named 'fix-2' already exists".to_owned(),
+            ),
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(
+                RunEnding::Warned,
+                RequestedWork::PullRequest,
+                &existing_branch
+            ),
+            RunEnding::Succeeded
+        );
+        // F1: a local edit/commit with a failed push is not verified remote work.
+        // The failed command and the negative summary stay visible in the warning;
+        // the reason names the local work rather than pretending it succeeded.
+        let local_only = NativeState {
+            workspace_wrote: true,
+            failed_call: Some(
+                "bash: exit 1 — error: failed to push some refs to 'nowhere'".to_owned(),
+            ),
+            ..NativeState::default()
+        };
+        let ending =
+            decide_native_ending(RunEnding::Warned, RequestedWork::PullRequest, &local_only);
+        assert_eq!(ending, RunEnding::Warned);
+        let reason = run_reason(
+            ending,
+            "I could not finish the task. The work is still pending.",
+            &local_only,
+            RequestedWork::PullRequest,
+        )
+        .expect("reason");
+        assert!(reason.contains("workspace changed"), "{reason}");
+        assert!(reason.contains("failed to push"), "{reason}");
+        assert!(
+            !reason.contains("no matching tool or work fact"),
+            "{reason}"
+        );
+
+        // A blocked write is not hidden; the reason names the observed work first.
+        let blocked = NativeState {
+            comment_ok: true,
+            wrote: true,
+            refused_write: Some("forgejo_update_pull_request: no open pull request".to_owned()),
+            ..NativeState::default()
+        };
+        let reason = run_reason(
+            RunEnding::Refused,
+            "I could not update the pull request",
+            &blocked,
+            RequestedWork::PullRequestUpdate,
+        )
+        .expect("reason");
+        assert!(reason.contains("comment written"), "{reason}");
+        assert!(reason.contains("no open pull request"), "{reason}");
+        assert!(
+            !reason.contains("no matching tool or work fact"),
+            "{reason}"
         );
     }
 
@@ -1991,10 +2155,32 @@ mod native_proof_tests {
             wrote: true,
             ..NativeState::default()
         };
+        let local_ending =
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &local);
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &local),
-            RunEnding::Succeeded,
-            "a product-observed workspace write is work even without a push"
+            local_ending,
+            RunEnding::Warned,
+            "a local-only write is not verified remote work"
+        );
+        let local_reason = run_reason(
+            local_ending,
+            "I could not push the branch.",
+            &local,
+            RequestedWork::PullRequest,
+        )
+        .expect("reason");
+        assert!(local_reason.contains("workspace changed"), "{local_reason}");
+        assert!(
+            local_reason.contains("the requested remote work was not verified"),
+            "{local_reason}"
+        );
+        assert!(
+            !local_reason.contains("no tool call or workspace change"),
+            "{local_reason}"
+        );
+        assert!(
+            !local_reason.contains("no matching tool or work fact"),
+            "{local_reason}"
         );
         assert_eq!(
             requested_work("Open a pull request and comment on the issue.", &[]),
@@ -2378,9 +2564,22 @@ mod native_proof_tests {
             .as_deref(),
             Some(prose)
         );
+        // No work is the run's own neutral sentence, not a generic failure. It is
+        // the reason the card shows after `∅`, so it must be kept.
+        assert_eq!(
+            run_reason(
+                RunEnding::NoWork,
+                "nothing new to add",
+                &NativeState::default(),
+                RequestedWork::Ambiguous
+            )
+            .as_deref(),
+            Some("nothing new to add")
+        );
+        // A warning that is not a refusal never repeats the success prose.
         assert!(
             !run_reason(
-                RunEnding::NoWork,
+                RunEnding::Warned,
                 prose,
                 &NativeState::default(),
                 RequestedWork::Ambiguous

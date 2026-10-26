@@ -223,12 +223,29 @@ pub fn agent_face(agent: &AgentView) -> Face {
         };
     }
     match &agent.session {
-        SessionState::Running { .. } => Face {
-            symbol: '●',
-            word: "working".to_owned(),
-            colour: theme::RUNNING,
-            status: "working".to_owned(),
-        },
+        SessionState::Running { since, .. } => {
+            // DeepSeek Harness and OpenCode retry or wait inside their own process
+            // without a status event. Their card still shows honest elapsed working
+            // time from the run's start, without inventing a provider status.
+            let silent_native = matches!(agent.program.as_str(), "dsh" | "opencode")
+                && agent.retrying.is_none()
+                && agent.current_tool.is_none();
+            let word = if silent_native {
+                SystemTime::now()
+                    .duration_since(*since)
+                    .ok()
+                    .map(|elapsed| format!("working {}", elapsed_words(elapsed)))
+                    .unwrap_or_else(|| "working".to_owned())
+            } else {
+                "working".to_owned()
+            };
+            Face {
+                symbol: '●',
+                word: word.clone(),
+                colour: theme::RUNNING,
+                status: word,
+            }
+        }
         SessionState::Restarting { next_at, last } => {
             let seconds = next_at
                 .duration_since(SystemTime::now())
@@ -277,6 +294,36 @@ pub fn agent_face(agent: &AgentView) -> Face {
             }
         }
     }
+}
+
+/// A temporary model failure the running program is retrying.
+///
+/// The run is still `● working`: this line names the provider's condition while the
+/// program's own retry loop waits, before any run-level `✗ failed` exists. It uses
+/// the `◐` waiting mark, never the failure mark, because the condition is temporary
+/// and the outcome is not decided yet.
+pub fn retry_line(agent: &AgentView) -> Option<String> {
+    if !matches!(agent.session, SessionState::Running { .. }) {
+        return None;
+    }
+    let cause = agent.retrying.as_deref()?.trim();
+    if cause.is_empty() {
+        return None;
+    }
+    // The card has one short row. Keep the status the person needs: the HTTP
+    // class and the fact that it is being retried. The full provider sentence is
+    // still in the run reason once the program gives up.
+    let lower = cause.to_ascii_lowercase();
+    let word = if lower.contains("503") {
+        "◐ HTTP 503 — retrying"
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        "◐ rate limited — retrying"
+    } else if lower.contains("502") || lower.contains("504") {
+        "◐ temporary model outage — retrying"
+    } else {
+        "◐ model retrying"
+    };
+    Some(word.to_owned())
 }
 
 /// The newest activity of a running agent, in the card's words, if it has one.
@@ -419,6 +466,19 @@ fn age_words_short(age: std::time::Duration) -> String {
         format!("{}m", seconds / 60)
     } else {
         format!("{}h", seconds / 3600)
+    }
+}
+
+/// Elapsed working time with both minutes and seconds, so a silent retry never
+/// hides how long the run has really been going.
+fn elapsed_words(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }
 
@@ -895,7 +955,7 @@ pub fn failure_words(reason: &str) -> String {
         // dropped, leaving `HTTP 401 from the model` and `HTTP 503` with nothing to
         // do.
         if code == 503 || code == 502 || code == 504 {
-            return "the model is temporarily unavailable — retrying".to_owned();
+            return format!("the model is temporarily unavailable (HTTP {code})");
         }
         let detail = provider_detail_after_status(reason, code);
         let mut word = format!("HTTP {code}");
@@ -997,6 +1057,7 @@ pub const BANNED: [&str; 9] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_api::EndpointTest;
     use std::time::Duration;
 
     fn agent(session: SessionState, desired: Desired) -> AgentView {
@@ -1026,6 +1087,7 @@ mod tests {
             leftover: None,
             current_tool: None,
             current_tool_seconds: 0,
+            retrying: None,
             last_work: Vec::new(),
             no_assigned_work: false,
             last_work_result: None,
@@ -1039,11 +1101,31 @@ mod tests {
             base_url: "http://127.0.0.1:9/v1".to_owned(),
             model: "lab-chat-1".to_owned(),
             key_present: true,
+            model_test: EndpointTest::NotRun,
             program_error: None,
             active_program: None,
             next_program: None,
             codex_sandbox: None,
         }
+    }
+
+    #[test]
+    fn c5_a_retried_503_is_named_without_a_failed_mark() {
+        let mut agent = agent(
+            SessionState::Running {
+                number: 1,
+                since: SystemTime::now(),
+            },
+            Desired::Started,
+        );
+        agent.retrying = Some("the provider answered HTTP 503: temporarily unavailable".to_owned());
+        let line = retry_line(&agent).expect("a retrying line");
+        assert!(line.starts_with('◐'), "{line}");
+        assert!(line.contains("HTTP 503"), "{line}");
+        assert!(line.contains("retrying"), "{line}");
+        assert!(!line.contains('✗'), "{line}");
+        agent.retrying = None;
+        assert!(retry_line(&agent).is_none());
     }
 
     #[test]
@@ -1135,6 +1217,26 @@ mod tests {
             Desired::Started,
         ));
         assert_eq!(working.symbol, '●');
+    }
+
+    #[test]
+    fn c5_a_silent_native_wait_shows_elapsed_working_time() {
+        for program in ["dsh", "opencode"] {
+            let mut waiting = agent(
+                SessionState::Running {
+                    number: 1,
+                    since: SystemTime::now() - Duration::from_secs(130),
+                },
+                Desired::Started,
+            );
+            waiting.program = program.to_owned();
+            let face = agent_face(&waiting);
+            assert_eq!(face.symbol, '●');
+            assert!(face.word.starts_with("working "), "{program}: {face:?}");
+            assert!(face.word.contains("2m 1"), "{program}: {face:?}");
+            waiting.program = "pi".to_owned();
+            assert_eq!(agent_face(&waiting).word, "working");
+        }
     }
 
     #[test]

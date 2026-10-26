@@ -5,6 +5,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// Both probes scan the process table for an anonymous capability holder. Run
+/// them one at a time so one probe's helper cannot be attributed to the other.
+static CAPABILITY_PROBE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "gewu-helper-settle-{tag}-{}-{}",
@@ -20,6 +24,9 @@ fn run_dir(tag: &str) -> std::path::PathBuf {
 
 #[test]
 fn a_setsid_helper_holding_the_run_capability_is_found_and_closed() {
+    let _serial = CAPABILITY_PROBE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let dir = run_dir("scan");
     let _capability = gewu_multiverse::run::prepare_shell_capability(&dir)
         .expect("the probe capability is recorded");
@@ -47,6 +54,9 @@ fn a_setsid_helper_holding_the_run_capability_is_found_and_closed() {
 
 #[test]
 fn normal_settle_closes_a_setsid_helper_before_clearing_records() {
+    let _serial = CAPABILITY_PROBE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let dir = run_dir("settle");
     let _capability = gewu_multiverse::run::prepare_shell_capability(&dir)
         .expect("the probe capability is recorded");

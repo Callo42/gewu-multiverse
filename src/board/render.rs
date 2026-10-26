@@ -112,6 +112,18 @@ fn inner(area: Rect) -> Rect {
     )
 }
 
+/// Start tall content near the top instead of centring it into a mostly empty
+/// frame. A screen that nearly fills its frame stays centred; a large window uses
+/// its rows for the picture, and the residual space falls below the content.
+fn content_origin(top: u16, height: u16, block: u16) -> u16 {
+    let spare = height.saturating_sub(block);
+    if spare >= 4 {
+        top.saturating_add(1)
+    } else {
+        top.saturating_add(spare / 2)
+    }
+}
+
 /// Fill a rectangle with the product background and draw a plain border.
 fn draw_plain_box(buf: &mut Buffer, rect: Rect, style: Style) {
     if rect.width < 2 || rect.height < 2 {
@@ -918,53 +930,31 @@ fn draw_card(
     // card shows all five facts without a paragraph.
     let state_row = rect.y + 2;
     if rect.height >= 4 {
-        let failure = matches!(
-            agent.recent.last(),
-            Some(SessionEnd::Failed { .. } | SessionEnd::TimedOut)
+        // The bottom border already carries the program and the failure word. The
+        // state row does not repeat the program; on an error card that read `Pi`
+        // twice and crowded the wire.
+        text_util::put(
+            buf,
+            interior,
+            interior.x + 1,
+            state_row,
+            &text_util::ellipsize(
+                &board_state(&face),
+                interior.width.saturating_sub(1) as usize,
+            ),
+            theme::card(face.colour, selected),
         );
-        if failure {
-            // A failed run's sentence is long, so the program keeps the short state
-            // row's right edge and the whole failure keeps the bottom border.
-            let program = status::program_word(agent);
-            let program_width = text_util::width(&program) as u16;
-            let state_room = interior.width.saturating_sub(program_width + 3).max(1) as usize;
-            text_util::put(
-                buf,
-                interior,
-                interior.x + 1,
-                state_row,
-                &text_util::ellipsize(&board_state(&face), state_room),
-                theme::card(face.colour, selected),
-            );
-            let program_x = interior.right().saturating_sub(program_width + 1);
-            text_util::put(
-                buf,
-                interior,
-                program_x,
-                state_row,
-                &program,
-                theme::card(theme::MUTED, selected),
-            );
-        } else {
-            text_util::put(
-                buf,
-                interior,
-                interior.x + 1,
-                state_row,
-                &text_util::ellipsize(
-                    &board_state(&face),
-                    interior.width.saturating_sub(1) as usize,
-                ),
-                theme::card(face.colour, selected),
-            );
-        }
     }
     if rect.height >= 5 {
         // A roomy card carries the newest activity and its age in its own body row,
         // as the board docs promise; the last-work (or failure) word stays on the
         // bottom border. A card that is not roomy keeps the run's own result line.
         let width = interior.width.saturating_sub(1) as usize;
-        let (line, colour) = if detailed {
+        let (line, colour) = if let Some(retrying) = status::retry_line(agent) {
+            // A 503 being retried outranks the last activity: the run is still
+            // working, and the temporary condition is the current fact.
+            (Some(retrying), theme::AMBER)
+        } else if detailed {
             match status::activity_in(agent, width) {
                 Some(line) => (Some(line), theme::MUTED),
                 None => (status::run_result_line(agent), status::result_colour(agent)),
@@ -1182,7 +1172,17 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
     let inner = inner(area);
     let compact = area.width < 80;
     let agent_count = board.view.agents.len().max(1);
-    let gap = if compact { 0 } else { 2 };
+    // Three cells between cards leave a blank on each side of the inter-card trunk,
+    // so a connector never touches both card borders at once. A crowded board keeps
+    // the two-cell gap: one more column of border is worse than a connector that
+    // the compact card form does not draw between those cards at all.
+    let gap = if compact {
+        0
+    } else if agent_count <= 3 {
+        3
+    } else {
+        2
+    };
     let usable = inner.width.saturating_sub(2);
 
     // The Forgejo box keeps its login and repository count at every size; the
@@ -1327,7 +1327,7 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
         let visible = rows_total.min(available).max(1);
         let list_h = visible as u16 + 2;
         let block = forgejo_h + trunk_gap + list_h;
-        let block_top = inner.y + content_h.saturating_sub(block) / 2;
+        let block_top = content_origin(inner.y, content_h, block);
         let list_x = inner.x + inner.width.saturating_sub(list_w) / 2;
         let list = Rect::new(list_x, block_top + forgejo_h + trunk_gap, list_w, list_h);
         let col_w = if dense_identity {
@@ -1380,7 +1380,7 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             + trunk_gap
             + visible as u16 * (1 + card_h)
             + (visible.saturating_sub(1) as u16) * row_gap;
-        let block_top = inner.y + content_h.saturating_sub(block) / 2;
+        let block_top = content_origin(inner.y, content_h, block);
         let grid_start = card_group_start(inner, columns, card_w, gap);
         let mut row_tops = Vec::new();
         let mut bus_ys = Vec::new();
@@ -1489,7 +1489,14 @@ fn choose_spine_x(
     let mut best_distance = u16::MAX;
     for column in 0..columns.saturating_sub(1) {
         let gap_start = grid_start + (column as u16 + 1) * card_w + column as u16 * gap;
-        for offset in 0..gap {
+        let offsets: Vec<u16> = if gap >= 3 {
+            // A three-cell gap puts the trunk in the middle, with one blank cell
+            // against each card border.
+            vec![gap / 2]
+        } else {
+            (0..gap).collect()
+        };
+        for offset in offsets {
             let x = gap_start + offset;
             let distance = x.abs_diff(trunk_x);
             if distance < best_distance {
@@ -2531,7 +2538,7 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
         1
     };
     let block_h = total_lines + spacing * blocks.len().saturating_sub(1);
-    let mut y = content_top + content_h.saturating_sub(block_h as u16) / 2;
+    let mut y = content_origin(content_top, content_h, block_h as u16);
     let offset = board.terms_offset.min(blocks.len().saturating_sub(1));
     board.terms_offset = offset;
     let mut drawn_all = vec![false; blocks.len()];
@@ -2636,7 +2643,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let form_height = (10 + 2 * field_gap + 2 + 6).min(content_h);
     let form = Rect::new(
         inner.x + inner.width.saturating_sub(form_width) / 2,
-        content_top + content_h.saturating_sub(form_height) / 2,
+        content_origin(content_top, content_h, form_height),
         form_width,
         form_height,
     );
@@ -2730,6 +2737,18 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     }
     let test = if board.model_agent.is_none() && board.model_test_visible() {
         board.view.endpoint.test.clone()
+    } else if let Some(name) = board.model_agent.as_deref() {
+        if board.model_test_visible() {
+            board
+                .view
+                .agents
+                .iter()
+                .find(|agent| agent.name == name)
+                .map(|agent| agent.model_test.clone())
+                .unwrap_or(EndpointTest::NotRun)
+        } else {
+            EndpointTest::NotRun
+        }
     } else {
         EndpointTest::NotRun
     };
@@ -2759,7 +2778,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let actions = if board.model_editing {
         "⏎ next field   ctrl-u clear   ↑↓ field   esc cancel"
     } else if board.model_agent.is_some() {
-        "e edit   ↑↓ field   ⏎ save   ctrl-u clear   esc back   Start is the test"
+        "e edit   ↑↓ field   t test   ⏎ save   ctrl-u clear   esc back"
     } else {
         "e edit   ↑↓ field   t test   ⏎ next   ctrl-u clear   esc back"
     };
@@ -2768,7 +2787,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         inner.x + 1,
         inner.bottom().saturating_sub(2),
-        actions,
+        &text_util::ellipsize_words(actions, inner.width.saturating_sub(2) as usize),
         theme::fg(theme::MUTED),
     );
     if let Some(notice) = board.notice() {
@@ -2795,7 +2814,7 @@ fn field_text(board: &Board, index: usize, editing: bool) -> String {
             .and_then(|name| board.view.agents.iter().find(|agent| agent.name == name))
             .map(|agent| agent.key_present)
             .unwrap_or(board.view.endpoint.key_present);
-        if raw.is_empty() && !key_present {
+        if raw.is_empty() && (!key_present || board.model_key_cleared) {
             String::new()
         } else {
             "••••••••".to_owned()
@@ -2846,7 +2865,7 @@ fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
         row_gap += per;
     }
     let block = forgejo_h + trunk_gap + rows as u16 * (1 + card_h) + (rows as u16 - 1) * row_gap;
-    let block_top = content_top + content_h.saturating_sub(block) / 2;
+    let block_top = content_origin(content_top, content_h, block);
     let forgejo_w = if roomy {
         (inner.width / 2 + 8).clamp(44, 64) & !1
     } else {
@@ -3086,6 +3105,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     // error, else what it is doing now. Never a stale sentence pretending to be
     // current: `status::activity` adds `last:` and an age when the run is over.
     let activity = status::activity(&agent);
+    let retrying = status::retry_line(&agent);
     let failure_mark = status::failure_mark(&agent);
     let failure = if let Some(leftover) = agent.leftover.as_deref() {
         // A cleanup the engine could not finish has its own three state names; the
@@ -3111,6 +3131,10 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             })
     };
     let result = status::run_result_line(&agent);
+    let failure_lines = failure
+        .as_deref()
+        .map(|text| text_util::wrap(text, width))
+        .unwrap_or_default();
     let result_colour = if status::run_result_is_refusal(&agent) {
         theme::RED
     } else if status::run_result_is_warning(&agent) {
@@ -3151,8 +3175,14 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     if let Some(result) = result {
         extras.push((result, theme::card(result_colour, true)));
     }
-    if let Some(failure) = failure {
-        extras.push((failure, theme::card(theme::RED, true)));
+    if let Some(failure) = failure_lines.first() {
+        extras.push((failure.clone(), theme::card(theme::RED, true)));
+        // A 401/403 sentence keeps its provider clause and its `check the key`
+        // action at 80 columns: the rest of the wrapped refusal gets its own row
+        // before the result, rather than being cut at the right edge.
+        for line in failure_lines.iter().skip(1) {
+            extras.push((line.clone(), theme::card(theme::RED, true)));
+        }
     }
     // `last work` carries the work; the run's own last sentence is still on the
     // screen, labelled as the result, so a warning is not presented as the work and
@@ -3171,16 +3201,22 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     if let Some(changed) = status::active_next_line(&agent) {
         extras.push((changed, theme::card(theme::AMBER, true)));
     }
-    let (second, extras) = match (&activity, extras.is_empty()) {
-        (Some(activity), _) => (
+    let (second, extras) = match (&retrying, &activity, extras.is_empty()) {
+        // A retrying model is the live fact the person needs while the run works:
+        // name it before the last activity or work row.
+        (Some(retrying), _, _) => (
+            Some((retrying.clone(), theme::card(theme::AMBER, true))),
+            extras,
+        ),
+        (None, Some(activity), _) => (
             Some((activity.clone(), theme::card(theme::MUTED, true))),
             extras,
         ),
-        (None, false) => {
+        (None, None, false) => {
             let first = extras.remove(0);
             (Some(first), extras)
         }
-        (None, true) => (None, extras),
+        (None, None, true) => (None, extras),
     };
     if let Some((line, style)) = second {
         text_util::put(
@@ -3761,9 +3797,9 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
             .and_then(|agent| agent.codex_sandbox.clone())
             .unwrap_or_else(|| "native".to_owned());
         let text = if sandbox == "full-access" {
-            "Codex sandbox: sandbox off (product Landlock) · f return to default"
+            "Codex sandbox: sandbox off (product Landlock) · press f twice: returns Codex's own sandbox"
         } else {
-            "Codex sandbox: its own default · f opt in to removing it"
+            "Codex sandbox: its own default · press f twice: removes Codex's own sandbox, keeps product Landlock"
         };
         text_util::put(
             buf,
@@ -3861,15 +3897,58 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
             .as_ref()
             .map(describe)
             .unwrap_or_else(|| "no run yet".to_owned());
-        let next = agent
-            .next_program
-            .as_ref()
-            .map(describe)
-            .unwrap_or_else(|| "not chosen".to_owned());
-        let active_word = if matches!(agent.session, SessionState::Running { .. }) {
-            "active"
+        // `next` previews the highlighted program and connection, not the last one
+        // saved. Moving the highlight or changing ←→ must update this row before
+        // Enter, so the person sees what they are about to use.
+        let saved_view = board
+            .view
+            .programs
+            .iter()
+            .find(|view| view.id == program.id());
+        let state = if !program.is_native() {
+            "always ready".to_owned()
+        } else if saved_view.is_some_and(|view| view.installing.is_some()) {
+            "installing".to_owned()
+        } else if let Some(view) = saved_view.filter(|view| view.installed) {
+            view.installed_version
+                .clone()
+                .unwrap_or_else(|| view.version.clone())
         } else {
-            "latest"
+            "not installed".to_owned()
+        };
+        // When the highlight is still the saved program and protocol, the line is
+        // the exact next run the engine already holds, including its address. A
+        // moved highlight or a changed connection is a preview built from the
+        // selection, so it updates before Enter.
+        let saved_protocol = crate::harness::Protocol::parse(&agent.protocol);
+        let preview = if program.id() == agent.program
+            && saved_protocol == Some(protocol)
+            && let Some(next) = agent.next_program.as_ref()
+            && next.program == program.id()
+        {
+            describe(next)
+        } else if narrow {
+            format!(
+                "{} · {} · {} · {}",
+                program.label(),
+                state,
+                protocol.label(),
+                agent.model
+            )
+        } else {
+            format!(
+                "{} {} · {} · {} @ {}",
+                program.label(),
+                state,
+                protocol.label(),
+                agent.model,
+                status::host_of(&agent.base_url)
+            )
+        };
+        let active_word = if matches!(agent.session, SessionState::Running { .. }) {
+            "active run"
+        } else {
+            "latest run"
         };
         text_util::put(
             buf,
@@ -3884,7 +3963,7 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
             inner,
             inner.x + 1,
             y + 1,
-            &text_util::ellipsize_words(&format!("next: {next}"), width),
+            &text_util::ellipsize_words(&format!("next run: {preview}"), width),
             theme::fg(theme::MUTED),
         );
         y += 2;
@@ -4099,7 +4178,7 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
         0
     };
     let block = line_count + spacing * rows.len().saturating_sub(1);
-    let mut y = content_top + content_h.saturating_sub(block as u16) / 2;
+    let mut y = content_origin(content_top, content_h, block as u16);
     for (label, lines) in rows {
         text_util::put(buf, inner, label_x, y, label, theme::fg(theme::MUTED));
         for (index, line) in lines.iter().enumerate() {
@@ -4198,12 +4277,32 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::fg(theme::MUTED),
             false,
         ),
-        (
-            format!("new: {}", upgrade.whats_new),
-            theme::fg(theme::ACCENT),
-            true,
-        ),
     ];
+    if !upgrade.kept_agents.is_empty() {
+        lines.push((
+            format!(
+                "kept: {}",
+                crate::words::counted(upgrade.programs, "installed program", "installed programs")
+            ),
+            theme::fg(theme::MUTED),
+            false,
+        ));
+    }
+    for agent in &upgrade.kept_agents {
+        lines.push((
+            format!(
+                "kept: {} · {} · {} · {}",
+                agent.name, agent.program, agent.model, agent.protocol
+            ),
+            theme::fg(theme::FG),
+            false,
+        ));
+    }
+    lines.extend([(
+        format!("new: {}", upgrade.whats_new),
+        theme::fg(theme::ACCENT),
+        true,
+    )]);
     if upgrade.warnings_changed {
         lines.push((
             "warnings changed — ⏎ shows them".to_owned(),
@@ -4229,7 +4328,7 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
         .collect();
     let total: usize = wrapped.iter().map(|(lines, _)| lines.len()).sum();
     let rule = content_h as usize;
-    let mut y = content_top + rule.saturating_sub(total) as u16 / 2;
+    let mut y = content_origin(content_top, content_h, total as u16);
     let mut shown = 0_usize;
     for (lines, style) in wrapped {
         for line in lines {
@@ -4290,7 +4389,7 @@ fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
         0
     };
     let block = line_count + spacing * line_count.saturating_sub(1);
-    let mut y = content_top + content_h.saturating_sub(block) / 2;
+    let mut y = content_origin(content_top, content_h, block);
     for (group, line) in lines {
         if group.is_empty() {
             text_util::put(
@@ -4484,6 +4583,10 @@ mod program_view_tests {
             let mut board = Board::new(engine);
             board.screen = Screen::Program;
             board.agent_name = "agent-1".to_owned();
+            // The Program screen preselects the agent's saved program (Codex here);
+            // the preview must follow that highlight.
+            board.program_index = 2;
+            board.program_protocol = crate::harness::Protocol::Responses;
             board.view.agents[0].active_program = Some(RunProgramView {
                 program: "codex".to_owned(),
                 label: "Codex".to_owned(),
@@ -4517,7 +4620,7 @@ mod program_view_tests {
                 "the active opt-out state was lost at {width} columns: {text}"
             );
             assert!(
-                text.contains("next: Codex") && !text.contains("full-access"),
+                text.contains("next run: Codex") && !text.contains("full-access"),
                 "the next native state still read as full-access at {width} columns: {text}"
             );
         }
