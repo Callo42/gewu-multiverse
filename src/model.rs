@@ -1050,7 +1050,7 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
                 format!(": {}", whole_message(message, 400))
             };
             if matches!(status, 502..=504) {
-                format!("the model is temporarily unavailable — retrying (HTTP {status}{detail})")
+                format!("the model is temporarily unavailable (HTTP {status}{detail})")
             } else {
                 format!("the provider answered HTTP {status}{detail}")
             }
@@ -1601,6 +1601,20 @@ mod tests {
             ..one.clone()
         };
         assert_eq!(two.summary(), "asked for 2 tool calls; 1 token used");
+    }
+
+    #[test]
+    fn f3_a_one_shot_503_does_not_claim_a_live_retry() {
+        let words = failure_words(
+            &ModelError::Server {
+                status: 503,
+                message: "The model is temporarily unavailable. Retry later.".to_owned(),
+            },
+            "example-model",
+        );
+        assert!(words.contains("temporarily unavailable"), "{words}");
+        assert!(words.contains("HTTP 503"), "{words}");
+        assert!(!words.contains("retrying"), "{words}");
     }
 
     #[test]

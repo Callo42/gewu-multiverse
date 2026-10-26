@@ -7778,7 +7778,7 @@ mod tests {
         .expect("engine opens");
         tick(&mut engine, &clock, Duration::ZERO);
         let pid = report
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(20))
             .expect("the real child reached its spawn boundary");
         let run_dir = newest_run_for_test(&root, "agent-1");
         assert_real_child_started(&run_dir, pid);
@@ -7788,7 +7788,7 @@ mod tests {
             })
             .expect("Stop");
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
             tick(&mut engine, &clock, Duration::ZERO);
             std::thread::sleep(Duration::from_millis(10));
@@ -7816,13 +7816,13 @@ mod tests {
         .expect("engine opens");
         tick(&mut engine, &clock, Duration::ZERO);
         let pid = report
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(20))
             .expect("the real child reached its spawn boundary");
         let run_dir = newest_run_for_test(&root, "agent-1");
         assert_real_child_started(&run_dir, pid);
         engine.shutdown(Duration::from_millis(200));
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -7846,7 +7846,7 @@ mod tests {
         .expect("engine opens");
         tick(&mut engine, &clock, Duration::ZERO);
         let pid = report
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(20))
             .expect("the real child reached its spawn boundary");
         let run_dir = newest_run_for_test(&root, "agent-1");
         assert_real_child_started(&run_dir, pid);
@@ -7856,7 +7856,7 @@ mod tests {
             inner.agents.clear();
         }
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
             tick(&mut engine, &clock, Duration::ZERO);
             std::thread::sleep(Duration::from_millis(10));
@@ -7934,7 +7934,7 @@ mod tests {
             })
             .expect("stop before spawn");
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
             tick(&mut engine, &clock, Duration::ZERO);
             std::thread::sleep(Duration::from_millis(10));
@@ -7994,7 +7994,7 @@ mod tests {
         fake.fail_spawn("the session process could not be started: fixture");
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut run_dir = None;
         while Instant::now() < deadline {
             run_dir = fake.last_run_dir();
@@ -8034,6 +8034,10 @@ mod tests {
             {
                 break;
             }
+            // The prepare failure is reported on the engine's next turn; under a
+            // loaded parallel suite the first tick can return before the fake has
+            // failed. Keep the engine turning so the ending is not lost.
+            tick(&mut engine, &clock, Duration::ZERO);
             std::thread::sleep(Duration::from_millis(10));
         }
         let run_dir = run_dir.expect("prepare created a run directory");
@@ -8071,8 +8075,9 @@ mod tests {
             inner.agents.clear();
         }
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+            tick(&mut engine, &clock, Duration::ZERO);
             std::thread::sleep(Duration::from_millis(10));
         }
         let terminal = crate::transcript::terminal_record(&run_dir)

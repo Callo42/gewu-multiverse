@@ -308,6 +308,18 @@ fn sequence(program: &str, issue: u64, scenario: &str, branch: &str) -> Vec<Stub
                 "I could not finish the task. The work is still pending; please check it.",
             ),
         ],
+        "local-failed-push" => vec![
+            command_for(
+                program,
+                &format!(
+                    "cd workspace && git checkout -b {branch} && printf 'local only\n' > {branch}.txt && git add {branch}.txt && git -c user.email=gewu-agent-1@agents.invalid -c user.name=gewu-agent-1 commit -m 'local only' -q && git push no-such-remote HEAD"
+                ),
+            ),
+            final_for(
+                program,
+                "I could not finish the task. The work is still pending; please check it.",
+            ),
+        ],
         "503-recovers" => vec![
             StubReply::status(
                 503,
@@ -399,6 +411,9 @@ fn run_scenario(
         "failing-pr" => format!(
             "Run the test, then fix it on branch `w37-{program}-pr`, push it, and open a pull request for issue #{issue}."
         ),
+        "local-failed-push" => format!(
+            "Make a local commit on branch `w37-{program}-local`, then push it. Do not open a pull request."
+        ),
         "503-recovers" => format!(
             "Read issue #{issue} in team/workspace. The model may be temporarily unavailable; if so, retry. Do not change anything."
         ),
@@ -441,18 +456,21 @@ fn run_scenario(
     let (outcome, reason) = terminal(&run_dir);
     // The terminal record is written by the child; the engine settles it on a later
     // tick. Wait for the card to carry this run's mark before reading the board.
-    let expected = if scenario == "no-work" {
-        SessionEnd::NoWork {
+    let expected = match scenario {
+        "no-work" => SessionEnd::NoWork {
             reason: String::new(),
-        }
-    } else {
-        SessionEnd::Succeeded
+        },
+        "local-failed-push" => SessionEnd::Warned {
+            reason: String::new(),
+        },
+        _ => SessionEnd::Succeeded,
     };
     let mark_matches = |end: &SessionEnd| {
         matches!(
             (&expected, end),
             (SessionEnd::Succeeded, SessionEnd::Succeeded)
                 | (SessionEnd::NoWork { .. }, SessionEnd::NoWork { .. })
+                | (SessionEnd::Warned { .. }, SessionEnd::Warned { .. })
         )
     };
     let settle = Instant::now();
@@ -601,13 +619,20 @@ fn wave37_c1_c5_runs() {
         if !only.is_empty() && !only.contains(program) {
             continue;
         }
-        for scenario in ["comment-push", "no-work", "failing-pr", "503-recovers"] {
+        for scenario in [
+            "comment-push",
+            "no-work",
+            "failing-pr",
+            "503-recovers",
+            "local-failed-push",
+        ] {
             if !only.is_empty() && !format!("{program}/{scenario}").contains(&only) {
                 continue;
             }
             let branch = match scenario {
                 "comment-push" => format!("w37-{program}-comment"),
                 "failing-pr" => format!("w37-{program}-pr"),
+                "local-failed-push" => format!("w37-{program}-local"),
                 _ => String::new(),
             };
             let replies = sequence(program, issue.number, scenario, &branch);
@@ -649,6 +674,39 @@ fn wave37_c1_c5_runs() {
                             "{program}/{scenario}: no comment result\n{transcript_text}"
                         );
                     }
+                }
+                "local-failed-push" => {
+                    assert_eq!(
+                        observed.outcome, "warned",
+                        "{program}/{scenario}: {}",
+                        observed.reason
+                    );
+                    assert!(
+                        matches!(observed.board, Some(SessionEnd::Warned { .. })),
+                        "{program}/{scenario}: the card mark is {:?}",
+                        observed.board
+                    );
+                    assert!(
+                        observed.reason.contains("workspace changed"),
+                        "{program}/{scenario}: the reason denied the local work: {}",
+                        observed.reason
+                    );
+                    assert!(
+                        observed.reason.contains("failed to push")
+                            || observed.reason.contains("no-such-remote")
+                            || observed
+                                .reason
+                                .contains("does not appear to be a git repository")
+                            || observed
+                                .reason
+                                .contains("Could not read from remote repository"),
+                        "{program}/{scenario}: the failed push is missing: {}",
+                        observed.reason
+                    );
+                    assert!(
+                        !observed.run_dir.join("push.json").is_file(),
+                        "{program}/{scenario}: a failed push was recorded as a push"
+                    );
                 }
                 "no-work" => {
                     assert_eq!(

@@ -195,7 +195,8 @@ fn c1_status_words_keep_the_provider_message_and_the_503_retry() {
     assert!(words.contains("check the key"), "{words}");
     let busy = status::failure_words("the provider answered HTTP 503: temporarily unavailable");
     assert!(busy.contains("temporarily unavailable"), "{busy}");
-    assert!(busy.contains("retrying"), "{busy}");
+    assert!(!busy.contains("retrying"), "{busy}");
+    assert!(busy.contains("HTTP 503"), "{busy}");
 }
 
 #[test]
@@ -508,7 +509,11 @@ fn c4_an_address_only_change_is_visible_in_the_agent_and_program_facts() {
     press(&mut board, KeyCode::Char('p'));
     let frame = text(&mut board, 120, 40);
     assert!(
-        frame.contains("127.0.0.1:18899") && frame.contains("next run: Pi"),
+        frame.contains("127.0.0.1:18889") && frame.contains("127.0.0.1:18899"),
+        "the Program facts lost the active or saved next address: {frame}"
+    );
+    assert!(
+        frame.contains("next run: Pi") && frame.contains("127.0.0.1:18899"),
         "the Program preview lost the saved next address: {frame}"
     );
 }

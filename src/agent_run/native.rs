@@ -1183,12 +1183,15 @@ fn decide_native_ending(
     requested: RequestedWork,
     state: &NativeState,
 ) -> RunEnding {
-    // A product-observed work fact outranks both prose and a failed command. A run
-    // that opened a pull request or pushed and commented did work even if it ran a
-    // failing test first, reused a branch left by an interrupted run, or ended with
-    // a sentence that claims failure. A blocked write is still a refusal: the work
-    // is named in its reason, but the refusal is not hidden.
-    if observed_work(state) && state.refused_write.is_none() {
+    // Verified remote work outranks prose and a failed command. A run that opened a
+    // pull request or pushed and commented did work even if it ran a failing test
+    // first, reused a branch left by an interrupted run, or ended with a sentence
+    // that claims failure. A local-only edit or commit is **not** enough: a failed
+    // push or test must stay a warning, and the reason names the local work. A
+    // blocked write is still a refusal: the work is named in its reason, but the
+    // refusal is not hidden.
+    let verified_remote_work = state.pr_ok || state.pushed || state.comment_ok;
+    if verified_remote_work && state.refused_write.is_none() {
         return RunEnding::Succeeded;
     }
     match base {
@@ -2089,6 +2092,33 @@ mod native_proof_tests {
             ),
             RunEnding::Succeeded
         );
+        // F1: a local edit/commit with a failed push is not verified remote work.
+        // The failed command and the negative summary stay visible in the warning;
+        // the reason names the local work rather than pretending it succeeded.
+        let local_only = NativeState {
+            workspace_wrote: true,
+            failed_call: Some(
+                "bash: exit 1 — error: failed to push some refs to 'nowhere'".to_owned(),
+            ),
+            ..NativeState::default()
+        };
+        let ending =
+            decide_native_ending(RunEnding::Warned, RequestedWork::PullRequest, &local_only);
+        assert_eq!(ending, RunEnding::Warned);
+        let reason = run_reason(
+            ending,
+            "I could not finish the task. The work is still pending.",
+            &local_only,
+            RequestedWork::PullRequest,
+        )
+        .expect("reason");
+        assert!(reason.contains("workspace changed"), "{reason}");
+        assert!(reason.contains("failed to push"), "{reason}");
+        assert!(
+            !reason.contains("no matching tool or work fact"),
+            "{reason}"
+        );
+
         // A blocked write is not hidden; the reason names the observed work first.
         let blocked = NativeState {
             comment_ok: true,
@@ -2118,11 +2148,21 @@ mod native_proof_tests {
             wrote: true,
             ..NativeState::default()
         };
+        let local_ending =
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &local);
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &local),
-            RunEnding::Succeeded,
-            "a product-observed workspace write is work even without a push"
+            local_ending,
+            RunEnding::Warned,
+            "a local-only write is not verified remote work"
         );
+        let local_reason = run_reason(
+            local_ending,
+            "I could not push the branch.",
+            &local,
+            RequestedWork::PullRequest,
+        )
+        .expect("reason");
+        assert!(local_reason.contains("workspace changed"), "{local_reason}");
         assert_eq!(
             requested_work("Open a pull request and comment on the issue.", &[]),
             RequestedWork::PullRequest
