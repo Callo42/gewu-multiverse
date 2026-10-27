@@ -1780,7 +1780,12 @@ pub fn request_stop(
     proposed: FirstEnding,
 ) -> Result<FirstEnding, String> {
     let ending = pin_first_ending(run_dir, run_id, proposed)?;
-    handle.signal(false);
+    if ending == FirstEnding::Stop {
+        // A Terminal first ending means the supervisor's own finish won. Do not
+        // signal it in the small window before it appends run_finished; the stop
+        // only changes the desired state while the bounded finish completes.
+        handle.signal(false);
+    }
     Ok(ending)
 }
 
@@ -1872,8 +1877,12 @@ pub fn request_stop_and_wait(
     _reason: &str,
     grace: Duration,
 ) -> Result<(), String> {
-    pin_first_ending(run_dir, run_id, proposed)?;
-    stop_and_wait(handle, grace);
+    let ending = pin_first_ending(run_dir, run_id, proposed)?;
+    if ending == FirstEnding::Stop {
+        stop_and_wait(handle, grace);
+    } else {
+        wait_for_finish_or_force(handle, grace);
+    }
     Ok(())
 }
 
@@ -1888,7 +1897,11 @@ pub fn request_stop_and_wait_ending(
     grace: Duration,
 ) -> Result<FirstEnding, String> {
     let ending = request_stop(handle, run_dir, run_id, proposed)?;
-    stop_and_wait(handle, grace);
+    if ending == FirstEnding::Stop {
+        stop_and_wait(handle, grace);
+    } else {
+        wait_for_finish_or_force(handle, grace);
+    }
     Ok(ending)
 }
 
@@ -1899,6 +1912,19 @@ fn stop_and_wait(handle: &mut RunHandle, grace: Duration) {
         return;
     }
     handle.signal(false);
+    if wait_session_status(handle, grace) {
+        return;
+    }
+    handle.signal(true);
+    let _ = wait_session_status(handle, Duration::from_secs(1));
+}
+
+/// Give a supervisor whose own ending already won the bounded stop window, then
+/// force only if it is genuinely stuck. No polite signal is sent in this path.
+fn wait_for_finish_or_force(handle: &mut RunHandle, grace: Duration) {
+    if handle.try_status().is_some() {
+        return;
+    }
     if wait_session_status(handle, grace) {
         return;
     }
@@ -4087,6 +4113,36 @@ mod stop_record_tests {
         fs::create_dir_all(&run).expect("run dir");
         let run_id = "run-1700000200000-0001";
         ensure_first_ending(&run, run_id, FirstEnding::Terminal).expect("terminal fact");
+        // A stop that loses the first-ending arbitration to Terminal must not
+        // signal the supervisor that is writing its own run_finished.
+        struct RecordingSession {
+            signalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl RunningSession for RecordingSession {
+            fn pid(&self) -> u32 {
+                4_000_099
+            }
+            fn try_status(&mut self) -> Option<std::process::ExitStatus> {
+                None
+            }
+            fn signal(&mut self, _force: bool) {
+                self.signalled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handle = RunHandle {
+            inner: Box::new(RecordingSession {
+                signalled: std::sync::Arc::clone(&signalled),
+            }),
+        };
+        let ending = request_stop(&mut handle, &run, run_id, FirstEnding::Stop)
+            .expect("the existing Terminal fact wins");
+        assert_eq!(ending, FirstEnding::Terminal);
+        assert!(
+            !signalled.load(std::sync::atomic::Ordering::SeqCst),
+            "a stop signalled a supervisor whose terminal fact had already won"
+        );
         let error = settle_run_with_stop(
             &run,
             4_000_020,
