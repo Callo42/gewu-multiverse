@@ -7619,8 +7619,12 @@ mod tests {
             on_spawn: &mut dyn FnMut(u32),
         ) -> Result<Box<dyn crate::engine::session::RunningSession>, String> {
             use std::os::unix::process::CommandExt;
-            let child = std::process::Command::new("/bin/sleep")
-                .arg("30")
+            // A real child that ignores SIGTERM until the force step: the settle
+            // must wait through the owned handle instead of judging the group while
+            // this child is still alive.
+            let child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM HUP; sleep 30")
                 .process_group(0)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -7738,6 +7742,14 @@ mod tests {
         );
     }
 
+    /// The real-child tests exercise the bounded stop: the child ignores SIGTERM,
+    /// so the settle has to wait through its owned handle and then force it.
+    fn real_child_options(root: &Path) -> EngineOptions {
+        let mut options = test_options(root);
+        options.stop_grace = Duration::from_millis(200);
+        options
+    }
+
     #[test]
     fn a_real_child_cancelled_during_spawn_has_a_durable_start_and_settles() {
         let root = scratch_root("engine-real-child-stop-spawn");
@@ -7745,7 +7757,7 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let (spawner, report, release) = real_child_spawner();
         let mut engine = open_for_test(
-            test_options(&root),
+            real_child_options(&root),
             Arc::clone(&clock) as SharedClock,
             spawner,
             settings,
@@ -7780,7 +7792,7 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let (spawner, report, release) = real_child_spawner();
         let mut engine = open_for_test(
-            test_options(&root),
+            real_child_options(&root),
             Arc::clone(&clock) as SharedClock,
             spawner,
             settings,
@@ -7807,7 +7819,7 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let (spawner, report, release) = real_child_spawner();
         let mut engine = open_for_test(
-            test_options(&root),
+            real_child_options(&root),
             Arc::clone(&clock) as SharedClock,
             spawner,
             settings,
