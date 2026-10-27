@@ -6601,6 +6601,20 @@ mod tests {
             )],
             "the stop changed the terminal record"
         );
+        drop(engine);
+        let settings = Settings::load(&settings::path_in(&root)).expect("the reopen settings");
+        let mut reopened = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        assert!(
+            reopened.board().agents[0].leftover.is_none(),
+            "a stop that raced the ending blocked the reopen: {:?}",
+            reopened.board().agents[0].leftover
+        );
+        drop(reopened);
         let _ = fs::remove_dir_all(&root);
     }
 
