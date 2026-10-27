@@ -69,3 +69,6 @@ pub mod test_stub;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+pub(crate) mod test_wait;

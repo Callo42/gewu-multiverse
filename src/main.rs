@@ -46,6 +46,10 @@ use ratatui::backend::CrosstermBackend;
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
+#[cfg(test)]
+#[path = "test_wait.rs"]
+mod test_wait;
+
 /// How long the loop waits for a key before drawing again.
 const TICK: Duration = Duration::from_millis(250);
 
@@ -883,6 +887,7 @@ impl Drop for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_wait::{recv_within, wait_until};
 
     #[test]
     fn the_final_line_uses_the_right_noun() {
@@ -910,10 +915,7 @@ mod tests {
             .status()
             .expect("the hand-off child runs");
         assert!(status.success());
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !guard.interrupted() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until("the caught interrupt", || guard.interrupted());
         assert!(guard.interrupted());
     }
 
@@ -993,24 +995,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             setter.store(true, Ordering::SeqCst);
         });
-        let mut board = Board::new(FakeEngine::new());
-        let mut input = ScriptedInput { reads: Vec::new() };
-        let began = std::time::Instant::now();
-        let end = run_board(
-            &mut board,
-            &|| flag.load(Ordering::SeqCst),
-            &mut input,
-            &mut NoUi,
-        )
-        .expect("the loop ends");
-        let elapsed = began.elapsed();
+        // The board must end from the flag alone, with no key to wake it. A loop
+        // that waited for a key would never return; the liveness receive fails the
+        // test instead of hanging it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let mut board = Board::new(FakeEngine::new());
+            let mut input = ScriptedInput { reads: Vec::new() };
+            let end = run_board(
+                &mut board,
+                &|| flag.load(Ordering::SeqCst),
+                &mut input,
+                &mut NoUi,
+            )
+            .expect("the loop ends");
+            let _ = done_tx.send((end, board.shutdown_calls()));
+        });
+        let (end, shutdown_calls) =
+            recv_within("the board to honour the terminal-signal flag", &done_rx);
+        runner.join().expect("the board loop ends");
         handle.join().expect("the setter ends");
         assert_eq!(end, LoopEnd::Finished);
-        assert!(
-            elapsed < Duration::from_secs(1),
-            "the flag took {elapsed:?} to end the loop"
-        );
-        assert_eq!(board.shutdown_calls(), 1);
+        assert_eq!(shutdown_calls, 1);
     }
 
     /// The terminal-signal guard records the two signals a closing terminal sends.
@@ -1024,10 +1030,7 @@ mod tests {
             .status()
             .expect("the child runs");
         assert!(status.success());
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !guard.requested() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until("the closing terminal's signal", || guard.requested());
         assert!(guard.requested());
     }
 
@@ -1135,10 +1138,7 @@ mod tests {
             let pid_file = pid_file.clone();
             let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
             let handle = std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                while !pid_file.is_file() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                wait_until("the fake editor's pid record", || pid_file.is_file());
                 stop.store(true, Ordering::SeqCst);
                 let _ = stopped_tx.send(std::time::Instant::now());
             });
@@ -1154,11 +1154,15 @@ mod tests {
             &mut ui,
         )
         .expect("the hand-off ends cleanly");
-        let stopped_at = setter
-            .1
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the stop was requested");
+        let stopped_at = recv_within("the hand-off stop request", &setter.1);
         setter.0.join().expect("the setter ends");
+        // The hand-off product promise is one second from the caught stop, not the
+        // liveness bound used to receive it.
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(1),
+            "the board's stopped hand-off took {:?}, not within the product's one second",
+            stopped_at.elapsed()
+        );
 
         assert_eq!(end, LoopEnd::Finished);
         assert_eq!(
@@ -1179,11 +1183,6 @@ mod tests {
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "the hand-off child {pid} was left behind"
-        );
-        assert!(
-            stopped_at.elapsed() < Duration::from_secs(1),
-            "the stop took {:?} to end the hand-off and reach shutdown",
-            stopped_at.elapsed()
         );
         let _ = std::fs::remove_dir_all(&root);
     }

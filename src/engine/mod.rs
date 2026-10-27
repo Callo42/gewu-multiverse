@@ -641,6 +641,7 @@ struct AgentRuntime {
     running: Option<RunningState>,
     starting: bool,
     starting_pid: Option<u32>,
+    starting_run_dir: Option<PathBuf>,
     starting_since: Option<Instant>,
     next_at: Option<Instant>,
     last_end: Option<SessionEnd>,
@@ -1098,6 +1099,7 @@ impl AgentRuntime {
             running: None,
             starting: false,
             starting_pid: None,
+            starting_run_dir: None,
             starting_since: None,
             next_at: None,
             last_end: None,
@@ -3477,7 +3479,12 @@ impl EngineApi for Engine {
                     }
                 }
                 if let Some(pid) = agent.starting_pid {
-                    run::request_starting_stop(pid, false, "the starting run was stopped");
+                    run::request_starting_stop(
+                        pid,
+                        agent.starting_run_dir.as_deref(),
+                        false,
+                        "the starting run was stopped",
+                    );
                 }
             }
             if let Some(server) = inner.forgejo.child.as_mut() {
@@ -3509,7 +3516,7 @@ impl EngineApi for Engine {
         let mut settled_runs: Vec<(PathBuf, u32, Option<run::FirstEnding>)> = Vec::new();
         loop {
             let mut appeared: Vec<u32> = Vec::new();
-            let mut run_appeared: Vec<u32> = Vec::new();
+            let mut run_appeared: Vec<(u32, Option<PathBuf>)> = Vec::new();
             let mut alive = false;
             {
                 let mut inner = lock_inner(&self.inner);
@@ -3532,7 +3539,7 @@ impl EngineApi for Engine {
                     if agent.starting {
                         alive = true;
                         if let Some(pid) = agent.starting_pid {
-                            run_appeared.push(pid);
+                            run_appeared.push((pid, agent.starting_run_dir.clone()));
                         }
                     }
                 }
@@ -3553,10 +3560,15 @@ impl EngineApi for Engine {
                     appeared.push(server.pid());
                 }
             }
-            for pid in run_appeared {
+            for (pid, run_dir) in run_appeared {
                 if !signalled.contains(&pid) {
                     signalled.push(pid);
-                    run::request_starting_stop(pid, false, "the starting run was stopped");
+                    run::request_starting_stop(
+                        pid,
+                        run_dir.as_deref(),
+                        false,
+                        "the starting run was stopped",
+                    );
                 }
             }
             for pid in appeared {
@@ -3621,7 +3633,13 @@ impl EngineApi for Engine {
                     }
                 }
                 if let Some(pid) = agent.starting_pid.take() {
-                    run::request_starting_stop(pid, true, "the starting run was forced");
+                    let run_dir = agent.starting_run_dir.take();
+                    run::request_starting_stop(
+                        pid,
+                        run_dir.as_deref(),
+                        true,
+                        "the starting run was forced",
+                    );
                 }
                 agent.starting = false;
                 agent.session = SessionState::Idle;
@@ -3940,7 +3958,12 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
         // The job checks the desired choice after every wait, stops a child it has
         // already spawned, and clears `starting` itself.
         if let Some(pid) = agent.starting_pid {
-            run::request_starting_stop(pid, false, "the starting run was stopped");
+            run::request_starting_stop(
+                pid,
+                agent.starting_run_dir.as_deref(),
+                false,
+                "the starting run was stopped",
+            );
         }
         agent.starting = false;
     }
@@ -4449,6 +4472,7 @@ fn session_job(
         {
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             // `prepared` is dropped here; its owner guard records the ending.
             return;
         }
@@ -4467,10 +4491,12 @@ fn session_job(
             {
                 guard.agents[index].starting = false;
                 guard.agents[index].starting_pid = None;
+                guard.agents[index].starting_run_dir = None;
                 return;
             }
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             let started = guard.agents[index].starting_since.unwrap_or(now);
             let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];
@@ -4490,10 +4516,12 @@ fn session_job(
     // pid takes the lock only for the short store.
     let record_inner = Arc::clone(&inner);
     let record_agent = request.agent.clone();
+    let record_run_dir = request.run_dir.clone();
     let mut on_spawn = move |pid: u32| {
         let mut guard = lock_inner(&record_inner);
         if let Some(index) = guard.agent_index(&record_agent) {
             guard.agents[index].starting_pid = Some(pid);
+            guard.agents[index].starting_run_dir = Some(record_run_dir.clone());
         }
     };
     let started = prepared
@@ -4511,12 +4539,15 @@ fn session_job(
         // directory on disk, not only the current settings.
         drop(guard);
         if let Ok(mut started) = started {
+            // The owned handle is the authority while this job holds it: let the
+            // child finish dying before the group is judged from disk identity.
+            let stop_grace = lock_inner(&inner).options.stop_grace;
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending = match started.request_stop(proposed) {
+            let first_ending = match started.request_stop_and_wait_ending(proposed, stop_grace) {
                 Ok(first_ending) => first_ending,
                 Err(error) => {
                     // The child still has to be stopped, but without a valid fact
@@ -4536,7 +4567,7 @@ fn session_job(
             let _ = started.request_finish(
                 run::RunOutcome::Stopped,
                 Some("the run was called off when its agent was removed".to_owned()),
-                Duration::from_secs(1),
+                stop_grace,
                 Some("the run was called off when its agent was removed".to_owned()),
                 first_ending,
             );
@@ -4550,17 +4581,20 @@ fn session_job(
     if called_off {
         guard.agents[index].starting = false;
         guard.agents[index].starting_pid = None;
+        guard.agents[index].starting_run_dir = None;
         let stopping = guard.stopping;
+        let stop_grace = guard.options.stop_grace;
         drop(guard);
         if let Ok(mut started) = started {
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
+            // The handle, not the run directory, is the authority while we hold it.
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending = match started.request_stop(proposed) {
+            let first_ending = match started.request_stop_and_wait_ending(proposed, stop_grace) {
                 Ok(first_ending) => first_ending,
                 Err(error) => {
                     let reason = started.stop_uncertain(&error, Duration::from_secs(1));
@@ -4583,7 +4617,7 @@ fn session_job(
             match started.request_finish(
                 run::RunOutcome::Stopped,
                 Some(reason.to_owned()),
-                Duration::from_secs(1),
+                stop_grace,
                 Some(reason.to_owned()),
                 first_ending,
             ) {
@@ -4608,6 +4642,7 @@ fn session_job(
             let _pid = started.pid();
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             guard.agents[index].running = Some(RunningState {
                 run_dir: request.run_dir.clone(),
                 started: started_at,
@@ -4640,6 +4675,7 @@ fn session_job(
         Err(reason) => {
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             let _ = run::request_failed_finish(&request.run_dir, &request.run_id, &reason);
             let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];
@@ -4910,6 +4946,12 @@ mod tests {
     use crate::board::Board;
     use crate::engine::clock::FakeClock;
     use crate::test_support::scratch_root;
+    use crate::test_wait::{recv_within, wait_for, wait_until};
+
+    /// The shutdown product bound: a 200–250 ms hand-over plus the two 500 ms
+    /// settlement windows. Scheduling is absorbed by liveness receives; a shutdown
+    /// that takes seconds to minutes must still fail this bound.
+    const SHUTDOWN_TEST_BOUND: Duration = Duration::from_secs(2);
 
     fn test_options(root: &Path) -> EngineOptions {
         let layout = Layout::rooted_at(root.to_path_buf()).expect("the test layout is absolute");
@@ -4965,10 +5007,7 @@ mod tests {
 
     /// Wait for the background start job to land, without advancing the fake clock.
     fn wait_started(fake: &FakeSpawner, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while fake.counts().1 < count && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        wait_until("the session start", || fake.counts().1 >= count);
         assert_eq!(fake.counts().1, count, "the session did not start");
     }
 
@@ -5851,23 +5890,13 @@ mod tests {
                 name: "agent-1".to_owned(),
             })
             .expect("Start");
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
+        wait_until("the current start failure", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            let shown = engine.board().agents[0]
+            engine.board().agents[0]
                 .last_error
                 .as_deref()
-                .is_some_and(|error| error.contains("fixture"));
-            if shown {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the current start failure never appeared: {:?}",
-                engine.board().agents[0]
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+                .is_some_and(|error| error.contains("fixture"))
+        });
         let after = engine.board().agents[0].clone();
         assert_eq!(
             after.last_failure, None,
@@ -5986,20 +6015,11 @@ mod tests {
         // the state lock and installs the new run. Wait for the board state the
         // assertion is about, not only for the spawner, so a loaded host cannot
         // expose the previous row between those two steps.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
+        wait_until("the new run's board state", || {
             let board = engine.board();
-            if board.agents[0].last_failure.is_none()
+            board.agents[0].last_failure.is_none()
                 && matches!(board.agents[0].session, SessionState::Running { .. })
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the previous run's failure is still presented beside the new run after 2 s"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        });
         assert!(
             engine.board().agents[0].last_failure.is_none(),
             "the previous run's failure is still presented beside the new run"
@@ -6568,17 +6588,37 @@ mod tests {
         tick(&mut engine, &clock, Duration::ZERO);
         wait_started(&fake, 1);
         let run_dir = fake.last_run_dir().expect("the run directory");
-        write_terminal_record(
-            &run_dir,
-            run::RunOutcome::Succeeded,
-            "the run finished before the stop",
-        );
+        // The supervisor's own finish pinned Terminal and is between that fact and
+        // its run_finished record. A stop must not signal it away in that window.
+        let run_id = run_id_in(&run_dir).expect("the run id");
+        fs::write(
+            run_dir.join(run::FIRST_ENDING_FILE),
+            serde_json::json!({
+                "ts": "2026-10-27T00:00:00.000Z",
+                "run_id": run_id,
+                "ending": "terminal"
+            })
+            .to_string(),
+        )
+        .expect("the supervisor's terminal fact");
         engine
             .send(Command::Stop {
                 name: "agent-1".to_owned(),
             })
             .expect("stop");
         assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
+        let live = fake.live();
+        assert_eq!(live.len(), 1, "the stop removed the finishing child");
+        assert!(
+            fake.is_live(live[0]),
+            "a stop signalled a supervisor that was already writing its ending"
+        );
+        // The supervisor's terminal record appears within the bounded stop.
+        write_terminal_record(
+            &run_dir,
+            run::RunOutcome::Succeeded,
+            "the run finished before the stop",
+        );
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
         let board = engine.board();
@@ -6595,6 +6635,20 @@ mod tests {
             )],
             "the stop changed the terminal record"
         );
+        drop(engine);
+        let settings = Settings::load(&settings::path_in(&root)).expect("the reopen settings");
+        let mut reopened = open_test_engine(
+            &root,
+            settings,
+            Arc::new(FakeClock::new()),
+            Arc::new(FakeSpawner::new()),
+        );
+        assert!(
+            reopened.board().agents[0].leftover.is_none(),
+            "a stop that raced the ending blocked the reopen: {:?}",
+            reopened.board().agents[0].leftover
+        );
+        drop(reopened);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -6607,6 +6661,16 @@ mod tests {
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
         wait_started(&fake, 1);
+        // The pid is recorded before the spawn job returns. The stop under test is
+        // the one that owns the running child, so wait for the hand-over rather
+        // than racing the starting path.
+        wait_until("the spawned session to become current", || {
+            tick(&mut engine, &clock, Duration::ZERO);
+            matches!(
+                engine.board().agents[0].session,
+                SessionState::Running { .. }
+            )
+        });
         let run_dir = fake.last_run_dir().expect("the run directory");
         engine
             .send(Command::Stop {
@@ -6839,6 +6903,9 @@ mod tests {
             run::RunOutcome::Succeeded,
             "the run finished before the deadline",
         );
+        // The supervisor wrote its ending and exited; the deadline must only be a
+        // desired-state change, not a signal to a child that is already gone.
+        fake.finish_current(0);
         tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
         assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
         let board = engine.board();
@@ -7052,23 +7119,17 @@ mod tests {
             })
             .expect("endpoint");
         engine.send(Command::TestEndpoint).expect("test");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        wait_until("the endpoint test", || {
             let board = engine.board();
             match board.endpoint.test {
                 EndpointTest::Passed { answer } => {
                     assert_eq!(answer, "the model answered");
-                    break;
+                    true
                 }
                 EndpointTest::Failed { reason } => panic!("the probe failed: {reason}"),
-                _ => {}
+                _ => false,
             }
-            assert!(
-                Instant::now() < deadline,
-                "the endpoint test did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        });
     }
 
     #[test]
@@ -7138,22 +7199,16 @@ mod tests {
                 name: "agent-1".to_owned(),
             })
             .expect("test");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        wait_until("the per-agent model test", || {
             match &engine.board().agents[0].model_test {
                 EndpointTest::Passed { answer } => {
                     assert_eq!(answer, "the model answered");
-                    break;
+                    true
                 }
                 EndpointTest::Failed { reason } => panic!("the agent test failed: {reason}"),
-                _ => {}
+                _ => false,
             }
-            assert!(
-                Instant::now() < deadline,
-                "the per-agent test did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        });
         let requests = stub.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].path, "/v1/chat/completions");
@@ -7380,15 +7435,14 @@ mod tests {
 
         let token_inner = Arc::clone(&engine.inner);
         let cancel_inner = Arc::clone(&token_inner);
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
         let job = std::thread::spawn(move || {
-            ensure_admin_token(&token_inner, &helper, &root, "tester", &move || {
+            let result = ensure_admin_token(&token_inner, &helper, &root, "tester", &move || {
                 lock_inner(&cancel_inner).stopping
-            })
+            });
+            let _ = job_tx.send(result);
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !pid_file.is_file() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until("the token helper's pid record", || pid_file.is_file());
         let pid: u32 = std::fs::read_to_string(&pid_file)
             .expect("the token helper wrote its pid")
             .trim()
@@ -7396,10 +7450,23 @@ mod tests {
             .expect("a pid");
         assert!(process_alive(pid), "the token helper did not start");
 
-        let began = Instant::now();
-        engine.shutdown(Duration::from_millis(200));
-        let elapsed = began.elapsed();
-        let result = job.join().expect("the token job ends");
+        // A shutdown that waited for this helper (which traps TERM) would never
+        // return; the liveness bound fails the test instead of hanging it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown_started = Instant::now();
+        let shutdown_thread = std::thread::spawn(move || {
+            engine.shutdown(Duration::from_millis(200));
+            let _ = done_tx.send(engine);
+        });
+        let engine = recv_within("shutdown with a token helper running", &done_rx);
+        shutdown_thread.join().expect("the shutdown thread ends");
+        assert!(
+            shutdown_started.elapsed() < SHUTDOWN_TEST_BOUND,
+            "shutdown with a running token helper took {:?}, not within the product bound",
+            shutdown_started.elapsed()
+        );
+        let result = recv_within("the token job's end", &job_rx);
+        job.join().expect("the token job ends");
         assert!(result.is_err(), "the helper was not called off");
         assert!(
             !process_alive(pid),
@@ -7409,10 +7476,6 @@ mod tests {
             engine.live_pids().is_empty(),
             "the engine still records {:?}",
             engine.live_pids()
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "shutdown waited {elapsed:?} for the token helper"
         );
     }
 
@@ -7431,17 +7494,23 @@ mod tests {
             .expect("the test engine opens");
         engine.send(Command::StartForgejo).expect("start Forgejo");
         engine.tick();
-        let pid = entered
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake server reached its child");
+        let pid = recv_within("the fake server's child", &entered);
         assert!(process_alive(pid), "the fake child did not start");
 
-        let began = Instant::now();
-        engine.shutdown(Duration::from_millis(250));
-        let waited = began.elapsed();
+        // If shutdown waited for the blocked start, the test would hang; the
+        // liveness receive fails it at the bound instead.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown_started = Instant::now();
+        let shutdown_thread = std::thread::spawn(move || {
+            engine.shutdown(Duration::from_millis(250));
+            let _ = done_tx.send(engine);
+        });
+        let mut engine = recv_within("shutdown during an in-flight Forgejo start", &done_rx);
+        shutdown_thread.join().expect("the shutdown thread ends");
         assert!(
-            waited < Duration::from_secs(2),
-            "shutdown waited {waited:?} on an in-flight start"
+            shutdown_started.elapsed() < SHUTDOWN_TEST_BOUND,
+            "shutdown during an in-flight Forgejo start took {:?}, not within the product bound",
+            shutdown_started.elapsed()
         );
         // The child was signalled during the block. It may be a zombie until the job
         // that owns it is released and reaps it, but it is no longer running.
@@ -7458,13 +7527,10 @@ mod tests {
         // Releasing after shutdown must finish the job and reap the child, not keep
         // the server for a later start.
         release.send(()).expect("the fake is released");
-        finished
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the start job exits after shutdown");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while process_alive(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        recv_within("the start job's end after shutdown", &finished);
+        wait_until("the released start job's child to be reaped", || {
+            !process_alive(pid)
+        });
         assert!(!process_alive(pid), "pid {pid} was kept after release");
         assert!(
             engine.live_pids().is_empty(),
@@ -7646,8 +7712,12 @@ mod tests {
             on_spawn: &mut dyn FnMut(u32),
         ) -> Result<Box<dyn crate::engine::session::RunningSession>, String> {
             use std::os::unix::process::CommandExt;
-            let child = std::process::Command::new("/bin/sleep")
-                .arg("30")
+            // A real child that ignores SIGTERM until the force step: the settle
+            // must wait through the owned handle instead of judging the group while
+            // this child is still alive.
+            let child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM HUP; sleep 30")
                 .process_group(0)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -7684,10 +7754,10 @@ mod tests {
             }
             if let Some(release) = self.release.lock().expect("release").take() {
                 // The test removes the agent before releasing this boundary. Under
-                // a loaded parallel suite that setup can take longer than five
-                // seconds; a short timeout would let the spawn return as a normal
-                // start and the removal would have no in-flight job to settle.
-                let _ = release.recv_timeout(Duration::from_secs(30));
+                // a loaded parallel suite that setup can take far longer than a
+                // short deadline; the shared liveness bound keeps the spawn in
+                // flight until the removal has happened.
+                crate::test_wait::recv_within("the test's release of the spawn boundary", &release);
             }
             Ok(Box::new(RealChild {
                 child,
@@ -7765,6 +7835,14 @@ mod tests {
         );
     }
 
+    /// The real-child tests exercise the bounded stop: the child ignores SIGTERM,
+    /// so the settle has to wait through its owned handle and then force it.
+    fn real_child_options(root: &Path) -> EngineOptions {
+        let mut options = test_options(root);
+        options.stop_grace = Duration::from_millis(200);
+        options
+    }
+
     #[test]
     fn a_real_child_cancelled_during_spawn_has_a_durable_start_and_settles() {
         let root = scratch_root("engine-real-child-stop-spawn");
@@ -7772,16 +7850,14 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let (spawner, report, release) = real_child_spawner();
         let mut engine = open_for_test(
-            test_options(&root),
+            real_child_options(&root),
             Arc::clone(&clock) as SharedClock,
             spawner,
             settings,
         )
         .expect("engine opens");
         tick(&mut engine, &clock, Duration::ZERO);
-        let pid = report
-            .recv_timeout(Duration::from_secs(20))
-            .expect("the real child reached its spawn boundary");
+        let pid = recv_within("the real child at its spawn boundary", &report);
         let run_dir = newest_run_for_test(&root, "agent-1");
         assert_real_child_started(&run_dir, pid);
         engine
@@ -7790,11 +7866,10 @@ mod tests {
             })
             .expect("Stop");
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
+        wait_until("the real child's whole completion", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            real_child_completion_visible(&run_dir, pid)
+        });
         assert_real_child_settled(&run_dir, pid);
         assert!(
             !process_group_has_members(pid),
@@ -7810,24 +7885,21 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let (spawner, report, release) = real_child_spawner();
         let mut engine = open_for_test(
-            test_options(&root),
+            real_child_options(&root),
             Arc::clone(&clock) as SharedClock,
             spawner,
             settings,
         )
         .expect("engine opens");
         tick(&mut engine, &clock, Duration::ZERO);
-        let pid = report
-            .recv_timeout(Duration::from_secs(20))
-            .expect("the real child reached its spawn boundary");
+        let pid = recv_within("the real child at its spawn boundary", &report);
         let run_dir = newest_run_for_test(&root, "agent-1");
         assert_real_child_started(&run_dir, pid);
         engine.shutdown(Duration::from_millis(200));
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("the real child's whole completion", || {
+            real_child_completion_visible(&run_dir, pid)
+        });
         assert_real_child_settled(&run_dir, pid);
         assert!(!process_group_has_members(pid));
         let _ = fs::remove_dir_all(&root);
@@ -7840,16 +7912,14 @@ mod tests {
         let clock = Arc::new(FakeClock::new());
         let (spawner, report, release) = real_child_spawner();
         let mut engine = open_for_test(
-            test_options(&root),
+            real_child_options(&root),
             Arc::clone(&clock) as SharedClock,
             spawner,
             settings,
         )
         .expect("engine opens");
         tick(&mut engine, &clock, Duration::ZERO);
-        let pid = report
-            .recv_timeout(Duration::from_secs(20))
-            .expect("the real child reached its spawn boundary");
+        let pid = recv_within("the real child at its spawn boundary", &report);
         let run_dir = newest_run_for_test(&root, "agent-1");
         assert_real_child_started(&run_dir, pid);
         {
@@ -7858,11 +7928,10 @@ mod tests {
             inner.agents.clear();
         }
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !real_child_completion_visible(&run_dir, pid) && Instant::now() < deadline {
+        wait_until("the real child's whole completion", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            real_child_completion_visible(&run_dir, pid)
+        });
         assert_real_child_settled(&run_dir, pid);
         assert!(!process_group_has_members(pid));
         let _ = fs::remove_dir_all(&root);
@@ -7910,6 +7979,10 @@ mod tests {
             let Some(rest) = stat.rsplit(')').next() else {
                 continue;
             };
+            // A zombie has ended; the product's own group scan ignores it too.
+            if rest.split_whitespace().next() == Some("Z") {
+                continue;
+            }
             if rest.split_whitespace().nth(2) == Some(pgid.to_string().as_str()) {
                 return true;
             }
@@ -7926,9 +7999,7 @@ mod tests {
         let (prepared_rx, release) = fake.block_next_prepare();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        prepared_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake session prepared its run directory");
+        recv_within("the fake session's prepared run directory", &prepared_rx);
         let run_dir = fake.last_run_dir().expect("the run directory");
         engine
             .send(Command::Stop {
@@ -7936,11 +8007,10 @@ mod tests {
             })
             .expect("stop before spawn");
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        wait_until("the run's durable ending", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            crate::transcript::terminal_record(&run_dir).is_some()
+        });
         let terminal = crate::transcript::terminal_record(&run_dir)
             .expect("a prepared run cancelled before spawn has no ending");
         match terminal {
@@ -7962,19 +8032,16 @@ mod tests {
         let (prepared_rx, release) = fake.block_next_prepare();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        prepared_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake session prepared its run directory");
+        recv_within("the fake session's prepared run directory", &prepared_rx);
         let run_dir = fake.last_run_dir().expect("the run directory");
         std::thread::scope(|scope| {
             let shutdown = scope.spawn(|| engine.shutdown(Duration::ZERO));
             let _ = release.send(());
             shutdown.join().expect("shutdown");
         });
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("the run's durable ending", || {
+            crate::transcript::terminal_record(&run_dir).is_some()
+        });
         let terminal = crate::transcript::terminal_record(&run_dir)
             .expect("a prepared run shut down before spawn has no ending");
         match terminal {
@@ -7996,20 +8063,11 @@ mod tests {
         fake.fail_spawn("the session process could not be started: fixture");
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut run_dir = None;
-        while Instant::now() < deadline {
-            run_dir = fake.last_run_dir();
-            if run_dir
-                .as_ref()
-                .is_some_and(|dir| crate::transcript::terminal_record(dir).is_some())
-            {
-                break;
-            }
+        let run_dir = wait_for("the run directory with a spawn-error ending", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let run_dir = run_dir.expect("the run directory");
+            fake.last_run_dir()
+                .filter(|dir| crate::transcript::terminal_record(dir).is_some())
+        });
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "a spawn error left no ending"
@@ -8026,23 +8084,13 @@ mod tests {
         fake.fail_prepare_after_dir("the workspace could not be prepared");
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut run_dir = None;
-        while Instant::now() < deadline {
-            run_dir = fake.last_run_dir();
-            if run_dir
-                .as_ref()
-                .is_some_and(|dir| crate::transcript::terminal_record(dir).is_some())
-            {
-                break;
-            }
-            // The prepare failure is reported on the engine's next turn; under a
-            // loaded parallel suite the first tick can return before the fake has
-            // failed. Keep the engine turning so the ending is not lost.
+        // The prepare failure is reported on the engine's next turn; keep the
+        // engine turning until the ending appears.
+        let run_dir = wait_for("the run directory with a prepare-error ending", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let run_dir = run_dir.expect("prepare created a run directory");
+            fake.last_run_dir()
+                .filter(|dir| crate::transcript::terminal_record(dir).is_some())
+        });
         let terminal =
             crate::transcript::terminal_record(&run_dir).expect("a failed prepare left no ending");
         match terminal {
@@ -8068,20 +8116,17 @@ mod tests {
         let (prepared_rx, release) = fake.block_next_prepare();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        prepared_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake session prepared its run directory");
+        recv_within("the fake session's prepared run directory", &prepared_rx);
         let run_dir = fake.last_run_dir().expect("the run directory");
         {
             let mut inner = lock_inner(&engine.inner);
             inner.agents.clear();
         }
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        wait_until("the run's durable ending", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            crate::transcript::terminal_record(&run_dir).is_some()
+        });
         let terminal = crate::transcript::terminal_record(&run_dir)
             .expect("a prepare error with the agent removed left no ending");
         match terminal {
@@ -8103,19 +8148,16 @@ mod tests {
         let (pid_rx, release) = fake.block_next_spawn();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let _pid = pid_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake reported the child");
+        let _pid = recv_within("the fake session's reported child", &pid_rx);
         let run_dir = fake.last_run_dir().expect("the run directory");
         {
             let mut inner = lock_inner(&engine.inner);
             inner.agents.clear();
         }
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("the run's durable ending", || {
+            crate::transcript::terminal_record(&run_dir).is_some()
+        });
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "a spawn error after the pid report left no ending"
@@ -8131,9 +8173,7 @@ mod tests {
         let (pid_rx, release) = fake.block_next_spawn();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let pid = pid_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake session reached its child");
+        let pid = recv_within("the fake session's child", &pid_rx);
         assert!(fake.is_live(pid));
         // The removal job changes settings before the in-flight spawn returns.
         {
@@ -8145,11 +8185,10 @@ mod tests {
         }
         let _ = release.send(());
         let run_dir = fake.last_run_dir().expect("the run directory");
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        wait_until("the run's durable ending", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            crate::transcript::terminal_record(&run_dir).is_some()
+        });
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "a removed agent's spawned child left no durable ending"
@@ -8176,9 +8215,7 @@ mod tests {
         let (pid_rx, release) = fake.block_next_spawn();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let pid = pid_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake session reached its child");
+        let pid = recv_within("the fake session's child", &pid_rx);
         let run_dir = fake.last_run_dir().expect("the run directory");
         fs::create_dir(run_dir.join(run::FIRST_ENDING_FILE)).expect("the obstructed fact");
         {
@@ -8187,16 +8224,12 @@ mod tests {
             inner.agents.clear();
         }
         let _ = release.send(());
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("the uncertain ending fact", || {
+            run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file()
+        });
         // `stop_uncertain` writes the uncertainty fact just before it signals and
-        // waits for the child. Wait for that bounded stop, not for the file alone.
-        let gone = Instant::now() + Duration::from_secs(2);
-        while fake.is_live(pid) && Instant::now() < gone {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // waits for the child. Wait for that stop, not for the file alone.
+        wait_until("the uncertain stop to end the child", || !fake.is_live(pid));
         assert!(!fake.is_live(pid), "the removed agent's child survived");
         assert!(run_dir.join(run::ENDING_UNCERTAIN_FILE).is_file());
         assert!(!run_dir.join(run::STOPPED_FILE).is_file());
@@ -8215,46 +8248,30 @@ mod tests {
         let (pid_rx, release) = fake.block_next_spawn();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let pid = pid_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake session reached its child");
+        let pid = recv_within("the fake session's child", &pid_rx);
         assert!(fake.is_live(pid), "the fake child did not start");
 
-        let began = Instant::now();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // A shutdown that waited for the blocked spawn would never return; the
+        // liveness receive fails the test instead of hanging it.
         let (engine_tx, engine_rx) = std::sync::mpsc::channel();
+        let shutdown_started = Instant::now();
         let shutdown_thread = std::thread::spawn(move || {
             let mut engine = engine;
             engine.shutdown(Duration::from_millis(200));
-            let _ = done_tx.send(());
             let _ = engine_tx.send(engine);
         });
-        match done_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(()) => assert!(
-                // The shutdown is bounded, not instant: this allows the 200 ms
-                // hand-over plus the two 500 ms settlement windows. A blocked
-                // spawn must not be awaited; the 2 s recv_timeout below is the
-                // same hard limit.
-                began.elapsed() < Duration::from_secs(2),
-                "shutdown took {:?} while a spawn was blocked",
-                began.elapsed()
-            ),
-            Err(_) => {
-                let _ = release.send(());
-                let _ = done_rx.recv_timeout(Duration::from_secs(5));
-                panic!("shutdown blocked on the in-flight session spawn");
-            }
-        }
-        let mut engine = engine_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the engine comes back after shutdown");
-        let _ = shutdown_thread.join();
+        let mut engine = recv_within("shutdown while a session spawn is blocked", &engine_rx);
+        shutdown_thread.join().expect("the shutdown thread ends");
+        assert!(
+            shutdown_started.elapsed() < SHUTDOWN_TEST_BOUND,
+            "shutdown during a blocked session spawn took {:?}, not within the product bound",
+            shutdown_started.elapsed()
+        );
         let _ = release.send(());
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while fake.is_live(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until("the blocked spawn's child to be stopped", || {
+            !fake.is_live(pid)
+        });
         assert!(!fake.is_live(pid), "the session child was kept");
         assert!(
             engine.live_pids().is_empty(),
@@ -8265,12 +8282,11 @@ mod tests {
         assert!(matches!(board.agents[0].session, SessionState::Idle));
         let run_dir = fake.last_run_dir().expect("the spawned run directory");
         // `settle_ending` writes the durable ending on the session thread just after
-        // the child is reaped; the liveness check above is not a write barrier.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        // the child is reaped; the check above is not a write barrier.
+        wait_until("shutdown during spawn's durable ending", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            crate::transcript::terminal_record(&run_dir).is_some()
+        });
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "shutdown during spawn left no durable ending"
@@ -8291,9 +8307,7 @@ mod tests {
         let (pid_rx, release) = fake.block_next_spawn();
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
-        let pid = pid_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the fake session reached its child");
+        let pid = recv_within("the fake session's child", &pid_rx);
         assert!(fake.is_live(pid));
         engine
             .send(Command::Stop {
@@ -8302,11 +8316,10 @@ mod tests {
             .expect("stop");
         let _ = release.send(());
         let run_dir = fake.last_run_dir().expect("the run directory");
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while crate::transcript::terminal_record(&run_dir).is_none() && Instant::now() < deadline {
+        wait_until("the run's durable ending", || {
             tick(&mut engine, &clock, Duration::ZERO);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            crate::transcript::terminal_record(&run_dir).is_some()
+        });
         assert!(
             crate::transcript::terminal_record(&run_dir).is_some(),
             "a stop during spawn left no durable ending"
@@ -8508,9 +8521,10 @@ mod tests {
             .expect("the settings file is writable again");
         assert!(result.is_err(), "the failed save was reported as success");
         assert!(result.unwrap_err().contains("was stopped, but"));
-        for _ in 0..5 {
+        wait_until("the stopped agent's child to end", || {
             tick(&mut engine, &clock, Duration::from_secs(1));
-        }
+            fake.live().is_empty()
+        });
         assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
         assert!(fake.live().is_empty());
         assert_eq!(engine.board().agents[0].desired, Desired::Stopped);
@@ -8539,9 +8553,10 @@ mod tests {
             "the failed removal was reported as success"
         );
         assert!(result.unwrap_err().contains("was stopped, but the removal"));
-        for _ in 0..5 {
+        wait_until("the stopped agent's child to end", || {
             tick(&mut engine, &clock, Duration::from_secs(1));
-        }
+            fake.live().is_empty()
+        });
         assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
         assert!(fake.live().is_empty());
         assert_eq!(
@@ -8691,20 +8706,13 @@ mod tests {
             })
             .expect("RemoveAgent");
         tick(&mut engine, &clock, Duration::ZERO);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let note = loop {
+        let note = wait_for("the removal marker failure note", || {
             let inner = lock_inner(&engine.inner);
-            if let Some(note) = inner.notice.clone()
-                && note.contains("could not be removed")
-            {
-                break note;
-            }
-            if Instant::now() >= deadline {
-                panic!("the marker failure was not noted");
-            }
-            drop(inner);
-            std::thread::sleep(Duration::from_millis(5));
-        };
+            inner
+                .notice
+                .clone()
+                .filter(|note| note.contains("could not be removed"))
+        });
         assert!(note.contains("was stopped and left stopped"), "{note}");
         assert!(
             note.contains("sign-in and account were not changed"),
@@ -8758,20 +8766,13 @@ mod tests {
             })
             .expect("RemoveAgent");
         tick(&mut engine, &clock, Duration::ZERO);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let note = loop {
+        let note = wait_for("the removal marker failure note", || {
             let inner = lock_inner(&engine.inner);
-            if let Some(note) = inner.notice.clone()
-                && note.contains("could not be removed")
-            {
-                break note;
-            }
-            if Instant::now() >= deadline {
-                panic!("the marker failure was not noted");
-            }
-            drop(inner);
-            std::thread::sleep(Duration::from_millis(5));
-        };
+            inner
+                .notice
+                .clone()
+                .filter(|note| note.contains("could not be removed"))
+        });
         assert!(
             note.len() <= 600,
             "the notice exceeded its documented bound: {} bytes",
@@ -9249,11 +9250,9 @@ mod tests {
             })
             .expect("the install starts");
         let harness_dir = root.join("data/harnesses/pi");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut downloading = false;
-        while Instant::now() < deadline {
-            if let Ok(entries) = fs::read_dir(&harness_dir) {
-                downloading = entries.flatten().any(|entry| {
+        wait_until("the install download", || {
+            fs::read_dir(&harness_dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
                     let stage = entry.path();
                     stage
                         .file_name()
@@ -9262,21 +9261,11 @@ mod tests {
                         && fs::metadata(stage.join("pi.tar.part"))
                             .map(|metadata| metadata.len() > 0)
                             .unwrap_or(false)
-                });
-            }
-            if downloading {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(downloading, "the install did not reach the download");
+                })
+            })
+        });
 
-        let started = Instant::now();
         engine.shutdown(Duration::from_secs(5));
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "shutdown waited for the whole download"
-        );
         assert_eq!(
             fs::read_to_string(&old_binary).expect("the old binary"),
             "#!/bin/sh\necho old-pi\n"

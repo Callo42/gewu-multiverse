@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use gewu_multiverse::board::{Board, BoardForm};
 use gewu_multiverse::engine::{self, EngineOptions, TERMS_VERSION};
@@ -32,6 +32,9 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 
 const SIZES: [(u16, u16); 5] = [(72, 18), (80, 24), (100, 30), (120, 40), (200, 60)];
 
@@ -917,15 +920,12 @@ fn shell_members(pgid: u32) -> Vec<u32> {
         .collect()
 }
 
-fn wait_until(deadline: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let end = Instant::now() + deadline;
-    while Instant::now() < end {
-        if check() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    check()
+/// Wait for one guarded process state. The shared liveness bound is used; the
+/// return value is always true, and a condition that never holds panics inside
+/// the helper.
+fn wait_until(what: &str, mut check: impl FnMut() -> bool) -> bool {
+    test_wait::wait_until(what, &mut check);
+    true
 }
 
 fn write_records(run_dir: &Path, pid: u32) {
@@ -963,7 +963,7 @@ fn a_supervisor_waiting_for_the_model_is_reaped_before_its_first_shell() {
     let mut supervisor = spawn_supervisor(&run_dir);
     write_records(&run_dir, supervisor.id());
     let mut request = None;
-    let waiting = wait_until(Duration::from_secs(5), || {
+    let waiting = wait_until("a guarded process condition", || {
         if let Ok((stream, _)) = listener.accept() {
             request = Some(stream);
         }
@@ -971,9 +971,8 @@ fn a_supervisor_waiting_for_the_model_is_reaped_before_its_first_shell() {
     });
     let no_capability = !run_dir.join("shell.capability").exists();
     let result = run::recover_ending(&run_dir, Duration::from_millis(150));
-    let stopped = wait_until(Duration::from_secs(2), || {
-        supervisor.try_wait().is_ok_and(|status| status.is_some())
-    });
+    let stopped =
+        test_wait::wait_until_or(|| supervisor.try_wait().is_ok_and(|status| status.is_some()));
     if !stopped {
         stop_unrelated(supervisor);
     }
@@ -1002,7 +1001,7 @@ fn a_killed_supervisors_shell_is_reaped_at_the_next_start() {
     let pgid = supervisor.id();
     write_records(&run_dir, pgid);
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until("a guarded process condition", || {
             !shell_members(pgid).is_empty()
         }),
         "the sleeping shell never started"
@@ -1056,7 +1055,7 @@ fn a_killed_products_left_over_shell_is_reaped_on_reopen() {
     let helper_pid = helper.id();
     // Wait for the run-agent child the helper started.
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until("a guarded process condition", || {
             let mut found = false;
             if let Ok(entries) = fs::read_dir("/proc") {
                 for entry in entries.flatten() {
@@ -1100,7 +1099,7 @@ fn a_killed_products_left_over_shell_is_reaped_on_reopen() {
     .expect("kill the product");
     let _ = helper.wait();
     assert!(
-        wait_until(Duration::from_secs(5), || {
+        wait_until("a guarded process condition", || {
             process_cmdline(pgid).is_empty()
         }),
         "the supervisor did not end with its product"
@@ -1176,7 +1175,7 @@ fn a_stale_shell_record_never_owns_an_unrelated_group() {
     let child = spawn_unrelated_group("stale-shell");
     let pid = child.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the unrelated process did not start"
     );
     fs::write(run_dir.join("shell.pid"), pid.to_string()).expect("shell pid");
@@ -1214,7 +1213,7 @@ fn a_reused_supervisor_pid_is_never_identity() {
     let child = spawn_unrelated_group("stale-session");
     let pid = child.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the unrelated process did not start"
     );
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
@@ -1252,7 +1251,7 @@ fn an_unverified_shell_identity_never_signals_the_group() {
     let child = spawn_unrelated_group("stale-identity");
     let pid = child.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the unrelated process did not start"
     );
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
@@ -1301,7 +1300,7 @@ fn a_failed_cleanup_reaches_the_card_and_blocks_a_replacement_run() {
     let pgid = supervisor.id();
     write_records(&run_dir, pgid);
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until("a guarded process condition", || {
             run_dir.join("shell.pgid").is_file() && !shell_members(pgid).is_empty()
         }),
         "the shell or its run-directory record never appeared"
@@ -1423,7 +1422,7 @@ fn an_inherited_capability_finds_the_group_before_its_pid_record() {
     let pid = child.id();
     drop(capability);
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the capability-holding process did not start"
     );
     // No shell record yet; only the inherited capability and the group number.
@@ -1469,7 +1468,7 @@ fn an_unrelated_process_opening_the_named_marker_is_not_owned() {
         .expect("the unrelated opener starts");
     let pid = opener.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the unrelated opener did not start"
     );
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
@@ -1514,7 +1513,7 @@ fn an_unrelated_process_opening_the_capability_record_is_not_owned() {
         .expect("the unrelated opener starts");
     let pid = opener.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the unrelated opener did not start"
     );
     fs::write(run_dir.join("session.pid"), pid.to_string()).expect("session pid");
@@ -1548,7 +1547,7 @@ fn a_capability_preparation_failure_stops_the_run() {
     let pgid = supervisor.id();
     // The supervisor may spend a moment failing the step; what matters is that no
     // shell exists in the window, not that the model loop has already exited.
-    let _ = wait_until(Duration::from_secs(2), || {
+    let _ = wait_until("a guarded process condition", || {
         !shell_members(pgid).is_empty()
             || fs::read_to_string(run_dir.join("run.log"))
                 .is_ok_and(|log| log.contains("capability") || log.contains("cannot be written"))
@@ -1644,7 +1643,7 @@ fn a_repaired_agent_directory_is_rescanned_before_start() {
     let child = spawn_unrelated_group("agent-retry");
     let pid = child.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the run's old process did not start"
     );
     fs::write(run_dir.join("shell.pid"), pid.to_string()).expect("shell pid");
@@ -1731,7 +1730,7 @@ fn an_empty_target_list_with_a_live_member_is_an_error() {
     let child = spawn_unrelated_group("empty-targets");
     let pgid = child.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pgid)),
+        wait_until("a guarded process condition", || unrelated_alive(pgid)),
         "the unrelated process did not start"
     );
     let error = run::reap_process_group(pgid, &run_dir, Duration::from_millis(100))
@@ -1827,7 +1826,7 @@ fn a_find_reader_of_the_run_directory_is_not_owned() {
         .expect("the unrelated find reader starts");
     let pid = reader.id();
     assert!(
-        wait_until(Duration::from_secs(5), || unrelated_alive(pid)),
+        wait_until("a guarded process condition", || unrelated_alive(pid)),
         "the unrelated find reader did not start"
     );
     // Stale numeric records name the reader's group.
@@ -1878,7 +1877,7 @@ fn spawn_inaccessible_reader() -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("unrelated non-dumpable process");
-    assert!(wait_until(Duration::from_secs(5), || {
+    assert!(wait_until("a guarded process condition", || {
         fs::read_dir(format!("/proc/{}/fd", child.id())).is_err()
     }));
     child
@@ -1896,9 +1895,8 @@ fn an_inaccessible_unrelated_process_does_not_hide_a_readable_holder() {
     let mut holder = spawn_unrelated_group("readable-holder");
     drop(capability);
     let result = run::recover_ending(&run_dir, Duration::from_millis(150));
-    let stopped = wait_until(Duration::from_secs(2), || {
-        holder.try_wait().is_ok_and(|status| status.is_some())
-    });
+    let stopped =
+        test_wait::wait_until_or(|| holder.try_wait().is_ok_and(|status| status.is_some()));
     if !stopped {
         stop_unrelated(holder);
     }
@@ -1990,7 +1988,7 @@ fn an_inaccessible_capability_holder_blocks_start_and_keeps_evidence() {
     let holder_pid = holder.id();
     drop(capability);
     assert!(
-        wait_until(Duration::from_secs(5), || {
+        wait_until("a guarded process condition", || {
             fs::read_dir(format!("/proc/{holder_pid}/fd")).is_err()
         }),
         "the holder's fd table did not become inaccessible"
@@ -2056,7 +2054,7 @@ fn a_shell_whose_session_pid_is_gone_is_reaped_from_the_run_directory() {
     let pgid = supervisor.id();
     write_records(&run_dir, pgid);
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until("a guarded process condition", || {
             run_dir.join("shell.pgid").is_file() && !shell_members(pgid).is_empty()
         }),
         "the shell or its run-directory record never appeared"

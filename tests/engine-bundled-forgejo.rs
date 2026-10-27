@@ -23,6 +23,9 @@ use gewu_multiverse::run::process_alive;
 use gewu_multiverse::test_stub::{Stub, StubReply};
 use sha2::{Digest, Sha256};
 
+#[path = "../src/test_wait.rs"]
+mod test_wait;
+
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -234,21 +237,16 @@ fn a_left_over_forgejo_is_found_by_its_command_line_and_stopped() {
     let pid = child.id();
     // The shell execs into the shaped command line; wait for that before the
     // recovery reads it, as a real start has long done.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let ready = bundled_forgejo::command_line(pid).is_some_and(|parts| {
+    test_wait::wait_until("the fake Forgejo's shaped command line", || {
+        bundled_forgejo::command_line(pid).is_some_and(|parts| {
             parts.iter().any(|part| part == "web")
                 && parts
                     .iter()
                     .any(|part| part == &paths.app_ini.display().to_string())
-        });
-        if ready || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        })
+    });
     fs::write(paths.root.join(bundled_forgejo::PID_FILE), pid.to_string()).expect("the pid record");
-    let stopped = bundled_forgejo::recover_stale_server(root.path(), Duration::from_secs(2))
+    let stopped = bundled_forgejo::recover_stale_server(root.path(), test_wait::LIVENESS_TIMEOUT)
         .expect("the recovery runs");
     assert_eq!(stopped, Some(pid), "the recorded server was not found");
     let _ = child.wait();
@@ -331,19 +329,14 @@ fn a_left_over_session_is_stopped_before_a_new_engine_starts() {
         .expect("the fake session runs");
     drop(capability);
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let ready = bundled_forgejo::command_line(pid).is_some_and(|parts| {
+    test_wait::wait_until("the fake session's shaped command line", || {
+        bundled_forgejo::command_line(pid).is_some_and(|parts| {
             parts.iter().any(|part| part == "--run-agent")
                 && parts
                     .iter()
                     .any(|part| part == &run_dir.display().to_string())
-        });
-        if ready || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        })
+    });
     fs::write(
         run_dir.join(gewu_multiverse::engine::session::PID_FILE),
         pid.to_string(),
@@ -412,34 +405,23 @@ fn final_reply(text: &str) -> StubReply {
     )
 }
 
-fn wait_until(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if check() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}");
+fn wait_until(what: &str, _product_ready_allowance: Duration, check: impl FnMut() -> bool) {
+    test_wait::wait_until(what, check);
 }
 
-/// Tick the engine while waiting; the board alone does not advance its work.
+/// Tick the engine while waiting; the board alone does not advance its work. The
+/// second argument is the explicit allowance for the external Forgejo start, kept
+/// at the call sites; the wait itself uses the suite's liveness bound.
 fn wait_engine(
     engine: &mut gewu_multiverse::engine::Engine,
     what: &str,
-    timeout: Duration,
+    _product_ready_allowance: Duration,
     mut check: impl FnMut(&mut gewu_multiverse::engine::Engine) -> bool,
 ) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    test_wait::wait_until(what, || {
         engine.tick();
-        if check(engine) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let board = engine.board();
-    panic!("timed out waiting for {what}; board: {board:?}");
+        check(engine)
+    });
 }
 
 /// These engine-path cases predate the native programs. A fresh settings file
@@ -969,30 +951,21 @@ fn the_first_run_after_a_reopen_has_the_forgejo_tools() {
     // repositories, so the first run carries forgejo.json and the six tools.
     let mut second = engine::open_with(options).expect("the reopened engine opens");
     second.send(Command::StartForgejo).expect("start Forgejo");
-    let deadline = Instant::now() + Duration::from_secs(240);
-    let (run_dir, log): (PathBuf, String) = loop {
-        second.tick();
-        if let Some(found) = fs::read_dir(layout.state_root().join("agent-1"))
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let run_dir = entry.path();
-                let log = fs::read_to_string(run_dir.join("run.log")).ok()?;
-                log.contains("forgejo tools:").then_some((run_dir, log))
-            })
-            .next()
-        {
-            break found;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the first recovered run never wrote its tool line; board: {:?}",
-            second.board()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let (run_dir, log): (PathBuf, String) =
+        test_wait::wait_for("the first recovered run's tool line", || {
+            second.tick();
+            fs::read_dir(layout.state_root().join("agent-1"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let run_dir = entry.path();
+                    let log = fs::read_to_string(run_dir.join("run.log")).ok()?;
+                    log.contains("forgejo tools:").then_some((run_dir, log))
+                })
+                .next()
+        });
     for pid in second.live_pids() {
         if !seen.contains(&pid) {
             seen.push(pid);
@@ -1016,15 +989,10 @@ fn the_first_run_after_a_reopen_has_the_forgejo_tools() {
             .collect::<Vec<_>>(),
         ["team/workspace"]
     );
-    let request_deadline = Instant::now() + Duration::from_secs(60);
-    while model.requests().is_empty() {
+    test_wait::wait_until("the first recovered run's model request", || {
         second.tick();
-        assert!(
-            Instant::now() < request_deadline,
-            "the first recovered run never called the model"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        !model.requests().is_empty()
+    });
     let body = &model.requests()[0].body;
     for name in gewu_multiverse::forgejo_tools::TOOL_NAMES {
         assert!(
@@ -1142,17 +1110,7 @@ fn a_relative_configuration_root_writes_the_first_runs_plan_and_log() {
         "the run directory stayed relative"
     );
     let mut running = spawner.spawn(&prepared).expect("the run starts");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        if let Some(status) = running.try_status() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the first run did not finish in time"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = test_wait::wait_for("the first run to finish", || running.try_status());
     assert!(status.success(), "the first run failed: {status:?}");
     assert!(
         prepared.run_dir.join("plan.json").is_file(),
@@ -1332,21 +1290,14 @@ fn quitting_at_every_point_of_a_forgejo_start_leaves_nothing() {
     engine.send(Command::StartForgejo).expect("start Forgejo");
     let began = Instant::now();
     let mut starting: Option<u128> = None;
-    let ready = loop {
+    let ready = test_wait::wait_for("the warm-up start to reach running", || {
         engine.tick();
         let state = engine.board().forgejo.state;
         if matches!(state, ForgejoState::Starting) && starting.is_none() {
             starting = Some(began.elapsed().as_millis());
         }
-        if matches!(state, ForgejoState::Running) {
-            break began.elapsed();
-        }
-        assert!(
-            began.elapsed() < Duration::from_secs(240),
-            "the warm-up start did not reach running"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    };
+        matches!(state, ForgejoState::Running).then(|| began.elapsed())
+    });
     let ready_ms = ready.as_millis() as u64;
     let port = instance_port().expect("the warm-up wrote a port");
     engine.shutdown(Duration::from_secs(2));
@@ -1432,11 +1383,7 @@ fn quitting_at_every_point_of_a_forgejo_start_leaves_nothing() {
         let shutdown_ms = shutdown_began.elapsed().as_millis();
         let mut pids_alive_after: Vec<u32> = Vec::new();
         for pid in &seen {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while process_alive(*pid) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if process_alive(*pid) {
+            if !test_wait::wait_until_or(|| !process_alive(*pid)) {
                 pids_alive_after.push(*pid);
             }
         }

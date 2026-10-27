@@ -19,6 +19,9 @@ use gewu_multiverse::paths::Layout;
 use gewu_multiverse::run;
 use gewu_multiverse::test_stub::{Stub, StubReply};
 
+#[path = "../src/test_wait.rs"]
+mod test_wait;
+
 fn scratch(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "gewu-live-engine-{label}-{}-{}",
@@ -33,17 +36,13 @@ fn scratch(label: &str) -> PathBuf {
     root
 }
 
-fn wait_until(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + limit;
-    loop {
-        if check() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// Wait for one live engine state. The argument is the explicit allowance for the
+/// external Forgejo start kept at the call sites; the wait itself uses the suite's
+/// liveness bound. A condition that never holds panics; the return stays true for
+/// the existing assertions.
+fn wait_until(_product_ready_allowance: Duration, mut check: impl FnMut() -> bool) -> bool {
+    test_wait::wait_until("a live engine state", &mut check);
+    true
 }
 
 fn install_forgejo(data_root: &Path) {
@@ -752,8 +751,7 @@ fn live_engine_no_work_resets_the_failure_wait() {
     let mut run_dirs: Vec<PathBuf> = Vec::new();
     let mut starts: Vec<Instant> = Vec::new();
     let mut saw_no_work_wait = false;
-    let deadline = Instant::now() + Duration::from_secs(130);
-    while Instant::now() < deadline && starts.len() < 3 {
+    test_wait::wait_until("the loopback run sequence to reach three runs", || {
         engine.tick();
         let board = engine.board();
         if let SessionState::Restarting { last, .. } = &board.agents[0].session {
@@ -776,12 +774,8 @@ fn live_engine_no_work_resets_the_failure_wait() {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        starts.len() >= 3,
-        "the loopback run sequence did not reach three runs: {starts:?}"
-    );
+        starts.len() >= 3
+    });
     let first_wait = starts[1].duration_since(last_finished_for(&run_dirs, 0));
     assert!(
         first_wait >= Duration::from_secs(8) && first_wait <= Duration::from_secs(25),

@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gewu_multiverse::agent_run;
 use gewu_multiverse::board::Board;
@@ -23,6 +23,9 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 
 static PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -46,17 +49,12 @@ fn scratch(label: &str) -> PathBuf {
     root
 }
 
-fn wait_until(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + limit;
-    loop {
-        if check() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+/// Wait for one real-child state. The shared liveness bound is used; the
+/// return value is always true, and a condition that never holds panics inside
+/// the helper.
+fn wait_until(what: &str, mut check: impl FnMut() -> bool) -> bool {
+    test_wait::wait_until(what, &mut check);
+    true
 }
 
 fn group_members(pgid: u32) -> Vec<u32> {
@@ -156,7 +154,7 @@ fn spawn_supervisor(run_dir: &Path) -> Child {
 
 fn wait_for_shell(run_dir: &Path, pgid: u32) {
     assert!(
-        wait_until(Duration::from_secs(10), || {
+        wait_until("a real-child state", || {
             run_dir.join(run::SHELL_PGID_FILE).is_file() && !group_members(pgid).is_empty()
         }),
         "the supervisor's shell never appeared in its group"
@@ -171,7 +169,7 @@ fn stop_group(pgid: u32) {
 }
 
 fn wait_child(child: &mut Child) {
-    let _ = wait_until(Duration::from_secs(5), || {
+    let _ = wait_until("a real-child state", || {
         child.try_wait().is_ok_and(|status| status.is_some())
     });
 }
@@ -242,7 +240,7 @@ fn a_normal_stop_records_a_durable_ending_before_handles_and_reopens_clean() {
     wait_for_shell(&old, pgid);
     stop_group(pgid);
     wait_child(&mut supervisor);
-    let ended = wait_until(Duration::from_secs(3), || group_members(pgid).is_empty());
+    let ended = wait_until("a real-child state", || group_members(pgid).is_empty());
     assert!(
         ended,
         "the control's group did not end before the old boundary ran: {:?}",

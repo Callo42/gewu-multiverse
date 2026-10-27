@@ -723,6 +723,7 @@ pub fn process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::scratch_root;
+    use crate::test_wait::wait_until;
 
     fn plan(run_id: &str, agent: &str) -> RunPlan {
         RunPlan {
@@ -1107,23 +1108,14 @@ mod tests {
             command.env("GEWU_RUN_CAPABILITY_FILE", file);
         }
         let child = command.spawn().expect("the capability helper starts");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !marker.is_file() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(marker.is_file(), "the capability helper never became ready");
+        wait_until("the capability helper's ready marker", || marker.is_file());
         child
     }
 
     fn wait_for_inaccessible_fds(pid: u32) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if fs::read_dir(format!("/proc/{pid}/fd")).is_err() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the helper's fd table never became inaccessible");
+        wait_until("the helper's inaccessible fd table", || {
+            fs::read_dir(format!("/proc/{pid}/fd")).is_err()
+        });
     }
 
     fn memfd_capability() -> (fs::File, Capability) {
@@ -1206,9 +1198,12 @@ mod tests {
             "the live inaccessible holder error changed: {error}"
         );
         assert!(
-            elapsed >= std::time::Duration::from_millis(300)
-                && elapsed < std::time::Duration::from_secs(2),
-            "the bounded recheck was not bounded: {elapsed:?}"
+            elapsed >= std::time::Duration::from_millis(300),
+            "the bounded recheck returned before its product window: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the bounded recheck exceeded its 2 s test upper bound (the product rechecks for 500 ms): {elapsed:?}"
         );
     }
 }
@@ -1785,7 +1780,12 @@ pub fn request_stop(
     proposed: FirstEnding,
 ) -> Result<FirstEnding, String> {
     let ending = pin_first_ending(run_dir, run_id, proposed)?;
-    handle.signal(false);
+    if ending == FirstEnding::Stop {
+        // A Terminal first ending means the supervisor's own finish won. Do not
+        // signal it in the small window before it appends run_finished; the stop
+        // only changes the desired state while the bounded finish completes.
+        handle.signal(false);
+    }
     Ok(ending)
 }
 
@@ -1877,9 +1877,32 @@ pub fn request_stop_and_wait(
     _reason: &str,
     grace: Duration,
 ) -> Result<(), String> {
-    pin_first_ending(run_dir, run_id, proposed)?;
-    stop_and_wait(handle, grace);
+    let ending = pin_first_ending(run_dir, run_id, proposed)?;
+    if ending == FirstEnding::Stop {
+        stop_and_wait(handle, grace);
+    } else {
+        wait_for_finish_or_force(handle, grace);
+    }
     Ok(())
+}
+
+/// Pin the one ending, stop the owned child through its handle, and wait for its
+/// status within `grace` (forcing after it) before the caller judges the process
+/// group. A fact failure still sends no signal.
+pub fn request_stop_and_wait_ending(
+    handle: &mut RunHandle,
+    run_dir: &Path,
+    run_id: &str,
+    proposed: FirstEnding,
+    grace: Duration,
+) -> Result<FirstEnding, String> {
+    let ending = request_stop(handle, run_dir, run_id, proposed)?;
+    if ending == FirstEnding::Stop {
+        stop_and_wait(handle, grace);
+    } else {
+        wait_for_finish_or_force(handle, grace);
+    }
+    Ok(ending)
 }
 
 /// Stop one session handle politely, then by force, and wait for its status so the
@@ -1889,6 +1912,19 @@ fn stop_and_wait(handle: &mut RunHandle, grace: Duration) {
         return;
     }
     handle.signal(false);
+    if wait_session_status(handle, grace) {
+        return;
+    }
+    handle.signal(true);
+    let _ = wait_session_status(handle, Duration::from_secs(1));
+}
+
+/// Give a supervisor whose own ending already won the bounded stop window, then
+/// force only if it is genuinely stuck. No polite signal is sent in this path.
+fn wait_for_finish_or_force(handle: &mut RunHandle, grace: Duration) {
+    if handle.try_status().is_some() {
+        return;
+    }
     if wait_session_status(handle, grace) {
         return;
     }
@@ -1922,7 +1958,21 @@ pub(crate) fn adapter_signal_run_group(pid: u32, force: bool) {
 
 /// Request a signal to a starting child's group by the pid the job reported. The
 /// job owns the wait and reaps it when it returns.
-pub(crate) fn request_starting_stop(pid: u32, force: bool, _reason: &str) {
+pub(crate) fn request_starting_stop(pid: u32, run_dir: Option<&Path>, force: bool, _reason: &str) {
+    // The spawn job owns the handle, but a Stop or shutdown can arrive before that
+    // job returns. Pin through the same first-ending arbitration as the handle
+    // path: a Terminal winner is never signalled, and a Stop winner is durable
+    // before the signal. A fact failure sends no signal; the job's handle settles.
+    if let Some(run_dir) = run_dir {
+        let Ok(run_id) = run_id_of(run_dir) else {
+            return;
+        };
+        match pin_first_ending(run_dir, run_id, FirstEnding::Stop) {
+            Ok(FirstEnding::Terminal) => return,
+            Ok(FirstEnding::Stop) => {}
+            Err(_) => return,
+        }
+    }
     adapter_signal_run_group(pid, force);
 }
 
@@ -3589,6 +3639,7 @@ fn bounded(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod review3_identity_tests {
     use super::*;
+    use crate::test_wait::wait_until;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -3604,15 +3655,10 @@ mod review3_identity_tests {
     }
 
     fn wait_for(pid: u32) {
-        for _ in 0..200 {
-            if crate::bundled_forgejo::command_line(pid)
+        wait_until("the unrelated process to become visible", || {
+            crate::bundled_forgejo::command_line(pid)
                 .is_some_and(|parts| parts.iter().any(|part| part == "30"))
-            {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the unrelated process never became visible");
+        });
     }
 
     /// The signal site rechecks the boot/start identity of every known member: an
@@ -3664,15 +3710,9 @@ mod review3_identity_tests {
         assert!(blocked.is_none());
         assert_eq!(targets.len(), 1, "the owned process was not selected");
         signal_targets(&targets, nix::sys::signal::Signal::SIGTERM).expect("signal");
-        let mut ended = false;
-        for _ in 0..200 {
-            if child.try_wait().expect("status").is_some() {
-                ended = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(ended, "the verified process was not signalled");
+        wait_until("the verified process to be signalled", || {
+            child.try_wait().expect("status").is_some()
+        });
         let _ = fs::remove_dir_all(&run_dir);
     }
 
@@ -3717,16 +3757,10 @@ mod review3_identity_tests {
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
         );
-        let mut ended = false;
-        for _ in 0..200 {
-            if matches!(process_facts(pid), Ok(Some((state, _, _))) if process_state_has_ended(state))
-            {
-                ended = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(ended, "the child never reached an ended state");
+        wait_until(
+            "the child to reach an ended state",
+            || matches!(process_facts(pid), Ok(Some((state, _, _))) if process_state_has_ended(state)),
+        );
         assert!(
             pidfd_einval_is_absence(pid),
             "a zombie was not a positive ending fact"
@@ -4128,6 +4162,82 @@ mod stop_record_tests {
         fs::create_dir_all(&run).expect("run dir");
         let run_id = "run-1700000200000-0001";
         ensure_first_ending(&run, run_id, FirstEnding::Terminal).expect("terminal fact");
+        // A stop that loses the first-ending arbitration to Terminal must not
+        // signal the supervisor that is writing its own run_finished.
+        struct RecordingSession {
+            signalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl RunningSession for RecordingSession {
+            fn pid(&self) -> u32 {
+                4_000_099
+            }
+            fn try_status(&mut self) -> Option<std::process::ExitStatus> {
+                None
+            }
+            fn signal(&mut self, _force: bool) {
+                self.signalled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handle = RunHandle {
+            inner: Box::new(RecordingSession {
+                signalled: std::sync::Arc::clone(&signalled),
+            }),
+        };
+        let ending = request_stop(&mut handle, &run, run_id, FirstEnding::Stop)
+            .expect("the existing Terminal fact wins");
+        assert_eq!(ending, FirstEnding::Terminal);
+        assert!(
+            !signalled.load(std::sync::atomic::Ordering::SeqCst),
+            "a stop signalled a supervisor whose terminal fact had already won"
+        );
+
+        // The pre-handle start path has only the reported pid, but it must consult
+        // the same Terminal fact before signalling a finishing supervisor.
+        use std::os::unix::process::CommandExt;
+        let mut raw = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the pre-handle child starts");
+        let raw_pid = raw.id();
+        request_starting_stop(raw_pid, Some(&run), false, "the starting run was stopped");
+        // Observe the process, not a zombie: a signalled child may still answer
+        // /proc until it is reaped. The product's own liveness check skips zombies.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{raw_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit(')')
+                        .next()
+                        .and_then(|rest| rest.split_whitespace().next().map(|state| state != "Z"))
+                })
+                .unwrap_or(false)
+        };
+        let observe_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut raw_running = true;
+        while std::time::Instant::now() < observe_until {
+            raw_running = running();
+            if !raw_running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(raw_pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = raw.wait();
+        assert!(
+            raw_running,
+            "the pre-handle stop signalled a supervisor whose terminal fact had already won"
+        );
+
         let error = settle_run_with_stop(
             &run,
             4_000_020,

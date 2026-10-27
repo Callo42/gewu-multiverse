@@ -1619,6 +1619,7 @@ fn signal_group(pid: u32, signal: nix::sys::signal::Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_wait::recv_within;
 
     #[test]
     fn the_app_ini_is_loopback_sqlite_and_closed() {
@@ -1890,17 +1891,28 @@ esac
     /// A plain executable fixture for the command paths.
     fn fake_helper(root: &Path, name: &str, body: &str) -> PathBuf {
         let path = root.join(name);
-        // Write and close the executable before it appears at the path other
-        // threads may exec. Writing the final inode directly lets a parallel
-        // fork inherit the open writer and makes exec fail with ETXTBSY.
-        let stage = root.join(format!(
-            ".{name}.stage-{}-{}",
-            std::process::id(),
-            crate::time::now_unix_ms()
-        ));
-        fs::write(&stage, body).expect("the fake helper is written");
-        crate::mode::set_mode(&stage, 0o755).expect("the fake helper is executable");
-        fs::rename(&stage, &path).expect("the fake helper is published");
+        // The test process must never hold this executable's write descriptor:
+        // another test thread can fork in that window, the child inherits the
+        // writer and exec of the script fails with ETXTBSY. A short-lived child
+        // writes and closes the file instead; only then does the test get the path.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fake helper writer starts");
+        child
+            .stdin
+            .take()
+            .expect("the fake helper writer has stdin")
+            .write_all(body.as_bytes())
+            .expect("the fake helper is written");
+        let status = child.wait().expect("the fake helper writer ends");
+        assert!(status.success(), "the fake helper is created");
         path
     }
 
@@ -1916,19 +1928,21 @@ esac
             "big-output.sh",
             "#!/bin/sh\nhead -c 1048576 /dev/zero | tr '\\0' x\nprintf '\\n'\n",
         );
-        let began = Instant::now();
-        let output = forgejo_output_checked(&helper, &paths, &[], &|| false)
+        // A pipe that stops being drained would block the helper for ever; the
+        // liveness receive fails this test instead of hanging the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let output = forgejo_output_checked(&helper, &paths, &[], &|| false);
+            let _ = done_tx.send(output);
+        });
+        let output = recv_within("the large helper's drained output", &done_rx)
             .expect("a large output is drained");
+        runner.join().expect("the helper thread ends");
         assert!(output.status.success());
         assert_eq!(
             output.stdout.len(),
             1048576 + 1,
             "the helper output was cut short"
-        );
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "the helper took {:?}; its pipe was not drained",
-            began.elapsed()
         );
     }
 

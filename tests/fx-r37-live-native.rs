@@ -11,7 +11,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gewu_multiverse::credentials;
 use gewu_multiverse::engine::{self, EngineOptions};
@@ -24,6 +24,9 @@ use gewu_multiverse::paths::Layout;
 use gewu_multiverse::test_stub::{Stub, StubReply};
 use gewu_multiverse::transcript::{self, Record};
 use serde_json::json;
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
@@ -345,18 +348,13 @@ fn sequence(program: &str, issue: u64, scenario: &str, branch: &str) -> Vec<Stub
 fn wait_engine(
     engine: &mut impl EngineApi,
     what: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
     mut ready: impl FnMut(&mut dyn EngineApi) -> bool,
 ) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
+    test_wait::wait_until(what, || {
         engine.tick();
-        if ready(engine) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}: {:?}", engine.board());
+        ready(engine)
+    });
 }
 
 fn newest_run(layout: &Layout, agent: &str) -> Option<PathBuf> {
@@ -442,29 +440,23 @@ fn run_scenario(
         .send(Command::Start { name: name.clone() })
         .expect("start");
 
-    let start = Instant::now();
     let mut retrying = None;
-    let run_dir = loop {
-        engine.tick();
-        let board = engine.board();
-        let agent = &board.agents[index];
-        if let Some(cause) = agent.retrying.clone() {
-            retrying = Some(cause);
-        }
-        if agent.runs_total > before
-            && let Some(dir) = newest_run(layout, &name)
-            && transcript::terminal_record(&dir).is_some()
-        {
-            break dir;
-        }
-        if start.elapsed() > Duration::from_secs(240) {
-            panic!(
-                "timed out waiting for {program}/{scenario}: {:?}",
-                engine.board().agents[index]
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let run_dir = test_wait::wait_for(
+        &format!("the {program}/{scenario} run's terminal record"),
+        || {
+            engine.tick();
+            let board = engine.board();
+            let agent = &board.agents[index];
+            if let Some(cause) = agent.retrying.clone() {
+                retrying = Some(cause);
+            }
+            if agent.runs_total > before {
+                newest_run(layout, &name).filter(|dir| transcript::terminal_record(dir).is_some())
+            } else {
+                None
+            }
+        },
+    );
     let (outcome, reason) = terminal(&run_dir);
     // The terminal record is written by the child; the engine settles it on a later
     // tick. Wait for the card to carry this run's mark before reading the board.
@@ -485,21 +477,14 @@ fn run_scenario(
                 | (SessionEnd::Warned { .. }, SessionEnd::Warned { .. })
         )
     };
-    let settle = Instant::now();
-    let board = loop {
+    let board = test_wait::wait_for(&format!("the {program}/{scenario} board to settle"), || {
         engine.tick();
         let board = engine.board();
         let agent = &board.agents[index];
         let settled = !matches!(agent.session, SessionState::Running { .. })
             && agent.recent.last().is_some_and(mark_matches);
-        if settled {
-            break board;
-        }
-        if settle.elapsed() > Duration::from_secs(20) {
-            panic!("the board did not settle {program}/{scenario}: {:?}", agent);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+        settled.then_some(board)
+    });
     let agent = &board.agents[index];
     eprintln!(
         "wave37-live: {program:>8} {scenario:>12} requests={:?}",

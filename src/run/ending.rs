@@ -230,6 +230,22 @@ impl StartedRun {
         stop_uncertain(&mut self.handle, &self.run_dir, &self.run_id, error, grace)
     }
 
+    /// Request the one ending, then wait for this owned child's status through
+    /// the handle (forcing after `grace`) before the caller judges its group.
+    pub fn request_stop_and_wait_ending(
+        &mut self,
+        proposed: FirstEnding,
+        grace: Duration,
+    ) -> Result<FirstEnding, String> {
+        super::request_stop_and_wait_ending(
+            &mut self.handle,
+            &self.run_dir,
+            &self.run_id,
+            proposed,
+            grace,
+        )
+    }
+
     /// Request a stop and wait for the child before dropping the handle.
     pub fn request_stop_and_wait(
         &mut self,

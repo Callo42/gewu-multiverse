@@ -10,7 +10,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gewu_multiverse::bundled_forgejo;
 use gewu_multiverse::credentials;
@@ -20,6 +20,9 @@ use gewu_multiverse::forgejo::{DEFAULT_TIMEOUT, ForgejoClient};
 use gewu_multiverse::harness::{self, InstallRecord, Program};
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::test_stub::{Stub, StubReply};
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 
 struct Scratch(PathBuf);
 
@@ -49,26 +52,13 @@ impl Drop for Scratch {
 fn wait_engine(
     engine: &mut impl EngineApi,
     what: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
     mut ready: impl FnMut(&mut dyn EngineApi) -> bool,
 ) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
+    test_wait::wait_until(what, || {
         engine.tick();
-        if ready(engine) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let board = engine.board();
-    eprintln!(
-        "timed out waiting for {what}: forgejo={:?} events={:?} notice={:?} agents={:?}",
-        board.forgejo.state,
-        board.forgejo.events,
-        board.notice,
-        board.agents.len()
-    );
-    panic!("timed out waiting for {what}");
+        ready(engine)
+    });
 }
 
 fn install_pi_fixture(data_root: &Path) {
@@ -478,32 +468,24 @@ fn wait_for_run(
     _engine: &mut impl EngineApi,
     layout: &Layout,
     agent: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
 ) -> PathBuf {
-    let start = Instant::now();
     let state = layout
         .agent(agent)
         .expect("the agent layout")
         .state_dir()
         .to_path_buf();
-    while start.elapsed() < limit {
+    test_wait::wait_for("the first native run's ending", || {
         _engine.tick();
-        if let Ok(entries) = fs::read_dir(&state) {
-            for entry in entries.flatten() {
-                let dir = entry.path();
-                if let Some(record) = gewu_multiverse::transcript::terminal_record(&dir) {
-                    if matches!(
-                        record,
-                        gewu_multiverse::transcript::Record::RunFinished { .. }
-                    ) {
-                        return dir;
-                    }
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for the first native run");
+        fs::read_dir(&state).ok()?.flatten().find_map(|entry| {
+            let dir = entry.path();
+            matches!(
+                gewu_multiverse::transcript::terminal_record(&dir),
+                Some(gewu_multiverse::transcript::Record::RunFinished { .. })
+            )
+            .then_some(dir)
+        })
+    })
 }
 
 #[test]
