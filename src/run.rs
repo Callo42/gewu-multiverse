@@ -2560,16 +2560,11 @@ pub fn recorded_group(run_dir: &Path) -> Option<(u32, u32)> {
 /// naming a dead process while the shell or the native child it started is still
 /// alive in the same group; the shell record and `native.identity` still name
 /// them. Checking only the first record would let the dead supervisor hide the
-/// live child. The supervisor's own record is believed as before; every other
-/// candidate group is believed only through the same checks the stop path uses
-/// (`live_run_pids`), so a bare pid, a reused number or an unrelated live process
-/// is never called this run's.
+/// live child. Every candidate group, the supervisor's included, is believed
+/// only through the same checks the stop path uses (`live_run_pids`), so a bare
+/// pid, a reused number, a zombie or an unrelated live process is never called
+/// this run's.
 pub fn recorded_run_is_live(run_dir: &Path) -> bool {
-    if let Some(pid) = read_number(run_dir, crate::engine::session::PID_FILE)
-        && process_alive(pid)
-    {
-        return true;
-    }
     let mut groups = Vec::new();
     if let Some((_, pgid)) = recorded_group(run_dir) {
         groups.push(pgid);

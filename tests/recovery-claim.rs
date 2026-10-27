@@ -341,3 +341,86 @@ fn a_live_shell_identity_is_found_after_the_supervisor_record_dies() {
     assert!(stopped, "recovery found nothing to stop");
     fixture.live.wait_gone();
 }
+
+#[test]
+fn a_reused_supervisor_pid_is_not_named_or_signalled() {
+    let mut fixture = Fixture::hard_killed("reused-pid");
+    fixture.live.kill_native();
+    let mut unrelated = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("the unrelated process starts");
+    let pid = unrelated.id();
+    fs::write(fixture.run_dir().join("session.pid"), pid.to_string()).expect("session.pid");
+    fs::write(fixture.run_dir().join("session.pgid"), pid.to_string()).expect("session.pgid");
+
+    assert!(run::process_alive(pid), "the unrelated process is alive");
+    assert!(
+        !run::recorded_run_is_live(fixture.run_dir()),
+        "an unrelated live pid was called the supervisor's run"
+    );
+    assert!(
+        !engine::stale_recovery_pending(&fixture.layout, &fixture.data_root()),
+        "the opening screen named an unrelated live pid"
+    );
+    assert!(fixture.claim().is_none(), "the reused pid was claimed");
+    assert!(
+        !run::recover_ending(fixture.run_dir(), Duration::from_millis(50))
+            .expect("the dead group is cleaned without a signal"),
+        "the dead group reported a stopped process"
+    );
+    assert!(
+        run::process_alive(pid),
+        "the unrelated live process was signalled"
+    );
+
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+}
+
+#[test]
+fn a_zombie_supervisor_is_not_named() {
+    let mut fixture = Fixture::hard_killed("zombie-supervisor");
+    fixture.live.kill_native();
+    let mut zombie = Command::new("/bin/sleep")
+        .arg("120")
+        .process_group(0)
+        .spawn()
+        .expect("the future zombie starts");
+    let pid = zombie.id();
+    fs::write(fixture.run_dir().join("session.pid"), pid.to_string()).expect("session.pid");
+    fs::write(fixture.run_dir().join("session.pgid"), pid.to_string()).expect("session.pgid");
+    zombie.kill().expect("the supervisor is killed");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = stat_fields(pid).map(|(state, _, _)| state);
+        if state == Some('Z') {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the killed supervisor did not become a zombie: {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        run::process_alive(pid),
+        "kill(pid, 0) does not answer for a zombie in this test"
+    );
+    assert!(
+        !run::recorded_run_is_live(fixture.run_dir()),
+        "a zombie supervisor was called a live run"
+    );
+    assert!(
+        !engine::stale_recovery_pending(&fixture.layout, &fixture.data_root()),
+        "the opening screen named a zombie supervisor"
+    );
+    assert!(fixture.claim().is_none(), "the zombie run was claimed");
+    assert!(
+        !run::recover_ending(fixture.run_dir(), Duration::from_millis(50))
+            .expect("the zombie's records are cleaned without a signal"),
+        "the zombie run reported a stopped process"
+    );
+    zombie.wait().expect("the zombie is reaped");
+    assert!(!run::process_alive(pid));
+}
