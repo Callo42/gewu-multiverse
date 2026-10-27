@@ -404,9 +404,7 @@ pub fn stale_recovery_claim(layout: &Layout, data_root: &Path) -> Option<Recover
                 if !run_dir.path().is_dir() {
                     continue;
                 }
-                if let Some((pid, _)) = run::recorded_group(&run_dir.path())
-                    && run::process_alive(pid)
-                {
+                if run::recorded_run_is_live(&run_dir.path()) {
                     live_agent = agent.file_name().to_str().map(str::to_owned);
                     live_run = run_dir.file_name().to_str().map(str::to_owned);
                     break 'agents;

@@ -2552,6 +2552,46 @@ pub fn recorded_group(run_dir: &Path) -> Option<(u32, u32)> {
     read_native_record(run_dir).map(|record| (record.pid, record.pgid))
 }
 
+/// Whether a process of this run is still alive, believed through any durable
+/// identity the run left behind.
+///
+/// `recorded_group` answers which group the stop path should try, and its first
+/// record is the supervisor. A supervisor killed outright leaves that record
+/// naming a dead process while the shell or the native child it started is still
+/// alive in the same group; the shell record and `native.identity` still name
+/// them. Checking only the first record would let the dead supervisor hide the
+/// live child. The supervisor's own record is believed as before; every other
+/// candidate group is believed only through the same checks the stop path uses
+/// (`live_run_pids`), so a bare pid, a reused number or an unrelated live process
+/// is never called this run's.
+pub fn recorded_run_is_live(run_dir: &Path) -> bool {
+    if let Some(pid) = read_number(run_dir, crate::engine::session::PID_FILE)
+        && process_alive(pid)
+    {
+        return true;
+    }
+    let mut groups = Vec::new();
+    if let Some((_, pgid)) = recorded_group(run_dir) {
+        groups.push(pgid);
+    }
+    if let Some(record) = read_shell_record(run_dir) {
+        groups.push(record.pgid);
+    }
+    if let Some(record) = read_native_record(run_dir) {
+        groups.push(record.pgid);
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    for pgid in groups {
+        if live_run_pids(pgid, run_dir).is_ok_and(|members| !members.is_empty()) {
+            return true;
+        }
+    }
+    // The inherited anonymous descriptor can outlive every pid record and still
+    // be held by the run's group.
+    capability_group(run_dir).is_ok_and(|group| group.is_some())
+}
+
 /// Every process in a recorded group, read from the kernel's `stat` only. No
 /// process environment is read (F-02 review). An unreadable process table or
 /// stat is an error, not an empty group (review-3b).
