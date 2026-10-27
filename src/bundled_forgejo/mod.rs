@@ -1891,17 +1891,28 @@ esac
     /// A plain executable fixture for the command paths.
     fn fake_helper(root: &Path, name: &str, body: &str) -> PathBuf {
         let path = root.join(name);
-        // Write and close the executable before it appears at the path other
-        // threads may exec. Writing the final inode directly lets a parallel
-        // fork inherit the open writer and makes exec fail with ETXTBSY.
-        let stage = root.join(format!(
-            ".{name}.stage-{}-{}",
-            std::process::id(),
-            crate::time::now_unix_ms()
-        ));
-        fs::write(&stage, body).expect("the fake helper is written");
-        crate::mode::set_mode(&stage, 0o755).expect("the fake helper is executable");
-        fs::rename(&stage, &path).expect("the fake helper is published");
+        // The test process must never hold this executable's write descriptor:
+        // another test thread can fork in that window, the child inherits the
+        // writer and exec of the script fails with ETXTBSY. A short-lived child
+        // writes and closes the file instead; only then does the test get the path.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the fake helper writer starts");
+        child
+            .stdin
+            .take()
+            .expect("the fake helper writer has stdin")
+            .write_all(body.as_bytes())
+            .expect("the fake helper is written");
+        let status = child.wait().expect("the fake helper writer ends");
+        assert!(status.success(), "the fake helper is created");
         path
     }
 
