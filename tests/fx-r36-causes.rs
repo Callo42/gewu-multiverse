@@ -576,7 +576,12 @@ fn c4_the_agent_count_preview_speaks_in_the_future_tense() {
 
 #[test]
 fn c4_a_live_earlier_run_makes_the_reopen_say_what_it_is_stopping() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
     use gewu_multiverse::paths::Layout;
+    use gewu_multiverse::run::RunPlan;
+
     let root = std::env::temp_dir().join(format!(
         "gewu-r36-startup-{}-{}",
         std::process::id(),
@@ -593,8 +598,54 @@ fn c4_a_live_earlier_run_makes_the_reopen_say_what_it_is_stopping() {
     std::fs::create_dir_all(&data).expect("data root");
     let run = layout.state_root().join("agent-1").join("run-1");
     std::fs::create_dir_all(&run).expect("run dir");
-    std::fs::write(run.join("session.pid"), std::process::id().to_string()).expect("pid");
-    std::fs::write(run.join("session.pgid"), std::process::id().to_string()).expect("pgid");
+
+    // A real product supervisor, so the claim has to verify the supervisor's
+    // own invocation rather than trust a bare pid.
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let skills = root.join("skills");
+    std::fs::create_dir_all(&skills).expect("skills");
+    let instruction = root.join("instruction.md");
+    std::fs::write(&instruction, "sleep\n").expect("instruction");
+    let credentials = root.join("credentials.toml");
+    gewu_multiverse::mode::write_private(
+        &credentials,
+        b"[model_keys]\n\"agent-1\" = \"gw-synthetic-not-a-secret\"\n",
+    )
+    .expect("credentials");
+    RunPlan {
+        run_id: "run-1".to_owned(),
+        agent: "agent-1".to_owned(),
+        workspace,
+        instruction,
+        skills_dir: skills,
+        endpoint: "http://127.0.0.1:9/v1/chat/completions".to_owned(),
+        model: "synthetic-model".to_owned(),
+        credentials,
+        max_turns: 1,
+        steps: vec!["sleep 60".to_owned()],
+        timeout_secs: 60,
+        confinement: "none".to_owned(),
+        hide: Vec::new(),
+    }
+    .write(&run)
+    .expect("the plan is written");
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--run-agent")
+        .arg(&run)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("the supervisor starts");
+    assert!(
+        supervisor.try_wait().expect("supervisor state").is_none(),
+        "the supervisor ended before the opening"
+    );
+    std::fs::write(run.join("session.pid"), supervisor.id().to_string()).expect("pid");
+    std::fs::write(run.join("session.pgid"), supervisor.id().to_string()).expect("pgid");
+
     assert!(
         gewu_multiverse::engine::stale_recovery_pending(&layout, &data),
         "a live earlier run was not seen before the board opened"
@@ -605,6 +656,16 @@ fn c4_a_live_earlier_run_makes_the_reopen_say_what_it_is_stopping() {
     assert_eq!(claim.run_id.as_deref(), Some("run-1"));
     assert!(claim.message().contains("agent-1"), "{claim:?}");
     assert!(claim.message().contains("run-1"), "{claim:?}");
+
+    let _ = gewu_multiverse::run::recover_ending(&run, Duration::from_millis(250));
+    for _ in 0..200 {
+        if supervisor.try_wait().expect("supervisor state").is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = supervisor.kill();
+    let _ = supervisor.wait();
     let _ = std::fs::remove_file(run.join("session.pid"));
     let _ = std::fs::remove_file(run.join("session.pgid"));
     assert!(
