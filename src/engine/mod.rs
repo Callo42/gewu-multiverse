@@ -8523,9 +8523,10 @@ mod tests {
             .expect("the settings file is writable again");
         assert!(result.is_err(), "the failed save was reported as success");
         assert!(result.unwrap_err().contains("was stopped, but"));
-        for _ in 0..5 {
+        wait_until("the stopped agent's child to end", || {
             tick(&mut engine, &clock, Duration::from_secs(1));
-        }
+            fake.live().is_empty()
+        });
         assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
         assert!(fake.live().is_empty());
         assert_eq!(engine.board().agents[0].desired, Desired::Stopped);
@@ -8554,9 +8555,10 @@ mod tests {
             "the failed removal was reported as success"
         );
         assert!(result.unwrap_err().contains("was stopped, but the removal"));
-        for _ in 0..5 {
+        wait_until("the stopped agent's child to end", || {
             tick(&mut engine, &clock, Duration::from_secs(1));
-        }
+            fake.live().is_empty()
+        });
         assert_eq!(fake.counts().1, 1, "a stopped agent started a replacement");
         assert!(fake.live().is_empty());
         assert_eq!(
