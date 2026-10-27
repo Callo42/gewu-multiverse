@@ -643,6 +643,7 @@ struct AgentRuntime {
     running: Option<RunningState>,
     starting: bool,
     starting_pid: Option<u32>,
+    starting_run_dir: Option<PathBuf>,
     starting_since: Option<Instant>,
     next_at: Option<Instant>,
     last_end: Option<SessionEnd>,
@@ -1100,6 +1101,7 @@ impl AgentRuntime {
             running: None,
             starting: false,
             starting_pid: None,
+            starting_run_dir: None,
             starting_since: None,
             next_at: None,
             last_end: None,
@@ -3479,7 +3481,12 @@ impl EngineApi for Engine {
                     }
                 }
                 if let Some(pid) = agent.starting_pid {
-                    run::request_starting_stop(pid, false, "the starting run was stopped");
+                    run::request_starting_stop(
+                        pid,
+                        agent.starting_run_dir.as_deref(),
+                        false,
+                        "the starting run was stopped",
+                    );
                 }
             }
             if let Some(server) = inner.forgejo.child.as_mut() {
@@ -3511,7 +3518,7 @@ impl EngineApi for Engine {
         let mut settled_runs: Vec<(PathBuf, u32, Option<run::FirstEnding>)> = Vec::new();
         loop {
             let mut appeared: Vec<u32> = Vec::new();
-            let mut run_appeared: Vec<u32> = Vec::new();
+            let mut run_appeared: Vec<(u32, Option<PathBuf>)> = Vec::new();
             let mut alive = false;
             {
                 let mut inner = lock_inner(&self.inner);
@@ -3534,7 +3541,7 @@ impl EngineApi for Engine {
                     if agent.starting {
                         alive = true;
                         if let Some(pid) = agent.starting_pid {
-                            run_appeared.push(pid);
+                            run_appeared.push((pid, agent.starting_run_dir.clone()));
                         }
                     }
                 }
@@ -3555,10 +3562,15 @@ impl EngineApi for Engine {
                     appeared.push(server.pid());
                 }
             }
-            for pid in run_appeared {
+            for (pid, run_dir) in run_appeared {
                 if !signalled.contains(&pid) {
                     signalled.push(pid);
-                    run::request_starting_stop(pid, false, "the starting run was stopped");
+                    run::request_starting_stop(
+                        pid,
+                        run_dir.as_deref(),
+                        false,
+                        "the starting run was stopped",
+                    );
                 }
             }
             for pid in appeared {
@@ -3623,7 +3635,13 @@ impl EngineApi for Engine {
                     }
                 }
                 if let Some(pid) = agent.starting_pid.take() {
-                    run::request_starting_stop(pid, true, "the starting run was forced");
+                    let run_dir = agent.starting_run_dir.take();
+                    run::request_starting_stop(
+                        pid,
+                        run_dir.as_deref(),
+                        true,
+                        "the starting run was forced",
+                    );
                 }
                 agent.starting = false;
                 agent.session = SessionState::Idle;
@@ -3942,7 +3960,12 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
         // The job checks the desired choice after every wait, stops a child it has
         // already spawned, and clears `starting` itself.
         if let Some(pid) = agent.starting_pid {
-            run::request_starting_stop(pid, false, "the starting run was stopped");
+            run::request_starting_stop(
+                pid,
+                agent.starting_run_dir.as_deref(),
+                false,
+                "the starting run was stopped",
+            );
         }
         agent.starting = false;
     }
@@ -4451,6 +4474,7 @@ fn session_job(
         {
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             // `prepared` is dropped here; its owner guard records the ending.
             return;
         }
@@ -4469,10 +4493,12 @@ fn session_job(
             {
                 guard.agents[index].starting = false;
                 guard.agents[index].starting_pid = None;
+                guard.agents[index].starting_run_dir = None;
                 return;
             }
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             let started = guard.agents[index].starting_since.unwrap_or(now);
             let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];
@@ -4492,10 +4518,12 @@ fn session_job(
     // pid takes the lock only for the short store.
     let record_inner = Arc::clone(&inner);
     let record_agent = request.agent.clone();
+    let record_run_dir = request.run_dir.clone();
     let mut on_spawn = move |pid: u32| {
         let mut guard = lock_inner(&record_inner);
         if let Some(index) = guard.agent_index(&record_agent) {
             guard.agents[index].starting_pid = Some(pid);
+            guard.agents[index].starting_run_dir = Some(record_run_dir.clone());
         }
     };
     let started = prepared
@@ -4555,6 +4583,7 @@ fn session_job(
     if called_off {
         guard.agents[index].starting = false;
         guard.agents[index].starting_pid = None;
+        guard.agents[index].starting_run_dir = None;
         let stopping = guard.stopping;
         let stop_grace = guard.options.stop_grace;
         drop(guard);
@@ -4615,6 +4644,7 @@ fn session_job(
             let _pid = started.pid();
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             guard.agents[index].running = Some(RunningState {
                 run_dir: request.run_dir.clone(),
                 started: started_at,
@@ -4647,6 +4677,7 @@ fn session_job(
         Err(reason) => {
             guard.agents[index].starting = false;
             guard.agents[index].starting_pid = None;
+            guard.agents[index].starting_run_dir = None;
             let _ = run::request_failed_finish(&request.run_dir, &request.run_id, &reason);
             let state_root = guard.options.layout.state_root().to_path_buf();
             let agent = &mut guard.agents[index];

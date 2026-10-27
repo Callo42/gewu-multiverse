@@ -1958,7 +1958,21 @@ pub(crate) fn adapter_signal_run_group(pid: u32, force: bool) {
 
 /// Request a signal to a starting child's group by the pid the job reported. The
 /// job owns the wait and reaps it when it returns.
-pub(crate) fn request_starting_stop(pid: u32, force: bool, _reason: &str) {
+pub(crate) fn request_starting_stop(pid: u32, run_dir: Option<&Path>, force: bool, _reason: &str) {
+    // The spawn job owns the handle, but a Stop or shutdown can arrive before that
+    // job returns. Pin through the same first-ending arbitration as the handle
+    // path: a Terminal winner is never signalled, and a Stop winner is durable
+    // before the signal. A fact failure sends no signal; the job's handle settles.
+    if let Some(run_dir) = run_dir {
+        let Ok(run_id) = run_id_of(run_dir) else {
+            return;
+        };
+        match pin_first_ending(run_dir, run_id, FirstEnding::Stop) {
+            Ok(FirstEnding::Terminal) => return,
+            Ok(FirstEnding::Stop) => {}
+            Err(_) => return,
+        }
+    }
     adapter_signal_run_group(pid, force);
 }
 
