@@ -102,17 +102,13 @@ fn cancelling_a_slow_download_keeps_the_old_install_and_removes_the_stage() {
         .spawn()
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
-    let ready = wait_until(
-        || {
-            stage_dirs(&harness).iter().any(|stage| {
-                fs::metadata(stage.join("pi.tar.part"))
-                    .map(|metadata| metadata.len() > 0)
-                    .unwrap_or(false)
-            })
-        },
-        Duration::from_secs(10),
-    );
-    assert!(ready, "the slow download started");
+    wait_until("the slow download started", || {
+        stage_dirs(&harness).iter().any(|stage| {
+            fs::metadata(stage.join("pi.tar.part"))
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+        })
+    });
     signal(&child, "INT");
     let status = child.wait().expect("the installer ends");
     assert_eq!(status.code(), Some(130), "{status:?}");
@@ -146,10 +142,7 @@ fn cancelling_during_extraction_kills_the_unpacker_and_removes_the_stage() {
         .stderr(Stdio::null())
         .spawn()
         .expect("the installer starts");
-    assert!(
-        wait_until(|| marker.exists(), Duration::from_secs(10)),
-        "the unpacker did not start"
-    );
+    wait_until("the unpacker did not start", || marker.exists());
     signal(&child, "INT");
     let status = child.wait().expect("the installer ends");
     assert_eq!(status.code(), Some(130), "{status:?}");
@@ -186,10 +179,7 @@ exec sleep 30
         .stderr(Stdio::null())
         .spawn()
         .expect("the installer starts");
-    assert!(
-        wait_until(|| marker.exists(), Duration::from_secs(10)),
-        "npm did not start"
-    );
+    wait_until("npm did not start", || marker.exists());
     signal(&child, "INT");
     let status = child.wait().expect("the installer ends");
     assert_eq!(status.code(), Some(130), "{status:?}");
@@ -218,17 +208,13 @@ fn a_hard_kill_before_the_rename_leaves_only_an_owned_stage_and_a_foreign_stage_
         .spawn()
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
-    let ready = wait_until(
-        || {
-            stage_dirs(&harness).iter().any(|stage| {
-                fs::metadata(stage.join("pi.tar.part"))
-                    .map(|metadata| metadata.len() > 0)
-                    .unwrap_or(false)
-            })
-        },
-        Duration::from_secs(10),
-    );
-    assert!(ready, "the download started");
+    wait_until("the download started", || {
+        stage_dirs(&harness).iter().any(|stage| {
+            fs::metadata(stage.join("pi.tar.part"))
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+        })
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -309,18 +295,14 @@ fn a_hard_kill_after_the_old_root_rename_is_recovered_before_use() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
+    wait_until(
+        "the installer reached the pause after the old rename",
         || {
             fs::read_to_string(&journal)
                 .map(|text| text.contains("\"old-moved\""))
                 .unwrap_or(false)
                 && !root.exists()
         },
-        Duration::from_secs(15),
-    );
-    assert!(
-        ready,
-        "the installer reached the pause after the old rename"
     );
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
@@ -375,16 +357,12 @@ fn a_staged_not_ready_old_restores_and_settles_by_identity() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"staged\""))
-                .unwrap_or(false)
-                && !root.exists()
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the pre-journal pause");
+    wait_until("the installer reached the pre-journal pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"staged\""))
+            .unwrap_or(false)
+            && !root.exists()
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -418,20 +396,16 @@ fn a_staged_foreign_root_keeps_the_journal_and_old_backup() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"staged\""))
-                .unwrap_or(false)
-                && !root.exists()
-                && fs::read_dir(&harness)
-                    .expect("the harness directory")
-                    .flatten()
-                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the pre-journal pause");
+    wait_until("the installer reached the pre-journal pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"staged\""))
+            .unwrap_or(false)
+            && !root.exists()
+            && fs::read_dir(&harness)
+                .expect("the harness directory")
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -494,16 +468,12 @@ fn an_old_not_ready_restored_root_settles_and_a_retry_succeeds() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"old-moved\""))
-                .unwrap_or(false)
-                && !root.exists()
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the old-moved pause");
+    wait_until("the installer reached the old-moved pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"old-moved\""))
+            .unwrap_or(false)
+            && !root.exists()
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -551,17 +521,13 @@ fn a_fresh_old_moved_kill_is_recoverable_and_a_retry_succeeds() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"old-moved\"") && text.contains("\"had_old\": false"))
-                .unwrap_or(false)
-                && !root.exists()
-                && stage_dirs(&harness).len() == 1
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the fresh installer reached the old-moved pause");
+    wait_until("the fresh installer reached the old-moved pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"old-moved\"") && text.contains("\"had_old\": false"))
+            .unwrap_or(false)
+            && !root.exists()
+            && stage_dirs(&harness).len() == 1
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -602,20 +568,16 @@ fn an_old_moved_foreign_root_without_a_backup_keeps_the_journal() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"old-moved\""))
-                .unwrap_or(false)
-                && !root.exists()
-                && fs::read_dir(&harness)
-                    .expect("the harness directory")
-                    .flatten()
-                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the after-old-rename pause");
+    wait_until("the installer reached the after-old-rename pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"old-moved\""))
+            .unwrap_or(false)
+            && !root.exists()
+            && fs::read_dir(&harness)
+                .expect("the harness directory")
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -664,20 +626,16 @@ fn a_published_foreign_root_without_a_backup_keeps_the_journal() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"published\""))
-                .unwrap_or(false)
-                && root.join("install.json").is_file()
-                && fs::read_dir(&harness)
-                    .expect("the harness directory")
-                    .flatten()
-                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the after-publish pause");
+    wait_until("the installer reached the after-publish pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"published\""))
+            .unwrap_or(false)
+            && root.join("install.json").is_file()
+            && fs::read_dir(&harness)
+                .expect("the harness directory")
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -733,20 +691,16 @@ fn a_published_old_not_ready_root_settles_without_calling_it_ready() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"published\""))
-                .unwrap_or(false)
-                && root.join("install.json").is_file()
-                && fs::read_dir(&harness)
-                    .expect("the harness directory")
-                    .flatten()
-                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the after-publish pause");
+    wait_until("the installer reached the after-publish pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"published\""))
+            .unwrap_or(false)
+            && root.join("install.json").is_file()
+            && fs::read_dir(&harness)
+                .expect("the harness directory")
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -802,16 +756,12 @@ fn cancelling_after_a_not_ready_old_rename_restores_it() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"old-moved\""))
-                .unwrap_or(false)
-                && !root.exists()
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the old-moved pause");
+    wait_until("the installer reached the old-moved pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"old-moved\""))
+            .unwrap_or(false)
+            && !root.exists()
+    });
     signal(&child, "INT");
     let status = child.wait().expect("the installer ends");
     assert_eq!(status.code(), Some(130), "{status:?}");
@@ -847,18 +797,14 @@ fn cancelling_after_the_old_rename_restores_it_and_removes_the_journal() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
+    wait_until(
+        "the installer reached the pause after the old rename",
         || {
             fs::read_to_string(&journal)
                 .map(|text| text.contains("\"old-moved\""))
                 .unwrap_or(false)
                 && !root.exists()
         },
-        Duration::from_secs(15),
-    );
-    assert!(
-        ready,
-        "the installer reached the pause after the old rename"
     );
     signal(&child, "INT");
     let status = child.wait().expect("the installer ends");
@@ -897,18 +843,14 @@ fn a_failed_restore_keeps_foreign_data_the_old_backup_and_the_journal() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
+    wait_until(
+        "the installer reached the pause after the old rename",
         || {
             fs::read_to_string(&journal)
                 .map(|text| text.contains("\"old-moved\""))
                 .unwrap_or(false)
                 && !root.exists()
         },
-        Duration::from_secs(15),
-    );
-    assert!(
-        ready,
-        "the installer reached the pause after the old rename"
     );
 
     // Occupy the destination with data this installer does not own. A truthful
@@ -977,20 +919,16 @@ fn a_kill_between_the_old_rename_and_its_journal_write_is_recovered() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"staged\""))
-                .unwrap_or(false)
-                && !root.exists()
-                && fs::read_dir(&harness)
-                    .expect("the harness directory")
-                    .flatten()
-                    .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the pre-journal pause");
+    wait_until("the installer reached the pre-journal pause", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"staged\""))
+            .unwrap_or(false)
+            && !root.exists()
+            && fs::read_dir(&harness)
+                .expect("the harness directory")
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".old-"))
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -1047,16 +985,12 @@ fn a_hard_kill_after_the_new_root_is_published_keeps_the_verified_new_tree() {
         .expect("the installer starts");
     let harness = sandbox.harness_dir("pi");
     let journal = harness.join(".install-journal");
-    let ready = wait_until(
-        || {
-            fs::read_to_string(&journal)
-                .map(|text| text.contains("\"published\""))
-                .unwrap_or(false)
-                && root.join("install.json").is_file()
-        },
-        Duration::from_secs(15),
-    );
-    assert!(ready, "the installer reached the pause after publication");
+    wait_until("the installer reached the pause after publication", || {
+        fs::read_to_string(&journal)
+            .map(|text| text.contains("\"published\""))
+            .unwrap_or(false)
+            && root.join("install.json").is_file()
+    });
     child.kill().expect("SIGKILL");
     let status = child.wait().expect("the installer is reaped");
     assert_eq!(status.signal(), Some(9));
@@ -1103,17 +1037,13 @@ fn a_second_install_is_refused_and_a_repeat_after_success_is_ready_without_a_dow
         .spawn()
         .expect("the first installer starts");
     let harness = sandbox.harness_dir("pi");
-    let ready = wait_until(
-        || {
-            stage_dirs(&harness).iter().any(|stage| {
-                fs::metadata(stage.join("pi.tar.part"))
-                    .map(|metadata| metadata.len() > 0)
-                    .unwrap_or(false)
-            })
-        },
-        Duration::from_secs(10),
-    );
-    assert!(ready, "the first download started");
+    wait_until("the first download started", || {
+        stage_dirs(&harness).iter().any(|stage| {
+            fs::metadata(stage.join("pi.tar.part"))
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false)
+        })
+    });
 
     let second = run(&sandbox, "pi", &server, &digest);
     assert!(!second.status.success());

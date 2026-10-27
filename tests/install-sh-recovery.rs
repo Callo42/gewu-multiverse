@@ -5,7 +5,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 
 struct Scratch(PathBuf);
 
@@ -143,17 +145,6 @@ fn sha256_file(path: &Path) -> String {
         .next()
         .expect("a digest")
         .to_owned()
-}
-
-fn wait_until(mut test: impl FnMut() -> bool, limit: Duration) -> bool {
-    let deadline = Instant::now() + limit;
-    while Instant::now() < deadline {
-        if test() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    test()
 }
 
 #[test]
@@ -301,8 +292,7 @@ exit 1
         .spawn()
         .expect("install.sh starts");
     let marker = release.home.join("harness-started");
-    let started = wait_until(|| marker.exists(), Duration::from_secs(20));
-    assert!(started, "the program install did not start");
+    test_wait::wait_until("the program install to start", || marker.exists());
     let status = Command::new("/bin/kill")
         .args(["-INT", &child.id().to_string()])
         .status()

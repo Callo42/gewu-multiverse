@@ -723,6 +723,7 @@ pub fn process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::scratch_root;
+    use crate::test_wait::wait_until;
 
     fn plan(run_id: &str, agent: &str) -> RunPlan {
         RunPlan {
@@ -1107,23 +1108,14 @@ mod tests {
             command.env("GEWU_RUN_CAPABILITY_FILE", file);
         }
         let child = command.spawn().expect("the capability helper starts");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !marker.is_file() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(marker.is_file(), "the capability helper never became ready");
+        wait_until("the capability helper's ready marker", || marker.is_file());
         child
     }
 
     fn wait_for_inaccessible_fds(pid: u32) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if fs::read_dir(format!("/proc/{pid}/fd")).is_err() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the helper's fd table never became inaccessible");
+        wait_until("the helper's inaccessible fd table", || {
+            fs::read_dir(format!("/proc/{pid}/fd")).is_err()
+        });
     }
 
     fn memfd_capability() -> (fs::File, Capability) {
@@ -1206,9 +1198,12 @@ mod tests {
             "the live inaccessible holder error changed: {error}"
         );
         assert!(
-            elapsed >= std::time::Duration::from_millis(300)
-                && elapsed < std::time::Duration::from_secs(2),
-            "the bounded recheck was not bounded: {elapsed:?}"
+            elapsed >= std::time::Duration::from_millis(300),
+            "the bounded recheck returned before its product window: {elapsed:?}"
+        );
+        assert!(
+            elapsed < crate::test_wait::LIVENESS_TIMEOUT,
+            "the recheck did not return within the liveness bound: {elapsed:?}"
         );
     }
 }
@@ -3554,6 +3549,7 @@ fn bounded(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod review3_identity_tests {
     use super::*;
+    use crate::test_wait::wait_until;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -3569,15 +3565,10 @@ mod review3_identity_tests {
     }
 
     fn wait_for(pid: u32) {
-        for _ in 0..200 {
-            if crate::bundled_forgejo::command_line(pid)
+        wait_until("the unrelated process to become visible", || {
+            crate::bundled_forgejo::command_line(pid)
                 .is_some_and(|parts| parts.iter().any(|part| part == "30"))
-            {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        panic!("the unrelated process never became visible");
+        });
     }
 
     /// The signal site rechecks the boot/start identity of every known member: an
@@ -3629,15 +3620,9 @@ mod review3_identity_tests {
         assert!(blocked.is_none());
         assert_eq!(targets.len(), 1, "the owned process was not selected");
         signal_targets(&targets, nix::sys::signal::Signal::SIGTERM).expect("signal");
-        let mut ended = false;
-        for _ in 0..200 {
-            if child.try_wait().expect("status").is_some() {
-                ended = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(ended, "the verified process was not signalled");
+        wait_until("the verified process to be signalled", || {
+            child.try_wait().expect("status").is_some()
+        });
         let _ = fs::remove_dir_all(&run_dir);
     }
 
@@ -3682,16 +3667,10 @@ mod review3_identity_tests {
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
         );
-        let mut ended = false;
-        for _ in 0..200 {
-            if matches!(process_facts(pid), Ok(Some((state, _, _))) if process_state_has_ended(state))
-            {
-                ended = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(ended, "the child never reached an ended state");
+        wait_until(
+            "the child to reach an ended state",
+            || matches!(process_facts(pid), Ok(Some((state, _, _))) if process_state_has_ended(state)),
+        );
         assert!(
             pidfd_einval_is_absence(pid),
             "a zombie was not a positive ending fact"

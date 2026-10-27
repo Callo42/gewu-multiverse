@@ -6,13 +6,16 @@
 //!   GEWU_MODEL_URL=http://127.0.0.1:18880/v1 GEWU_PROGRAM=pi \
 //!   cargo test --test fx-r36-live-native -- --ignored --nocapture
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gewu_multiverse::credentials;
 use gewu_multiverse::engine::{self, EngineOptions};
 use gewu_multiverse::engine_api::{Command, EngineApi, ForgejoState, Provisioning};
 use gewu_multiverse::forgejo::ForgejoClient;
 use gewu_multiverse::paths::Layout;
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
@@ -21,18 +24,13 @@ fn env(name: &str) -> String {
 fn wait_engine(
     engine: &mut impl EngineApi,
     what: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
     mut ready: impl FnMut(&mut dyn EngineApi) -> bool,
 ) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
+    test_wait::wait_until(what, || {
         engine.tick();
-        if ready(engine) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}: {:?}", engine.board().agents);
+        ready(engine)
+    });
 }
 
 #[test]

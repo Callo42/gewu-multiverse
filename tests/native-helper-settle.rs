@@ -2,8 +2,10 @@
 //! still holding the run's anonymous capability. Settlement must close it before
 //! the run's identity records are removed.
 use std::path::Path;
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 /// Both probes scan the process table for an anonymous capability holder. Run
 /// them one at a time so one probe's helper cannot be attributed to the other.
@@ -22,6 +24,17 @@ fn run_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// The kernel session a pid belongs to, from field 6 of `/proc/<pid>/stat`.
+fn session_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit(')')
+        .next()?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()
+}
+
 #[test]
 fn a_setsid_helper_holding_the_run_capability_is_found_and_closed() {
     let _serial = CAPABILITY_PROBE
@@ -38,13 +51,10 @@ fn a_setsid_helper_holding_the_run_capability_is_found_and_closed() {
         .stderr(Stdio::null())
         .spawn()
         .expect("the setsid helper starts");
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(2)
-        && Path::new(&format!("/proc/{}", child.id())).exists()
-    {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let result = gewu_multiverse::run::recover_ending(&dir, Duration::from_secs(2));
+    test_wait::wait_until("the setsid helper's own session", || {
+        session_of(child.id()) == Some(child.id())
+    });
+    let result = gewu_multiverse::run::recover_ending(&dir, test_wait::LIVENESS_TIMEOUT);
     let _ = child.kill();
     let _ = child.wait();
     let reaped = result.expect("the existing capability scan must close the helper");
@@ -76,12 +86,9 @@ fn normal_settle_closes_a_setsid_helper_before_clearing_records() {
         .stderr(Stdio::null())
         .spawn()
         .expect("the leader starts");
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(2)
-        && (!leader_file.exists() || !helper_file.exists())
-    {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    test_wait::wait_until("the leader and helper pid records", || {
+        leader_file.exists() && helper_file.exists()
+    });
     let leader_pid: u32 = std::fs::read_to_string(&leader_file)
         .expect("leader pid")
         .trim()
@@ -97,7 +104,7 @@ fn normal_settle_closes_a_setsid_helper_before_clearing_records() {
         leader_pid,
         gewu_multiverse::run::RunOutcome::Stopped,
         None,
-        Duration::from_secs(2),
+        test_wait::LIVENESS_TIMEOUT,
         Some("the run was stopped on request".to_owned()),
         gewu_multiverse::run::FirstEnding::Stop,
     );

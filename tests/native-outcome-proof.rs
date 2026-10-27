@@ -12,7 +12,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gewu_multiverse::engine::{self, EngineOptions};
 use gewu_multiverse::engine_api::{Command, EngineApi, ForgejoState, Provisioning};
@@ -20,6 +20,9 @@ use gewu_multiverse::harness::{self, InstallRecord, Program};
 use gewu_multiverse::paths::Layout;
 use gewu_multiverse::run;
 use gewu_multiverse::transcript::{self, Record};
+
+#[path = "../src/test_wait.rs"]
+mod test_wait;
 
 struct Scratch(PathBuf);
 
@@ -74,18 +77,13 @@ fn install_pi(data_root: &Path, source: &Path) {
 fn wait_engine(
     engine: &mut impl EngineApi,
     what: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
     mut ready: impl FnMut(&mut dyn EngineApi) -> bool,
 ) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
+    test_wait::wait_until(what, || {
         engine.tick();
-        if ready(engine) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}");
+        ready(engine)
+    });
 }
 
 fn write_mock_state(tag: &str, probe: &str, value: serde_json::Value) -> String {
@@ -152,50 +150,44 @@ fn create_agent(engine: &mut impl EngineApi) {
         .expect("Pi program");
 }
 
-fn wait_run_dir(engine: &mut impl EngineApi, layout: &Layout, limit: Duration) -> PathBuf {
-    let start = Instant::now();
+fn wait_run_dir(
+    engine: &mut impl EngineApi,
+    layout: &Layout,
+    _product_ready_allowance: Duration,
+) -> PathBuf {
     let state = layout
         .agent("agent-1")
         .expect("agent")
         .state_dir()
         .to_path_buf();
-    while start.elapsed() < limit {
+    test_wait::wait_for("the native run's plan", || {
         engine.tick();
-        if let Ok(entries) = fs::read_dir(&state) {
-            for entry in entries.flatten() {
-                if entry.path().join(run::NATIVE_PLAN_FILE).is_file() {
-                    return entry.path();
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("the native run never started");
+        fs::read_dir(&state).ok()?.flatten().find_map(|entry| {
+            entry
+                .path()
+                .join(run::NATIVE_PLAN_FILE)
+                .is_file()
+                .then(|| entry.path())
+        })
+    })
 }
 
 fn wait_terminal(
     engine: &mut impl EngineApi,
     layout: &Layout,
-    limit: Duration,
+    _product_ready_allowance: Duration,
 ) -> (PathBuf, Record) {
-    let start = Instant::now();
     let state = layout
         .agent("agent-1")
         .expect("agent")
         .state_dir()
         .to_path_buf();
-    while start.elapsed() < limit {
+    test_wait::wait_for("the run's terminal record", || {
         engine.tick();
-        if let Ok(entries) = fs::read_dir(&state) {
-            for entry in entries.flatten() {
-                if let Some(record) = transcript::terminal_record(&entry.path()) {
-                    return (entry.path(), record);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("the run never wrote a terminal record");
+        fs::read_dir(&state).ok()?.flatten().find_map(|entry| {
+            transcript::terminal_record(&entry.path()).map(|record| (entry.path(), record))
+        })
+    })
 }
 
 fn set_endpoint(engine: &mut impl EngineApi, url: &str) {
@@ -234,14 +226,10 @@ fn a_cancelled_run_writes_a_stop_record_and_a_stopped_ending() {
     // Wait until the harness's request is in flight, then stop the run.
     let request_log = PathBuf::from(std::env::var("GEWU_PROOF_ROOT").expect("proof root"))
         .join("probes/reqlogs/proof-cancel.jsonl");
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(30) {
+    test_wait::wait_until("the harness's in-flight request", || {
         engine.tick();
-        if request_log.is_file() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        request_log.is_file()
+    });
     engine
         .send(Command::Stop {
             name: "agent-1".to_owned(),
@@ -546,52 +534,42 @@ fn wait_run_dir_for(
     engine: &mut impl EngineApi,
     layout: &Layout,
     agent: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
 ) -> PathBuf {
-    let start = Instant::now();
     let state = layout
         .agent(agent)
         .expect("agent")
         .state_dir()
         .to_path_buf();
-    while start.elapsed() < limit {
+    test_wait::wait_for("the native run's plan", || {
         engine.tick();
-        if let Ok(entries) = fs::read_dir(&state) {
-            for entry in entries.flatten() {
-                if entry.path().join(run::NATIVE_PLAN_FILE).is_file() {
-                    return entry.path();
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("the native run never started for {agent}");
+        fs::read_dir(&state).ok()?.flatten().find_map(|entry| {
+            entry
+                .path()
+                .join(run::NATIVE_PLAN_FILE)
+                .is_file()
+                .then(|| entry.path())
+        })
+    })
 }
 
 fn wait_terminal_for(
     engine: &mut impl EngineApi,
     layout: &Layout,
     agent: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
 ) -> (PathBuf, Record) {
-    let start = Instant::now();
     let state = layout
         .agent(agent)
         .expect("agent")
         .state_dir()
         .to_path_buf();
-    while start.elapsed() < limit {
+    test_wait::wait_for("the run's terminal record", || {
         engine.tick();
-        if let Ok(entries) = fs::read_dir(&state) {
-            for entry in entries.flatten() {
-                if let Some(record) = transcript::terminal_record(&entry.path()) {
-                    return (entry.path(), record);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("the run never wrote a terminal record for {agent}");
+        fs::read_dir(&state).ok()?.flatten().find_map(|entry| {
+            transcript::terminal_record(&entry.path()).map(|record| (entry.path(), record))
+        })
+    })
 }
 
 fn start_agent(
@@ -623,17 +601,10 @@ fn start_agent(
     wait_run_dir_for(engine, layout, agent, Duration::from_secs(60))
 }
 
-fn wait_for_request(probe: &str, limit: Duration) {
+fn wait_for_request(probe: &str, _product_ready_allowance: Duration) {
     let root = PathBuf::from(std::env::var("GEWU_PROOF_ROOT").expect("proof root"));
     let log = root.join("probes/reqlogs").join(format!("{probe}.jsonl"));
-    let start = Instant::now();
-    while start.elapsed() < limit {
-        if log.is_file() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("the harness never sent a request for {probe}");
+    test_wait::wait_until("the harness's request", || log.is_file());
 }
 
 #[test]
@@ -771,10 +742,9 @@ fn a_stop_after_the_runs_terminal_record_does_not_replace_it() {
         );
         // Wait for the child to write its own ending without ticking the engine. The
         // engine still holds the run as running, exactly the Main journey's race.
-        let start = Instant::now();
-        while terminal_records(&run_dir).is_empty() && start.elapsed() < Duration::from_secs(60) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        test_wait::wait_until("the child's own ending", || {
+            !terminal_records(&run_dir).is_empty()
+        });
         let before = terminal_records(&run_dir);
         assert_eq!(
             before.len(),

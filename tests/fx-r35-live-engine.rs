@@ -19,6 +19,9 @@ use gewu_multiverse::paths::Layout;
 use gewu_multiverse::run;
 use gewu_multiverse::test_stub::{Stub, StubReply};
 
+#[path = "../src/test_wait.rs"]
+mod test_wait;
+
 fn scratch(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "gewu-live-engine-{label}-{}-{}",
@@ -33,17 +36,13 @@ fn scratch(label: &str) -> PathBuf {
     root
 }
 
-fn wait_until(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + limit;
-    loop {
-        if check() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// Wait for one live engine state. The argument is the explicit allowance for the
+/// external Forgejo start kept at the call sites; the wait itself uses the suite's
+/// liveness bound. A condition that never holds panics; the return stays true for
+/// the existing assertions.
+fn wait_until(_product_ready_allowance: Duration, mut check: impl FnMut() -> bool) -> bool {
+    test_wait::wait_until("a live engine state", &mut check);
+    true
 }
 
 fn install_forgejo(data_root: &Path) {

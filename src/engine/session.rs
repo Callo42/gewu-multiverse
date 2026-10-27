@@ -741,6 +741,7 @@ pub fn exit_code(status: ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_wait::wait_until;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -770,19 +771,17 @@ mod tests {
             spawner.spawn_with(run_dir, workspace, on_spawn)
         });
         assert!(started.is_err(), "the abandoned start reported success");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !run_dir.join(PID_FILE).is_file() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_until("the host's pid record for the abandoned start", || {
+            run_dir.join(PID_FILE).is_file()
+        });
         let pid: u32 = fs::read_to_string(run_dir.join(PID_FILE))
             .expect("the host reported its pid")
             .trim()
             .parse()
             .expect("pid");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while crate::run::process_alive(pid) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_until("the abandoned child to end", || {
+            !crate::run::process_alive(pid)
+        });
         assert!(
             !crate::run::process_alive(pid),
             "the abandoned child survived"

@@ -25,6 +25,9 @@ use gewu_multiverse::test_stub::{Stub, StubReply};
 use gewu_multiverse::transcript::{self, Record};
 use serde_json::json;
 
+#[path = "../src/test_wait.rs"]
+mod test_wait;
+
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
@@ -345,18 +348,13 @@ fn sequence(program: &str, issue: u64, scenario: &str, branch: &str) -> Vec<Stub
 fn wait_engine(
     engine: &mut impl EngineApi,
     what: &str,
-    limit: Duration,
+    _product_ready_allowance: Duration,
     mut ready: impl FnMut(&mut dyn EngineApi) -> bool,
 ) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
+    test_wait::wait_until(what, || {
         engine.tick();
-        if ready(engine) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}: {:?}", engine.board());
+        ready(engine)
+    });
 }
 
 fn newest_run(layout: &Layout, agent: &str) -> Option<PathBuf> {

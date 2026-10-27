@@ -318,15 +318,11 @@ fn serve(stream: &mut TcpStream, body: &[u8], chunk: usize, pause: Duration, sto
     }
 }
 
-pub fn wait_until(mut test: impl FnMut() -> bool, limit: Duration) -> bool {
-    let deadline = Instant::now() + limit;
-    while Instant::now() < deadline {
-        if test() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    test()
+#[path = "../../src/test_wait.rs"]
+pub mod test_wait;
+
+pub fn wait_until(what: &str, mut test: impl FnMut() -> bool) {
+    test_wait::wait_until(what, &mut test);
 }
 
 pub fn stage_dirs(directory: &Path) -> Vec<PathBuf> {

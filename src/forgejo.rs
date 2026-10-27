@@ -1382,10 +1382,14 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(3));
             }
         });
+        // The product's promise is the client's own timeout; the bound asserted
+        // below is that promise plus a scheduling allowance for the blocked
+        // reader to be woken after the kernel timeout fires.
+        let client_timeout = Duration::from_secs(1);
         let client = ForgejoClient::new(
             &format!("http://{addr}"),
             Secret::new("gw-fixture-token-not-real"),
-            Duration::from_secs(1),
+            client_timeout,
         )
         .expect("a client");
         let started = std::time::Instant::now();
@@ -1397,9 +1401,10 @@ mod tests {
             !text.contains("30 s"),
             "the message names a wrong bound: {text}"
         );
+        let product_bound = client_timeout + Duration::from_secs(4);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the client did not honour its own timeout: {:?}",
+            started.elapsed() < product_bound,
+            "the client did not honour its own {client_timeout:?} timeout within {product_bound:?}: {:?}",
             started.elapsed()
         );
     }

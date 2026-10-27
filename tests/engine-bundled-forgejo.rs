@@ -23,6 +23,9 @@ use gewu_multiverse::run::process_alive;
 use gewu_multiverse::test_stub::{Stub, StubReply};
 use sha2::{Digest, Sha256};
 
+#[path = "../src/test_wait.rs"]
+mod test_wait;
+
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -234,21 +237,16 @@ fn a_left_over_forgejo_is_found_by_its_command_line_and_stopped() {
     let pid = child.id();
     // The shell execs into the shaped command line; wait for that before the
     // recovery reads it, as a real start has long done.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let ready = bundled_forgejo::command_line(pid).is_some_and(|parts| {
+    test_wait::wait_until("the fake Forgejo's shaped command line", || {
+        bundled_forgejo::command_line(pid).is_some_and(|parts| {
             parts.iter().any(|part| part == "web")
                 && parts
                     .iter()
                     .any(|part| part == &paths.app_ini.display().to_string())
-        });
-        if ready || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        })
+    });
     fs::write(paths.root.join(bundled_forgejo::PID_FILE), pid.to_string()).expect("the pid record");
-    let stopped = bundled_forgejo::recover_stale_server(root.path(), Duration::from_secs(2))
+    let stopped = bundled_forgejo::recover_stale_server(root.path(), test_wait::LIVENESS_TIMEOUT)
         .expect("the recovery runs");
     assert_eq!(stopped, Some(pid), "the recorded server was not found");
     let _ = child.wait();
@@ -331,19 +329,14 @@ fn a_left_over_session_is_stopped_before_a_new_engine_starts() {
         .expect("the fake session runs");
     drop(capability);
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let ready = bundled_forgejo::command_line(pid).is_some_and(|parts| {
+    test_wait::wait_until("the fake session's shaped command line", || {
+        bundled_forgejo::command_line(pid).is_some_and(|parts| {
             parts.iter().any(|part| part == "--run-agent")
                 && parts
                     .iter()
                     .any(|part| part == &run_dir.display().to_string())
-        });
-        if ready || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        })
+    });
     fs::write(
         run_dir.join(gewu_multiverse::engine::session::PID_FILE),
         pid.to_string(),
@@ -412,34 +405,23 @@ fn final_reply(text: &str) -> StubReply {
     )
 }
 
-fn wait_until(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if check() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out waiting for {what}");
+fn wait_until(what: &str, _product_ready_allowance: Duration, check: impl FnMut() -> bool) {
+    test_wait::wait_until(what, check);
 }
 
-/// Tick the engine while waiting; the board alone does not advance its work.
+/// Tick the engine while waiting; the board alone does not advance its work. The
+/// second argument is the explicit allowance for the external Forgejo start, kept
+/// at the call sites; the wait itself uses the suite's liveness bound.
 fn wait_engine(
     engine: &mut gewu_multiverse::engine::Engine,
     what: &str,
-    timeout: Duration,
+    _product_ready_allowance: Duration,
     mut check: impl FnMut(&mut gewu_multiverse::engine::Engine) -> bool,
 ) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    test_wait::wait_until(what, || {
         engine.tick();
-        if check(engine) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let board = engine.board();
-    panic!("timed out waiting for {what}; board: {board:?}");
+        check(engine)
+    });
 }
 
 /// These engine-path cases predate the native programs. A fresh settings file
@@ -1142,17 +1124,7 @@ fn a_relative_configuration_root_writes_the_first_runs_plan_and_log() {
         "the run directory stayed relative"
     );
     let mut running = spawner.spawn(&prepared).expect("the run starts");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        if let Some(status) = running.try_status() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the first run did not finish in time"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let status = test_wait::wait_for("the first run to finish", || running.try_status());
     assert!(status.success(), "the first run failed: {status:?}");
     assert!(
         prepared.run_dir.join("plan.json").is_file(),

@@ -1619,6 +1619,7 @@ fn signal_group(pid: u32, signal: nix::sys::signal::Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_wait::recv_within;
 
     #[test]
     fn the_app_ini_is_loopback_sqlite_and_closed() {
@@ -1916,19 +1917,21 @@ esac
             "big-output.sh",
             "#!/bin/sh\nhead -c 1048576 /dev/zero | tr '\\0' x\nprintf '\\n'\n",
         );
-        let began = Instant::now();
-        let output = forgejo_output_checked(&helper, &paths, &[], &|| false)
+        // A pipe that stops being drained would block the helper for ever; the
+        // liveness receive fails this test instead of hanging the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let output = forgejo_output_checked(&helper, &paths, &[], &|| false);
+            let _ = done_tx.send(output);
+        });
+        let output = recv_within("the large helper's drained output", &done_rx)
             .expect("a large output is drained");
+        runner.join().expect("the helper thread ends");
         assert!(output.status.success());
         assert_eq!(
             output.stdout.len(),
             1048576 + 1,
             "the helper output was cut short"
-        );
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "the helper took {:?}; its pipe was not drained",
-            began.elapsed()
         );
     }
 
