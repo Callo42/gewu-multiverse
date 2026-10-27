@@ -1154,8 +1154,15 @@ mod tests {
             &mut ui,
         )
         .expect("the hand-off ends cleanly");
-        let _stopped_at = recv_within("the hand-off stop request", &setter.1);
+        let stopped_at = recv_within("the hand-off stop request", &setter.1);
         setter.0.join().expect("the setter ends");
+        // The hand-off product promise is one second from the caught stop, not the
+        // liveness bound used to receive it.
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(1),
+            "the board's stopped hand-off took {:?}, not within the product's one second",
+            stopped_at.elapsed()
+        );
 
         assert_eq!(end, LoopEnd::Finished);
         assert_eq!(

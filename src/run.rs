@@ -1202,8 +1202,8 @@ mod tests {
             "the bounded recheck returned before its product window: {elapsed:?}"
         );
         assert!(
-            elapsed < crate::test_wait::LIVENESS_TIMEOUT,
-            "the recheck did not return within the liveness bound: {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(2),
+            "the bounded recheck exceeded its 2 s test upper bound (the product rechecks for 500 ms): {elapsed:?}"
         );
     }
 }
@@ -4157,6 +4157,52 @@ mod stop_record_tests {
             !signalled.load(std::sync::atomic::Ordering::SeqCst),
             "a stop signalled a supervisor whose terminal fact had already won"
         );
+
+        // The pre-handle start path has only the reported pid, but it must consult
+        // the same Terminal fact before signalling a finishing supervisor.
+        use std::os::unix::process::CommandExt;
+        let mut raw = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the pre-handle child starts");
+        let raw_pid = raw.id();
+        request_starting_stop(raw_pid, Some(&run), false, "the starting run was stopped");
+        // Observe the process, not a zombie: a signalled child may still answer
+        // /proc until it is reaped. The product's own liveness check skips zombies.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{raw_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit(')')
+                        .next()
+                        .and_then(|rest| rest.split_whitespace().next().map(|state| state != "Z"))
+                })
+                .unwrap_or(false)
+        };
+        let observe_until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut raw_running = true;
+        while std::time::Instant::now() < observe_until {
+            raw_running = running();
+            if !raw_running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(raw_pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = raw.wait();
+        assert!(
+            raw_running,
+            "the pre-handle stop signalled a supervisor whose terminal fact had already won"
+        );
+
         let error = settle_run_with_stop(
             &run,
             4_000_020,

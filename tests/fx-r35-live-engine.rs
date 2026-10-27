@@ -751,8 +751,7 @@ fn live_engine_no_work_resets_the_failure_wait() {
     let mut run_dirs: Vec<PathBuf> = Vec::new();
     let mut starts: Vec<Instant> = Vec::new();
     let mut saw_no_work_wait = false;
-    let deadline = Instant::now() + Duration::from_secs(130);
-    while Instant::now() < deadline && starts.len() < 3 {
+    test_wait::wait_until("the loopback run sequence to reach three runs", || {
         engine.tick();
         let board = engine.board();
         if let SessionState::Restarting { last, .. } = &board.agents[0].session {
@@ -775,12 +774,8 @@ fn live_engine_no_work_resets_the_failure_wait() {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        starts.len() >= 3,
-        "the loopback run sequence did not reach three runs: {starts:?}"
-    );
+        starts.len() >= 3
+    });
     let first_wait = starts[1].duration_since(last_finished_for(&run_dirs, 0));
     assert!(
         first_wait >= Duration::from_secs(8) && first_wait <= Duration::from_secs(25),

@@ -4950,6 +4950,11 @@ mod tests {
     use crate::test_support::scratch_root;
     use crate::test_wait::{recv_within, wait_for, wait_until};
 
+    /// The shutdown product bound: a 200–250 ms hand-over plus the two 500 ms
+    /// settlement windows. Scheduling is absorbed by liveness receives; a shutdown
+    /// that takes seconds to minutes must still fail this bound.
+    const SHUTDOWN_TEST_BOUND: Duration = Duration::from_secs(2);
+
     fn test_options(root: &Path) -> EngineOptions {
         let layout = Layout::rooted_at(root.to_path_buf()).expect("the test layout is absolute");
         EngineOptions {
@@ -6658,6 +6663,16 @@ mod tests {
         let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
         tick(&mut engine, &clock, Duration::ZERO);
         wait_started(&fake, 1);
+        // The pid is recorded before the spawn job returns. The stop under test is
+        // the one that owns the running child, so wait for the hand-over rather
+        // than racing the starting path.
+        wait_until("the spawned session to become current", || {
+            tick(&mut engine, &clock, Duration::ZERO);
+            matches!(
+                engine.board().agents[0].session,
+                SessionState::Running { .. }
+            )
+        });
         let run_dir = fake.last_run_dir().expect("the run directory");
         engine
             .send(Command::Stop {
@@ -7440,12 +7455,18 @@ mod tests {
         // A shutdown that waited for this helper (which traps TERM) would never
         // return; the liveness bound fails the test instead of hanging it.
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown_started = Instant::now();
         let shutdown_thread = std::thread::spawn(move || {
             engine.shutdown(Duration::from_millis(200));
             let _ = done_tx.send(engine);
         });
         let engine = recv_within("shutdown with a token helper running", &done_rx);
         shutdown_thread.join().expect("the shutdown thread ends");
+        assert!(
+            shutdown_started.elapsed() < SHUTDOWN_TEST_BOUND,
+            "shutdown with a running token helper took {:?}, not within the product bound",
+            shutdown_started.elapsed()
+        );
         let result = recv_within("the token job's end", &job_rx);
         job.join().expect("the token job ends");
         assert!(result.is_err(), "the helper was not called off");
@@ -7481,12 +7502,18 @@ mod tests {
         // If shutdown waited for the blocked start, the test would hang; the
         // liveness receive fails it at the bound instead.
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown_started = Instant::now();
         let shutdown_thread = std::thread::spawn(move || {
             engine.shutdown(Duration::from_millis(250));
             let _ = done_tx.send(engine);
         });
         let mut engine = recv_within("shutdown during an in-flight Forgejo start", &done_rx);
         shutdown_thread.join().expect("the shutdown thread ends");
+        assert!(
+            shutdown_started.elapsed() < SHUTDOWN_TEST_BOUND,
+            "shutdown during an in-flight Forgejo start took {:?}, not within the product bound",
+            shutdown_started.elapsed()
+        );
         // The child was signalled during the block. It may be a zombie until the job
         // that owns it is released and reaps it, but it is no longer running.
         assert!(
@@ -7954,6 +7981,10 @@ mod tests {
             let Some(rest) = stat.rsplit(')').next() else {
                 continue;
             };
+            // A zombie has ended; the product's own group scan ignores it too.
+            if rest.split_whitespace().next() == Some("Z") {
+                continue;
+            }
             if rest.split_whitespace().nth(2) == Some(pgid.to_string().as_str()) {
                 return true;
             }
@@ -8225,6 +8256,7 @@ mod tests {
         // A shutdown that waited for the blocked spawn would never return; the
         // liveness receive fails the test instead of hanging it.
         let (engine_tx, engine_rx) = std::sync::mpsc::channel();
+        let shutdown_started = Instant::now();
         let shutdown_thread = std::thread::spawn(move || {
             let mut engine = engine;
             engine.shutdown(Duration::from_millis(200));
@@ -8232,6 +8264,11 @@ mod tests {
         });
         let mut engine = recv_within("shutdown while a session spawn is blocked", &engine_rx);
         shutdown_thread.join().expect("the shutdown thread ends");
+        assert!(
+            shutdown_started.elapsed() < SHUTDOWN_TEST_BOUND,
+            "shutdown during a blocked session spawn took {:?}, not within the product bound",
+            shutdown_started.elapsed()
+        );
         let _ = release.send(());
 
         wait_until("the blocked spawn's child to be stopped", || {

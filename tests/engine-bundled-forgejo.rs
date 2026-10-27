@@ -951,30 +951,21 @@ fn the_first_run_after_a_reopen_has_the_forgejo_tools() {
     // repositories, so the first run carries forgejo.json and the six tools.
     let mut second = engine::open_with(options).expect("the reopened engine opens");
     second.send(Command::StartForgejo).expect("start Forgejo");
-    let deadline = Instant::now() + Duration::from_secs(240);
-    let (run_dir, log): (PathBuf, String) = loop {
-        second.tick();
-        if let Some(found) = fs::read_dir(layout.state_root().join("agent-1"))
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|entry| {
-                let run_dir = entry.path();
-                let log = fs::read_to_string(run_dir.join("run.log")).ok()?;
-                log.contains("forgejo tools:").then_some((run_dir, log))
-            })
-            .next()
-        {
-            break found;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the first recovered run never wrote its tool line; board: {:?}",
-            second.board()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let (run_dir, log): (PathBuf, String) =
+        test_wait::wait_for("the first recovered run's tool line", || {
+            second.tick();
+            fs::read_dir(layout.state_root().join("agent-1"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| {
+                    let run_dir = entry.path();
+                    let log = fs::read_to_string(run_dir.join("run.log")).ok()?;
+                    log.contains("forgejo tools:").then_some((run_dir, log))
+                })
+                .next()
+        });
     for pid in second.live_pids() {
         if !seen.contains(&pid) {
             seen.push(pid);
@@ -998,15 +989,10 @@ fn the_first_run_after_a_reopen_has_the_forgejo_tools() {
             .collect::<Vec<_>>(),
         ["team/workspace"]
     );
-    let request_deadline = Instant::now() + Duration::from_secs(60);
-    while model.requests().is_empty() {
+    test_wait::wait_until("the first recovered run's model request", || {
         second.tick();
-        assert!(
-            Instant::now() < request_deadline,
-            "the first recovered run never called the model"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        !model.requests().is_empty()
+    });
     let body = &model.requests()[0].body;
     for name in gewu_multiverse::forgejo_tools::TOOL_NAMES {
         assert!(
@@ -1304,21 +1290,14 @@ fn quitting_at_every_point_of_a_forgejo_start_leaves_nothing() {
     engine.send(Command::StartForgejo).expect("start Forgejo");
     let began = Instant::now();
     let mut starting: Option<u128> = None;
-    let ready = loop {
+    let ready = test_wait::wait_for("the warm-up start to reach running", || {
         engine.tick();
         let state = engine.board().forgejo.state;
         if matches!(state, ForgejoState::Starting) && starting.is_none() {
             starting = Some(began.elapsed().as_millis());
         }
-        if matches!(state, ForgejoState::Running) {
-            break began.elapsed();
-        }
-        assert!(
-            began.elapsed() < Duration::from_secs(240),
-            "the warm-up start did not reach running"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    };
+        matches!(state, ForgejoState::Running).then(|| began.elapsed())
+    });
     let ready_ms = ready.as_millis() as u64;
     let port = instance_port().expect("the warm-up wrote a port");
     engine.shutdown(Duration::from_secs(2));
@@ -1404,11 +1383,7 @@ fn quitting_at_every_point_of_a_forgejo_start_leaves_nothing() {
         let shutdown_ms = shutdown_began.elapsed().as_millis();
         let mut pids_alive_after: Vec<u32> = Vec::new();
         for pid in &seen {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while process_alive(*pid) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if process_alive(*pid) {
+            if !test_wait::wait_until_or(|| !process_alive(*pid)) {
                 pids_alive_after.push(*pid);
             }
         }

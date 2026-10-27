@@ -461,12 +461,14 @@ mod tests {
         crate::mode::set_mode(&script, 0o755).expect("the fake editor is executable");
 
         let stop = Arc::new(AtomicBool::new(false));
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
         let setter = {
             let stop = Arc::clone(&stop);
             let pid_file = pid_file.clone();
             std::thread::spawn(move || {
                 wait_until("the fake editor's pid record", || pid_file.is_file());
                 stop.store(true, Ordering::SeqCst);
+                let _ = stopped_tx.send(std::time::Instant::now());
             })
         };
         // A stop that never reached the hand-off would leave this receive to fail
@@ -490,6 +492,14 @@ mod tests {
             .expect("the hand-off returns after the stop");
         runner.join().expect("the hand-off thread ends");
         setter.join().expect("the setter ends");
+        // The product promises a caught stop is acted on within one second
+        // (`HANDOFF_STOP_GRACE`); liveness is not the timing contract.
+        let stopped_at = recv_within("the hand-off stop instant", &stopped_rx);
+        assert!(
+            stopped_at.elapsed() < std::time::Duration::from_secs(1),
+            "the stopped hand-off took {:?} after the stop, not within the product's one second",
+            stopped_at.elapsed()
+        );
 
         let pid: u32 = std::fs::read_to_string(&pid_file)
             .expect("the fake editor wrote its pid")

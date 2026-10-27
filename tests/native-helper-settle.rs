@@ -1,8 +1,6 @@
 //! A native helper may call setsid and leave the leader's process group while
 //! still holding the run's anonymous capability. Settlement must close it before
 //! the run's identity records are removed.
-use std::path::Path;
-
 #[path = "../src/test_wait.rs"]
 mod test_wait;
 use std::process::{Command, Stdio};
@@ -108,7 +106,16 @@ fn normal_settle_closes_a_setsid_helper_before_clearing_records() {
         Some("the run was stopped on request".to_owned()),
         gewu_multiverse::run::FirstEnding::Stop,
     );
-    let helper_alive = Path::new(&format!("/proc/{helper_pid}")).exists();
+    // A zombie has ended; only its reaping is left, and this test is not its
+    // parent. The product's own group scan ignores zombies for the same reason.
+    let helper_alive = std::fs::read_to_string(format!("/proc/{helper_pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next().map(|state| state != "Z"))
+        })
+        .unwrap_or(false);
     if helper_alive {
         let _ = Command::new("/bin/kill")
             .arg("-KILL")
