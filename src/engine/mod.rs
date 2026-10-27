@@ -4513,12 +4513,15 @@ fn session_job(
         // directory on disk, not only the current settings.
         drop(guard);
         if let Ok(mut started) = started {
+            // The owned handle is the authority while this job holds it: let the
+            // child finish dying before the group is judged from disk identity.
+            let stop_grace = lock_inner(&inner).options.stop_grace;
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending = match started.request_stop(proposed) {
+            let first_ending = match started.request_stop_and_wait_ending(proposed, stop_grace) {
                 Ok(first_ending) => first_ending,
                 Err(error) => {
                     // The child still has to be stopped, but without a valid fact
@@ -4538,7 +4541,7 @@ fn session_job(
             let _ = started.request_finish(
                 run::RunOutcome::Stopped,
                 Some("the run was called off when its agent was removed".to_owned()),
-                Duration::from_secs(1),
+                stop_grace,
                 Some("the run was called off when its agent was removed".to_owned()),
                 first_ending,
             );
@@ -4553,16 +4556,18 @@ fn session_job(
         guard.agents[index].starting = false;
         guard.agents[index].starting_pid = None;
         let stopping = guard.stopping;
+        let stop_grace = guard.options.stop_grace;
         drop(guard);
         if let Ok(mut started) = started {
             // This job owns the child it has just spawned. Stop and reap it; the
             // shutdown that called it off may have signalled the group already.
+            // The handle, not the run directory, is the authority while we hold it.
             let proposed = if run::terminal_recorded(&request.run_dir).unwrap_or(true) {
                 run::FirstEnding::Terminal
             } else {
                 run::FirstEnding::Stop
             };
-            let first_ending = match started.request_stop(proposed) {
+            let first_ending = match started.request_stop_and_wait_ending(proposed, stop_grace) {
                 Ok(first_ending) => first_ending,
                 Err(error) => {
                     let reason = started.stop_uncertain(&error, Duration::from_secs(1));
@@ -4585,7 +4590,7 @@ fn session_job(
             match started.request_finish(
                 run::RunOutcome::Stopped,
                 Some(reason.to_owned()),
-                Duration::from_secs(1),
+                stop_grace,
                 Some(reason.to_owned()),
                 first_ending,
             ) {

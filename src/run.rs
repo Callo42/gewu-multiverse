@@ -1877,6 +1877,21 @@ pub fn request_stop_and_wait(
     Ok(())
 }
 
+/// Pin the one ending, stop the owned child through its handle, and wait for its
+/// status within `grace` (forcing after it) before the caller judges the process
+/// group. A fact failure still sends no signal.
+pub fn request_stop_and_wait_ending(
+    handle: &mut RunHandle,
+    run_dir: &Path,
+    run_id: &str,
+    proposed: FirstEnding,
+    grace: Duration,
+) -> Result<FirstEnding, String> {
+    let ending = request_stop(handle, run_dir, run_id, proposed)?;
+    stop_and_wait(handle, grace);
+    Ok(ending)
+}
+
 /// Stop one session handle politely, then by force, and wait for its status so the
 /// child is reaped before the handle is dropped.
 fn stop_and_wait(handle: &mut RunHandle, grace: Duration) {

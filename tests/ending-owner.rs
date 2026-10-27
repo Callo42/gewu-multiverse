@@ -169,6 +169,7 @@ fn the_owner_exposes_the_ending_requests() {
         "pub fn request_force_stop",
         "pub fn stop_uncertain",
         "pub fn request_stop_and_wait",
+        "pub fn request_stop_and_wait_ending",
         "pub fn request_finish",
         "pub fn recover_ending",
         "pub fn request_natural_finish",
