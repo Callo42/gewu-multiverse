@@ -6554,17 +6554,37 @@ mod tests {
         tick(&mut engine, &clock, Duration::ZERO);
         wait_started(&fake, 1);
         let run_dir = fake.last_run_dir().expect("the run directory");
-        write_terminal_record(
-            &run_dir,
-            run::RunOutcome::Succeeded,
-            "the run finished before the stop",
-        );
+        // The supervisor's own finish pinned Terminal and is between that fact and
+        // its run_finished record. A stop must not signal it away in that window.
+        let run_id = run_id_in(&run_dir).expect("the run id");
+        fs::write(
+            run_dir.join(run::FIRST_ENDING_FILE),
+            serde_json::json!({
+                "ts": "2026-10-27T00:00:00.000Z",
+                "run_id": run_id,
+                "ending": "terminal"
+            })
+            .to_string(),
+        )
+        .expect("the supervisor's terminal fact");
         engine
             .send(Command::Stop {
                 name: "agent-1".to_owned(),
             })
             .expect("stop");
         assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
+        let live = fake.live();
+        assert_eq!(live.len(), 1, "the stop removed the finishing child");
+        assert!(
+            fake.is_live(live[0]),
+            "a stop signalled a supervisor that was already writing its ending"
+        );
+        // The supervisor's terminal record appears within the bounded stop.
+        write_terminal_record(
+            &run_dir,
+            run::RunOutcome::Succeeded,
+            "the run finished before the stop",
+        );
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
         let board = engine.board();
@@ -6825,6 +6845,9 @@ mod tests {
             run::RunOutcome::Succeeded,
             "the run finished before the deadline",
         );
+        // The supervisor wrote its ending and exited; the deadline must only be a
+        // desired-state change, not a signal to a child that is already gone.
+        fake.finish_current(0);
         tick(&mut engine, &clock, DEFAULT_SESSION_TIMEOUT);
         assert_eq!(first_ending(&run_dir), Some(run::FirstEnding::Terminal));
         let board = engine.board();
