@@ -11,7 +11,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gewu_multiverse::credentials;
 use gewu_multiverse::engine::{self, EngineOptions};
