@@ -539,12 +539,11 @@ fn run_board(
                     }
                 }
                 Ok(InputRead::Event(Event::Paste(text))) => {
-                    // A paste into the model form is ordinary text. The board's
-                    // fields are edited one key at a time, so a paste is delivered
-                    // as its characters in order.
-                    for ch in text.chars().filter(|ch| !ch.is_control()) {
-                        board.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-                    }
+                    // A paste is one user action. The board puts the whole text in
+                    // the focused field at once, so a letter in it can never run a
+                    // binding and move the focus in the middle of the paste. The
+                    // keys after it are read next and keep their own meaning.
+                    board.on_paste(&text);
                 }
                 Ok(InputRead::Event(_)) | Ok(InputRead::Idle) => {}
                 // End-of-file and every input error end the board: a loop that
@@ -888,6 +887,7 @@ impl Drop for Screen {
 mod tests {
     use super::*;
     use crate::test_wait::{recv_within, wait_until};
+    use gewu_multiverse::engine_api::EngineApi;
 
     #[test]
     fn the_final_line_uses_the_right_noun() {
@@ -919,11 +919,13 @@ mod tests {
         assert!(guard.interrupted());
     }
 
-    /// A scripted terminal input: one outcome per read, then idle.
+    /// A scripted terminal input: one outcome per read, in the order the terminal
+    /// gives them, then idle.
     enum FakeRead {
         Closed,
         Error(io::Error),
         Key(KeyCode),
+        Paste(String),
     }
 
     struct ScriptedInput {
@@ -932,11 +934,14 @@ mod tests {
 
     impl TerminalInput for ScriptedInput {
         fn read(&mut self, _timeout: Duration) -> io::Result<InputRead> {
-            match self.reads.pop() {
-                Some(FakeRead::Closed) => Ok(InputRead::Closed),
-                Some(FakeRead::Error(error)) => Err(error),
-                Some(FakeRead::Key(code)) => Ok(InputRead::Event(Event::Key(KeyEvent::from(code)))),
-                None => Ok(InputRead::Idle),
+            if self.reads.is_empty() {
+                return Ok(InputRead::Idle);
+            }
+            match self.reads.remove(0) {
+                FakeRead::Closed => Ok(InputRead::Closed),
+                FakeRead::Error(error) => Err(error),
+                FakeRead::Key(code) => Ok(InputRead::Event(Event::Key(KeyEvent::from(code)))),
+                FakeRead::Paste(text) => Ok(InputRead::Event(Event::Paste(text))),
             }
         }
     }
@@ -1185,5 +1190,194 @@ mod tests {
             "the hand-off child {pid} was left behind"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The address the reader pasted: one line, with a key-binding letter in it
+    /// (`e`, at the end of `completions`) that must be text, not a command.
+    const PASTED_ADDRESS: &str = "http://127.0.0.1:20001/v1/chat/completions";
+
+    fn first_run_model_form() -> Board {
+        let mut engine = FakeEngine::new();
+        engine
+            .send(gewu_multiverse::engine_api::Command::AcknowledgeTerms)
+            .expect("the terms are acknowledged");
+        // The model and the key are ready; only the address is left to paste.
+        engine
+            .send(gewu_multiverse::engine_api::Command::SetEndpoint {
+                url: String::new(),
+                model: "demo-model".to_owned(),
+                key: Some("demo-key".to_owned()),
+            })
+            .expect("the rest of the endpoint");
+        let board = Board::new(engine);
+        assert_eq!(board.screen(), gewu_multiverse::board::Screen::Model);
+        board
+    }
+
+    fn model_frame(board: &mut Board) -> String {
+        use ratatui::backend::TestBackend;
+        let mut terminal =
+            ratatui::Terminal::new(TestBackend::new(100, 30)).expect("a test terminal");
+        terminal
+            .draw(|frame| board.draw(frame))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                out.push_str(buffer.cell((x, y)).expect("a cell").symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn endpoint_set(board: &mut Board) -> (String, String, Option<String>) {
+        let commands = board.sent_commands().to_vec();
+        commands
+            .iter()
+            .find_map(|command| match command {
+                gewu_multiverse::engine_api::Command::SetEndpoint { url, model, key } => {
+                    Some((url.clone(), model.clone(), key.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                let notice = board.notice().map(str::to_owned);
+                let frame = model_frame(board);
+                panic!(
+                    "no endpoint was saved; the notice is {notice:?}, the commands are {commands:?}, and the form is:\n{frame}"
+                )
+            })
+    }
+
+    /// A pasted line and the Enter pressed right after it are two user actions, in
+    /// that order: the whole line lands in the focused field and Enter still saves
+    /// the form. The paste's own letters are never key bindings — this address
+    /// contains `e`, which used to start editing in the middle of the paste.
+    #[test]
+    fn a_paste_lands_whole_before_the_enter_that_follows_it() {
+        let mut board = first_run_model_form();
+        let reads = vec![
+            FakeRead::Paste(PASTED_ADDRESS.to_owned()),
+            FakeRead::Key(KeyCode::Enter),
+            FakeRead::Closed,
+        ];
+        let mut input = ScriptedInput { reads };
+        let end = run_board(&mut board, &|| false, &mut input, &mut NoUi)
+            .expect("the scripted terminal reads cleanly");
+        assert_eq!(end, LoopEnd::Lost);
+        let (url, model, key) = endpoint_set(&mut board);
+        assert_eq!(url, PASTED_ADDRESS, "the pasted address was cut short");
+        assert_eq!(model, "demo-model");
+        assert_eq!(
+            key, None,
+            "the key field was empty, so the saved key is kept"
+        );
+    }
+
+    /// A fake native-program agent, so the per-agent model form (`m`) is the real
+    /// one: built-in agents share the default connection instead.
+    struct NativeAgentEngine(FakeEngine);
+
+    impl EngineApi for NativeAgentEngine {
+        fn board(&mut self) -> gewu_multiverse::engine_api::BoardView {
+            let mut view = self.0.board();
+            if let Some(agent) = view.agents.first_mut() {
+                agent.program = "pi".to_owned();
+                agent.program_label = "Pi".to_owned();
+                agent.program_installed = true;
+            }
+            view
+        }
+
+        fn send(&mut self, command: gewu_multiverse::engine_api::Command) -> Result<(), String> {
+            self.0.send(command)
+        }
+
+        fn tick(&mut self) {
+            self.0.tick();
+        }
+
+        fn instruction_path(&self, agent: &str) -> Option<std::path::PathBuf> {
+            self.0.instruction_path(agent)
+        }
+
+        fn session_files(&self, agent: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+            self.0.session_files(agent)
+        }
+
+        fn shutdown(&mut self, grace: Duration) {
+            self.0.shutdown(grace);
+        }
+    }
+
+    /// The per-agent form is the same paste path: the focused `model` field gets
+    /// the whole line, and the `t` at the start of the address does not run a test.
+    #[test]
+    fn a_paste_into_the_per_agent_model_field_is_text_not_a_test() {
+        use gewu_multiverse::engine_api::Command;
+
+        let mut engine = FakeEngine::new();
+        engine.send(Command::AcknowledgeTerms).expect("terms");
+        engine
+            .send(Command::SetEndpoint {
+                url: "http://127.0.0.1:20001".to_owned(),
+                model: "old-model".to_owned(),
+                key: Some("old-key".to_owned()),
+            })
+            .expect("endpoint");
+        engine
+            .send(Command::CreateAgents { count: 1 })
+            .expect("one agent");
+        engine.send(Command::StartForgejo).expect("Forgejo");
+        for _ in 0..130 {
+            engine.tick();
+        }
+        let mut board = Board::new(NativeAgentEngine(engine));
+        assert_eq!(board.screen(), gewu_multiverse::board::Screen::Home);
+        board.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(board.screen(), gewu_multiverse::board::Screen::Agent);
+        board.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert_eq!(board.screen(), gewu_multiverse::board::Screen::Model);
+        // Focus the model, clear the old value, then paste the whole address there.
+        board.on_key(KeyEvent::from(KeyCode::Down));
+        board.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+        let reads = vec![
+            FakeRead::Paste(PASTED_ADDRESS.to_owned()),
+            FakeRead::Key(KeyCode::Enter),
+            FakeRead::Closed,
+        ];
+        let mut input = ScriptedInput { reads };
+        let end = run_board(&mut board, &|| false, &mut input, &mut NoUi)
+            .expect("the scripted terminal reads cleanly");
+        assert_eq!(end, LoopEnd::Lost);
+        let commands = board.sent_commands().to_vec();
+        let saved = commands
+            .iter()
+            .find_map(|command| match command {
+                Command::SetAgentModel { base_url, model, .. } => {
+                    Some((base_url.clone(), model.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                let notice = board.notice().map(str::to_owned);
+                let frame = model_frame(&mut board);
+                panic!(
+                    "the agent's connection was not saved; the notice is {notice:?}, the commands are {commands:?}, and the form is:\n{frame}"
+                )
+            });
+        assert_eq!(saved.0, "http://127.0.0.1:20001");
+        assert_eq!(saved.1, PASTED_ADDRESS, "the paste was split or cut short");
+        assert!(
+            !board
+                .sent_commands()
+                .iter()
+                .any(|command| matches!(command, Command::TestAgentModel { .. })),
+            "a letter in the pasted address ran a key binding: {:?}",
+            board.sent_commands()
+        );
     }
 }

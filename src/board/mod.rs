@@ -467,6 +467,39 @@ impl Board {
         }
     }
 
+    /// Put one terminal paste into the field the person is in.
+    ///
+    /// A paste is one user action, not a burst of keys: its characters are text
+    /// even when they spell a binding (`e`, `t`, `q`), and the focus never moves
+    /// inside it. The model fields are one line each, so the first line is kept
+    /// and the rest is named as unused; the field is replaced so pasting a value
+    /// twice cannot silently double it. It does not change whether the field was
+    /// being edited: the keys that follow keep their own meaning (Enter advances a
+    /// field being edited, and saves from the form otherwise).
+    pub fn on_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.screen != Screen::Model {
+            self.set_notice("there is no text field here to take a paste");
+            return;
+        }
+        let first = text.split(['\n', '\r']).next().unwrap_or_default();
+        let more = text.contains(['\n', '\r']);
+        let pasted: String = first.chars().filter(|ch| !ch.is_control()).collect();
+        self.model_fields[self.model_focus] = pasted;
+        self.model_cursor = self.model_fields[self.model_focus].chars().count();
+        self.model_edited = true;
+        if self.model_focus == 2 {
+            self.model_key_cleared = self.model_fields[2].is_empty();
+        }
+        self.set_notice(if more {
+            "kept the first line; the rest of the paste was not used"
+        } else {
+            "pasted into the field"
+        });
+    }
+
     /// After the upgrade screen: the first screen this person belongs on.
     fn after_upgrade(&self) -> Screen {
         if !self.view.terms_acknowledged {
