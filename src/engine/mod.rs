@@ -633,6 +633,9 @@ struct AgentRuntime {
     /// A temporary provider failure the live native program is retrying.
     retrying: Option<String>,
     last_work: Vec<String>,
+    /// The live states of the pull requests named in `last_work`, refreshed from
+    /// Forgejo while the board is open.
+    pull_states: Vec<crate::engine_api::PullStateView>,
     no_assigned_work: bool,
     last_work_result: Option<String>,
     last_result_is_work: bool,
@@ -1091,6 +1094,7 @@ impl AgentRuntime {
             current_tool_since: None,
             retrying: None,
             last_work,
+            pull_states: Vec::new(),
             no_assigned_work,
             last_work_result,
             last_result_is_work,
@@ -1167,7 +1171,15 @@ fn end_from_outcome(summary: &run::RunSummary) -> Option<SessionEnd> {
             ),
         }),
         run::RunOutcome::TimedOut => Some(SessionEnd::TimedOut),
-        run::RunOutcome::Stopped => Some(SessionEnd::Stopped),
+        run::RunOutcome::Stopped => Some(SessionEnd::Stopped {
+            reason: crate::forgejo_tools::sentence(
+                summary
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "the run was stopped on request".to_owned()),
+            ),
+            at: summary.ended_at,
+        }),
     }
 }
 
@@ -1181,7 +1193,14 @@ fn end_from_terminal_ending(ending: &run::TerminalEnding) -> Option<SessionEnd> 
         crate::run::RunOutcome::Warned => Some(SessionEnd::Warned { reason }),
         crate::run::RunOutcome::Failed => Some(SessionEnd::Failed { reason }),
         crate::run::RunOutcome::TimedOut => Some(SessionEnd::TimedOut),
-        crate::run::RunOutcome::Stopped => Some(SessionEnd::Stopped),
+        crate::run::RunOutcome::Stopped => Some(SessionEnd::Stopped {
+            reason: if reason.is_empty() {
+                "the run was stopped on request".to_owned()
+            } else {
+                reason
+            },
+            at: ending.at,
+        }),
     }
 }
 
@@ -1201,9 +1220,13 @@ fn outcome_for_end(end: &SessionEnd) -> (run::RunOutcome, Option<String>) {
             run::RunOutcome::TimedOut,
             Some("the run reached its time limit and was stopped".to_owned()),
         ),
-        SessionEnd::Stopped => (
+        SessionEnd::Stopped { reason, .. } => (
             run::RunOutcome::Stopped,
-            Some("the run was stopped on request".to_owned()),
+            Some(if reason.trim().is_empty() {
+                "the run was stopped on request".to_owned()
+            } else {
+                reason.clone()
+            }),
         ),
     }
 }
@@ -1470,7 +1493,10 @@ impl Inner {
                 };
                 let end = if stop_wins {
                     if engine_stopped {
-                        SessionEnd::Stopped
+                        SessionEnd::Stopped {
+                            reason: "the run was stopped on request".to_owned(),
+                            at: Some(SystemTime::now()),
+                        }
                     } else {
                         deadline_end()
                     }
@@ -1485,7 +1511,10 @@ impl Inner {
                         }
                     })
                 } else if engine_stopped {
-                    SessionEnd::Stopped
+                    SessionEnd::Stopped {
+                        reason: "the run was stopped on request".to_owned(),
+                        at: Some(SystemTime::now()),
+                    }
                 } else if timed_out {
                     deadline_end()
                 } else if status.success() {
@@ -2436,7 +2465,7 @@ fn finish_session(
         }
     }
     agent.last_result = result;
-    if agent.desired == Desired::Stopped || end == SessionEnd::Stopped {
+    if agent.desired == Desired::Stopped || matches!(end, SessionEnd::Stopped { .. }) {
         agent.session = SessionState::Idle;
         agent.next_at = None;
         return;
@@ -2545,6 +2574,7 @@ impl EngineApi for Engine {
                     .unwrap_or(0),
                 retrying: agent.retrying.clone(),
                 last_work: agent.last_work.clone(),
+                pull_states: agent.pull_states.clone(),
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
                 last_result_is_work: agent.last_result_is_work,
@@ -4356,45 +4386,135 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
         }
         return;
     };
-    let result = ForgejoClient::new(&url, token, DEFAULT_TIMEOUT)
-        .and_then(|client| client.organisation_repositories(bundled_forgejo::ORGANISATION));
-    if let Ok(mut inner) = inner.lock() {
-        inner.forgejo.repositories_inflight = false;
-        // A failed fetch is retried on the next tick rather than after a full poll
-        // interval: the board must not keep an old count for two intervals because
-        // one request failed (W31-8).
-        inner.forgejo.repositories_refreshed_at = result.is_ok().then(Instant::now);
-        if let Ok(repositories) = result {
-            // The administration API's own repository list is polled; a name that
-            // disappeared or appeared between two polls is an event on the board, so
-            // a destroyed repository is never traceless.
-            let before: Vec<String> = inner
-                .forgejo
-                .repositories
-                .iter()
-                .map(|repository| repository.full_name.clone())
-                .collect();
-            let after: Vec<String> = repositories
-                .iter()
-                .map(|repository| repository.full_name.clone())
-                .collect();
-            let seen = repository_events(&before, &after);
-            for event in seen {
-                inner.forgejo.events.push_back(event);
+    let client = match ForgejoClient::new(&url, token, DEFAULT_TIMEOUT) {
+        Ok(client) => client,
+        Err(_) => {
+            if let Ok(mut inner) = inner.lock() {
+                inner.forgejo.repositories_inflight = false;
+                inner.forgejo.repositories_refreshed_at = None;
             }
-            while inner.forgejo.events.len() > 5 {
-                inner.forgejo.events.pop_front();
-            }
-            if before != after {
-                if let Some(event) = inner.forgejo.events.back().cloned() {
-                    inner.settings.forgejo.last_event = Some(event.clone());
-                    let _ = inner.save_settings();
-                    inner.note(event);
+            return;
+        }
+    };
+    let result = client.organisation_repositories(bundled_forgejo::ORGANISATION);
+    // Read the agents' tracked pull requests and the current repository list under
+    // the lock, then release it for the network reads below.
+    let (repositories, targets) = match inner.lock() {
+        Ok(mut inner) => {
+            // A failed fetch is retried on the next tick rather than after a full
+            // poll interval: the board must not keep an old count for two intervals
+            // because one request failed (W31-8).
+            inner.forgejo.repositories_refreshed_at = result.is_ok().then(Instant::now);
+            match result {
+                Ok(repositories) => {
+                    // The administration API's own repository list is polled; a name
+                    // that disappeared or appeared between two polls is an event on
+                    // the board, so a destroyed repository is never traceless.
+                    let before: Vec<String> = inner
+                        .forgejo
+                        .repositories
+                        .iter()
+                        .map(|repository| repository.full_name.clone())
+                        .collect();
+                    let after: Vec<String> = repositories
+                        .iter()
+                        .map(|repository| repository.full_name.clone())
+                        .collect();
+                    let seen = repository_events(&before, &after);
+                    for event in seen {
+                        inner.forgejo.events.push_back(event);
+                    }
+                    while inner.forgejo.events.len() > 5 {
+                        inner.forgejo.events.pop_front();
+                    }
+                    if before != after {
+                        if let Some(event) = inner.forgejo.events.back().cloned() {
+                            inner.settings.forgejo.last_event = Some(event.clone());
+                            let _ = inner.save_settings();
+                            inner.note(event);
+                        }
+                    }
+                    inner.forgejo.repositories = repositories.clone();
+                    let targets = tracked_pull_numbers(&inner.agents);
+                    (repositories, targets)
+                }
+                Err(_) => {
+                    inner.forgejo.repositories_inflight = false;
+                    return;
                 }
             }
-            inner.forgejo.repositories = repositories;
+        }
+        Err(poisoned) => {
+            let mut inner = poisoned.into_inner();
+            inner.forgejo.repositories_inflight = false;
+            return;
+        }
+    };
+    // Refresh the live state of every request a work block names. Only a request
+    // this read actually answered replaces the stored state; a failed read leaves
+    // the previous truth in place.
+    let mut refreshed: Vec<(usize, Vec<crate::engine_api::PullStateView>)> = Vec::new();
+    for (agent_index, numbers) in targets {
+        let mut states = Vec::new();
+        for number in numbers {
+            let mut found = None;
+            for repository in &repositories {
+                if let Some((namespace, name)) = repository.full_name.split_once('/') {
+                    match client.pull_request(namespace, name, number) {
+                        Ok(Some(pull)) => {
+                            found = Some(crate::engine_api::PullStateView {
+                                number,
+                                state: pull.state,
+                            });
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            if let Some(state) = found {
+                states.push(state);
+            }
+        }
+        refreshed.push((agent_index, states));
+    }
+    if let Ok(mut inner) = inner.lock() {
+        inner.forgejo.repositories_inflight = false;
+        for (agent_index, states) in refreshed {
+            let Some(agent) = inner.agents.get_mut(agent_index) else {
+                continue;
+            };
+            // Keep a state already read for requests this poll did not answer.
+            for state in &states {
+                agent.pull_states.retain(|old| old.number != state.number);
+            }
+            agent.pull_states.extend(states);
         }
     }
+}
+
+/// The pull request numbers each agent's last-work block names.
+fn tracked_pull_numbers(agents: &[AgentRuntime]) -> Vec<(usize, Vec<u64>)> {
+    agents
+        .iter()
+        .enumerate()
+        .filter_map(|(index, agent)| {
+            let mut numbers: Vec<u64> = Vec::new();
+            for line in &agent.last_work {
+                let Some(rest) = line.strip_prefix("pull request #") else {
+                    continue;
+                };
+                let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                if let Ok(number) = digits.parse::<u64>()
+                    && !numbers.contains(&number)
+                {
+                    numbers.push(number);
+                }
+            }
+            (!numbers.is_empty()).then_some((index, numbers))
+        })
+        .collect()
 }
 
 /// The repository changes between two administration-API polls, as the board's
@@ -5821,14 +5941,36 @@ mod tests {
             frame.push('\n');
         }
         assert!(
-            frame.contains("last work: comment on #1"),
-            "the card did not keep the newest work:\n{frame}"
+            frame.contains("last completed work: comment on #1"),
+            "the card did not keep the newest completed work:\n{frame}"
         );
         assert!(
             !frame.contains("result: The review is already addressed"),
             "the no-op's reason was presented as the work result:\n{frame}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stopped_run_keeps_its_own_reason_and_wall_time_across_a_reopen() {
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let summary = crate::run::RunSummary {
+            run_id: "run-1700000000000-0001".to_owned(),
+            outcome: Some(crate::run::RunOutcome::Stopped),
+            reason: Some("the run was stopped on request".to_owned()),
+            ended_at: Some(at),
+            dir: PathBuf::from("/tmp/run-1700000000000-0001"),
+        };
+        match end_from_outcome(&summary) {
+            Some(SessionEnd::Stopped {
+                reason,
+                at: Some(got),
+            }) => {
+                assert_eq!(reason, "the run was stopped on request");
+                assert_eq!(got, at);
+            }
+            other => panic!("the stopped ending lost its reason or time: {other:?}"),
+        }
     }
 
     #[test]
@@ -6741,7 +6883,10 @@ mod tests {
         fake.finish_current(0);
         tick(&mut engine, &clock, Duration::ZERO);
         let board = engine.board();
-        assert_eq!(board.agents[0].recent.last(), Some(&SessionEnd::Stopped));
+        assert!(matches!(
+            board.agents[0].recent.last(),
+            Some(SessionEnd::Stopped { .. })
+        ));
         assert!(run_dir.join(run::STOPPED_FILE).is_file());
         let endings = terminal_outcomes(&run_dir);
         assert_eq!(

@@ -94,7 +94,13 @@ pub enum SessionEnd {
         reason: String,
     },
     TimedOut,
-    Stopped,
+    /// The person (or the product's own restart) stopped this run. The reason and
+    /// time are the run's own ending, kept so the screen describes this run rather
+    /// than the work an earlier one left behind.
+    Stopped {
+        reason: String,
+        at: Option<SystemTime>,
+    },
 }
 
 /// What an agent is doing now.
@@ -163,6 +169,19 @@ pub struct RunProgramView {
     pub codex_sandbox: Option<String>,
 }
 
+/// One pull request's live state, as the Forgejo reports it now.
+///
+/// A run records the request it opened, not what later happened to it. The engine
+/// refreshes these states while the board is open, so the screen can say `merged`
+/// or `closed` instead of repeating the run's `open` forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullStateView {
+    /// The request's number.
+    pub number: u64,
+    /// `open`, `closed` or `merged`.
+    pub state: String,
+}
+
 /// One agent, as its card shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentView {
@@ -219,6 +238,10 @@ pub struct AgentView {
     /// did work, at most three short typed lines, for the card's work block. It stays
     /// until a later run does new work.
     pub last_work: Vec<String>,
+    /// The live states of the pull requests named in [`Self::last_work`], newest
+    /// first. The engine refreshes them from Forgejo; a state the engine has not
+    /// read yet is absent, and the screen then keeps the run's recorded word.
+    pub pull_states: Vec<PullStateView>,
     /// The newest run's own log says no open issue was assigned to this agent. The
     /// Agent screen names the fix instead of leaving an empty work block.
     pub no_assigned_work: bool,

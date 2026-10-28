@@ -132,6 +132,7 @@ fn agent(number: usize, program_id: &str) -> AgentView {
         current_tool_seconds: 0,
         retrying: None,
         last_work: vec!["comment on #1".to_owned()],
+        pull_states: Vec::new(),
         no_assigned_work: false,
         last_work_result: Some("done".to_owned()),
         last_result_is_work: true,

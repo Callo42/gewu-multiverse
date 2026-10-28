@@ -598,8 +598,7 @@ fn card_bottom_text(agent: &AgentView, card_h: u16) -> String {
         let mut line = format!("{login} · {program} · {count}");
         if let Some(word) = status::card_word(agent) {
             line.push_str(" · ");
-            if let Some(mark) = status::newest_run_mark(agent)
-                && agent.leftover.is_none()
+            if let Some(mark) = status::card_word_mark(agent)
                 && !word.starts_with(mark)
             {
                 line.push(mark);
@@ -631,7 +630,7 @@ fn card_bottom_text(agent: &AgentView, card_h: u16) -> String {
                 None => match word {
                     Some(word) => {
                         let state = board_state(&face);
-                        let mark = status::newest_run_mark(agent)
+                        let mark = status::card_word_mark(agent)
                             .filter(|mark| !word.starts_with(*mark))
                             .map(|mark| format!("{mark} "))
                             .unwrap_or_default();
@@ -674,8 +673,7 @@ fn card_bottom_text(agent: &AgentView, card_h: u16) -> String {
             let program = status::program_word(agent);
             match word {
                 Some(word) => {
-                    let mark = status::newest_run_mark(agent)
-                        .filter(|_| agent.leftover.is_none())
+                    let mark = status::card_word_mark(agent)
                         .filter(|mark| !word.starts_with(*mark))
                         .map(|mark| format!("{mark} "))
                         .unwrap_or_default();
@@ -849,6 +847,46 @@ fn wrap_limited(text: &str, width: usize, max_rows: u16) -> Vec<String> {
         }
     }
     parts
+}
+
+/// Wrap a failed test's sentence while reserving its action at the end.
+///
+/// The provider's message can be longer than the rows a small form has, and cutting
+/// the tail used to drop the only operative words (`check the key`, `check the model
+/// and its access`). The action after the final ` — ` is reserved first; only the
+/// provider's part is shortened, with an explicit ellipsis, when the rows run out.
+fn wrap_with_action(text: &str, width: usize, max_rows: u16) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    let max_rows = max_rows as usize;
+    let Some(at) = text.rfind(" — ") else {
+        return wrap_limited(text, width, max_rows as u16);
+    };
+    let body = text[..at].trim_end();
+    let action = text[at..].trim_start();
+    let action_lines = text_util::wrap(action, width);
+    let body_lines = text_util::wrap(body, width);
+    if body_lines.len() + action_lines.len() <= max_rows {
+        let mut out = body_lines;
+        out.extend(action_lines);
+        return out;
+    }
+    // The action gets its own row(s), so `check the key` is never split across a
+    // row edge; only the provider's part is shortened.
+    let reserve = action_lines.len().min(max_rows);
+    let body_rows = max_rows.saturating_sub(reserve);
+    let mut out = if body_rows > 0 {
+        wrap_limited(body, width, body_rows as u16)
+    } else {
+        Vec::new()
+    };
+    out.extend(
+        action_lines
+            .into_iter()
+            .take(max_rows.saturating_sub(out.len())),
+    );
+    out
 }
 
 /// A notice's wrapped rows, empty when there is no notice.
@@ -1311,20 +1349,12 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
     let mut row_gap = 0_u16;
 
     if compact {
-        // The floor keeps a short vertical list of two-row cards (the old
-        // picture) while it fits; four or more take the compact list, which
-        // keeps every fact and every agent on the frame.
-        if agent_count <= 3 {
-            columns = 1;
-            card_h = 2;
-            card_w = inner.width.saturating_sub(6).clamp(20, 64);
-            let total = forgejo_h + agent_count as u16 * (1 + card_h);
-            if total > content_h {
-                use_list = true;
-            }
-        } else {
-            use_list = true;
-        }
+        // The 72-column floor is the one size where a card picture cannot keep a
+        // whole card body: a two-row card is a border pair with a wire above it,
+        // and a reader sees a connector between rows rather than a list. Use the
+        // compact list here for every agent count; 80 columns and wider keep the
+        // card grid unchanged.
+        use_list = true;
     } else {
         let limit = card_column_limit(usable, gap).min(agent_count);
         columns = balanced_columns(agent_count, limit);
@@ -1703,6 +1733,10 @@ fn draw_list_line(
             None if !code.is_empty() => Some(code.to_owned()),
             None => None,
         }
+    } else if let Some(leftover) = agent.leftover.as_deref() {
+        // The one-column floor list has the room to keep the exact category; the
+        // whole-word fit below still falls back to the short word when it does not.
+        Some(status::leftover_words(leftover).to_owned())
     } else {
         status::list_word(agent)
     };
@@ -2659,7 +2693,16 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
     let form_width = inner.width.saturating_sub(8).clamp(40, 76).min(inner.width);
-    let field_gap = if content_h >= 22 { 3 } else { 1 };
+    // At the 72x18 floor the form drops the blank row between fields so a failed
+    // test can keep three rows: the provider's sentence and its action. Hiding the
+    // example or the action would be worse than losing the breathing room.
+    let field_gap = if content_h >= 22 {
+        3
+    } else if content_h <= 15 {
+        0
+    } else {
+        1
+    };
     // The test line gets real rows, not one: the provider's whole answer wraps to
     // what the form can hold, and at 80x24 that is the whole refusal (F-07).
     let form_height = (10 + 2 * field_gap + 2 + 6).min(content_h);
@@ -2784,18 +2827,13 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
         ),
     };
     // A failed test is the one sentence that has to repair the address, so it
-    // wraps rather than losing its end. At 80x24 the form has two rows below the
-    // fields; the `/v1` repair is already first, and the provider's clause follows
-    // on the second row (review B1).
-    let room = form.bottom().saturating_sub(1).saturating_sub(y) as usize;
-    let parts = text_util::wrap(&line, form.width.saturating_sub(4) as usize);
-    for (row, part) in parts.iter().take(room).enumerate() {
-        let shown = if row + 1 == room && parts.len() > room {
-            format!("{}…", part.trim_end())
-        } else {
-            part.clone()
-        };
-        text_util::put(buf, form, form.x + 2, y + row as u16, &shown, style);
+    // wraps rather than losing its end. The provider's message is shortened first
+    // when the form is small: the action after the last ` — ` is the part a person
+    // needs, and it is never the part that disappears (F-07, walk A S-2).
+    let room = form.bottom().saturating_sub(1).saturating_sub(y);
+    let parts = wrap_with_action(&line, form.width.saturating_sub(4) as usize, room);
+    for (row, part) in parts.iter().enumerate() {
+        text_util::put(buf, form, form.x + 2, y + row as u16, part, style);
     }
     let actions = if board.model_editing {
         "⏎ next field   ctrl-u clear   ↑↓ field   esc cancel"
@@ -3206,8 +3244,11 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     }
     // `last work` carries the work; the run's own last sentence is still on the
     // screen, labelled as the result, so a warning is not presented as the work and
-    // the model's account is not lost.
-    if !agent.last_work.is_empty()
+    // the model's account is not lost. When the newest run did no work (a stop, a
+    // refusal, a no-op), the work block is explicitly the earlier completed work and
+    // its summary is not repeated as if it were this run's own result.
+    if agent.last_result_is_work
+        && !agent.last_work.is_empty()
         && let Some(summary) = agent
             .last_work_result
             .as_deref()
@@ -3294,12 +3335,22 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         0
     };
     if labelled {
+        // After a stop the block is the work an earlier run completed; naming it
+        // `work` alone let the reader take it for the stopped run's own result.
+        let heading = if matches!(agent.recent.last(), Some(SessionEnd::Stopped { .. })) {
+            match status::newest_work_phrase(&agent) {
+                Some(work) => format!("last completed work: {work}"),
+                None => "last completed work".to_owned(),
+            }
+        } else {
+            "work".to_owned()
+        };
         text_util::put(
             buf,
             card,
             interior_x,
             work_start,
-            "work",
+            &text_util::ellipsize_words(&heading, width),
             theme::card(theme::MUTED, true),
         );
     }
@@ -3448,7 +3499,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         // The same words at every size. A narrow card wraps the legend onto two
         // rows rather than shortening `no work` or `timed out` (F-09).
         let first = "✓ ok ⊘ refused ∅ no work ✗ failed";
-        let second = "⚠ cmd ■ stopped ◷ timed out";
+        let second = "⚠ warning ■ stopped ◷ timed out";
         text_util::put(
             buf,
             card,

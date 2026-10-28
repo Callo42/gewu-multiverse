@@ -23,7 +23,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::prelude::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::engine::session::RunningSession;
 
@@ -402,6 +402,8 @@ pub struct RunSummary {
     pub outcome: Option<RunOutcome>,
     /// Why it ended that way, when the record says.
     pub reason: Option<String>,
+    /// When the run wrote its terminal record, when it has one.
+    pub ended_at: Option<SystemTime>,
     /// The run's directory.
     pub dir: PathBuf,
 }
@@ -731,16 +733,25 @@ pub fn runs_of_agent(state_root: &Path, agent: &str) -> Vec<RunSummary> {
 
 /// Read one run's terminal record into a summary.
 fn summarise(run_id: &str, run_dir: &Path) -> RunSummary {
-    let (outcome, reason) = match transcript::terminal_record(run_dir) {
+    let (outcome, reason, ended_at) = match transcript::terminal_record(run_dir) {
         Some(Record::RunFinished {
-            outcome, reason, ..
-        }) => (RunOutcome::parse(&outcome), reason),
-        _ => (None, None),
+            ts,
+            outcome,
+            reason,
+            ..
+        }) => (
+            RunOutcome::parse(&outcome),
+            reason,
+            crate::time::parse_rfc3339(&ts)
+                .map(|millis| UNIX_EPOCH + Duration::from_millis(millis)),
+        ),
+        _ => (None, None, None),
     };
     RunSummary {
         run_id: run_id.to_owned(),
         outcome,
         reason,
+        ended_at,
         dir: run_dir.to_path_buf(),
     }
 }
@@ -1263,12 +1274,14 @@ mod tests {
                 run_id: "run-1700000000001-0001".to_owned(),
                 outcome: Some(RunOutcome::Succeeded),
                 reason: None,
+                ended_at: None,
                 dir: idle.clone(),
             },
             RunSummary {
                 run_id: "run-1700000000002-0002".to_owned(),
                 outcome: Some(RunOutcome::Succeeded),
                 reason: None,
+                ended_at: None,
                 dir: work.clone(),
             },
         ];
@@ -1532,6 +1545,7 @@ mod tests {
                 run_id: "run-1700000000006-0001".to_owned(),
                 outcome: Some(RunOutcome::Warned),
                 reason: Some("workspace changed: README.md".to_owned()),
+                ended_at: None,
                 dir: run.clone(),
             }])
             .iter()
@@ -2221,6 +2235,8 @@ pub struct TerminalEnding {
     pub outcome: RunOutcome,
     /// The reason sentence, when the run wrote one.
     pub reason: Option<String>,
+    /// When the run wrote its terminal record.
+    pub at: Option<SystemTime>,
 }
 
 /// Read the run's terminal ending without exposing record construction to callers.
@@ -2228,7 +2244,10 @@ pub fn terminal_ending(run_dir: &Path) -> Result<Option<TerminalEnding>, String>
     let record = transcript::terminal_record_checked(run_dir)
         .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
     let Some(transcript::Record::RunFinished {
-        outcome, reason, ..
+        ts,
+        outcome,
+        reason,
+        ..
     }) = record
     else {
         return Ok(None);
@@ -2237,6 +2256,8 @@ pub fn terminal_ending(run_dir: &Path) -> Result<Option<TerminalEnding>, String>
         outcome: RunOutcome::parse(&outcome)
             .ok_or_else(|| format!("the run's ending `{outcome}` is unknown"))?,
         reason,
+        at: crate::time::parse_rfc3339(&ts)
+            .map(|millis| UNIX_EPOCH + Duration::from_millis(millis)),
     }))
 }
 

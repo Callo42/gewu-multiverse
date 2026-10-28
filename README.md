@@ -60,13 +60,14 @@ requests are its own. The board shows the whole thing at a glance:
 - **A card for each agent.** A filled circle means working, a half circle means waiting
   for its next run, an empty ring means stopped or not started. The board card keeps
   the few words: the agent's name, its program (`built-in`, `Pi`, `Codex`, `DSH` or
-  `OpenCode`), its Forgejo login, its state, its newest run mark and its run count. `run N` is the total from the run records, so it does not reset when an
+  `OpenCode`), its Forgejo login, its state, its newest work or failure mark and its run
+  count. `run N` is the total from the run records, so it does not reset when an
   agent starts again or the program reopens. Open it with `⏎` for the Agent screen:
   the last work block (typed, and kept until a later run does new work), the
   instruction's first line, always, and `… (N more lines)` where N counts the
   document's **file** lines (not wrapped display rows); where no count row fits, the
   visible cut itself ends in `…`, the bounded run marks with
-  their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷ timed out`,
+  their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ warning ■ stopped ◷ timed out`,
   wrapped whole on two rows at 72 columns), the newest mark's word, the last
   tool failure and the newest run's reason. The run's own final sentence is not
   rewritten apart from the credential masking; when it is too long for the visible
@@ -110,7 +111,15 @@ requests are its own. The board shows the whole thing at a glance:
   keeps the product-observed fact, including the pull request. The
   summary line prefers the newest run that did work (`last work: comment on #2`,
   `last work: PR #3 open`, `last work: local change README.md`); a later no-op's
-  reason is labelled `no work: …`. Started agents keep
+  reason is labelled `no work: …`. When the newest run was stopped, its own ending
+  takes that line (`stopped 2m ago — the run was stopped on request`) and the earlier
+  work is labelled `last completed work`; a previous run's result is not presented
+  as the stopped run's own. A failed command and a local-only change both wear `⚠`,
+  so the legend says `⚠ warning`; the newest mark's word is `cmd failed` only for a
+  real command failure and `local change` for the workspace change. A pull request's
+  word follows its live state (`PR #4 merged`, `PR #4 closed`), refreshed from
+  Forgejo while the board is open, rather than repeating the run's recorded `open`.
+  Started agents keep
   a visible idle between runs (the Agent screen says `next run in 5s`; a card's shorter
   form is `next 5s`); a no-work or warned run's longer wait says
   `next run in 20s · no work` (`next 20s·no work` on a card). A 503 is named as
@@ -153,10 +162,12 @@ The board repeats the negative sentence. One layout rule holds for 1–12 agents
 72×18, 80×24, 100×30, 120×40 and 200×60 (a home past twelve keeps the compact
 two-column list and scrolls with the selection): cards never collide, truncate a name or leave
 a dangling connector; the grid keeps its columns fixed so a wrapped last row cannot
-move under the wire. When the cards cannot keep a whole title and their facts, the
-board takes a compact list: one wired box with a line (or two columns) per agent,
-keeping the name, run count, state mark and the current or last-work word on the
-frame. The login is on the line while it fits; otherwise the box legend
+move under the wire. At 72×18 the board is always the compact list: one wired box
+with one line per agent and no connector drawn between rows. At 80×24 and above the
+card grid is unchanged. When the cards cannot keep a whole title and their facts at
+a size that uses them, the board also takes the compact list: one wired box with a
+line (or two columns) per agent, keeping the name, run count, state mark and the
+current or last-work word on the frame. The login is on the line while it fits; otherwise the box legend
 `login=gewu-<name>` names the exact generated login when that equality holds (the
 Agent screen always shows the whole login); a persisted non-standard login stays
 whole and agent-associated. On a mixed compact board, an exact `agent-N` name
@@ -250,7 +261,9 @@ and you can change any of them later.
    on a per-agent form `ctrl-u` then `⏎` clears that agent's stored key;
    every other failure names the provider's status and its own message, kept whole and
    wrapped to the form's rows at 80 columns (a 404 on a `/chat/completions` address
-   without `/v1` says so first). `↑`/`↓` moves between fields; `⏎` keeps a field and
+   without `/v1` says so first); a 401 or 403 reserves its `— check the key` /
+   `— check the model and its access` action at 72×18 and 80×24, shortening only the
+   provider's part when the rows run out. `↑`/`↓` moves between fields; `⏎` keeps a field and
    selects the next one without entering its edit mode, so `t` still tests; `Ctrl-U`
    (shown as `ctrl-u clear`) empties the selected field. Continuing past the model step
    runs the same address and key check: a wrong address stays on the form with the `✗`

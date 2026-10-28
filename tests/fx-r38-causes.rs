@@ -1,0 +1,390 @@
+//! Wave 38 cause regressions: the 72x18 compact list, a run's own ending, the
+//! warning word that matches the mark, the live pull-request state and the model
+//! test's action at the two small sizes.
+//!
+//! Every case is rendered at a size named by the walk report; each one fails on
+//! the base that reported the defect.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+use gewu_multiverse::board::{Board, BoardForm, Screen};
+use gewu_multiverse::engine_api::{
+    AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
+    ForgejoView, ProgramView, Provisioning, PullStateView, SessionEnd, SessionState,
+};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+struct ViewEngine {
+    view: BoardView,
+    sent: Arc<Mutex<Vec<Command>>>,
+}
+
+impl EngineApi for ViewEngine {
+    fn board(&mut self) -> BoardView {
+        self.view.clone()
+    }
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.sent.lock().expect("sent").push(command);
+        Ok(())
+    }
+    fn tick(&mut self) {}
+    fn instruction_path(&self, _agent: &str) -> Option<PathBuf> {
+        None
+    }
+    fn session_files(&self, _agent: &str) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+    fn shutdown(&mut self, _grace: Duration) {}
+}
+
+fn program(id: &str) -> ProgramView {
+    ProgramView {
+        id: id.to_owned(),
+        label: match id {
+            "pi" => "Pi",
+            "codex" => "Codex",
+            "dsh" => "DeepSeek Harness",
+            "opencode" => "OpenCode",
+            _ => "built-in engine",
+        }
+        .to_owned(),
+        version: "1.0.0".to_owned(),
+        installed_version: Some("1.0.0".to_owned()),
+        installed: true,
+        license: "MIT".to_owned(),
+        download_mb: 10,
+        prerequisite: None,
+        prerequisite_met: true,
+        installing: None,
+        installing_phase: None,
+        error: None,
+    }
+}
+
+fn agent(number: usize) -> AgentView {
+    AgentView {
+        name: format!("agent-{number}"),
+        login: format!("gewu-agent-{number}"),
+        provisioning: Provisioning::Ready,
+        desired: Desired::Stopped,
+        session: SessionState::Idle,
+        sessions_since_start: 0,
+        runs_total: 4,
+        recent: vec![SessionEnd::Succeeded],
+        instruction_chars: 12,
+        instruction_first_line: Some("do the work".to_owned()),
+        instruction: Some("do the work\n".to_owned()),
+        instruction_lines: 1,
+        activity: None,
+        activity_at: None,
+        last_error: None,
+        last_result: Some("done".to_owned()),
+        last_failure: None,
+        leftover: None,
+        current_tool: None,
+        current_tool_seconds: 0,
+        retrying: None,
+        last_work: vec!["comment on #1".to_owned()],
+        pull_states: Vec::new(),
+        no_assigned_work: false,
+        last_work_result: Some("done".to_owned()),
+        last_result_is_work: true,
+        program: "builtin".to_owned(),
+        program_label: "built-in engine".to_owned(),
+        unknown_program: None,
+        program_installed: true,
+        program_version: Some("1.0.0".to_owned()),
+        protocol: "chat-completions".to_owned(),
+        base_url: "https://model.example/v1".to_owned(),
+        model: "demo-model".to_owned(),
+        key_present: true,
+        model_test: EndpointTest::NotRun,
+        program_error: None,
+        active_program: None,
+        next_program: None,
+        codex_sandbox: None,
+    }
+}
+
+fn view(agents: Vec<AgentView>) -> BoardView {
+    BoardView {
+        terms_acknowledged: true,
+        terms: Vec::new(),
+        setup_complete: true,
+        forgejo: ForgejoView {
+            state: ForgejoState::Running,
+            url: "http://127.0.0.1:3000".to_owned(),
+            version: "17.0.0".to_owned(),
+            admin_login: "owner".to_owned(),
+            organisation: "team".to_owned(),
+            repositories: 1,
+            repository_names: vec!["team/workspace".to_owned()],
+            events: Vec::new(),
+            admin_login_kept: false,
+        },
+        agents,
+        endpoint: EndpointView {
+            configured: true,
+            url: "https://model.example/v1/chat/completions".to_owned(),
+            base_url: "https://model.example/v1".to_owned(),
+            protocol: "chat-completions".to_owned(),
+            model: "demo-model".to_owned(),
+            key_present: true,
+            test: EndpointTest::NotRun,
+        },
+        programs: ["pi", "codex", "dsh", "opencode"]
+            .into_iter()
+            .map(program)
+            .collect(),
+        notice: None,
+        admin_password: None,
+        confined: true,
+        confinement: Some("Landlock".to_owned()),
+        upgrade: None,
+    }
+}
+
+fn mounted(agents: Vec<AgentView>) -> Board {
+    Board::new(ViewEngine {
+        view: view(agents),
+        sent: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+fn press(board: &mut Board, code: KeyCode) {
+    board.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+}
+
+fn draw(board: &mut Board, width: u16, height: u16) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal.draw(|frame| board.draw(frame)).expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+fn text(buffer: &Buffer) -> String {
+    let mut out = String::new();
+    for y in buffer.area.y..buffer.area.bottom() {
+        for x in buffer.area.x..buffer.area.right() {
+            out.push_str(buffer.cell((x, y)).expect("a cell").symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn open_agent(board: &mut Board) {
+    press(board, KeyCode::Enter);
+    assert_eq!(board.screen(), Screen::Agent);
+}
+
+fn open_model(board: &mut Board) {
+    open_agent(board);
+    press(board, KeyCode::Char('m'));
+    assert_eq!(board.screen(), Screen::Model);
+}
+
+#[test]
+fn the_72x18_board_is_one_wired_list_at_every_agent_count() {
+    for count in [1, 3, 7] {
+        let mut board = mounted((1..=count).map(agent).collect());
+        let frame = text(&draw(&mut board, 72, 18));
+        let layout = board.layout();
+        assert_eq!(
+            layout.form,
+            BoardForm::List,
+            "72x18 with {count} agents is not the compact list:\n{frame}"
+        );
+        assert_eq!(layout.listed.len(), count, "a line is missing:\n{frame}");
+        assert_eq!(layout.cards.len(), 0, "a card is still drawn:\n{frame}");
+        for line in &layout.listed {
+            assert_eq!(line.rect.height, 1, "a line is not one row:\n{frame}");
+        }
+        assert!(
+            !frame.contains('├') && !frame.contains('┤'),
+            "72x18 with {count} agents draws a connector between rows:\n{frame}"
+        );
+    }
+    // The larger pictures are unchanged.
+    for (width, height) in [(80, 24), (120, 40)] {
+        let mut board = mounted((1..=3).map(agent).collect());
+        let _ = draw(&mut board, width, height);
+        assert_eq!(
+            board.layout().form,
+            BoardForm::Cards,
+            "{width}x{height} changed away from the card grid"
+        );
+    }
+}
+
+#[test]
+fn a_stopped_run_shows_its_own_ending_and_labels_completed_work() {
+    let mut stopped = agent(1);
+    stopped.recent = vec![
+        SessionEnd::Succeeded,
+        SessionEnd::Stopped {
+            reason: "the run was stopped on request".to_owned(),
+            at: Some(SystemTime::now() - Duration::from_secs(180)),
+        },
+    ];
+    stopped.last_work = vec![
+        "issue #1".to_owned(),
+        "pull request #4 from fix-readme-typo".to_owned(),
+    ];
+    stopped.last_result = Some("Pull request opened".to_owned());
+    stopped.last_work_result = Some("Pull request opened".to_owned());
+    stopped.last_result_is_work = false;
+    let mut board = mounted(vec![stopped]);
+    open_agent(&mut board);
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let frame = text(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("stopped 3m ago"),
+            "{width}x{height}: the stopped run's own age is missing:\n{frame}"
+        );
+        assert!(
+            frame.contains("the run was stopped on request"),
+            "{width}x{height}: the stopped run's own reason is missing:\n{frame}"
+        );
+        assert!(
+            frame.contains("last completed work: PR #4 open"),
+            "{width}x{height}: the completed work is not labelled as such:\n{frame}"
+        );
+        assert!(
+            !frame.contains("result: Pull request opened"),
+            "{width}x{height}: the stopped run wears the previous result:\n{frame}"
+        );
+    }
+    // The board card pairs the earlier work with its own tick, never the newest
+    // stopped mark.
+    let mut board = mounted(vec![{
+        let mut stopped = agent(1);
+        stopped.recent = vec![
+            SessionEnd::Succeeded,
+            SessionEnd::Stopped {
+                reason: "the run was stopped on request".to_owned(),
+                at: Some(SystemTime::now()),
+            },
+        ];
+        stopped.last_work = vec!["pull request #4 from fix-readme-typo".to_owned()];
+        stopped.last_work_result = Some("Pull request opened".to_owned());
+        stopped.last_result_is_work = false;
+        stopped
+    }]);
+    let frame = text(&draw(&mut board, 120, 40));
+    assert!(
+        frame.contains("✓ #4"),
+        "the card's work lost its own tick:\n{frame}"
+    );
+    assert!(
+        !frame.contains("■ #4"),
+        "the card pairs the stopped mark with earlier work:\n{frame}"
+    );
+}
+
+#[test]
+fn a_local_change_warning_is_named_in_the_strip_and_the_legend() {
+    let mut local = agent(1);
+    local.recent = vec![SessionEnd::Warned {
+        reason: "workspace changed: workspace/TODO.md".to_owned(),
+    }];
+    local.last_work = vec!["local change workspace/TODO.md".to_owned()];
+    local.last_result = Some("workspace changed: workspace/TODO.md".to_owned());
+    local.last_work_result = Some("workspace changed: workspace/TODO.md".to_owned());
+    local.last_result_is_work = true;
+    let mut board = mounted(vec![local]);
+    open_agent(&mut board);
+    for (width, height) in [(72, 18), (80, 24)] {
+        let frame = text(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("local change"),
+            "{width}x{height}: the newest warning is not named as a local change:\n{frame}"
+        );
+        assert!(
+            frame.contains("⚠ warning"),
+            "{width}x{height}: the legend does not describe the warning mark:\n{frame}"
+        );
+        assert!(
+            !frame.contains("⚠ cmd"),
+            "{width}x{height}: a local-only change still reads as a failed command:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn a_merged_or_closed_request_is_not_shown_open() {
+    for state in ["merged", "closed"] {
+        let mut worked = agent(1);
+        worked.recent = vec![SessionEnd::Succeeded];
+        worked.last_work = vec![
+            "issue #1".to_owned(),
+            "pull request #4 from fix-readme-typo".to_owned(),
+        ];
+        worked.last_result = Some("Pull request opened".to_owned());
+        worked.last_work_result = Some("Pull request opened".to_owned());
+        worked.last_result_is_work = true;
+        worked.pull_states = vec![PullStateView {
+            number: 4,
+            state: state.to_owned(),
+        }];
+        let mut board = mounted(vec![worked]);
+        open_agent(&mut board);
+        for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+            let frame = text(&draw(&mut board, width, height));
+            assert!(
+                frame.contains(&format!("PR #4 {state}")),
+                "{width}x{height}: the live {state} state is missing:\n{frame}"
+            );
+            assert!(
+                !frame.contains("PR #4 open"),
+                "{width}x{height}: the run's recorded open state survived the {state}:\n{frame}"
+            );
+        }
+        let home = text(&draw(&mut board, 120, 40));
+        assert!(
+            home.contains(&format!("#4 {state}")),
+            "the board card does not carry the live {state} state:\n{home}"
+        );
+    }
+}
+
+fn failed_test(reason: String) -> AgentView {
+    let mut failed = agent(1);
+    failed.program = "pi".to_owned();
+    failed.program_label = "Pi".to_owned();
+    failed.model_test = EndpointTest::Failed { reason };
+    failed
+}
+
+#[test]
+fn the_model_test_keeps_its_action_at_72x18_and_80x24() {
+    let long = "Incorrect API key provided. You can find your API key at the provider dashboard. \
+                The provider's own sentence continues for long enough that the form cannot show \
+                all of it at once on the smallest screens.";
+    for (reason, action) in [
+        (
+            format!("the provider refused the API key (HTTP 401): {long} — check the key"),
+            "check the key",
+        ),
+        (
+            format!(
+                "the provider denied access to this model (HTTP 403): {long} — check the model and its access"
+            ),
+            "check the model and its access",
+        ),
+    ] {
+        for (width, height) in [(72, 18), (80, 24)] {
+            let mut board = mounted(vec![failed_test(reason.clone())]);
+            open_model(&mut board);
+            let frame = text(&draw(&mut board, width, height));
+            assert!(
+                frame.contains(action),
+                "{width}x{height}: the model test cut its operative words:\n{frame}"
+            );
+        }
+    }
+}

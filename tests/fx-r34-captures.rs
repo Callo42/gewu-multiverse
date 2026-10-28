@@ -66,6 +66,7 @@ fn view(count: usize) -> BoardView {
                 current_tool_seconds: 0,
                 retrying: None,
                 last_work: vec![format!("pull request #{}", 10 + index)],
+                pull_states: Vec::new(),
                 no_assigned_work: false,
                 last_work_result: Some(format!("did run {number}")),
                 last_result_is_work: true,
@@ -228,7 +229,13 @@ fn capture_one_agent_panel_per_mark() {
                 reason: "exit 2: make: *** No rule to make target 'test'".to_owned(),
             },
         ),
-        ("stopped", SessionEnd::Stopped),
+        (
+            "stopped",
+            SessionEnd::Stopped {
+                reason: "the run was stopped on request".to_owned(),
+                at: Some(SystemTime::now()),
+            },
+        ),
         ("timed-out", SessionEnd::TimedOut),
     ];
     for (name, mark) in marks {

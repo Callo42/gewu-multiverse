@@ -537,7 +537,7 @@ pub fn session_symbol(end: &SessionEnd) -> (char, Color) {
         SessionEnd::Warned { .. } => ('⚠', theme::AMBER),
         SessionEnd::Failed { .. } => ('✗', theme::RED),
         SessionEnd::TimedOut => ('◷', theme::AMBER),
-        SessionEnd::Stopped => ('■', theme::GREY),
+        SessionEnd::Stopped { .. } => ('■', theme::GREY),
     }
 }
 
@@ -630,16 +630,47 @@ pub fn leftover_short(leftover: &str) -> &'static str {
 
 /// The one-word label for a run mark, used beside the newest mark so the two circle
 /// glyphs never have to be told apart from the legend alone (F-04).
+/// A warning's own reason decides the word: a change left only in the workspace is
+/// not a failed command, even though both are `⚠`.
 pub fn session_label(end: &SessionEnd) -> &'static str {
     match end {
         SessionEnd::Succeeded => "ok",
         SessionEnd::Refused { .. } => "refused",
         SessionEnd::NoWork { .. } => "no work",
+        SessionEnd::Warned { reason } if local_change_warning(reason) => "local change",
         SessionEnd::Warned { .. } => "cmd failed",
         SessionEnd::Failed { .. } => "failed",
         SessionEnd::TimedOut => "timed out",
-        SessionEnd::Stopped => "stopped",
+        SessionEnd::Stopped { .. } => "stopped",
     }
+}
+
+/// Whether a warned run's reason is the workspace change, not a failed command.
+pub fn local_change_warning(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("workspace changed")
+        || lower.contains("local change")
+        || lower.contains("local commit")
+        || lower.contains("local git change")
+}
+
+/// The stopped run's own ending: how long ago it ended and why.
+///
+/// This is drawn in place of the older `result:`/`last work` headline when the
+/// newest run was stopped, so the screen describes the run the person just ended
+/// rather than the successful work before it.
+pub fn stopped_ending_line(end: &SessionEnd) -> Option<String> {
+    let SessionEnd::Stopped { reason, at } = end else {
+        return None;
+    };
+    let age = at.and_then(|at| SystemTime::now().duration_since(at).ok());
+    let reason = first_clause(reason);
+    Some(match (age, reason.is_empty()) {
+        (Some(age), false) => format!("stopped {} — {reason}", age_words(age)),
+        (Some(age), true) => format!("stopped {}", age_words(age)),
+        (None, false) => format!("stopped — {reason}"),
+        (None, true) => "stopped".to_owned(),
+    })
 }
 
 /// The newest finished run's line, labelled by what it is.
@@ -654,11 +685,21 @@ pub fn run_result_line(agent: &AgentView) -> Option<String> {
         return None;
     }
     let newest = agent.recent.last()?;
+    // A stopped run has its own ending; the work before it is not this run's result.
+    if let Some(line) = stopped_ending_line(newest) {
+        return Some(line);
+    }
     // The row labelled `last work` carries work, never a warning sentence. The
     // warning keeps its mark and its own row; the newest work stays here until a
     // later run does new work (which is exactly what the work block says).
     if let Some(work) = newest_work_phrase(agent) {
-        return Some(format!("last work: {work}"));
+        // A stop, refusal, no-op, failure or timeout did no work this time: the
+        // block is the earlier completed work, and the label must say so.
+        let label = match newest {
+            SessionEnd::Succeeded | SessionEnd::Warned { .. } => "last work",
+            _ => "last completed work",
+        };
+        return Some(format!("{label}: {work}"));
     }
     let result = agent.last_result.as_deref().map(first_clause);
     match newest {
@@ -677,9 +718,20 @@ pub fn run_result_line(agent: &AgentView) -> Option<String> {
     }
 }
 
+/// The live state of one pull request, when the engine has read it.
+pub fn pull_state(agent: &AgentView, number: u64) -> Option<&str> {
+    agent
+        .pull_states
+        .iter()
+        .find(|pull| pull.number == number)
+        .map(|pull| pull.state.as_str())
+}
+
 /// The newest work word, typed for the card: `comment on #2`, `PR #3 open`, or
 /// `branch fix-greeting`. A read (`issue #N`) is not work and is skipped; the
-/// newest write in the block is the one the line carries.
+/// newest write in the block is the one the line carries. A pull request's word is
+/// its live state when the engine has read it; only a request the engine has not
+/// refreshed keeps the run's recorded `open`.
 pub fn newest_work_phrase(agent: &AgentView) -> Option<String> {
     for line in agent.last_work.iter().rev() {
         if line.starts_with("issue #") {
@@ -687,7 +739,12 @@ pub fn newest_work_phrase(agent: &AgentView) -> Option<String> {
         }
         if let Some(rest) = line.strip_prefix("pull request #") {
             let number = leading_number(rest);
-            return Some(format!("PR #{number} open"));
+            let state = number
+                .parse::<u64>()
+                .ok()
+                .and_then(|number| pull_state(agent, number))
+                .unwrap_or("open");
+            return Some(format!("PR #{number} {state}"));
         }
         if let Some(rest) = line.strip_prefix("comment on #") {
             let number = leading_number(rest);
@@ -700,6 +757,44 @@ pub fn newest_work_phrase(agent: &AgentView) -> Option<String> {
         return Some(line.clone());
     }
     None
+}
+
+/// The mark that belongs with the last completed work word.
+///
+/// The board card used to pair the newest run's mark (`■` after a stop) with work
+/// an earlier run did. A work word now carries the mark of the run that produced
+/// it: remote work is `✓`, a local-only change is `⚠`. `None` when the block names
+/// only a read, so the caller can fall back to the newest run's mark.
+pub fn work_mark(agent: &AgentView) -> Option<char> {
+    for line in agent.last_work.iter().rev() {
+        if line.starts_with("issue #") {
+            continue;
+        }
+        if line.starts_with("pull request #")
+            || line.starts_with("comment on #")
+            || line.starts_with("branch ")
+        {
+            return Some('✓');
+        }
+        if line.starts_with("local change") || line == "local commit" || line == "local git change"
+        {
+            return Some('⚠');
+        }
+        return None;
+    }
+    None
+}
+
+/// The mark the newest work (or failure) word on a card carries.
+pub fn card_word_mark(agent: &AgentView) -> Option<char> {
+    if agent.leftover.is_some() {
+        return Some('⚠');
+    }
+    match agent.recent.last() {
+        Some(SessionEnd::Failed { .. }) => Some('✗'),
+        Some(SessionEnd::TimedOut) => Some('◷'),
+        _ => work_mark(agent).or_else(|| newest_run_mark(agent)),
+    }
 }
 
 /// The one line that shows a running agent's exact settings and the saved settings
@@ -826,7 +921,18 @@ pub fn last_work_word(agent: &AgentView) -> Option<String> {
         if let Some(rest) = line.strip_prefix("pull request #") {
             // The number is the fact a person needs; the label is what gives way
             // when a compact line is tight. `PR #100` stays `#100`, never `PR#10`.
-            best = Some(format!("#{}", leading_number(rest)));
+            // A live state that is no longer `open` is kept beside it, so a merged
+            // request does not look outstanding on the board.
+            let number = leading_number(rest);
+            let state = number
+                .parse::<u64>()
+                .ok()
+                .and_then(|number| pull_state(agent, number))
+                .filter(|state| *state != "open");
+            best = Some(match state {
+                Some(state) => format!("#{number} {state}"),
+                None => format!("#{number}"),
+            });
             break;
         }
         if let Some(rest) = line.strip_prefix("issue #") {
@@ -1119,6 +1225,7 @@ mod tests {
             current_tool_seconds: 0,
             retrying: None,
             last_work: Vec::new(),
+            pull_states: Vec::new(),
             no_assigned_work: false,
             last_work_result: None,
             last_result_is_work: false,

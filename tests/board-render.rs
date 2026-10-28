@@ -9,11 +9,11 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gewu_multiverse::board::status::BANNED;
 use gewu_multiverse::board::{Board, BoardForm, FakeEngine, Screen};
-use gewu_multiverse::engine_api::{BoardView, Command, EngineApi};
+use gewu_multiverse::engine_api::{BoardView, Command, EndpointTest, EngineApi};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -967,51 +967,10 @@ fn no_card_text_shares_a_row_with_a_section_rule_at_any_size() {
 
 #[test]
 fn the_72_column_board_keeps_every_agent_on_the_frame() {
-    // One vertical list of compact cards while the cards fit (F7): the wire above
-    // each card leaves the box or the previous card's bottom centre.
-    for count in [1, 3] {
-        let mut board = Board::new(endpoint_engine(count));
-        let buffer = draw(&mut board, 72, 18);
-        let layout = board.layout();
-        assert_eq!(
-            layout.form,
-            BoardForm::Cards,
-            "72x18 with {count} agents is not the card form"
-        );
-        assert_eq!(
-            layout.columns, 1,
-            "72x18 with {count} agents is not a single column"
-        );
-        let mut x: Option<u16> = None;
-        let mut last_bottom = 0;
-        for (index, card) in layout.cards.iter().enumerate() {
-            if let Some(expected) = x {
-                assert_eq!(card.rect.x, expected, "the vertical list moves sideways");
-            } else {
-                x = Some(card.rect.x);
-            }
-            assert!(
-                card.rect.y >= last_bottom,
-                "cards overlap in the vertical list"
-            );
-            last_bottom = card.rect.bottom();
-            let (wire_x, wire_y) = layout.wire_cells[index];
-            let below = buffer
-                .cell((wire_x, wire_y))
-                .expect("the wire above a card")
-                .symbol();
-            let below_arms = below.chars().next().map(arms).unwrap_or_default();
-            assert!(
-                below_arms & D != 0,
-                "the vertical list has no wire dropping into card {}: {below:?}",
-                card.agent
-            );
-        }
-        assert!(!layout.cards.is_empty());
-    }
-    // When the cards cannot all fit, the same place becomes the one-line form and
-    // no agent is left off the frame (B1). Each line is one row.
-    for count in [4, 7, 12] {
+    // The 72x18 floor is the compact list: one wired box, one line per agent, and
+    // no connector drawn between rows. A two-row card picture is what read as a
+    // broken drawing. 80 columns and wider keep the card grid.
+    for count in [1, 3, 4, 7, 12] {
         let mut board = Board::new(endpoint_engine(count));
         let buffer = draw(&mut board, 72, 18);
         let frame = text(&buffer);
@@ -1019,12 +978,21 @@ fn the_72_column_board_keeps_every_agent_on_the_frame() {
         assert_eq!(
             layout.form,
             BoardForm::List,
-            "72x18 with {count} agents did not take the one-line form"
+            "72x18 with {count} agents is not the compact list"
         );
         assert_eq!(layout.listed.len(), count, "a list line is missing");
         assert!(
             !layout.scrolls,
             "the 72x18 list scrolls with {count} agents"
+        );
+        // Every line is one row inside one box; nothing draws a connector between
+        // two rows.
+        for line in &layout.listed {
+            assert_eq!(line.rect.height, 1, "a list line is not one row");
+        }
+        assert!(
+            !frame.contains('├') && !frame.contains('┤'),
+            "72x18 with {count} agents draws an inter-row connector:\n{frame}"
         );
         let words: Vec<&str> = frame.split_whitespace().collect();
         for number in 1..=count {
@@ -1038,6 +1006,14 @@ fn the_72_column_board_keeps_every_agent_on_the_frame() {
             );
         }
     }
+    // 80 columns is above the floor and still uses the card picture.
+    let mut board = Board::new(endpoint_engine(3));
+    let _ = draw(&mut board, 80, 24);
+    assert_eq!(
+        board.layout().form,
+        BoardForm::Cards,
+        "the 80x24 board changed away from the card grid"
+    );
 }
 
 #[test]
@@ -1475,7 +1451,10 @@ impl EngineApi for StripEngine {
                     reason: "the model call failed".to_owned(),
                 },
                 gewu_multiverse::engine_api::SessionEnd::TimedOut,
-                gewu_multiverse::engine_api::SessionEnd::Stopped,
+                gewu_multiverse::engine_api::SessionEnd::Stopped {
+                    reason: "the run was stopped on request".to_owned(),
+                    at: Some(SystemTime::now()),
+                },
                 gewu_multiverse::engine_api::SessionEnd::Succeeded,
                 gewu_multiverse::engine_api::SessionEnd::Succeeded,
                 gewu_multiverse::engine_api::SessionEnd::Succeeded,
@@ -1569,6 +1548,91 @@ fn a_successful_runs_own_summary_is_beside_the_tick() {
     );
 }
 
+struct FailedModelTestEngine(FakeEngine, String);
+
+impl EngineApi for FailedModelTestEngine {
+    fn board(&mut self) -> BoardView {
+        let mut view = self.0.board();
+        view.endpoint.test = EndpointTest::Failed {
+            reason: self.1.clone(),
+        };
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        self.0.send(command)
+    }
+
+    fn tick(&mut self) {
+        self.0.tick()
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.0.instruction_path(agent)
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        self.0.session_files(agent)
+    }
+
+    fn shutdown(&mut self, grace: Duration) {
+        self.0.shutdown(grace)
+    }
+}
+
+#[test]
+fn the_model_test_keeps_its_action_at_72_and_80() {
+    let long = "Incorrect API key provided. You can find your API key at the provider \
+                dashboard. The provider's own sentence continues for long enough that \
+                the form cannot show all of it at once on the smallest screens.";
+    for (reason, action) in [
+        (
+            format!("the provider refused the API key (HTTP 401): {long} — check the key"),
+            "check the key",
+        ),
+        (
+            format!(
+                "the provider denied access to this model (HTTP 403): {long} — check the model and its access"
+            ),
+            "check the model and its access",
+        ),
+    ] {
+        for (width, height) in [(72, 18), (80, 24)] {
+            let mut board = Board::new(FailedModelTestEngine(endpoint_engine(1), reason.clone()));
+            press(&mut board, KeyCode::Char('m'));
+            let frame = text(&draw(&mut board, width, height));
+            assert!(
+                frame.contains(action),
+                "{width}x{height}: the model test cut its operative words:\n{frame}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stopped_run_shows_its_own_ending_not_the_earlier_result() {
+    let mut engine = running_engine(1);
+    engine
+        .send(Command::Stop {
+            name: "agent-1".to_owned(),
+        })
+        .expect("the run stops");
+    engine.tick();
+    let mut board = Board::new(engine);
+    press(&mut board, KeyCode::Enter);
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let frame = text(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("stopped") && frame.contains("on request"),
+            "{width}x{height}: the stopped run has no own ending:\n{frame}"
+        );
+        assert!(
+            frame.contains("last completed work: comment on #1"),
+            "{width}x{height}: the earlier work is not labelled as completed:\n{frame}"
+        );
+    }
+}
+
 #[test]
 fn the_run_legend_is_whole_at_the_floor() {
     // Review N4: the padded legend was cut to `◷ t…` on the 72-column card.
@@ -1594,7 +1658,7 @@ fn the_warning_mark_is_in_the_legend_at_every_size() {
     for (width, height) in SIZES {
         let frame = flat(&draw(&mut board, width, height));
         assert!(
-            frame.contains("⚠ cmd"),
+            frame.contains("⚠ warning"),
             "{width}x{height}: the warning entry is not in the legend:\n{frame}"
         );
         assert!(

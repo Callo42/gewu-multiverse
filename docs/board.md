@@ -227,13 +227,11 @@ size, is only as tall as its facts, and no row inside it is left empty. The newe
 repository event is stored with the settings, so it survives a reopen; when the box
 cannot hold it, the board's footer gives it a row of its own, never sharing the keys.
 
-At 72×18 the board is one vertical list of two-row cards while up to three fit: the
-top border carries the state symbol, name and state; the bottom border carries the
-login, `run N` and the last-work (or newest-failure) word. When four or more would need
-a scroll, the same place becomes the compact list: one wired box with a line per
-agent, in one column while the line keeps the mark, name, login, run count and word,
-otherwise in two columns. A two-column waiting line keeps the name, run count, wait
-word and short last-work word. When even that cannot repeat the login, the box's
+At 72×18 the board is the compact list at every agent count: one wired box, one line
+per agent, and no connector drawn between rows. The line keeps the mark, name, login,
+run count and current or last-work word in one column while they fit, otherwise in two
+columns. A two-column waiting line keeps the name, run count, wait word and short
+last-work word. When even that cannot repeat the login, the box's
 `login=gewu-<name>` legend gives the exact generated login for those lines, but only
 when every shown login really is generated. A persisted non-standard login is always
 whole and agent-associated. On a mixed board the compact floor can use a denser
@@ -313,7 +311,7 @@ unpaired command, and never replaces a non-zero status an earlier record paired;
 duplicate record from the inherited `ERR` trap is collapsed to one segment. The
 records are written to a private file the model's stdout/stderr never carry and
 recorded in the transcript as `segments` (`command`, `status`). If any raw status is
-non-zero, the newest mark is `⚠` (legend `⚠ cmd`) with the failed command's cause as
+non-zero, the newest mark is `⚠` (legend `⚠ warning`) with the failed command's cause as
 its row (`⚠ shell: …`) — never `✓`; it is `⊘` when the failed command is a recognised
 write or its output carries refusal evidence. When the pairing cannot name the failed
 command, the run stays `⚠` with the raw status's output line as the cause, never `✓`.
@@ -464,13 +462,19 @@ The big card carries state, login, the last work block, the instruction's first
 lines (or `no instruction — e writes one`) and a strip of the newest run ends: `✓`
 succeeded, `⊘` **write** refused, `∅` no work, `⚠` finished with a failed command,
 `✗` failed, `◷` timed out, `■` stopped. The label is `last runs`, at most five marks
-then `+N`, the newest mark's one-word label (`⊘ refused`, `∅ no work`, `⚠ cmd failed`),
-the same legend at every size (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ cmd ■ stopped ◷
+then `+N`, the newest mark's one-word label (`⊘ refused`, `∅ no work`, `⚠ cmd failed`
+or `⚠ local change` when the warning is a workspace change),
+the same legend at every size (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ warning ■ stopped ◷
 timed out`; at the 72-column floor it wraps whole on two rows), and the total count
 `run 7`. A refused read is never `⊘`: a
 failed read inside a clean run is `⚠`. The summary line prefers the newest run that did
 work (`last work: …`); a later no-op's own reason is labelled `no work: …`, so it is
-not presented as the agent's work.
+not presented as the agent's work. When the newest run was stopped, the line is that
+run's own ending (`stopped 2m ago — the run was stopped on request`) and the earlier
+work is labelled `last completed work: …`; its result is not repeated as the stopped
+run's own. A pull request's word follows its live state (`PR #4 merged` or
+`PR #4 closed`), refreshed while the board is open, so a run's recorded `open` does
+not outlive a merge or close.
 
 `s` starts or stops; `e` hands `instruction_path` to `$EDITOR`; `l` hands the newest
 run's log to the pager; `t` writes and shows a readable transcript (turns, tools and

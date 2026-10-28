@@ -467,6 +467,28 @@ impl ForgejoClient {
         Ok(wire.into_iter().map(PullRequest::from).collect())
     }
 
+    /// One pull request in any state, when the token may see it.
+    ///
+    /// This is the read behind the board's live state: a request the run opened can
+    /// be merged or closed later, and the screen must not keep saying `open`.
+    pub fn pull_request(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<Option<PullRequest>, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/pulls/{number}",
+            segment(namespace),
+            segment(name)
+        );
+        match self.get(&path) {
+            Ok(body) => Ok(Some(parse::<WirePull>(&body, &path)?.into())),
+            Err(ForgejoError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// One issue or pull request by number, with its own facts and comment count.
     pub fn issue(&self, namespace: &str, name: &str, number: u64) -> Result<Issue, ForgejoError> {
         let path = format!(
@@ -1183,6 +1205,10 @@ struct WirePull {
     number: u64,
     title: String,
     state: String,
+    /// Forgejo reports a merged request as `closed` plus this flag; the public
+    /// `state` keeps the three words the screens use.
+    #[serde(default)]
+    merged: bool,
     #[serde(default)]
     html_url: Option<String>,
     head: WireRef,
@@ -1301,7 +1327,11 @@ impl From<WirePull> for PullRequest {
         Self {
             number: wire.number,
             title: wire.title,
-            state: wire.state,
+            state: if wire.merged {
+                "merged".to_owned()
+            } else {
+                wire.state
+            },
             html_url: wire.html_url,
             head_repo: wire.head.full_name(),
             head: wire.head.reference,
@@ -1458,6 +1488,62 @@ mod tests {
         assert_eq!(segment("namespace"), "namespace");
         assert_eq!(segment("a/b"), "a%2Fb");
         assert_eq!(segment("a b"), "a%20b");
+    }
+
+    #[test]
+    fn one_request_is_read_in_any_state_by_number() {
+        let stub = crate::test_stub::Stub::start_routed(vec![crate::test_stub::Route::new(
+            "GET",
+            "/api/v1/repos/team/workspace/pulls/4",
+            crate::test_stub::StubReply::json(
+                serde_json::json!({
+                    "number": 4,
+                    "title": "fix the typo",
+                    "state": "closed",
+                    "merged": true,
+                    "head": {"ref": "fix-typo", "repo": {"full_name": "team/workspace"}},
+                    "base": {"ref": "main", "repo": {"full_name": "team/workspace"}}
+                })
+                .to_string(),
+            ),
+        )]);
+        let client = ForgejoClient::new(
+            &format!("http://{}", stub.addr()),
+            Secret::new("gw-test"),
+            DEFAULT_TIMEOUT,
+        )
+        .expect("a client");
+        let pull = client
+            .pull_request("team", "workspace", 4)
+            .expect("the request is read")
+            .expect("the request is there");
+        assert_eq!(pull.number, 4);
+        assert_eq!(pull.state, "merged");
+    }
+
+    #[test]
+    fn a_merged_request_reads_as_merged_not_only_closed() {
+        let wire: WirePull = serde_json::from_value(serde_json::json!({
+            "number": 4,
+            "title": "fix the typo",
+            "state": "closed",
+            "merged": true,
+            "head": {"ref": "fix-typo", "repo": {"full_name": "team/workspace"}},
+            "base": {"ref": "main", "repo": {"full_name": "team/workspace"}}
+        }))
+        .expect("a pull request reply");
+        assert_eq!(PullRequest::from(wire).state, "merged");
+
+        let wire: WirePull = serde_json::from_value(serde_json::json!({
+            "number": 4,
+            "title": "fix the typo",
+            "state": "closed",
+            "merged": false,
+            "head": {"ref": "fix-typo", "repo": {"full_name": "team/workspace"}},
+            "base": {"ref": "main", "repo": {"full_name": "team/workspace"}}
+        }))
+        .expect("a pull request reply");
+        assert_eq!(PullRequest::from(wire).state, "closed");
     }
 
     #[test]
