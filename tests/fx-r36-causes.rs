@@ -67,6 +67,7 @@ fn agent(number: usize) -> AgentView {
         current_tool_seconds: 0,
         retrying: None,
         last_work: vec![format!("comment on #{number}")],
+        pull_states: Vec::new(),
         no_assigned_work: false,
         last_work_result: Some("I worked on the issue".to_owned()),
         last_result_is_work: true,
@@ -398,21 +399,41 @@ fn c4_every_card_names_its_program_and_newest_run_mark_at_72_80_120() {
     let mut four = agent(4);
     four.program = "pi".to_owned();
     four.program_label = "Pi".to_owned();
-    let (mut board, _) = board(view(vec![one, two, three, four]));
+    let (mut home, _) = board(view(vec![
+        one.clone(),
+        two.clone(),
+        three.clone(),
+        four.clone(),
+    ]));
     for (width, height) in [(72, 18), (80, 24), (120, 40)] {
-        let frame = text(&mut board, width, height);
+        let frame = text(&mut home, width, height);
         for word in ["built-in", "DSH", "OpenCode", "Pi"] {
             assert!(
                 frame.contains(word),
                 "{width}x{height}: the card does not name {word}:\n{frame}"
             );
         }
-        for mark in ['✓', '⚠', '✗'] {
+        for mark in ['✓', '✗'] {
             assert!(
                 frame.contains(mark),
-                "{width}x{height}: the newest run mark {mark} is gone:\n{frame}"
+                "{width}x{height}: the work/failure mark {mark} is gone:\n{frame}"
             );
         }
+        // A warning with earlier work is no longer paired with that work on the
+        // card; the Agent screen still carries the newest run's own mark.
+        let (mut detail, _) = board(view(vec![
+            one.clone(),
+            two.clone(),
+            three.clone(),
+            four.clone(),
+        ]));
+        press(&mut detail, KeyCode::Right);
+        open_agent(&mut detail);
+        let detail_frame = text(&mut detail, width, height);
+        assert!(
+            detail_frame.contains('⚠'),
+            "{width}x{height}: the newest run's warning mark is gone:\n{detail_frame}"
+        );
     }
 }
 

@@ -275,7 +275,7 @@ fn a_failed_command_is_a_warning_with_its_cause_and_never_a_tick() {
             "{width}x{height}: the model's result row is missing:\n{frame}"
         );
         assert!(
-            frame.contains("⚠ cmd"),
+            frame.contains("⚠ warning"),
             "{width}x{height}: the legend has no warning entry:\n{frame}"
         );
         assert!(

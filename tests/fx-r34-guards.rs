@@ -128,6 +128,7 @@ fn view(count: usize) -> BoardView {
                 current_tool_seconds: 0,
                 retrying: None,
                 last_work: vec![format!("pull request #{}", 10 + index)],
+                pull_states: Vec::new(),
                 no_assigned_work: false,
                 last_work_result: Some(format!("did run {number}")),
                 last_result_is_work: true,
@@ -417,7 +418,7 @@ fn one_picture_at_every_size_and_agent_count() {
             }
 
             // A lone card has no stray connector: no bus, just the trunk.
-            if count == 1 {
+            if count == 1 && form == BoardForm::Cards {
                 assert_eq!(layout.cards.len(), 1, "{label}");
                 assert_eq!(layout.wire_cells.len(), 1, "{label}");
                 assert!(
@@ -540,7 +541,7 @@ fn a_failed_run_keeps_http_status_and_the_connector_never_crosses_it() {
                     );
                 }
             }
-            if count == 3 && width == 72 {
+            if count == 3 && width == 72 && card.is_some() {
                 assert!(
                     frame.contains("HTTP 500 from the model"),
                     "{label}: the compact card cuts the failure sentence:\n{frame}"

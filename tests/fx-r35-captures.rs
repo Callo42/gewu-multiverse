@@ -78,6 +78,7 @@ fn agent(number: usize, state: State) -> AgentView {
         current_tool_seconds: 0,
         retrying: None,
         last_work: vec![format!("pull request #{}", 20 + number)],
+        pull_states: Vec::new(),
         no_assigned_work: false,
         last_work_result: Some(format!("I opened pull request #{number}")),
         last_result_is_work: true,

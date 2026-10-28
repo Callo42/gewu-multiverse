@@ -722,7 +722,7 @@ fn a_push_then_an_existing_open_request_is_a_success_that_names_the_request() {
     );
     assert_eq!(
         gewu_multiverse::run::work_summary(&run_dir),
-        vec!["pull request #3 from feature".to_owned()],
+        vec!["pull request lab/analysis-code#3 from feature".to_owned()],
         "the work line did not name the pull request"
     );
 }
@@ -758,7 +758,7 @@ fn a_comment_survives_a_turn_limit() {
     );
     assert_eq!(
         gewu_multiverse::run::work_summary(&run_dir),
-        vec!["comment on #12".to_owned()],
+        vec!["comment on lab/analysis-code#12".to_owned()],
         "the recorded comment was lost on the early exit"
     );
 }
@@ -800,7 +800,7 @@ fn a_comment_survives_a_later_refused_update_as_success() {
     );
     assert_eq!(
         gewu_multiverse::run::work_summary(&run_dir),
-        vec!["comment on #12".to_owned()]
+        vec!["comment on lab/analysis-code#12".to_owned()]
     );
 }
 

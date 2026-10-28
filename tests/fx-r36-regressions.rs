@@ -172,6 +172,7 @@ fn board_view(_run_dir: &Path, outcome: &str, reason: &str) -> BoardView {
             current_tool_seconds: 0,
             retrying: None,
             last_work: Vec::new(),
+            pull_states: Vec::new(),
             no_assigned_work: false,
             last_work_result: None,
             last_result_is_work: false,

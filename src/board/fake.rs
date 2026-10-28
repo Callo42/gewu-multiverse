@@ -266,7 +266,10 @@ impl FakeEngine {
 
     fn stop_agent(agent: &mut FakeAgent) {
         if matches!(agent.session, SessionState::Running { .. }) {
-            agent.recent.push(SessionEnd::Stopped);
+            agent.recent.push(SessionEnd::Stopped {
+                reason: "the run was stopped on request".to_owned(),
+                at: Some(SystemTime::now()),
+            });
             if agent.recent.len() > 10 {
                 agent.recent.remove(0);
             }
@@ -324,7 +327,10 @@ impl FakeEngine {
         }
         if agent.desired == Desired::Stopped {
             if matches!(agent.session, SessionState::Running { .. }) {
-                agent.recent.push(SessionEnd::Stopped);
+                agent.recent.push(SessionEnd::Stopped {
+                    reason: "the run was stopped on request".to_owned(),
+                    at: Some(SystemTime::now()),
+                });
                 if agent.recent.len() > 10 {
                     agent.recent.remove(0);
                 }
@@ -503,6 +509,7 @@ impl EngineApi for FakeEngine {
                 current_tool_seconds: agent.current_tool_seconds,
                 retrying: agent.retrying.clone(),
                 last_work: agent.last_work.clone(),
+                pull_states: Vec::new(),
                 no_assigned_work: agent.no_assigned_work,
                 last_work_result: agent.last_work_result.clone(),
                 last_result_is_work: agent.last_result_is_work,

@@ -23,13 +23,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::prelude::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::engine::session::RunningSession;
 
 static ATOMIC_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::time::now_unix_ms;
 use crate::transcript::{self, Record};
@@ -402,6 +402,8 @@ pub struct RunSummary {
     pub outcome: Option<RunOutcome>,
     /// Why it ended that way, when the record says.
     pub reason: Option<String>,
+    /// When the run wrote its terminal record, when it has one.
+    pub ended_at: Option<SystemTime>,
     /// The run's directory.
     pub dir: PathBuf,
 }
@@ -432,6 +434,11 @@ pub struct RunFacts {
     /// The branch a push witness proved.
     #[serde(default)]
     pub push: Option<String>,
+    /// `owner/name` of the repository the push witness moved, when the clone named
+    /// one. It keeps a push on one repository distinguishable from a branch with the
+    /// same name in another.
+    #[serde(default)]
+    pub push_repository: Option<String>,
     /// Pull requests this run opened or updated, oldest first.
     #[serde(default)]
     pub pulls: Vec<WorkPull>,
@@ -439,9 +446,10 @@ pub struct RunFacts {
     /// the request, not work this run did; it is named only beside a push or comment.
     #[serde(default)]
     pub existing: Vec<WorkPull>,
-    /// Issue or pull-request numbers this run commented on, oldest first.
-    #[serde(default)]
-    pub comments: Vec<u64>,
+    /// Issue or pull-request numbers this run commented on, oldest first, with the
+    /// repository each one belongs to.
+    #[serde(default, deserialize_with = "deserialize_comments")]
+    pub comments: Vec<WorkComment>,
     /// The issue this run read, when it read one.
     #[serde(default)]
     pub read_issue: Option<IssueRead>,
@@ -453,9 +461,158 @@ pub struct RunFacts {
 pub struct WorkPull {
     /// The request's number.
     pub number: u64,
+    /// `owner/name` of the repository the request lives in, when the record named
+    /// it. Numbering is per repository, so this is what identifies the request.
+    #[serde(default)]
+    pub repository: Option<String>,
     /// The clone branch the request's own tool result named, when it named one.
     #[serde(default)]
     pub branch: Option<String>,
+}
+
+/// One comment a run posted, with the repository it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkComment {
+    /// The issue or pull-request number.
+    pub number: u64,
+    /// `owner/name` of the repository, when the record named it.
+    #[serde(default)]
+    pub repository: Option<String>,
+}
+
+/// Read the old `comments = [12, 13]` shape and the new object shape.
+fn deserialize_comments<'de, D>(deserializer: D) -> Result<Vec<WorkComment>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Number(u64),
+        Object(WorkComment),
+    }
+    Ok(Vec::<Repr>::deserialize(deserializer)?
+        .into_iter()
+        .map(|comment| match comment {
+            Repr::Number(number) => WorkComment {
+                number,
+                repository: None,
+            },
+            Repr::Object(comment) => comment,
+        })
+        .collect())
+}
+
+/// The one identity formatter for a work item: `repository#number` for a pull
+/// request or comment, or `branch in repository` for a push. A legacy record with no
+/// repository keeps the older `#number` / bare branch form.
+pub fn work_identity(
+    repository: Option<&str>,
+    number: Option<u64>,
+    branch: Option<&str>,
+) -> String {
+    let repository = repository.filter(|repository| !repository.trim().is_empty());
+    if let Some(number) = number {
+        return match repository {
+            Some(repository) => format!("{repository}#{number}"),
+            None => format!("#{number}"),
+        };
+    }
+    match (
+        repository,
+        branch.filter(|branch| !branch.trim().is_empty()),
+    ) {
+        (Some(repository), Some(branch)) => format!("{repository}#{branch}"),
+        (None, Some(branch)) => branch.to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The work line for a pull request, with the repository that owns its number.
+pub fn pull_work_line(repository: Option<&str>, number: u64, branch: Option<&str>) -> String {
+    let reference = work_identity(repository, Some(number), None);
+    match branch.filter(|branch| !branch.trim().is_empty()) {
+        Some(branch) => format!("pull request {reference} from {branch}"),
+        None => format!("pull request {reference}"),
+    }
+}
+
+/// The work line for a comment, with the repository that owns its number.
+pub fn comment_work_line(repository: Option<&str>, number: u64) -> String {
+    format!(
+        "comment on {}",
+        work_identity(repository, Some(number), None)
+    )
+}
+
+/// The work line for a push, with the repository whose branch moved.
+pub fn push_work_line(repository: Option<&str>, branch: &str) -> String {
+    format!("branch {}", work_identity(repository, None, Some(branch)))
+}
+
+/// Split `repository#number` or the older `#number` reference.
+fn split_work_reference(rest: &str) -> Option<(Option<&str>, u64)> {
+    let (repository, digits) = match rest.strip_prefix('#') {
+        Some(digits) => (None, digits),
+        None => {
+            let (repository, digits) = rest.split_once('#')?;
+            let repository = repository.trim();
+            if repository.is_empty() {
+                return None;
+            }
+            (Some(repository), digits)
+        }
+    };
+    let digits: String = digits
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some((repository, digits.parse().ok()?))
+}
+
+/// The repository and number a pull-request work line names.
+pub fn pull_work_reference(line: &str) -> Option<(Option<&str>, u64)> {
+    split_work_reference(line.strip_prefix("pull request ")?)
+}
+
+/// The repository and number a comment work line names.
+pub fn comment_work_reference(line: &str) -> Option<(Option<&str>, u64)> {
+    split_work_reference(line.strip_prefix("comment on ")?)
+}
+
+/// The repository and branch a push work line names.
+pub fn push_work_reference(line: &str) -> Option<(Option<&str>, &str)> {
+    let rest = line.strip_prefix("branch ")?;
+    // `branch repository#branch` is the current form; `branch branch in repository`
+    // and a bare branch keep older records readable.
+    if let Some((repository, branch)) = rest.split_once('#')
+        && !repository.trim().is_empty()
+        && !branch.trim().is_empty()
+    {
+        return Some((Some(repository.trim()), branch.trim()));
+    }
+    match rest.rsplit_once(" in ") {
+        Some((branch, repository))
+            if !branch.trim().is_empty() && !repository.trim().is_empty() =>
+        {
+            Some((Some(repository.trim()), branch.trim()))
+        }
+        _ => Some((None, rest.trim())),
+    }
+}
+
+/// Whether two optional repository names can describe the same work. A missing name
+/// is an older record: it is never used to exclude a fact, only to show that the
+/// record does not identify one.
+fn same_work_repository(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 /// The issue a run read.
@@ -491,10 +648,22 @@ impl RunFacts {
         }
         let mut lines = Vec::new();
         // An already-open request is this run's work only when the push or comment
-        // that made the run remote is about that request.
+        // that made the run remote is about that request in the same repository.
         let existing = self.existing.iter().rev().find(|pull| {
-            (self.push.is_some() && self.push.as_deref() == pull.branch.as_deref())
-                || self.comments.contains(&pull.number)
+            let push_matches = self.push.is_some()
+                && self.push.as_deref() == pull.branch.as_deref()
+                && same_work_repository(
+                    self.push_repository.as_deref(),
+                    pull.repository.as_deref(),
+                );
+            let comment_matches = self.comments.iter().any(|comment| {
+                comment.number == pull.number
+                    && same_work_repository(
+                        comment.repository.as_deref(),
+                        pull.repository.as_deref(),
+                    )
+            });
+            push_matches || comment_matches
         });
         let pull = self.pulls.last().cloned().or_else(|| existing.cloned());
         if let Some(read) = self.read_issue.as_ref()
@@ -503,23 +672,27 @@ impl RunFacts {
             lines.push(format!("issue #{}", read.number));
         }
         if let Some(pull) = pull {
-            let shown = pull
+            let branch = pull
                 .branch
                 .as_deref()
                 .filter(|branch| !branch.trim().is_empty());
-            match shown {
-                Some(branch) => lines.push(format!("pull request #{} from {branch}", pull.number)),
-                None => lines.push(format!("pull request #{}", pull.number)),
-            }
+            lines.push(pull_work_line(
+                pull.repository.as_deref(),
+                pull.number,
+                branch,
+            ));
         } else if let Some(branch) = self
             .push
             .as_deref()
             .filter(|branch| !branch.trim().is_empty())
         {
-            lines.push(format!("branch {branch}"));
+            lines.push(push_work_line(self.push_repository.as_deref(), branch));
         }
-        if let Some(number) = self.comments.last() {
-            lines.push(format!("comment on #{number}"));
+        if let Some(comment) = self.comments.last() {
+            lines.push(comment_work_line(
+                comment.repository.as_deref(),
+                comment.number,
+            ));
         }
         lines.truncate(3);
         lines
@@ -540,6 +713,7 @@ pub fn facts_from_records(run_dir: &Path) -> RunFacts {
     };
     if let Some(witness) = read_push_witness(run_dir) {
         facts.push = Some(witness.branch);
+        facts.push_repository = witness.repository;
         facts.remote = true;
     }
     let Ok(file) = transcript::read_checked(run_dir) else {
@@ -628,6 +802,7 @@ pub fn facts_from_records(run_dir: &Path) -> RunFacts {
                         if let Some(number) = number {
                             facts.pulls.push(WorkPull {
                                 number: *number,
+                                repository: repository.clone(),
                                 branch: branch.clone().filter(|branch| !branch.trim().is_empty()),
                             });
                             facts.remote = true;
@@ -636,7 +811,10 @@ pub fn facts_from_records(run_dir: &Path) -> RunFacts {
                     }
                     Some("commented") => {
                         if let Some(number) = number {
-                            facts.comments.push(*number);
+                            facts.comments.push(WorkComment {
+                                number: *number,
+                                repository: repository.clone(),
+                            });
                             facts.remote = true;
                             facts.wrote = true;
                         }
@@ -645,6 +823,7 @@ pub fn facts_from_records(run_dir: &Path) -> RunFacts {
                         if let Some(number) = number {
                             facts.existing.push(WorkPull {
                                 number: *number,
+                                repository: repository.clone(),
                                 branch: branch.clone().filter(|branch| !branch.trim().is_empty()),
                             });
                         }
@@ -731,16 +910,25 @@ pub fn runs_of_agent(state_root: &Path, agent: &str) -> Vec<RunSummary> {
 
 /// Read one run's terminal record into a summary.
 fn summarise(run_id: &str, run_dir: &Path) -> RunSummary {
-    let (outcome, reason) = match transcript::terminal_record(run_dir) {
+    let (outcome, reason, ended_at) = match transcript::terminal_record(run_dir) {
         Some(Record::RunFinished {
-            outcome, reason, ..
-        }) => (RunOutcome::parse(&outcome), reason),
-        _ => (None, None),
+            ts,
+            outcome,
+            reason,
+            ..
+        }) => (
+            RunOutcome::parse(&outcome),
+            reason,
+            crate::time::parse_rfc3339(&ts)
+                .map(|millis| UNIX_EPOCH + Duration::from_millis(millis)),
+        ),
+        _ => (None, None, None),
     };
     RunSummary {
         run_id: run_id.to_owned(),
         outcome,
         reason,
+        ended_at,
         dir: run_dir.to_path_buf(),
     }
 }
@@ -853,9 +1041,11 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     let mut read: Option<(String, u64)> = None;
     // Each request keeps the branch its own tool result read, so several pushes and
     // pull requests in one run do not borrow the first (or newest) push's branch.
-    let mut pulls: Vec<(u64, Option<String>)> = Vec::new();
-    let mut existing: Vec<(u64, Option<String>)> = Vec::new();
-    let mut comments: Vec<u64> = Vec::new();
+    // The repository is part of the key: `#4` in one repository is not `#4` in
+    // another.
+    let mut pulls: Vec<(Option<String>, u64, Option<String>)> = Vec::new();
+    let mut existing: Vec<(Option<String>, u64, Option<String>)> = Vec::new();
+    let mut comments: Vec<(Option<String>, u64)> = Vec::new();
     for record in &file.records {
         match record {
             Record::ForgejoCall {
@@ -868,36 +1058,43 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
             }
             Record::ForgejoResult {
                 action: Some(action),
+                repository,
                 number: Some(number),
                 branch,
                 ..
-            } => match action.as_str() {
-                "opened" | "updated" => {
-                    pulls.retain(|(seen, _)| seen != number);
-                    pulls.push((
-                        *number,
-                        branch.clone().filter(|branch| !branch.trim().is_empty()),
-                    ));
+            } => {
+                let branch = branch.clone().filter(|branch| !branch.trim().is_empty());
+                let same = |pull: &(Option<String>, u64, Option<String>)| {
+                    pull.0.as_deref() == repository.as_deref() && pull.1 == *number
+                };
+                match action.as_str() {
+                    "opened" | "updated" => {
+                        pulls.retain(|pull| !same(pull));
+                        pulls.push((repository.clone(), *number, branch));
+                    }
+                    "already_open" => {
+                        existing.retain(|pull| !same(pull));
+                        existing.push((repository.clone(), *number, branch));
+                    }
+                    "commented" => {
+                        comments.retain(|comment| {
+                            comment.0.as_deref() == repository.as_deref() && comment.1 == *number
+                        });
+                        comments.push((repository.clone(), *number));
+                    }
+                    _ => {}
                 }
-                "already_open" => {
-                    existing.retain(|(seen, _)| seen != number);
-                    existing.push((
-                        *number,
-                        branch.clone().filter(|branch| !branch.trim().is_empty()),
-                    ));
-                }
-                "commented" => {
-                    comments.retain(|seen| seen != number);
-                    comments.push(*number);
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
     // A push with no comment or pull request is still work (review N5): the branch
     // is read before the early return, so the witness is never unreachable.
-    let branch = read_push_witness(run_dir)
+    let witness = read_push_witness(run_dir);
+    let push_repository = witness
+        .as_ref()
+        .and_then(|witness| witness.repository.clone());
+    let branch = witness
         .map(|witness| witness.branch)
         .filter(|branch| !branch.trim().is_empty());
     let local = read_local_work(run_dir).filter(|changes| !changes.is_empty());
@@ -912,35 +1109,42 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
             .collect();
     }
     // An already-open request is named only when this run pushed its branch or
-    // commented on it; otherwise it is not this run's work.
-    let matched_existing = existing.iter().rev().find(|(number, pull_branch)| {
-        (branch.is_some() && branch.as_deref() == pull_branch.as_deref())
-            || comments.contains(number)
-    });
+    // commented on it in the same repository; otherwise it is not this run's work.
+    let matched_existing = existing
+        .iter()
+        .rev()
+        .find(|(repository, number, pull_branch)| {
+            let push_matches = branch.is_some()
+                && branch.as_deref() == pull_branch.as_deref()
+                && same_work_repository(push_repository.as_deref(), repository.as_deref());
+            let comment_matches = comments.iter().any(|(comment_repository, comment_number)| {
+                comment_number == number
+                    && same_work_repository(comment_repository.as_deref(), repository.as_deref())
+            });
+            push_matches || comment_matches
+        });
     let pull = pulls.last().cloned().or_else(|| matched_existing.cloned());
     let mut lines = Vec::new();
     if let Some((_repository, number)) = read
-        && pull.as_ref().is_none_or(|(seen, _)| *seen != number)
+        && pull.as_ref().is_none_or(|(_, seen, _)| *seen != number)
     {
         lines.push(format!("issue #{number}"));
     }
-    if let Some((number, pull_branch)) = pull.as_ref() {
+    if let Some((repository, number, branch)) = pull.as_ref() {
         // The request's own result is the only witness for its branch. An older
         // record that did not carry one makes no branch claim: pairing it with the
         // run's single push witness is exactly the wrong-branch bug for a multi-PR
         // run, so there is no fallback to guess.
-        let shown = pull_branch
-            .as_deref()
-            .filter(|branch| !branch.trim().is_empty());
-        match shown {
-            Some(branch) => lines.push(format!("pull request #{number} from {branch}")),
-            None => lines.push(format!("pull request #{number}")),
-        }
+        lines.push(pull_work_line(
+            repository.as_deref(),
+            *number,
+            branch.as_deref(),
+        ));
     } else if let Some(branch) = branch.as_deref() {
-        lines.push(format!("branch {branch}"));
+        lines.push(push_work_line(push_repository.as_deref(), branch));
     }
-    if let Some(number) = comments.last() {
-        lines.push(format!("comment on #{number}"));
+    if let Some((repository, number)) = comments.last() {
+        lines.push(comment_work_line(repository.as_deref(), *number));
     }
     lines.truncate(3);
     lines
@@ -1249,8 +1453,8 @@ mod tests {
             lines,
             vec![
                 "issue #1".to_owned(),
-                "pull request #5 from fix/api-link".to_owned(),
-                "comment on #1".to_owned()
+                "pull request team/website#5 from fix/api-link".to_owned(),
+                "comment on team/website#1".to_owned()
             ]
         );
         assert!(
@@ -1263,12 +1467,14 @@ mod tests {
                 run_id: "run-1700000000001-0001".to_owned(),
                 outcome: Some(RunOutcome::Succeeded),
                 reason: None,
+                ended_at: None,
                 dir: idle.clone(),
             },
             RunSummary {
                 run_id: "run-1700000000002-0002".to_owned(),
                 outcome: Some(RunOutcome::Succeeded),
                 reason: None,
+                ended_at: None,
                 dir: work.clone(),
             },
         ];
@@ -1319,7 +1525,7 @@ mod tests {
         .expect("the witness");
         assert_eq!(
             work_summary(&run),
-            vec!["pull request #4 from fix/readme-separate".to_owned()]
+            vec!["pull request team/website#4 from fix/readme-separate".to_owned()]
         );
 
         // An older record without a branch result omits an unknown branch, and makes
@@ -1341,7 +1547,7 @@ mod tests {
             .expect("the legacy request");
         assert_eq!(
             work_summary(&legacy),
-            vec!["pull request #5".to_owned()],
+            vec!["pull request team/website#5".to_owned()],
             "a record with no branch made one up"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1377,7 +1583,7 @@ mod tests {
         .expect("the witness");
         assert_eq!(
             work_summary(&run),
-            vec!["pull request #4".to_owned()],
+            vec!["pull request team/website#4".to_owned()],
             "a legacy multi-PR record borrowed the single push witness"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1404,7 +1610,7 @@ mod tests {
         write_facts(&run, &RunFacts::default()).expect("an empty old facts record");
         assert_eq!(
             work_summary(&run),
-            vec!["comment on #12".to_owned()],
+            vec!["comment on team/workspace#12".to_owned()],
             "an empty facts record hid a recorded comment"
         );
         let _ = fs::remove_dir_all(&root);
@@ -1414,11 +1620,15 @@ mod tests {
     fn an_existing_request_is_named_only_for_its_own_push_or_comment() {
         let existing = WorkPull {
             number: 3,
+            repository: None,
             branch: Some("feature".to_owned()),
         };
         let unrelated = RunFacts {
             remote: true,
-            comments: vec![5],
+            comments: vec![WorkComment {
+                number: 5,
+                repository: None,
+            }],
             existing: vec![existing.clone()],
             ..RunFacts::default()
         };
@@ -1429,7 +1639,10 @@ mod tests {
         );
         let matching_comment = RunFacts {
             remote: true,
-            comments: vec![3],
+            comments: vec![WorkComment {
+                number: 3,
+                repository: None,
+            }],
             existing: vec![existing.clone()],
             ..RunFacts::default()
         };
@@ -1455,6 +1668,7 @@ mod tests {
             push: Some("other".to_owned()),
             existing: vec![WorkPull {
                 number: 3,
+                repository: None,
                 branch: Some("feature".to_owned()),
             }],
             ..RunFacts::default()
@@ -1463,6 +1677,42 @@ mod tests {
             other_push.work_lines(),
             vec!["branch other".to_owned()],
             "a different push named an unrelated request"
+        );
+        // Numbering is per repository: the same request number in another
+        // repository is not this run's request.
+        let other_repository = RunFacts {
+            remote: true,
+            push: Some("feature".to_owned()),
+            push_repository: Some("team/alpha".to_owned()),
+            existing: vec![WorkPull {
+                number: 4,
+                repository: Some("team/beta".to_owned()),
+                branch: Some("feature".to_owned()),
+            }],
+            ..RunFacts::default()
+        };
+        assert_eq!(
+            other_repository.work_lines(),
+            vec!["branch team/alpha#feature".to_owned()],
+            "a push borrowed a same-numbered request from another repository"
+        );
+        let other_comment = RunFacts {
+            remote: true,
+            comments: vec![WorkComment {
+                number: 4,
+                repository: Some("team/alpha".to_owned()),
+            }],
+            existing: vec![WorkPull {
+                number: 4,
+                repository: Some("team/beta".to_owned()),
+                branch: Some("feature".to_owned()),
+            }],
+            ..RunFacts::default()
+        };
+        assert_eq!(
+            other_comment.work_lines(),
+            vec!["comment on team/alpha#4".to_owned()],
+            "a comment borrowed a same-numbered request from another repository"
         );
     }
 
@@ -1473,6 +1723,7 @@ mod tests {
         fs::create_dir_all(&run).expect("a run directory");
         let existing = WorkPull {
             number: 3,
+            repository: None,
             branch: Some("feature".to_owned()),
         };
         let local = crate::workspace::WorkspaceChanges {
@@ -1510,6 +1761,35 @@ mod tests {
     }
 
     #[test]
+    fn old_facts_comments_and_requests_still_read_without_a_repository() {
+        let facts: RunFacts =
+            serde_json::from_str(r#"{"comments":[12],"pulls":[{"number":4,"branch":"fix/typo"}]}"#)
+                .expect("an older facts record");
+        assert_eq!(
+            facts.comments,
+            vec![WorkComment {
+                number: 12,
+                repository: None,
+            }]
+        );
+        assert_eq!(
+            facts.pulls,
+            vec![WorkPull {
+                number: 4,
+                repository: None,
+                branch: Some("fix/typo".to_owned()),
+            }]
+        );
+        assert_eq!(
+            facts.work_lines(),
+            vec![
+                "pull request #4 from fix/typo".to_owned(),
+                "comment on #12".to_owned()
+            ]
+        );
+    }
+
+    #[test]
     fn a_change_left_only_in_the_workspace_names_the_local_work() {
         // A local-only run is warning work, and the work line names the files it
         // changed instead of falling back to an older run's branch.
@@ -1532,6 +1812,7 @@ mod tests {
                 run_id: "run-1700000000006-0001".to_owned(),
                 outcome: Some(RunOutcome::Warned),
                 reason: Some("workspace changed: README.md".to_owned()),
+                ended_at: None,
                 dir: run.clone(),
             }])
             .iter()
@@ -1571,7 +1852,7 @@ mod tests {
         .expect("the witness");
         assert_eq!(
             work_summary(&run),
-            vec!["pull request #4 from fix/readme-typo".to_owned()]
+            vec!["pull request team/workspace#4 from fix/readme-typo".to_owned()]
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -1594,7 +1875,10 @@ mod tests {
             Some("main"),
         )
         .expect("the witness");
-        assert_eq!(work_summary(&run), vec!["branch fix/only-push".to_owned()]);
+        assert_eq!(
+            work_summary(&run),
+            vec!["branch team/website#fix/only-push".to_owned()]
+        );
 
         let empty = root.join("run-1700000000003-0002");
         fs::create_dir_all(&empty).expect("an empty run");
@@ -2221,6 +2505,8 @@ pub struct TerminalEnding {
     pub outcome: RunOutcome,
     /// The reason sentence, when the run wrote one.
     pub reason: Option<String>,
+    /// When the run wrote its terminal record.
+    pub at: Option<SystemTime>,
 }
 
 /// Read the run's terminal ending without exposing record construction to callers.
@@ -2228,7 +2514,10 @@ pub fn terminal_ending(run_dir: &Path) -> Result<Option<TerminalEnding>, String>
     let record = transcript::terminal_record_checked(run_dir)
         .map_err(|error| format!("the run's ending cannot be read: {error}"))?;
     let Some(transcript::Record::RunFinished {
-        outcome, reason, ..
+        ts,
+        outcome,
+        reason,
+        ..
     }) = record
     else {
         return Ok(None);
@@ -2237,6 +2526,8 @@ pub fn terminal_ending(run_dir: &Path) -> Result<Option<TerminalEnding>, String>
         outcome: RunOutcome::parse(&outcome)
             .ok_or_else(|| format!("the run's ending `{outcome}` is unknown"))?,
         reason,
+        at: crate::time::parse_rfc3339(&ts)
+            .map(|millis| UNIX_EPOCH + Duration::from_millis(millis)),
     }))
 }
 
