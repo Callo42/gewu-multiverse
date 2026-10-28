@@ -476,6 +476,7 @@ pub fn forgejo_actions(run_dir: &Path) -> Vec<ForgejoAction> {
                     },
                     "opened" => format!("opened {number}"),
                     "updated" => format!("updated {number}"),
+                    "already_open" => format!("pull request {number} already open"),
                     other => format!("{other} {number}"),
                 };
                 Some(ForgejoAction {
@@ -558,7 +559,7 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
                 branch,
                 ..
             } => match action.as_str() {
-                "opened" | "updated" => {
+                "opened" | "updated" | "already_open" => {
                     pulls.retain(|(seen, _)| seen != number);
                     pulls.push((
                         *number,
@@ -579,8 +580,15 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     let branch = read_push_witness(run_dir)
         .map(|witness| witness.branch)
         .filter(|branch| !branch.trim().is_empty());
+    let local = read_local_work(run_dir).filter(|changes| !changes.is_empty());
     if pulls.is_empty() && comments.is_empty() && branch.is_none() {
-        return Vec::new();
+        // No remote work: a change left only in the workspace is the run's work, and
+        // it is named here so the line never falls back to an older run's branch.
+        return local
+            .as_ref()
+            .and_then(crate::workspace::WorkspaceChanges::work_line)
+            .into_iter()
+            .collect();
     }
     let mut lines = Vec::new();
     if let Some((_repository, number)) = read
@@ -653,6 +661,28 @@ pub fn says_no_assigned_work(run_dir: &Path, login: &str) -> bool {
 /// Read a run's push witness, when one was written.
 pub fn read_push_witness(run_dir: &Path) -> Option<PushWitness> {
     let text = fs::read_to_string(run_dir.join(PUSH_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The file that records the local work a run left in its workspace.
+///
+/// It is written from the workspace's own before/after state, never from a command's
+/// text: a file the run edited, created or deleted, or a commit it made without
+/// pushing. A run that pushed has a remote fact and does not need this row.
+pub const LOCAL_FILE: &str = "local.json";
+
+/// Write the local work a run left, `0600` like every record.
+pub fn write_local_work(
+    run_dir: &Path,
+    changes: &crate::workspace::WorkspaceChanges,
+) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(changes).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(LOCAL_FILE), text.as_bytes())
+}
+
+/// Read the local work a run left, when the record exists and is readable.
+pub fn read_local_work(run_dir: &Path) -> Option<crate::workspace::WorkspaceChanges> {
+    let text = fs::read_to_string(run_dir.join(LOCAL_FILE)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -1021,6 +1051,72 @@ mod tests {
             work_summary(&run),
             vec!["pull request #4".to_owned()],
             "a legacy multi-PR record borrowed the single push witness"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_change_left_only_in_the_workspace_names_the_local_work() {
+        // A local-only run is warning work, and the work line names the files it
+        // changed instead of falling back to an older run's branch.
+        let root = scratch_root("work-local");
+        let run = root.join("run-1700000000006-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        transcript::Transcript::open(&run).expect("the transcript");
+        let changes = crate::workspace::WorkspaceChanges {
+            files: vec!["README.md".to_owned(), "NOTES-local.md".to_owned()],
+            committed: false,
+        };
+        write_local_work(&run, &changes).expect("the local record");
+        assert_eq!(
+            work_summary(&run),
+            vec!["local change README.md, NOTES-local.md".to_owned()]
+        );
+        assert!(
+            latest_work(&[RunSummary {
+                run_id: "run-1700000000006-0001".to_owned(),
+                outcome: Some(RunOutcome::Warned),
+                reason: Some("workspace changed: README.md".to_owned()),
+                dir: run.clone(),
+            }])
+            .iter()
+            .any(|line| line.contains("README.md"))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_existing_own_pull_request_is_named_as_the_work_it_is() {
+        // The duplicate-open answer is a successful no-op carrying the request's
+        // number and branch; the run that pushed before it must name the request.
+        let root = scratch_root("work-existing-pr");
+        let run = root.join("run-1700000000007-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        let mut transcript = transcript::Transcript::open(&run).expect("transcript");
+        transcript
+            .append(&Record::forgejo_result_with_branch(
+                0,
+                1,
+                crate::forgejo_tools::OPEN_PULL_REQUEST,
+                Some("team/workspace"),
+                Some(4),
+                "ok",
+                Some("http://127.0.0.1:3000/team/workspace/pulls/4"),
+                Some("already_open"),
+                Some("fix/readme-typo"),
+            ))
+            .expect("the existing request");
+        write_push_witness_at(
+            &run,
+            "fix/readme-typo",
+            "refs/remotes/origin/fix/readme-typo",
+            Some("team/workspace"),
+            Some("main"),
+        )
+        .expect("the witness");
+        assert_eq!(
+            work_summary(&run),
+            vec!["pull request #4 from fix/readme-typo".to_owned()]
         );
         let _ = fs::remove_dir_all(&root);
     }

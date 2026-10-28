@@ -24,6 +24,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 use crate::credentials;
 
 /// The environment variable naming the credentials file, for the askpass mode.
@@ -572,6 +574,160 @@ pub fn push(repository: &Path, credential: &GitCredential<'_>) -> Result<(), Wor
         Some(credential),
     )?;
     Ok(())
+}
+
+/// What a run changed in its workspace, and whether it made a local commit.
+///
+/// The snapshot keeps worktree files plus the few `.git` files that prove a commit:
+/// `HEAD`, the local branch refs and `HEAD`'s reflog. Objects, the index and
+/// remote-tracking refs are deliberately absent, so a fetch or a push is never
+/// mistaken for local work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceChanges {
+    /// Worktree files that differ from the before-picture, sorted.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// A local commit was made (a local branch ref or `HEAD`'s reflog changed).
+    #[serde(default)]
+    pub committed: bool,
+}
+
+impl WorkspaceChanges {
+    /// Whether the run left anything local.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && !self.committed
+    }
+
+    /// The work row this change is shown as, or `None` when nothing changed.
+    ///
+    /// The row names the files rather than saying only "workspace changed": a
+    /// person needs to know which local work the warning is about.
+    pub fn work_line(&self) -> Option<String> {
+        if !self.files.is_empty() {
+            let shown: Vec<&str> = self.files.iter().take(3).map(String::as_str).collect();
+            let mut line = format!("local change {}", shown.join(", "));
+            let rest = self.files.len().saturating_sub(shown.len());
+            if rest > 0 {
+                line.push_str(&format!(" +{rest}"));
+            }
+            return Some(line);
+        }
+        self.committed.then(|| "local commit".to_owned())
+    }
+
+    /// The short reason sentence for a local-only run, naming the work.
+    pub fn reason(&self) -> Option<String> {
+        if !self.files.is_empty() {
+            let shown: Vec<&str> = self.files.iter().take(3).map(String::as_str).collect();
+            let mut named = shown.join(", ");
+            let rest = self.files.len().saturating_sub(shown.len());
+            if rest > 0 {
+                named.push_str(&format!(" and {rest} more"));
+            }
+            return Some(format!(
+                "workspace changed: {named}; the change is local and was not pushed"
+            ));
+        }
+        self.committed.then(|| {
+            "workspace changed: a local commit; the commit is local and was not pushed".to_owned()
+        })
+    }
+}
+
+/// The before-picture of an agent's workspace.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceSnapshot {
+    files: BTreeMap<PathBuf, (u64, u64)>,
+}
+
+/// Take the before-picture of an agent's workspace.
+///
+/// Worktree files are compared by length and modified time. Inside `.git` only the
+/// files that prove a local commit are kept, so walking a large object store is
+/// avoided and a fetch or push cannot look like local work.
+pub fn snapshot_workspace(root: &Path) -> WorkspaceSnapshot {
+    fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, (u64, u64)>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                let inside_git = relative
+                    .components()
+                    .any(|component| component.as_os_str() == ".git");
+                if inside_git {
+                    // Only the ref/log spine can prove a local commit. Objects and
+                    // the index are large and irrelevant, and skipping them keeps the
+                    // before/after snapshot cheap on a big repository.
+                    let name = entry.file_name();
+                    if !matches!(
+                        name.to_string_lossy().as_ref(),
+                        ".git" | "refs" | "heads" | "logs" | "remotes"
+                    ) {
+                        continue;
+                    }
+                }
+                walk(root, &path, out);
+            } else if kind.is_file() {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                let inside_git = relative
+                    .components()
+                    .any(|component| component.as_os_str() == ".git");
+                if inside_git && !git_fact(relative) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos() as u64)
+                    .unwrap_or(0);
+                out.insert(relative.to_path_buf(), (meta.len(), modified));
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(root, root, &mut files);
+    WorkspaceSnapshot { files }
+}
+
+/// Whether a path inside a `.git` directory is one of the commit facts.
+fn git_fact(relative: &Path) -> bool {
+    let text = relative.to_string_lossy().replace('\\', "/");
+    let Some((_before, after)) = text.split_once(".git/") else {
+        return false;
+    };
+    after == "HEAD" || after == "logs/HEAD" || after.starts_with("refs/heads/")
+}
+
+/// The changes since a before-picture, named for the run's records and screens.
+pub fn changes_since(before: &WorkspaceSnapshot, root: &Path) -> WorkspaceChanges {
+    let after = snapshot_workspace(root);
+    let mut changes = WorkspaceChanges::default();
+    let mut paths: Vec<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        if before.files.get(path) == after.files.get(path) {
+            continue;
+        }
+        let relative = path.to_string_lossy().replace('\\', "/");
+        if relative.split('/').any(|component| component == ".git") {
+            if git_fact(path) {
+                changes.committed = true;
+            }
+            continue;
+        }
+        changes.files.push(relative);
+    }
+    changes
 }
 
 /// A read-only snapshot of the remote-tracking refs a run can move.

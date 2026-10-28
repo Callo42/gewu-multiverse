@@ -617,7 +617,7 @@ fn another_accounts_open_request_is_never_updated() {
 }
 
 #[test]
-fn a_duplicate_open_is_refused_and_names_the_existing_request() {
+fn a_duplicate_open_keeps_the_refusal_and_names_the_existing_request() {
     let root = scratch("duplicate");
     write_credentials(&root.join("credentials.toml"));
     let _ = clone_fixture(&root);
@@ -647,11 +647,121 @@ fn a_duplicate_open_is_refused_and_names_the_existing_request() {
     );
     let transcript = transcript_text(&run_dir);
     assert!(
-        transcript.contains("already has an open pull request")
-            && transcript.contains("lab/analysis-code#3"),
+        transcript.contains("is already open") && transcript.contains("lab/analysis-code#3"),
         "{transcript}"
     );
-    assert!(gewu_multiverse::run::forgejo_actions(&run_dir).is_empty());
+    let actions = gewu_multiverse::run::forgejo_actions(&run_dir);
+    assert!(
+        actions.iter().any(
+            |action| action.sentence.contains("#3") && action.sentence.contains("already open")
+        ),
+        "the existing request is not named: {actions:?}"
+    );
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let outcome = match terminal {
+        Record::RunFinished { outcome, .. } => outcome,
+        other => panic!("no terminal record: {other:?}"),
+    };
+    assert_eq!(
+        outcome, "refused",
+        "with no other work, the agent's already-open request keeps the refusal mark"
+    );
+}
+
+#[test]
+fn a_push_then_an_existing_open_request_is_a_success_that_names_the_request() {
+    // Walk A F3: the run pushed a corrective commit, then opening the pull request
+    // found the agent's own request already open. The push is real work; the mark
+    // must stay a success and the work line must name the request, not only the
+    // branch.
+    let root = scratch("push-existing-pr");
+    write_credentials(&root.join("credentials.toml"));
+    let _ = clone_fixture(&root);
+    let model = Stub::start(vec![
+        tool_reply(
+            "c1",
+            "shell",
+            &serde_json::json!({
+                "command": "cd analysis-code && git commit --allow-empty -q -m 'second' && git push -q origin feature"
+            })
+            .to_string(),
+        ),
+        tool_reply(
+            "c2",
+            "forgejo_open_pull_request",
+            &serde_json::json!({"repository": REPO, "title": "Another one"}).to_string(),
+        ),
+        final_reply("Opened the pull request for the README wording fix."),
+    ]);
+    let forgejo = Stub::start_routed(standard_routes(serde_json::json!([pull_json(
+        3,
+        "gewu-scribe"
+    )])));
+    let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+    let paths = layout.agent("scribe").expect("the agent path");
+    let run_dir = write_plan(&root, &paths, &model, "run-push-existing-1", 6);
+    write_context(&run_dir, &forgejo);
+    assert!(run_binary(&run_dir).success());
+
+    assert!(
+        run_dir.join(gewu_multiverse::run::PUSH_FILE).is_file(),
+        "the push witness is missing"
+    );
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let outcome = match terminal {
+        Record::RunFinished { outcome, .. } => outcome,
+        other => panic!("no terminal record: {other:?}"),
+    };
+    assert_eq!(
+        outcome, "succeeded",
+        "a push plus the agent's own open request is not a refusal"
+    );
+    assert_eq!(
+        gewu_multiverse::run::work_summary(&run_dir),
+        vec!["pull request #3 from feature".to_owned()],
+        "the work line did not name the pull request"
+    );
+}
+
+#[test]
+fn a_comment_survives_a_later_refused_update_as_success() {
+    // Real remote work outranks a later refused write: the comment is on Forgejo,
+    // so the run is a success and its work line names the comment, not a refusal.
+    let root = scratch("comment-then-refused");
+    write_credentials(&root.join("credentials.toml"));
+    let _ = clone_fixture(&root);
+    let model = Stub::start(vec![
+        tool_reply(
+            "c1",
+            "forgejo_comment",
+            &serde_json::json!({"repository": REPO, "number": 12, "body": "a comment"}).to_string(),
+        ),
+        tool_reply(
+            "c2",
+            "forgejo_update_pull_request",
+            &serde_json::json!({"repository": REPO, "number": 3, "title": "Not now"}).to_string(),
+        ),
+        final_reply("I could not update the pull request."),
+    ]);
+    let forgejo = Stub::start_routed(standard_routes(serde_json::json!([])));
+    let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+    let paths = layout.agent("scribe").expect("the agent path");
+    let run_dir = write_plan(&root, &paths, &model, "run-comment-refused-1", 6);
+    write_context(&run_dir, &forgejo);
+    assert!(run_binary(&run_dir).success());
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let outcome = match terminal {
+        Record::RunFinished { outcome, .. } => outcome,
+        other => panic!("no terminal record: {other:?}"),
+    };
+    assert_eq!(
+        outcome, "succeeded",
+        "the recorded comment is real work even though the update was refused"
+    );
+    assert_eq!(
+        gewu_multiverse::run::work_summary(&run_dir),
+        vec!["comment on #12".to_owned()]
+    );
 }
 
 #[test]

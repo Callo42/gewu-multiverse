@@ -407,10 +407,53 @@ fn a_successful_write_listing_a_file_named_refused_is_still_a_tick() {
     ]);
     endpoint(&run_dir, &model.url());
     let end = agent_run::execute(&run_dir);
-    let (outcome, _reason) = terminal(&run_dir);
+    let (outcome, reason) = terminal(&run_dir);
+    let local = gewu_multiverse::run::read_local_work(&run_dir).expect("the local work record");
     let _ = fs::remove_dir_all(&root);
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded", "a filename is not a refusal");
+    assert_eq!(
+        end.ending,
+        RunEnding::Warned,
+        "a change left only in the workspace is a warning: {end:?}"
+    );
+    assert_eq!(outcome, "warned", "a filename is not a refusal");
+    assert!(local.files.contains(&"refused".to_owned()), "{local:?}");
+    assert!(reason.contains("refused"), "{reason}");
+    assert!(reason.contains("README.md"), "{reason}");
+}
+
+#[test]
+fn a_local_only_change_is_warned_and_names_the_file() {
+    // Walk B F1: the run edited README.md and did not commit or push it. The mark
+    // must be a warning, and the work line must name the local file rather than
+    // falling back to an older run's branch.
+    let root = scratch_root("local-only");
+    let run_dir = prepare(&root, "Edit the README and report.\n");
+    let workspace = root.join("agents").join("scribe").join("workspace");
+    fs::write(workspace.join("README.md"), "hello\n").expect("a README");
+    let model = Stub::start(vec![
+        StubReply::json(tool_call("printf 'local edit\n' >> README.md")),
+        StubReply::json(final_reply(
+            "I edited README.md locally but did not commit or push it.",
+        )),
+    ]);
+    endpoint(&run_dir, &model.url());
+    let end = agent_run::execute(&run_dir);
+    let (outcome, reason) = terminal(&run_dir);
+    let local = gewu_multiverse::run::read_local_work(&run_dir).expect("the local record");
+    let work = gewu_multiverse::run::work_summary(&run_dir);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        end.ending,
+        RunEnding::Warned,
+        "a local-only change is a warning: {end:?}"
+    );
+    assert_eq!(outcome, "warned");
+    assert!(reason.contains("README.md"), "{reason}");
+    assert!(local.files.contains(&"README.md".to_owned()), "{local:?}");
+    assert!(
+        work.iter().any(|line| line.contains("README.md")),
+        "the work line did not name the local file: {work:?}"
+    );
 }
 
 #[test]

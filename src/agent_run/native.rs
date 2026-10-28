@@ -405,6 +405,8 @@ struct NativeState {
     refused_write: Option<String>,
     wrote: bool,
     workspace_wrote: bool,
+    /// The local work the workspace comparison found, when it found any.
+    local_work: crate::workspace::WorkspaceChanges,
     pr_ok: bool,
     pr_updated: bool,
     comment_ok: bool,
@@ -431,6 +433,7 @@ impl NativeState {
             refused_write: None,
             wrote: false,
             workspace_wrote: false,
+            local_work: crate::workspace::WorkspaceChanges::default(),
             pr_ok: false,
             pr_updated: false,
             comment_ok: false,
@@ -507,6 +510,26 @@ fn requires_confirmed_tool(requested: RequestedWork) -> bool {
     )
 }
 
+/// The local work's own sentence, including the boolean-only fallback older tests
+/// and records may carry.
+fn local_reason(state: &NativeState) -> Option<String> {
+    state.local_work.reason().or_else(|| {
+        state
+            .workspace_wrote
+            .then(|| "workspace changed: a local change was recorded".to_owned())
+    })
+}
+
+/// Whether the run recorded a failure cause worth putting beside its local work.
+fn has_failure_cause(state: &NativeState) -> bool {
+    state.outcome.terminal_failure_reason().is_some()
+        || state.outcome.first_tool_failure().is_some()
+        || state.first_failure.is_some()
+        || state.refused_write.is_some()
+        || state.failed_call.is_some()
+        || state.uncertain_write
+}
+
 fn run_reason(
     ending: RunEnding,
     summary: &str,
@@ -520,17 +543,17 @@ fn run_reason(
         } else {
             summary.to_owned()
         }),
-        _ if observed_work(state) => {
-            // The record must never deny work the product itself observed. A
-            // blocked write can still make the run a warning/refusal, but its row
-            // names the work first and the remaining cause after it.
-            Some(format!(
-                "recorded work: {}; {}",
-                observed_work_words(state),
-                non_success_reason(state, requested)
-            ))
+        RunEnding::Warned => {
+            let local = local_reason(state);
+            match local {
+                Some(local) if has_failure_cause(state) => {
+                    Some(format!("{local}; {}", non_success_reason(state, requested)))
+                }
+                Some(local) => Some(local),
+                None => Some(non_success_reason(state, requested)),
+            }
         }
-        _ => Some(non_success_reason(state, requested)),
+        RunEnding::Refused => Some(non_success_reason(state, requested)),
     }
 }
 
@@ -623,7 +646,7 @@ pub(super) fn run(
         }
     }
 
-    let workspace_before = workspace_fingerprint(&plan.workspace);
+    let workspace_before = crate::workspace::snapshot_workspace(&plan.workspace);
     let (mut argv, envs, config_note) = match build_launch(plan, native, program, protocol, &files)
     {
         Ok(launch) => launch,
@@ -872,9 +895,12 @@ pub(super) fn run(
         state.pushed = true;
     }
     apply_ledger(&files, transcript, &mut state);
-    if workspace_fingerprint(&plan.workspace) != workspace_before {
+    let local = crate::workspace::changes_since(&workspace_before, &plan.workspace);
+    if !local.is_empty() {
+        let _ = crate::run::write_local_work(&shell.run_dir, &local);
         state.wrote = true;
         state.workspace_wrote = true;
+        state.local_work = local;
     }
 
     let exit = status.expect("the child exited");
@@ -959,29 +985,34 @@ pub(super) fn run(
         .as_deref()
         .map(|text| model::whole_message(text, 4000))
         .unwrap_or_default();
+    let facts = super::RunFacts {
+        remote: state.pr_ok || state.pushed || state.comment_ok,
+        read: state.tool_ok || state.forgejo_read_ok,
+        local: state.local_work.clone(),
+    };
     let evidence = RunEvidence {
         failed_call: state.failed_call.clone(),
         refused_write: state.refused_write.clone(),
         wrote: state.wrote,
         checked_empty: state.checked_empty,
+        remote: facts.remote,
+        read: facts.read && !facts.has_local(),
         ..RunEvidence::default()
     };
     let instruction = String::from_utf8_lossy(instruction);
     let requested = requested_work(&instruction, &plan.steps);
-    let base = crate::agent_run::ending_for_instruction(&instruction, &summary, &evidence);
-    if state.uncertain_write {
-        return RunEnd {
-            exit_code: 0,
-            reason: Some(non_success_reason(&state, requested)),
-            ending: RunEnding::Warned,
-        };
-    }
+    let base = if state.uncertain_write {
+        RunEnding::Warned
+    } else {
+        crate::agent_run::ending_for_instruction(&instruction, &summary, &evidence)
+    };
     let ending = decide_native_ending(base, requested, &state);
     let reason = run_reason(ending, &summary, &state, requested);
     RunEnd {
         exit_code: 0,
         reason,
         ending,
+        facts,
     }
 }
 
@@ -1163,98 +1194,25 @@ fn observed_work(state: &NativeState) -> bool {
     state.wrote || state.comment_ok || state.pr_ok || state.pushed || state.workspace_wrote
 }
 
-/// The work facts in the card's own short words, for a reason that must not hide
-/// them behind a later warning.
-fn observed_work_words(state: &NativeState) -> String {
-    let mut words = Vec::new();
-    if state.pr_ok {
-        words.push("pull request opened");
-    }
-    if state.pushed {
-        words.push("branch pushed");
-    }
-    if state.comment_ok {
-        words.push("comment written");
-    }
-    if words.is_empty() && state.workspace_wrote {
-        words.push("workspace changed");
-    }
-    if words.is_empty() {
-        words.push("work recorded");
-    }
-    words.join(", ")
-}
-
 fn decide_native_ending(
     base: RunEnding,
-    requested: RequestedWork,
+    _requested: RequestedWork,
     state: &NativeState,
 ) -> RunEnding {
-    // Verified remote work outranks prose and a failed command. A run that opened a
-    // pull request or pushed and commented did work even if it ran a failing test
-    // first, reused a branch left by an interrupted run, or ended with a sentence
-    // that claims failure. A local-only edit or commit is **not** enough: a failed
-    // push or test must stay a warning, and the reason names the local work. A
-    // blocked write is still a refusal: the work is named in its reason, but the
-    // refusal is not hidden.
-    let verified_remote_work = state.pr_ok || state.pushed || state.comment_ok;
-    if verified_remote_work && state.refused_write.is_none() {
-        return RunEnding::Succeeded;
+    // The same rule as every other run: the mark comes from the facts the run
+    // recorded, not from the instruction's prose or from one failing tool call.
+    let mut local = state.local_work.clone();
+    if state.workspace_wrote && local.is_empty() {
+        // Older callers/tests set only the boolean. A changed workspace is still a
+        // local fact even when the paths were not carried.
+        local.committed = true;
     }
-    match base {
-        RunEnding::Succeeded => {
-            let matched = match requested {
-                RequestedWork::PullRequest => state.pr_ok && state.pushed,
-                RequestedWork::PullRequestUpdate => state.pr_ok && state.pr_updated,
-                RequestedWork::Comment => state.comment_ok,
-                RequestedWork::UnsupportedForgejoWrite => false,
-                RequestedWork::GenericWrite => state.workspace_wrote || state.pushed,
-                RequestedWork::Push => state.pushed,
-                RequestedWork::ReadOnly => state.tool_ok,
-                RequestedWork::ForgejoRead => state.forgejo_read_ok,
-                RequestedWork::Ambiguous => false,
-            };
-            if matched {
-                RunEnding::Succeeded
-            } else {
-                RunEnding::Warned
-            }
-        }
-        other => other,
-    }
-}
-
-/// A cheap before/after witness of actual workspace changes. It covers files the
-/// native program itself created, edited or committed; arbitrary shell success with
-/// no filesystem effect is not counted as a write.
-fn workspace_fingerprint(root: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
-    fn walk(root: &Path, path: &Path, out: &mut std::collections::BTreeMap<PathBuf, (u64, u64)>) {
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() {
-                walk(root, &path, out);
-            } else if kind.is_file() {
-                let Ok(meta) = entry.metadata() else { continue };
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos() as u64)
-                    .unwrap_or(0);
-                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-                out.insert(relative, (meta.len(), modified));
-            }
-        }
-    }
-    let mut out = std::collections::BTreeMap::new();
-    walk(root, root, &mut out);
-    out
+    let facts = super::RunFacts {
+        remote: state.pr_ok || state.pushed || state.comment_ok,
+        read: state.tool_ok || state.forgejo_read_ok,
+        local,
+    };
+    super::decide_ending(base, &facts)
 }
 
 /// Prepare all private native files for one harness.
@@ -1806,15 +1764,21 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
         let ok = record.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let outcome = record.get("outcome").and_then(Value::as_str).unwrap_or("");
         let action = record.get("action").and_then(Value::as_str);
-        let _ = transcript.append(&Record::forgejo_result(
+        let url = record.get("url").and_then(Value::as_str);
+        let branch = record.get("branch").and_then(Value::as_str);
+        // The ledger now carries the reply's own number, URL and branch. Older
+        // ledgers that only carried the call's arguments leave them absent, and the
+        // work line then makes no claim it cannot prove.
+        let _ = transcript.append(&Record::forgejo_result_with_branch(
             0,
             index,
             tool,
             repository,
             number,
             if ok { "ok" } else { outcome },
-            None,
+            url,
             action,
+            branch,
         ));
         if ok
             && (tool.ends_with(crate::forgejo_tools::LIST_ASSIGNED_ISSUES)
@@ -1833,7 +1797,12 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
             state.checked_empty = true;
         }
         if crate::forgejo_tools::is_write_tool(tool) {
-            if ok {
+            if ok && action == Some("already_open") {
+                // The agent's own request is already open. The transcript names it
+                // for the work block, but this run did not open or update it; with
+                // no other work it stays a refused-write mark.
+                state.refused_write = Some(format!("{tool}: {outcome}"));
+            } else if ok {
                 state.wrote = true;
                 if tool.ends_with(crate::forgejo_tools::COMMENT) {
                     state.comment_ok = true;
@@ -2133,19 +2102,22 @@ mod native_proof_tests {
             refused_write: Some("forgejo_update_pull_request: no open pull request".to_owned()),
             ..NativeState::default()
         };
-        let reason = run_reason(
+        // The comment is real remote work, so the failed update cannot make the run
+        // a refusal; the mark is a tick and the work block names the comment.
+        let ending = decide_native_ending(
             RunEnding::Refused,
+            RequestedWork::PullRequestUpdate,
+            &blocked,
+        );
+        assert_eq!(ending, RunEnding::Succeeded);
+        let reason = run_reason(
+            ending,
             "I could not update the pull request",
             &blocked,
             RequestedWork::PullRequestUpdate,
         )
         .expect("reason");
-        assert!(reason.contains("comment written"), "{reason}");
-        assert!(reason.contains("no open pull request"), "{reason}");
-        assert!(
-            !reason.contains("no matching tool or work fact"),
-            "{reason}"
-        );
+        assert_eq!(reason, "I could not update the pull request");
     }
 
     #[test]
@@ -2170,10 +2142,6 @@ mod native_proof_tests {
         )
         .expect("reason");
         assert!(local_reason.contains("workspace changed"), "{local_reason}");
-        assert!(
-            local_reason.contains("the requested remote work was not verified"),
-            "{local_reason}"
-        );
         assert!(
             !local_reason.contains("no tool call or workspace change"),
             "{local_reason}"
@@ -2270,8 +2238,8 @@ mod native_proof_tests {
         let no_work = NativeState::default();
         assert_eq!(
             decide_native_ending(RunEnding::Succeeded, close, &no_work),
-            RunEnding::Warned,
-            "a run with no observed work was reported as success"
+            RunEnding::Succeeded,
+            "with no recorded fact the run's own clean finish stands"
         );
     }
 
@@ -2287,7 +2255,8 @@ mod native_proof_tests {
                 RequestedWork::ForgejoRead,
                 &native_only
             ),
-            RunEnding::Warned
+            RunEnding::NoWork,
+            "a successful read with no write is no work"
         );
         let ledger = NativeState {
             forgejo_read_ok: true,
@@ -2295,8 +2264,177 @@ mod native_proof_tests {
         };
         assert_eq!(
             decide_native_ending(RunEnding::Succeeded, RequestedWork::ForgejoRead, &ledger),
+            RunEnding::NoWork,
+            "a successful Forgejo read with no write is no work"
+        );
+    }
+
+    #[test]
+    fn r8_a_ledger_existing_request_is_named_but_is_not_this_runs_write() {
+        // Walk A F3: the agent's own request is already open. The work block names
+        // it, but the fact alone is not a write this run made. With no push or
+        // comment the refused-write mark stands; a push in the same run outranks it.
+        let root = crate::test_support::scratch_root("ledger-existing-pr");
+        let run_dir = root.join("run-1700000000008-0001");
+        std::fs::create_dir_all(&run_dir).expect("the run directory");
+        let state = root.join("mcp-state");
+        std::fs::create_dir_all(&state).expect("the MCP state");
+        let line = serde_json::json!({
+            "tool": crate::forgejo_tools::OPEN_PULL_REQUEST,
+            "repository": "team/workspace",
+            "number": 4,
+            "ok": true,
+            "outcome": "the pull request is already open",
+            "action": "already_open",
+            "url": "http://127.0.0.1:3000/team/workspace/pulls/4",
+            "branch": "fix/readme-typo",
+            "accepted": false,
+        })
+        .to_string();
+        std::fs::write(state.join("calls.jsonl"), format!("{line}\n")).expect("the ledger");
+        let files = NativeFiles {
+            root: root.clone(),
+            home: root.join("home"),
+            tmp: root.join("tmp"),
+            config: root.join("config"),
+            key: root.join("model.key"),
+            key_helper: root.join("helper"),
+            program: root.join("program"),
+            install_root: root.join("install"),
+            skills: Vec::new(),
+            mcp_state: Some(state),
+            mcp_socket: None,
+        };
+        let mut transcript = Transcript::open(&run_dir).expect("the transcript");
+        let mut state = NativeState::default();
+        apply_ledger(&files, &mut transcript, &mut state);
+        assert!(
+            state.refused_write.is_some(),
+            "the no-op was called a write"
+        );
+        assert!(!state.pr_ok, "the no-op was called remote work");
+        assert_eq!(
+            crate::run::work_summary(&run_dir),
+            vec!["pull request #4 from fix/readme-typo".to_owned()]
+        );
+        // A verified push in the same run is real remote work and outranks it.
+        let pushed = NativeState {
+            pushed: true,
+            refused_write: state.refused_write.clone(),
+            ..NativeState::default()
+        };
+        assert_eq!(
+            decide_native_ending(RunEnding::Refused, RequestedWork::PullRequest, &pushed),
             RunEnding::Succeeded
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn r8_a_read_only_check_is_no_work_and_keeps_its_own_sentence() {
+        // Walk B F2: the run listed and read its issue, wrote nothing, and said
+        // `no work — ...`. The instruction's change word must not turn it into a
+        // command failure; the fact that it only read makes it no work.
+        let state = NativeState {
+            forgejo_read_ok: true,
+            ..NativeState::default()
+        };
+        let summary = "no work — I read issue #1 and nothing needed changing.";
+        let base = crate::agent_run::ending_for_instruction(
+            "Read the open issues and change what they ask. Say if nothing is needed.",
+            summary,
+            &RunEvidence {
+                read: true,
+                ..RunEvidence::default()
+            },
+        );
+        assert_eq!(
+            decide_native_ending(base, RequestedWork::GenericWrite, &state),
+            RunEnding::NoWork
+        );
+        assert_eq!(
+            run_reason(
+                RunEnding::NoWork,
+                summary,
+                &state,
+                RequestedWork::GenericWrite
+            )
+            .as_deref(),
+            Some(summary)
+        );
+    }
+
+    #[test]
+    fn r8_a_local_only_change_is_warned_and_names_the_file() {
+        // Walk B F1: the workspace comparison found README.md changed, so the run
+        // is a warning even when the instruction's prose asks for a change.
+        let state = NativeState {
+            workspace_wrote: true,
+            local_work: crate::workspace::WorkspaceChanges {
+                files: vec!["README.md".to_owned()],
+                committed: false,
+            },
+            ..NativeState::default()
+        };
+        let ending =
+            decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &state);
+        assert_eq!(ending, RunEnding::Warned);
+        let reason = run_reason(
+            ending,
+            "I edited README.md locally.",
+            &state,
+            RequestedWork::GenericWrite,
+        )
+        .expect("reason");
+        assert!(reason.contains("README.md"), "{reason}");
+        assert!(reason.contains("workspace changed"), "{reason}");
+    }
+
+    #[test]
+    fn r8_a_ledger_open_result_names_the_pull_request_and_its_branch() {
+        // The MCP ledger is the supervisor's only record of a native Forgejo write.
+        // A real open has no number in its arguments; the reply's number, URL and
+        // branch are what make the work line say `pull request #6 from ...`.
+        let root = crate::test_support::scratch_root("ledger-pr");
+        let run_dir = root.join("run-1700000000005-0001");
+        std::fs::create_dir_all(&run_dir).expect("the run directory");
+        let state = root.join("mcp-state");
+        std::fs::create_dir_all(&state).expect("the MCP state");
+        let line = serde_json::json!({
+            "tool": crate::forgejo_tools::OPEN_PULL_REQUEST,
+            "repository": "team/workspace",
+            "number": 6,
+            "ok": true,
+            "outcome": "opened team/workspace#6",
+            "action": "opened",
+            "url": "http://127.0.0.1:3000/team/workspace/pulls/6",
+            "branch": "agent-1/pr-only",
+            "accepted": false,
+        })
+        .to_string();
+        std::fs::write(state.join("calls.jsonl"), format!("{line}\n")).expect("the ledger");
+        let files = NativeFiles {
+            root: root.clone(),
+            home: root.join("home"),
+            tmp: root.join("tmp"),
+            config: root.join("config"),
+            key: root.join("model.key"),
+            key_helper: root.join("helper"),
+            program: root.join("program"),
+            install_root: root.join("install"),
+            skills: Vec::new(),
+            mcp_state: Some(state),
+            mcp_socket: None,
+        };
+        let mut transcript = Transcript::open(&run_dir).expect("the transcript");
+        let mut state = NativeState::default();
+        apply_ledger(&files, &mut transcript, &mut state);
+        assert!(state.pr_ok);
+        assert_eq!(
+            crate::run::work_summary(&run_dir),
+            vec!["pull request #6 from agent-1/pr-only".to_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2326,7 +2464,8 @@ mod native_proof_tests {
         };
         assert_eq!(
             decide_native_ending(RunEnding::Succeeded, RequestedWork::ReadOnly, &read),
-            RunEnding::Succeeded
+            RunEnding::NoWork,
+            "a read-only run is no work even when the instruction asked for a change"
         );
         assert_eq!(
             requested_work("Rename the parser module.", &[]),
@@ -2334,7 +2473,8 @@ mod native_proof_tests {
         );
         assert_eq!(
             decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &read),
-            RunEnding::Warned
+            RunEnding::NoWork,
+            "a successful read is not a workspace write"
         );
     }
     #[test]
@@ -2374,7 +2514,8 @@ mod native_proof_tests {
                 RequestedWork::UnsupportedForgejoWrite,
                 &read
             ),
-            RunEnding::Warned
+            RunEnding::NoWork,
+            "a run that only read did no work"
         );
         assert_eq!(
             requested_work("Update the pull request description.", &[]),
