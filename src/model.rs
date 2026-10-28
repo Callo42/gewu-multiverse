@@ -822,6 +822,7 @@ struct ProbeTool {
     name: String,
     description: String,
     parameters: serde_json::Value,
+    prompt: String,
 }
 
 /// The tool a program's own run would call: the Forgejo list tool in the name
@@ -832,6 +833,27 @@ struct ProbeTool {
 /// MCP name over their own protocols. The built-in engine declares the six tools
 /// without the MCP prefix.
 fn probe_tool(program: crate::harness::Program) -> ProbeTool {
+    if program == crate::harness::Program::Opencode {
+        // OpenCode exposes MCP tools through its code-mode `execute` tool, not as
+        // direct functions. The probe must use the shape its runs use.
+        return ProbeTool {
+            name: "execute".to_owned(),
+            description: "Run JavaScript code to orchestrate tool calls.".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "JavaScript source to run."
+                    }
+                },
+                "required": ["code"],
+                "additionalProperties": false
+            }),
+            prompt: "Call the tool execute with JavaScript that calls                 `tools.gewu_forgejo.forgejo_list_assigned_issues({})` and returns its result.                 Do not answer in text."
+                .to_owned(),
+        };
+    }
     let function = forgejo_tools()
         .into_iter()
         .next()
@@ -843,6 +865,9 @@ fn probe_tool(program: crate::harness::Program) -> ProbeTool {
         crate::model_proxy::flat_name("mcp__gewu_forgejo", function.name)
     };
     ProbeTool {
+        prompt: format!(
+            "Call the tool {name} with an empty JSON object as its arguments. Do not answer in text."
+        ),
         name,
         description: function.description.to_owned(),
         parameters: function.parameters,
@@ -850,10 +875,8 @@ fn probe_tool(program: crate::harness::Program) -> ProbeTool {
 }
 
 /// The sentence the tool probe asks the model to act on.
-fn probe_prompt(tool: &str) -> String {
-    format!(
-        "Call the tool {tool} with an empty JSON object as its arguments. Do not answer in text."
-    )
+fn probe_prompt(tool: &ProbeTool) -> String {
+    tool.prompt.clone()
 }
 
 /// Which wire shape one probe request uses.
@@ -890,7 +913,7 @@ pub fn probe_agent(
     if api_key.is_empty() {
         return Err(ModelError::MissingKey);
     }
-    let prompt = probe_prompt(&tool.name);
+    let prompt = probe_prompt(&tool);
     let (body, shape) = match protocol {
         crate::harness::Protocol::ChatCompletions => (
             serde_json::json!({
@@ -905,7 +928,7 @@ pub fn probe_agent(
                     }
                 }],
                 "tool_choice": "auto",
-                "max_tokens": 64,
+                "max_tokens": 1024,
                 "stream": false,
             }),
             ProbeShape::Chat,
@@ -925,7 +948,7 @@ pub fn probe_agent(
                     "strict": false
                 }],
                 "tool_choice": "auto",
-                "max_output_tokens": 64,
+                "max_output_tokens": 2048,
                 "stream": true,
             }),
             ProbeShape::Responses,
@@ -933,7 +956,7 @@ pub fn probe_agent(
         crate::harness::Protocol::AnthropicMessages => (
             serde_json::json!({
                 "model": model,
-                "max_tokens": 64,
+                "max_tokens": 1024,
                 "messages": [{"role": "user", "content": prompt}],
                 "tools": [{
                     "name": tool.name,
@@ -1099,33 +1122,60 @@ fn chat_probe_reply(
     ))
 }
 
+/// The `data:` payloads of a standard SSE body, joined per event.
+///
+/// The parser follows the framing rules rather than the first bytes of the body:
+/// `event:`, `id:`, `retry:` and comment lines are ignored, and blank lines
+/// dispatch the data lines collected so far. This is what OpenAI's own
+/// `/v1/responses` stream sends.
+fn sse_data_events(text: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut data = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            if !data.is_empty() {
+                events.push(data.join("\n"));
+                data.clear();
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value).to_owned());
+        }
+    }
+    if !data.is_empty() {
+        events.push(data.join("\n"));
+    }
+    events
+}
+
 fn responses_probe_reply(
     text: &str,
     expected: &str,
     program: crate::harness::Program,
 ) -> Result<Reply, ModelError> {
-    let value: serde_json::Value = match serde_json::from_str(text) {
-        Ok(value) => value,
-        Err(_) if text.trim_start().starts_with("data:") => serde_json::Value::Null,
-        Err(error) => {
+    let mut calls = Vec::new();
+    let json = serde_json::from_str::<serde_json::Value>(text);
+    if let Ok(value) = &json {
+        collect_response_calls(value, &mut calls);
+    }
+    let events = sse_data_events(text);
+    if calls.is_empty() {
+        if json.is_err() && events.is_empty() {
+            let error = json.expect_err("the body is neither JSON nor SSE");
             return Err(ModelError::MalformedReply {
-                problem: format!("the body is not JSON of the expected shape: {error}"),
+                problem: format!("the body is not JSON or SSE of the expected shape: {error}"),
             });
         }
-    };
-    let mut calls = Vec::new();
-    collect_response_calls(&value, &mut calls);
-    if calls.is_empty() && text.trim_start().starts_with("data:") {
-        for line in text.lines() {
-            let Some(data) = line.trim_start().strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data.is_empty() || data == "[DONE]" {
+        for event in events {
+            if event == "[DONE]" {
                 continue;
             }
-            if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                collect_response_calls(&event, &mut calls);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event) {
+                collect_response_calls(&value, &mut calls);
             }
         }
     }
@@ -1660,6 +1710,9 @@ mod tests {
     fn sse_reply(events: Vec<serde_json::Value>) -> StubReply {
         let mut body = String::new();
         for event in events {
+            if let Some(kind) = event.get("type").and_then(serde_json::Value::as_str) {
+                body.push_str(&format!("event: {kind}\n"));
+            }
             body.push_str(&format!("data: {event}\n\n"));
         }
         body.push_str("data: [DONE]\n\n");
@@ -2076,6 +2129,36 @@ mod tests {
     }
 
     #[test]
+    fn a_standard_sse_frame_is_read_without_a_leading_data_line() {
+        let text = concat!(
+            ": keep-alive\n",
+            "\n",
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n",
+            "\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"mcp__gewu_forgejo__forgejo_list_assigned_issues\",\"arguments\":\"{}\",\"call_id\":\"call_1\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n",
+            "\n",
+            "data: [DONE]\n",
+            "\n",
+        );
+        let reply = responses_probe_reply(
+            text,
+            "mcp__gewu_forgejo__forgejo_list_assigned_issues",
+            crate::harness::Program::Codex,
+        )
+        .expect("the standard SSE frame");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(
+            reply.tool_calls[0].function.name,
+            "mcp__gewu_forgejo__forgejo_list_assigned_issues"
+        );
+    }
+
+    #[test]
     fn a_text_only_model_test_names_the_missing_tool_call() {
         let stub = Stub::start(vec![sse_reply(vec![
             serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
@@ -2107,6 +2190,55 @@ mod tests {
         );
         assert!(words.contains("cannot run Codex's tools"), "{words}");
         assert!(words.contains("text only"), "{words}");
+    }
+
+    #[test]
+    fn the_opencode_model_test_uses_its_code_mode_tool() {
+        let stub = Stub::start(vec![StubReply::json(
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "execute",
+                                "arguments": "{\"code\":\"return 1\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )]);
+        let key = Secret::new("sk-test-key-1234567890");
+        probe_agent(
+            crate::harness::Program::Opencode,
+            crate::harness::Protocol::ChatCompletions,
+            stub.url().trim_end_matches("/chat/completions"),
+            "example-model",
+            &key,
+            Duration::from_secs(5),
+        )
+        .expect("the OpenCode code-mode tool call");
+        let requests = stub.requests();
+        assert!(
+            requests[0].body.contains("\"name\":\"execute\""),
+            "{}",
+            requests[0].body
+        );
+        assert!(
+            requests[0].body.contains("\"code\""),
+            "{}",
+            requests[0].body
+        );
+        assert!(
+            !requests[0].body.contains("mcp__gewu_forgejo"),
+            "{}",
+            requests[0].body
+        );
     }
 
     #[test]

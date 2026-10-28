@@ -12,7 +12,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gewu_multiverse::model_proxy::ModelProxy;
 use serde_json::{Value, json};
@@ -81,11 +81,71 @@ impl Drop for Endpoint {
     }
 }
 
-fn serve(
-    mut stream: TcpStream,
-    handler: &(impl Fn(&Value) -> Result<String, String> + Send),
-    seen: &Mutex<Vec<Value>>,
-) -> std::io::Result<()> {
+/// A loopback Responses endpoint that writes its own stream.
+struct StreamEndpoint {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl StreamEndpoint {
+    fn start(handler: impl Fn(&mut TcpStream, &Value) + Send + Sync + 'static) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("the stream endpoint binds");
+        let address = listener.local_addr().expect("the stream endpoint address");
+        listener
+            .set_nonblocking(true)
+            .expect("the stream endpoint polls");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handler = Arc::new(handler);
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let handler = Arc::clone(&handler);
+                        thread::spawn(move || {
+                            if let Ok(request) = read_http_request(&mut stream) {
+                                handler(&mut stream, &request);
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+}
+
+impl Drop for StreamEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(50));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn write_stream_head(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+    )?;
+    stream.flush()
+}
+
+fn read_http_request(stream: &mut TcpStream) -> std::io::Result<Value> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -96,7 +156,7 @@ fn serve(
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+            break;
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -110,7 +170,15 @@ fn serve(
     }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
-    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    Ok(serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+fn serve(
+    mut stream: TcpStream,
+    handler: &(impl Fn(&Value) -> Result<String, String> + Send),
+    seen: &Mutex<Vec<Value>>,
+) -> std::io::Result<()> {
+    let request = read_http_request(&mut stream)?;
     seen.lock().expect("seen").push(request.clone());
     let reply = match handler(&request) {
         Ok(body) => (200, body),
@@ -230,6 +298,150 @@ fn post(base: &str, body: &Value) -> (u16, String) {
     )
 }
 
+/// Send one request and return the status, the time to the first body byte, and
+/// the whole body.
+fn post_with_first_byte(base: &str, body: &Value) -> (u16, Duration, String) {
+    let start = Instant::now();
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let response = agent
+        .post(&format!("{base}/responses"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer gw-synthetic-key")
+        .send(body.to_string())
+        .expect("the bridge answers");
+    let status = response.status().as_u16();
+    let mut reader = response.into_body().into_reader();
+    let mut first = [0u8; 1];
+    let read = reader.read(&mut first).expect("the first body byte");
+    let first_at = start.elapsed();
+    let mut rest = Vec::new();
+    if read > 0 {
+        reader.read_to_end(&mut rest).expect("the rest of the body");
+    }
+    let mut body = Vec::new();
+    if read > 0 {
+        body.push(first[0]);
+    }
+    body.extend_from_slice(&rest);
+    (
+        status,
+        first_at,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+}
+
+#[test]
+fn the_bridge_relays_a_slow_continuous_stream_as_it_arrives() {
+    let endpoint = StreamEndpoint::start(|stream, _request| {
+        let _ = write_stream_head(stream);
+        for index in 0..15 {
+            let item = if index == 0 {
+                json!({
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": TOOL,
+                    "arguments": "{}"
+                })
+            } else {
+                json!({
+                    "type": "message",
+                    "id": format!("msg_{index}"),
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "working"}]
+                })
+            };
+            let _ = write!(
+                stream,
+                "event: response.output_item.done\ndata: {}\n\n",
+                json!({"type": "response.output_item.done", "item": item})
+            );
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = stream.write_all(b"data: [DONE]\n\n");
+        let _ = stream.flush();
+    });
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(5),
+        Duration::from_millis(300),
+    )
+    .expect("proxy");
+    let (status, first_at, body) = post_with_first_byte(&proxy.url(), &codex_request());
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        first_at < Duration::from_millis(800),
+        "the first byte waited for the whole stream: {first_at:?}"
+    );
+    assert!(body.contains("event: response.output_item.done"), "{body}");
+    assert!(
+        body.contains("\"namespace\":\"mcp__gewu_forgejo\""),
+        "{body}"
+    );
+    assert!(body.contains("data: [DONE]"), "{body}");
+}
+
+#[test]
+fn the_bridge_times_out_a_silent_body_after_the_idle_timeout() {
+    let endpoint = StreamEndpoint::start(|stream, _request| {
+        let _ = write_stream_head(stream);
+        thread::sleep(Duration::from_secs(2));
+    });
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(5),
+        Duration::from_millis(200),
+    )
+    .expect("proxy");
+    let started = Instant::now();
+    let (status, body) = post(&proxy.url(), &codex_request());
+    assert_eq!(status, 504, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "the idle timeout did not fire: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn the_bridge_stops_at_the_session_timeout_not_a_body_deadline() {
+    let endpoint = StreamEndpoint::start(|stream, _request| {
+        let _ = write_stream_head(stream);
+        for index in 0..30 {
+            let _ = write!(
+                stream,
+                "data: {}\n\n",
+                json!({"type": "response.created", "response": {"id": format!("r{index}")}})
+            );
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_millis(500),
+        Duration::from_millis(250),
+    )
+    .expect("proxy");
+    let started = Instant::now();
+    let (status, body) = post(&proxy.url(), &codex_request());
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the session timeout did not bound the stream: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !body.contains("r29"),
+        "the stream outlived the session: {body}"
+    );
+}
+
 #[test]
 fn a_namespace_request_reaches_a_plain_endpoint_as_functions() {
     let endpoint = Endpoint::start(|request| {
@@ -276,7 +488,12 @@ fn a_namespace_request_reaches_a_plain_endpoint_as_functions() {
             "arguments": "{}"
         })]))
     });
-    let proxy = ModelProxy::start(&endpoint.base_url(), Duration::from_secs(10)).expect("proxy");
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+    )
+    .expect("proxy");
     let (status, reply) = post(&proxy.url(), &codex_request());
     assert_eq!(status, 200, "{reply}");
     assert!(
@@ -311,7 +528,12 @@ fn a_plain_call_to_a_custom_tool_is_restored_to_codex() {
             "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
         })]))
     });
-    let proxy = ModelProxy::start(&endpoint.base_url(), Duration::from_secs(10)).expect("proxy");
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+    )
+    .expect("proxy");
     let (status, reply) = post(&proxy.url(), &codex_request());
     assert_eq!(status, 200, "{reply}");
     assert!(reply.contains("\"type\":\"custom_tool_call\""), "{reply}");
@@ -335,7 +557,12 @@ fn an_endpoint_that_understands_namespaces_keeps_its_namespaced_reply() {
             "arguments": "{}"
         })]))
     });
-    let proxy = ModelProxy::start(&endpoint.base_url(), Duration::from_secs(10)).expect("proxy");
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+    )
+    .expect("proxy");
     let (status, reply) = post(&proxy.url(), &codex_request());
     assert_eq!(status, 200, "{reply}");
     assert!(
@@ -358,7 +585,12 @@ fn the_bridge_targets_the_configured_base_address() {
             "content": [{"type": "output_text", "text": "ok"}]
         })]))
     });
-    let proxy = ModelProxy::start(&endpoint.base_url(), Duration::from_secs(10)).expect("proxy");
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+    )
+    .expect("proxy");
     let (status, reply) = post(&proxy.url(), &codex_request());
     assert_eq!(status, 200, "{reply}");
     assert!(reply.contains("ok"), "{reply}");
@@ -458,7 +690,12 @@ fn the_real_codex_program_calls_a_forgejo_tool_on_a_plain_endpoint() {
             "arguments": "{}"
         })]))
     });
-    let proxy = ModelProxy::start(&endpoint.base_url(), Duration::from_secs(30)).expect("proxy");
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+    )
+    .expect("proxy");
     let key = root.join("key");
     fs::write(&key, "gw-synthetic-model-key").expect("key");
     fs::write(
@@ -666,7 +903,12 @@ fn the_real_codex_program_uses_a_known_model_catalog_and_custom_tool() {
             "arguments": json!({"input": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch"}).to_string()
         })]))
     });
-    let proxy = ModelProxy::start(&endpoint.base_url(), Duration::from_secs(30)).expect("proxy");
+    let proxy = ModelProxy::start(
+        &endpoint.base_url(),
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+    )
+    .expect("proxy");
     let key = root.join("key");
     fs::write(&key, "gw-synthetic-model-key").expect("key");
     fs::write(

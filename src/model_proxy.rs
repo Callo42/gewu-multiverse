@@ -18,16 +18,20 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 /// The largest request or reply body this bridge will carry.
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
-/// The upstream status, headers and body one request produced.
-type UpstreamReply = (u16, Vec<(String, String)>, Vec<u8>);
+/// How long the upstream may stay silent before the bridge gives up.
+///
+/// This resets whenever a body byte arrives, so a long but live stream is not
+/// cut off; the run's session timeout is the separate total bound.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(110);
 
 /// The canonical flat name for one namespaced tool: `<namespace>__<name>`.
 ///
@@ -359,26 +363,33 @@ fn custom_input(arguments: Option<&Value>) -> String {
 pub fn rewrite_sse(body: &str, names: &FlatNames) -> String {
     let mut out = String::with_capacity(body.len());
     for line in body.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        let Some(data) = trimmed.strip_prefix("data:") else {
-            out.push_str(line);
-            continue;
-        };
-        let data = data.trim_start();
-        if data.is_empty() || data == "[DONE]" {
-            out.push_str(line);
-            continue;
-        }
-        let Ok(mut event) = serde_json::from_str::<Value>(data) else {
-            out.push_str(line);
-            continue;
-        };
-        rewrite_reply(&mut event, names);
-        out.push_str("data: ");
-        out.push_str(&event.to_string());
-        out.push('\n');
+        out.push_str(&rewrite_sse_line(line, names));
     }
     out
+}
+
+/// Restore namespaces on one SSE line, preserving its line ending.
+fn rewrite_sse_line(line: &str, names: &FlatNames) -> String {
+    let ending = if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    };
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    let Some(data) = trimmed.strip_prefix("data:") else {
+        return line.to_owned();
+    };
+    let data = data.trim_start();
+    if data.is_empty() || data == "[DONE]" {
+        return line.to_owned();
+    }
+    let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+        return line.to_owned();
+    };
+    rewrite_reply(&mut event, names);
+    format!("data: {}{ending}", event)
 }
 
 /// The loopback bridge for one run's Responses traffic.
@@ -390,7 +401,15 @@ pub struct ModelProxy {
 
 impl ModelProxy {
     /// Start a bridge to one configured model base address.
-    pub fn start(upstream_base: &str, timeout: Duration) -> Result<Self, String> {
+    ///
+    /// `session_timeout` is the total bound for one request. `idle_timeout`
+    /// resets on every body byte received, so a continuous stream can outlive
+    /// it while a silent connection is cut off.
+    pub fn start(
+        upstream_base: &str,
+        session_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Result<Self, String> {
         let base = upstream_base.trim().trim_end_matches('/');
         if !base.starts_with("http://") && !base.starts_with("https://") {
             return Err("the model address is not a usable HTTP address".to_owned());
@@ -410,7 +429,13 @@ impl ModelProxy {
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = serve(stream, &upstream, timeout);
+                        let upstream = upstream.clone();
+                        // One connection at a time is normal; a connection owns its
+                        // own stream so dropping the run never waits on a silent
+                        // upstream body.
+                        std::thread::spawn(move || {
+                            let _ = serve(stream, &upstream, session_timeout, idle_timeout);
+                        });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
@@ -450,7 +475,12 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-fn serve(mut stream: TcpStream, upstream: &str, timeout: Duration) -> std::io::Result<()> {
+fn serve(
+    mut stream: TcpStream,
+    upstream: &str,
+    session_timeout: Duration,
+    idle_timeout: Duration,
+) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let Some(request) = read_request(&mut stream)? else {
@@ -468,43 +498,252 @@ fn serve(mut stream: TcpStream, upstream: &str, timeout: Duration) -> std::io::R
     } else {
         (request.body, FlatNames::new())
     };
-    let (status, headers, mut reply) = match forward(
+    let upstream = match forward(
         &request.method,
         &target,
         &request.headers,
         body,
-        timeout,
+        session_timeout,
     ) {
-        Ok(reply) => reply,
+        Ok(upstream) => upstream,
         Err(error) => {
             let message = format!(
                 "the model connection could not be reached through the run's Responses bridge: {error}"
             );
-            let body = json!({"error": {"message": message}}).to_string();
-            return write_reply(
-                &mut stream,
-                502,
-                "Bad Gateway",
-                &[("content-type".to_owned(), "application/json".to_owned())],
-                body.as_bytes(),
-            );
+            return write_bridge_error(&mut stream, 502, &message);
         }
     };
-    let content_type = headers
+    let content_type = upstream
+        .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.to_ascii_lowercase())
         .unwrap_or_default();
     if content_type.contains("text/event-stream") {
-        let text = String::from_utf8_lossy(&reply).into_owned();
-        reply = rewrite_sse(&text, &names).into_bytes();
-    } else if content_type.contains("application/json")
+        return relay_sse(&mut stream, upstream, &names, idle_timeout, session_timeout);
+    }
+    let mut reply = match read_body(upstream.body, idle_timeout, session_timeout) {
+        Ok(body) => body,
+        Err(error) => {
+            let (status, message) = body_error(&error);
+            return write_bridge_error(&mut stream, status, &message);
+        }
+    };
+    if content_type.contains("application/json")
         && let Ok(mut value) = serde_json::from_slice::<Value>(&reply)
     {
         rewrite_reply(&mut value, &names);
         reply = serde_json::to_vec(&value).unwrap_or(reply);
     }
-    write_reply(&mut stream, status, status_text(status), &headers, &reply)
+    write_reply(
+        &mut stream,
+        upstream.status,
+        status_text(upstream.status),
+        &upstream.headers,
+        &reply,
+    )
+}
+
+fn body_error(error: &BodyError) -> (u16, String) {
+    match error {
+        BodyError::Idle => (
+            504,
+            "the model stopped sending through the run's Responses bridge".to_owned(),
+        ),
+        BodyError::Total => (
+            504,
+            "the model connection reached the run's time limit".to_owned(),
+        ),
+        BodyError::Upstream(error) => (
+            502,
+            format!("the model connection failed through the run's Responses bridge: {error}"),
+        ),
+    }
+}
+
+fn write_bridge_error(stream: &mut TcpStream, status: u16, message: &str) -> std::io::Result<()> {
+    let body = json!({"error": {"message": message}}).to_string();
+    write_reply(
+        stream,
+        status,
+        status_text(status),
+        &[("content-type".to_owned(), "application/json".to_owned())],
+        body.as_bytes(),
+    )
+}
+
+/// One upstream response whose body has not been read yet.
+struct Upstream {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: ureq::Body,
+}
+
+/// Why a body read stopped before the upstream closed it.
+enum BodyError {
+    Idle,
+    Total,
+    Upstream(String),
+}
+
+/// The upstream body, delivered in arrival-sized chunks.
+struct BodyStream {
+    receiver: Receiver<Result<Vec<u8>, String>>,
+    handle: Option<JoinHandle<()>>,
+    deadline: Instant,
+    idle: Duration,
+}
+
+impl BodyStream {
+    fn new(body: ureq::Body, idle: Duration, session_timeout: Duration) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let handle = std::thread::spawn(move || {
+            let mut body = body.into_reader();
+            let mut buffer = [0u8; 16 * 1024];
+            loop {
+                match body.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if sender.send(Ok(buffer[..read].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            receiver,
+            handle: Some(handle),
+            deadline: Instant::now() + session_timeout,
+            idle,
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<Vec<u8>>, BodyError> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(BodyError::Total);
+        }
+        match self.receiver.recv_timeout(self.idle.min(remaining)) {
+            Ok(Ok(chunk)) => Ok(Some(chunk)),
+            Ok(Err(error)) => Err(BodyError::Upstream(error)),
+            Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= self.deadline {
+                    Err(BodyError::Total)
+                } else {
+                    Err(BodyError::Idle)
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => Ok(None),
+        }
+    }
+
+    fn finish(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn read_body(
+    body: ureq::Body,
+    idle: Duration,
+    session_timeout: Duration,
+) -> Result<Vec<u8>, BodyError> {
+    let mut stream = BodyStream::new(body, idle, session_timeout);
+    let mut reply = Vec::new();
+    while let Some(chunk) = stream.next()? {
+        if reply.len().saturating_add(chunk.len()) > MAX_BODY {
+            return Err(BodyError::Upstream("the reply is too large".to_owned()));
+        }
+        reply.extend_from_slice(&chunk);
+    }
+    stream.finish();
+    Ok(reply)
+}
+
+fn relay_sse(
+    stream: &mut TcpStream,
+    upstream: Upstream,
+    names: &FlatNames,
+    idle: Duration,
+    session_timeout: Duration,
+) -> std::io::Result<()> {
+    let mut body = BodyStream::new(upstream.body, idle, session_timeout);
+    let mut pending = Vec::new();
+    let mut started = false;
+    loop {
+        match body.next() {
+            Ok(Some(chunk)) => {
+                if !started {
+                    write_stream_head(
+                        stream,
+                        upstream.status,
+                        status_text(upstream.status),
+                        &upstream.headers,
+                    )?;
+                    started = true;
+                }
+                pending.extend_from_slice(&chunk);
+                while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=end).collect();
+                    let line = String::from_utf8_lossy(&line);
+                    stream.write_all(rewrite_sse_line(&line, names).as_bytes())?;
+                }
+                stream.flush()?;
+            }
+            Ok(None) => {
+                if !started {
+                    write_stream_head(
+                        stream,
+                        upstream.status,
+                        status_text(upstream.status),
+                        &upstream.headers,
+                    )?;
+                }
+                if !pending.is_empty() {
+                    let line = String::from_utf8_lossy(&pending);
+                    stream.write_all(rewrite_sse_line(&line, names).as_bytes())?;
+                }
+                stream.flush()?;
+                body.finish();
+                return Ok(());
+            }
+            Err(error) => {
+                if !started {
+                    let (status, message) = body_error(&error);
+                    return write_bridge_error(stream, status, &message);
+                }
+                // The status and some bytes are already on the wire; closing the
+                // connection is the only truthful signal left.
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn write_stream_head(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    headers: &[(String, String)],
+) -> std::io::Result<()> {
+    let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in headers {
+        if forward_reply_header(name) {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+    }
+    head.push_str("connection: close\r\n\r\n");
+    stream.write_all(head.as_bytes())?;
+    stream.flush()
 }
 
 fn is_responses_path(path: &str) -> bool {
@@ -518,10 +757,15 @@ fn forward(
     target: &str,
     headers: &[(String, String)],
     body: Vec<u8>,
-    timeout: Duration,
-) -> Result<UpstreamReply, String> {
+    session_timeout: Duration,
+) -> Result<Upstream, String> {
     let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
+        .timeout_global(Some(session_timeout))
+        .timeout_connect(Some(session_timeout.min(Duration::from_secs(30))))
+        .timeout_send_request(Some(session_timeout))
+        .timeout_send_body(Some(session_timeout))
+        .timeout_recv_response(Some(session_timeout))
+        .timeout_recv_body(Some(session_timeout))
         .http_status_as_error(false)
         .build()
         .new_agent();
@@ -559,11 +803,11 @@ fn forward(
             Some((name.as_str().to_owned(), value.to_owned()))
         })
         .collect();
-    let body = response
-        .into_body()
-        .read_to_vec()
-        .map_err(|error| error.to_string())?;
-    Ok((status, headers, body))
+    Ok(Upstream {
+        status,
+        headers,
+        body: response.into_body(),
+    })
 }
 
 fn forward_request_header(name: &str) -> bool {

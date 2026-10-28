@@ -654,11 +654,11 @@ pub(super) fn run(
     // bridge makes the same tools plain functions on the wire and restores the
     // namespace on the reply, so the connection needs only the plain protocol.
     let model_proxy = if program == Program::Codex && protocol == Protocol::Responses {
-        // Codex's own stream-idle bound is 120 s. Keep the bridge's upstream
-        // read shorter so a stalled endpoint returns a plain 502 before Codex's
-        // timer fires, instead of leaving the supervisor waiting on the socket.
-        let bridge_timeout = Duration::from_secs(plan.timeout_secs.clamp(1, 110));
-        match crate::model_proxy::ModelProxy::start(&native.base_url, bridge_timeout) {
+        match crate::model_proxy::ModelProxy::start(
+            &native.base_url,
+            Duration::from_secs(plan.timeout_secs.max(1)),
+            crate::model_proxy::IDLE_TIMEOUT,
+        ) {
             Ok(proxy) => {
                 files.model_url = Some(proxy.url());
                 log.line("Responses bridge: plain function tools");
@@ -3206,6 +3206,72 @@ mod attempt_replay_tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    #[test]
+    fn the_codex_launch_uses_the_run_bridge_and_the_catalog() {
+        let root = std::env::temp_dir().join(format!(
+            "gewu-codex-launch-{}-{}",
+            std::process::id(),
+            crate::time::now_unix_ms()
+        ));
+        std::fs::create_dir_all(root.join("workspace")).expect("workspace");
+        let plan = crate::run::RunPlan {
+            run_id: "run-1".to_owned(),
+            agent: "agent-1".to_owned(),
+            workspace: root.join("workspace"),
+            instruction: root.join("instruction"),
+            skills_dir: root.join("skills"),
+            endpoint: "http://127.0.0.1:1/v1".to_owned(),
+            model: "lab-model".to_owned(),
+            credentials: root.join("credentials"),
+            max_turns: 3,
+            steps: Vec::new(),
+            timeout_secs: 60,
+            confinement: "landlock".to_owned(),
+            hide: Vec::new(),
+        };
+        let native = NativePlan {
+            harness: "codex".to_owned(),
+            version: "0.164.0".to_owned(),
+            program: root.join("codex-bin"),
+            install_root: root.join("install"),
+            protocol: "responses".to_owned(),
+            base_url: "http://127.0.0.1:1/v1".to_owned(),
+            model: "lab-model".to_owned(),
+            codex_sandbox: "full-access".to_owned(),
+        };
+        let files = NativeFiles {
+            root: root.clone(),
+            home: root.join("home"),
+            tmp: root.join("tmp"),
+            config: root.join("config"),
+            key: root.join("model.key"),
+            key_helper: root.join("helper"),
+            program: native.program.clone(),
+            install_root: native.install_root.clone(),
+            skills: Vec::new(),
+            mcp_state: None,
+            mcp_socket: None,
+            model_url: Some("http://127.0.0.1:9".to_owned()),
+            model_catalog: Some(root.join("catalog.json")),
+        };
+        let (argv, _, _) =
+            build_launch(&plan, &native, Program::Codex, Protocol::Responses, &files)
+                .expect("the Codex launch");
+        let config =
+            std::fs::read_to_string(root.join("codex/config.toml")).expect("the Codex config");
+        assert!(
+            config.contains("base_url = \"http://127.0.0.1:9\""),
+            "{config}"
+        );
+        assert!(!config.contains("http://127.0.0.1:1/v1"), "{config}");
+        assert!(config.contains("model_catalog_json = "), "{config}");
+        assert!(config.contains("multi_agent = false"), "{config}");
+        assert!(config.contains("web_search = \"disabled\""), "{config}");
+        assert!(argv.iter().any(|arg| arg == "exec"), "{argv:?}");
+        assert_eq!(argv[0], native.program.display().to_string());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

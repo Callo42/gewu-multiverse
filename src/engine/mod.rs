@@ -7220,7 +7220,7 @@ mod tests {
         let root = scratch_root("engine-agent-test");
         let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
         let stub = crate::test_stub::Stub::start(vec![crate::test_stub::StubReply::sse(format!(
-            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            "event: response.created\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\ndata: [DONE]\n\n",
             serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
             serde_json::json!({
                 "type": "response.output_item.done",
@@ -7286,7 +7286,7 @@ mod tests {
         let root = scratch_root("engine-agent-test-no-tool");
         let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
         let stub = crate::test_stub::Stub::start(vec![crate::test_stub::StubReply::sse(format!(
-            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            "event: response.created\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\ndata: [DONE]\n\n",
             serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
             serde_json::json!({
                 "type": "response.output_item.done",

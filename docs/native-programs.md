@@ -25,8 +25,10 @@ Codex is Responses-only. Codex 0.164.0 declares MCP tools inside the Responses
 cannot see. For a Codex run the supervisor opens a second loopback transport in front
 of the configured model address: each nested tool is sent as a plain function named
 `<namespace>__<tool>`, and a plain function call is restored to the namespace shape
-Codex routes. The program keeps its internal tool identity while the connection sees
-only the plain protocol. A one-model catalog built from Codex's own metadata keeps a
+Codex routes. The bridge relays the stream as it arrives; its idle timeout resets on
+every byte received, and the run's session timeout is the only total bound. The
+program keeps its internal tool identity while the connection sees only the plain
+protocol. A one-model catalog built from Codex's own metadata keeps a
 known model id on direct function tools rather than Responses Lite or code mode, so
 the same bridge covers both. The per-agent model test sends one Forgejo tool in that
 flat shape and requires a call back, so a text-only endpoint fails the test before a
