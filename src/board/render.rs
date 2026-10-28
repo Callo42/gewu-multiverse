@@ -3222,31 +3222,105 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     } else {
         0
     };
-    // The failure and the run's own result answer different questions, and both are
-    // drawn: a transient failed tool must not hide the summary beside `✓` (review
-    // B2). The activity keeps the row under the status, then the failure, then the
-    // result. Active and next settings join them when a save changed the next run.
-    let mut extras: Vec<(String, ratatui::style::Style)> = Vec::new();
-    // The newest work outranks the run's failure row when the card is short: the
-    // last-work line is the persistent fact a person acts on, and the strip keeps
-    // the failure mark and word.
-    if let Some(result) = result {
-        extras.push((result, theme::card(result_colour, true)));
+    // The one row under the status is the run's own ending first. Activity is the
+    // live line while a run works; after an ending it must not take the ending's row.
+    let active_next = status::active_next_line(&agent);
+    let second = if let Some(result) = result {
+        Some((result, theme::card(result_colour, true)))
+    } else if let Some(retrying) = retrying {
+        Some((retrying, theme::card(theme::AMBER, true)))
+    } else if let Some(activity) = activity.clone() {
+        Some((activity, theme::card(theme::MUTED, true)))
+    } else {
+        active_next
+            .clone()
+            .map(|changed| (changed, theme::card(theme::AMBER, true)))
+    };
+    if let Some((line, style)) = &second {
+        text_util::put(
+            buf,
+            card,
+            interior_x,
+            card.y + 2,
+            &text_util::ellipsize_words(line, width),
+            *style,
+        );
     }
-    if let Some(failure) = failure_lines.first() {
-        extras.push((failure.clone(), theme::card(theme::RED, true)));
-        // A refusal keeps its provider clause and its action at 80 columns: the
-        // rest of the wrapped sentence gets its own row before the result, rather
-        // than being cut at the right edge.
-        for line in failure_lines.iter().skip(1) {
-            extras.push((line.clone(), theme::card(theme::RED, true)));
+
+    // Everything below the status line shares one budget, allocated in priority
+    // order: the run's own ending is the row above; then the completed-work heading
+    // and its remote work (pull requests, pushes, comments); then the failure detail;
+    // then reads and the remaining facts. The instruction keeps its heading and one
+    // row, so at the 72x18 floor a stopped run with a failure still names the work
+    // before the failure shortens or wraps away.
+    let priority_top = card.y + 3 + program_rows;
+    let priority_bottom = if has_rule { rule_y } else { strip_y };
+    let budget = priority_bottom.saturating_sub(priority_top);
+    let instruction_reserve = budget.min(2);
+    let usable = budget.saturating_sub(instruction_reserve) as usize;
+
+    let mut priority: Vec<(String, ratatui::style::Style)> = Vec::new();
+    if !agent.last_work.is_empty() {
+        let stopped = matches!(agent.recent.last(), Some(SessionEnd::Stopped { .. }));
+        let newest = if stopped {
+            status::newest_work_phrase(&agent)
+        } else {
+            None
+        };
+        let heading = match newest.as_deref() {
+            Some(work) => format!("last completed work: {work}"),
+            None if stopped => "last completed work".to_owned(),
+            None => "work".to_owned(),
+        };
+        priority.push((heading, theme::card(theme::MUTED, true)));
+        let work = status::ordered_work_lines(&agent);
+        let mut remote = Vec::new();
+        let mut reads = Vec::new();
+        for line in work {
+            if status::is_read_work_line(&line) {
+                reads.push(line);
+            } else {
+                remote.push(line);
+            }
+        }
+        // The stopped heading already names the newest work word; do not spend a
+        // second floor row repeating that same request/comment. The remote rows
+        // still name the other work, and the failure gets the row this saves.
+        if stopped
+            && remote.len() >= 2
+            && newest.as_deref().is_some_and(|work| {
+                work.starts_with("PR ")
+                    || work.starts_with("comment on ")
+                    || work.starts_with("branch ")
+            })
+        {
+            remote.pop();
+        }
+        for line in remote {
+            priority.push((line, theme::card(theme::FG, true)));
+        }
+        // Failure detail comes after the remote work it must not hide.
+        for line in &failure_lines {
+            priority.push((line.clone(), theme::card(theme::RED, true)));
+        }
+        for line in reads {
+            priority.push((line, theme::card(theme::FG, true)));
+        }
+    } else if agent.no_assigned_work {
+        priority.push((
+            format!("no issues assigned to {} yet", agent.login),
+            theme::card(theme::AMBER, true),
+        ));
+        for line in &failure_lines {
+            priority.push((line.clone(), theme::card(theme::RED, true)));
+        }
+    } else {
+        for line in &failure_lines {
+            priority.push((line.clone(), theme::card(theme::RED, true)));
         }
     }
-    // `last work` carries the work; the run's own last sentence is still on the
-    // screen, labelled as the result, so a warning is not presented as the work and
-    // the model's account is not lost. When the newest run did no work (a stop, a
-    // refusal, a no-op), the work block is explicitly the earlier completed work and
-    // its summary is not repeated as if it were this run's own result.
+    // The model's own account of the work run, when the newest run did that work;
+    // then activity remains a lower-priority fact when the ending took its row.
     if agent.last_result_is_work
         && !agent.last_work.is_empty()
         && let Some(summary) = agent
@@ -3254,132 +3328,45 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             .as_deref()
             .or(agent.last_result.as_deref())
     {
-        extras.push((
+        priority.push((
             format!("result: {}", status::first_clause(summary)),
             theme::card(result_colour, true),
         ));
     }
-    if let Some(changed) = status::active_next_line(&agent) {
-        extras.push((changed, theme::card(theme::AMBER, true)));
+    if !matches!(
+        (&second, &activity),
+        (Some((line, _)), Some(activity)) if line == activity
+    ) && let Some(activity) = activity
+    {
+        priority.push((activity, theme::card(theme::MUTED, true)));
     }
-    let (second, extras) = match (&retrying, &activity, extras.is_empty()) {
-        // A retrying model is the live fact the person needs while the run works:
-        // name it before the last activity or work row.
-        (Some(retrying), _, _) => (
-            Some((retrying.clone(), theme::card(theme::AMBER, true))),
-            extras,
-        ),
-        (None, Some(activity), _) => (
-            Some((activity.clone(), theme::card(theme::MUTED, true))),
-            extras,
-        ),
-        (None, None, false) => {
-            let first = extras.remove(0);
-            (Some(first), extras)
+    if let Some(changed) = active_next
+        && !matches!(&second, Some((line, _)) if line == &changed)
+    {
+        priority.push((changed, theme::card(theme::AMBER, true)));
+    }
+
+    let drawn = priority.len().min(usable);
+    for (index, (line, style)) in priority.iter().take(usable).enumerate() {
+        let mut shown = fit_work_line(line, width);
+        if priority.len() > usable && index + 1 == drawn {
+            if text_util::width(&shown) < width {
+                shown.push('…');
+            } else {
+                shown = text_util::ellipsize_words(&shown, width);
+            }
         }
-        (None, None, true) => (None, extras),
-    };
-    if let Some((line, style)) = second {
         text_util::put(
             buf,
             card,
             interior_x,
-            card.y + 2,
-            &text_util::ellipsize_words(&line, width),
-            style,
-        );
-    }
-    let extra_top = card.y + 3 + program_rows;
-    let extra_capacity = rule_y.saturating_sub(extra_top) as usize;
-    let extra_rows = extras.len().min(extra_capacity) as u16;
-    for (index, (notice, style)) in extras.iter().take(extra_capacity).enumerate() {
-        text_util::put(
-            buf,
-            card,
-            interior_x,
-            extra_top + index as u16,
-            &fit_work_line(notice, width),
+            priority_top + index as u16,
+            &shown,
             *style,
         );
     }
 
-    // The work block: the last issue / pull request / branch / comment a work run
-    // named, correctly typed and labelled `work`, in at most three lines (F5). It is
-    // kept until a later run does new work, so a read-only check run does not erase it
-    // (W31-3). With no work at all, the Agent screen names the assignment rule.
-    let work_start = extra_top + extra_rows;
-    let work_start = work_start.min(rule_y);
-    let available = if has_rule {
-        rule_y.saturating_sub(work_start) as usize
-    } else {
-        0
-    };
-    // A roomy card gets the `work` heading and up to three typed rows. A tight card
-    // keeps the typed rows but drops the heading, because showing the work matters
-    // more than the word and the row still carries its own type (`pull request #5 …`).
-    let labelled = available >= 5 && !agent.last_work.is_empty();
-    let work_lines = if !agent.last_work.is_empty() {
-        3.min(agent.last_work.len())
-            .min(available.saturating_sub(if labelled { 3 } else { 2 }))
-    } else {
-        0
-    };
-    let no_work = available >= 2 && agent.last_work.is_empty() && agent.no_assigned_work;
-    let work_rows = if labelled {
-        (work_lines + 1) as u16
-    } else if work_lines > 0 {
-        work_lines as u16
-    } else if no_work {
-        if available >= 3 { 2 } else { 1 }
-    } else {
-        0
-    };
-    if labelled {
-        // After a stop the block is the work an earlier run completed; naming it
-        // `work` alone let the reader take it for the stopped run's own result.
-        let heading = if matches!(agent.recent.last(), Some(SessionEnd::Stopped { .. })) {
-            match status::newest_work_phrase(&agent) {
-                Some(work) => format!("last completed work: {work}"),
-                None => "last completed work".to_owned(),
-            }
-        } else {
-            "work".to_owned()
-        };
-        text_util::put(
-            buf,
-            card,
-            interior_x,
-            work_start,
-            &text_util::ellipsize_words(&heading, width),
-            theme::card(theme::MUTED, true),
-        );
-    }
-    let first_work_row = work_start + u16::from(labelled);
-    for (index, line) in agent.last_work.iter().take(work_lines).enumerate() {
-        text_util::put(
-            buf,
-            card,
-            interior_x,
-            first_work_row + index as u16,
-            &text_util::ellipsize_words(line, width),
-            theme::card(theme::FG, true),
-        );
-    }
-    if no_work {
-        text_util::put(
-            buf,
-            card,
-            interior_x,
-            work_start,
-            &text_util::ellipsize_words(
-                &format!("no issues assigned to {} yet", agent.login),
-                width,
-            ),
-            theme::card(theme::AMBER, true),
-        );
-    }
-
-    let label_y = work_start + work_rows;
+    let label_y = priority_top + drawn as u16;
     let text_top = label_y + 1;
     let text_bottom = if has_rule { rule_y } else { strip_y };
     let rows = text_bottom.saturating_sub(text_top) as usize;

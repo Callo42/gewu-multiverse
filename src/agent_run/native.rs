@@ -2328,7 +2328,7 @@ mod native_proof_tests {
         let facts = crate::run::facts_from_records(&run_dir);
         assert_eq!(
             facts.work_lines(),
-            vec!["pull request #4 from fix/readme-typo".to_owned()]
+            vec!["pull request team/workspace#4 from fix/readme-typo".to_owned()]
         );
         assert_eq!(
             crate::agent_run::decide_ending(RunEnding::Refused, &facts),
@@ -2441,7 +2441,7 @@ mod native_proof_tests {
         let facts = crate::run::facts_from_records(&run_dir);
         assert_eq!(
             facts.work_lines(),
-            vec!["pull request #6 from agent-1/pr-only".to_owned()]
+            vec!["pull request team/workspace#6 from agent-1/pr-only".to_owned()]
         );
         let _ = std::fs::remove_dir_all(&root);
     }

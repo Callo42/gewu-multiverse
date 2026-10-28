@@ -291,8 +291,8 @@ fn the_work_block_types_a_pull_request_and_a_comment() {
     assert_eq!(
         lines,
         vec![
-            "pull request #5 from fix/x".to_owned(),
-            "comment on #1".to_owned()
+            "pull request team/website#5 from fix/x".to_owned(),
+            "comment on team/website#1".to_owned()
         ],
         "the base labels the pull request an issue or loses the rows"
     );

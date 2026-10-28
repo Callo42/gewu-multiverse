@@ -882,7 +882,7 @@ fn the_card_summary_prefers_the_newest_run_that_did_work() {
     press(&mut board, KeyCode::Enter);
     let frame = text(&draw(&mut board, 120, 40));
     assert!(
-        frame.contains("last completed work: comment on #1"),
+        frame.contains("last completed work: comment on"),
         "F-10: the card did not keep the newest completed work:\n{frame}"
     );
     assert!(

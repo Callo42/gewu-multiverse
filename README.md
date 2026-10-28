@@ -109,16 +109,18 @@ requests are its own. The board shows the whole thing at a glance:
   if a later write was refused, a test failed first, it reused the branch an
   interrupted run left, or it ended with a sentence claiming failure; the work block
   keeps the product-observed fact, including the pull request. The
-  summary line prefers the newest run that did work (`last work: comment on #2`,
-  `last work: PR #3 open`, `last work: local change README.md`); a later no-op's
+  summary line prefers the newest run that did work (`last work: comment on team/workspace#2`,
+  `last work: PR team/workspace#3 open`, `last work: local change README.md`); a later no-op's
   reason is labelled `no work: …`. When the newest run was stopped, its own ending
   takes that line (`stopped 2m ago — the run was stopped on request`) and the earlier
   work is labelled `last completed work`; a previous run's result is not presented
   as the stopped run's own. A failed command and a local-only change both wear `⚠`,
   so the legend says `⚠ warning`; the newest mark's word is `cmd failed` only for a
   real command failure and `local change` for the workspace change. A pull request's
-  word follows its live state (`PR #4 merged`, `PR #4 closed`), refreshed from
-  Forgejo while the board is open, rather than repeating the run's recorded `open`.
+  word follows its live state (`PR team/workspace#4 merged`,
+  `PR team/workspace#4 closed`), refreshed from Forgejo while the board is open. The
+  work fact keeps its repository, so a `#4` in another repository can never supply
+  this state. A request the product has not refreshed keeps the run's recorded word.
   Started agents keep
   a visible idle between runs (the Agent screen says `next run in 5s`; a card's shorter
   form is `next 5s`); a no-work or warned run's longer wait says
@@ -183,8 +185,8 @@ The version and then the names are the first facts given up when the box is tigh
 with the settings, so it survives a reopen and has a footer row of its own when the box
 is too short for it, never overwriting the keys.
 
-The last-work word keeps its number: `pull request #100` is `#100`, never `#10`, and
-`#10000` stays whole — the label is shortened, not the number. A failed run's word
+The last-work word keeps its repository and number: `pull request team/workspace#100`
+is `team/workspace#100`, never `team/workspace#10`, and `#10000` stays whole — the label is shortened, not the number. A failed run's word
 starts with the HTTP status (`✗ HTTP 500` on a card; the Agent screen names the model
 as well) and is cut on whole words, and
 a single-column connector is placed after the label so it never crosses the word.

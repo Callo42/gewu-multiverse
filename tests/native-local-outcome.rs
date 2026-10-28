@@ -556,7 +556,7 @@ fn a_native_opened_request_is_named_in_the_work_line() {
     );
     assert_eq!(
         work,
-        vec!["pull request #6 from feature".to_owned()],
+        vec!["pull request team/workspace#6 from feature".to_owned()],
         "the work line did not name the opened request"
     );
 }
@@ -677,7 +677,7 @@ fn a_native_push_then_an_existing_request_is_a_success_that_names_the_request() 
     );
     assert_eq!(
         work,
-        vec!["pull request #3 from feature".to_owned()],
+        vec!["pull request team/workspace#3 from feature".to_owned()],
         "the work line did not name the request"
     );
 }
@@ -1093,13 +1093,17 @@ fn a_native_fetch_is_no_work_not_a_local_git_change() {
 
 #[test]
 fn an_unrelated_existing_request_is_not_work() {
-    use gewu_multiverse::run::{RunFacts, WorkPull};
+    use gewu_multiverse::run::{RunFacts, WorkComment, WorkPull};
 
     let facts = RunFacts {
         remote: true,
-        comments: vec![5],
+        comments: vec![WorkComment {
+            number: 5,
+            repository: None,
+        }],
         existing: vec![WorkPull {
             number: 3,
+            repository: None,
             branch: Some("feature".to_owned()),
         }],
         ..RunFacts::default()

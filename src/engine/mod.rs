@@ -4397,9 +4397,9 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
         }
     };
     let result = client.organisation_repositories(bundled_forgejo::ORGANISATION);
-    // Read the agents' tracked pull requests and the current repository list under
-    // the lock, then release it for the network reads below.
-    let (repositories, targets) = match inner.lock() {
+    // Read the agents' tracked pull requests under the lock, then release it for
+    // the network reads below.
+    let targets = match inner.lock() {
         Ok(mut inner) => {
             // A failed fetch is retried on the next tick rather than after a full
             // poll interval: the board must not keep an old count for two intervals
@@ -4434,9 +4434,8 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
                             inner.note(event);
                         }
                     }
-                    inner.forgejo.repositories = repositories.clone();
-                    let targets = tracked_pull_numbers(&inner.agents);
-                    (repositories, targets)
+                    inner.forgejo.repositories = repositories;
+                    tracked_pull_targets(&inner.agents)
                 }
                 Err(_) => {
                     inner.forgejo.repositories_inflight = false;
@@ -4450,35 +4449,14 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
             return;
         }
     };
-    // Refresh the live state of every request a work block names. Only a request
-    // this read actually answered replaces the stored state; a failed read leaves
-    // the previous truth in place.
-    let mut refreshed: Vec<(usize, Vec<crate::engine_api::PullStateView>)> = Vec::new();
-    for (agent_index, numbers) in targets {
-        let mut states = Vec::new();
-        for number in numbers {
-            let mut found = None;
-            for repository in &repositories {
-                if let Some((namespace, name)) = repository.full_name.split_once('/') {
-                    match client.pull_request(namespace, name, number) {
-                        Ok(Some(pull)) => {
-                            found = Some(crate::engine_api::PullStateView {
-                                number,
-                                state: pull.state,
-                            });
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(_) => break,
-                    }
-                }
-            }
-            if let Some(state) = found {
-                states.push(state);
-            }
-        }
-        refreshed.push((agent_index, states));
-    }
+    // Refresh the live state of every request a work block names. The target is
+    // the exact repository and number: a `#4` in one repository never supplies the
+    // state of a `#4` in another. Only a request this read actually answered
+    // replaces the stored state; a failed read leaves the previous truth in place.
+    let refreshed: Vec<(usize, Vec<crate::engine_api::PullStateView>)> = targets
+        .into_iter()
+        .map(|(agent_index, targets)| (agent_index, read_pull_states(&client, &targets)))
+        .collect();
     if let Ok(mut inner) = inner.lock() {
         inner.forgejo.repositories_inflight = false;
         for (agent_index, states) in refreshed {
@@ -4487,34 +4465,65 @@ fn repository_refresh_job(inner: Arc<Mutex<Inner>>) {
             };
             // Keep a state already read for requests this poll did not answer.
             for state in &states {
-                agent.pull_states.retain(|old| old.number != state.number);
+                agent
+                    .pull_states
+                    .retain(|old| old.repository != state.repository || old.number != state.number);
             }
             agent.pull_states.extend(states);
         }
     }
 }
 
-/// The pull request numbers each agent's last-work block names.
-fn tracked_pull_numbers(agents: &[AgentRuntime]) -> Vec<(usize, Vec<u64>)> {
+/// Read the live state of the exact `(repository, number)` targets a work block
+/// names. A target the instance does not answer is left without a state.
+fn read_pull_states(
+    client: &ForgejoClient,
+    targets: &[(String, u64)],
+) -> Vec<crate::engine_api::PullStateView> {
+    let mut states = Vec::new();
+    for (repository, number) in targets {
+        let Some((namespace, name)) = repository.split_once('/') else {
+            continue;
+        };
+        if let Ok(Some(pull)) = client.pull_request(namespace, name, *number) {
+            states.push(crate::engine_api::PullStateView {
+                repository: repository.clone(),
+                number: *number,
+                state: pull.state,
+            });
+        }
+    }
+    states
+}
+
+/// The exact pull requests each agent's last-work block names. A legacy line with no
+/// repository cannot identify one request among same-numbered requests, so it is not
+/// guessed at; the screen keeps the run's recorded word for it.
+fn tracked_pull_targets(agents: &[AgentRuntime]) -> Vec<(usize, Vec<(String, u64)>)> {
     agents
         .iter()
         .enumerate()
         .filter_map(|(index, agent)| {
-            let mut numbers: Vec<u64> = Vec::new();
-            for line in &agent.last_work {
-                let Some(rest) = line.strip_prefix("pull request #") else {
-                    continue;
-                };
-                let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-                if let Ok(number) = digits.parse::<u64>()
-                    && !numbers.contains(&number)
-                {
-                    numbers.push(number);
-                }
-            }
-            (!numbers.is_empty()).then_some((index, numbers))
+            let targets = pull_targets_from_work(&agent.last_work);
+            (!targets.is_empty()).then_some((index, targets))
         })
         .collect()
+}
+
+/// The exact repository/number pairs named by work lines. A line with no repository
+/// cannot identify one request among same-numbered requests, so it is skipped.
+fn pull_targets_from_work(lines: &[String]) -> Vec<(String, u64)> {
+    let mut targets: Vec<(String, u64)> = Vec::new();
+    for line in lines {
+        let Some((Some(repository), number)) = run::pull_work_reference(line) else {
+            continue;
+        };
+        let target = (repository.to_owned(), number);
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
 }
 
 /// The repository changes between two administration-API polls, as the board's
@@ -5854,6 +5863,84 @@ mod tests {
     }
 
     #[test]
+    fn a_live_pull_state_is_read_from_the_repository_that_owns_the_number() {
+        let stub = crate::test_stub::Stub::start_routed(vec![
+            crate::test_stub::Route::new(
+                "GET",
+                "/api/v1/repos/team/alpha/pulls/4",
+                crate::test_stub::StubReply::json(
+                    serde_json::json!({
+                        "number": 4,
+                        "title": "alpha request",
+                        "state": "open",
+                        "merged": false,
+                        "head": {"ref": "topic", "repo": {"full_name": "team/alpha"}},
+                        "base": {"ref": "main", "repo": {"full_name": "team/alpha"}}
+                    })
+                    .to_string(),
+                ),
+            ),
+            crate::test_stub::Route::new(
+                "GET",
+                "/api/v1/repos/team/workspace/pulls/4",
+                crate::test_stub::StubReply::json(
+                    serde_json::json!({
+                        "number": 4,
+                        "title": "workspace request",
+                        "state": "closed",
+                        "merged": true,
+                        "head": {"ref": "topic", "repo": {"full_name": "team/workspace"}},
+                        "base": {"ref": "main", "repo": {"full_name": "team/workspace"}}
+                    })
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let client = ForgejoClient::new(
+            &format!("http://{}", stub.addr()),
+            Secret::new("gw-test"),
+            DEFAULT_TIMEOUT,
+        )
+        .expect("a client");
+        let targets = vec![("team/workspace".to_owned(), 4)];
+        let states = read_pull_states(&client, &targets);
+        assert_eq!(
+            states,
+            vec![crate::engine_api::PullStateView {
+                repository: "team/workspace".to_owned(),
+                number: 4,
+                state: "merged".to_owned(),
+            }]
+        );
+        let requests = stub.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.path.contains("/team/workspace/pulls/4")),
+            "the refresh asked another repository for the state: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn two_repositories_can_have_the_same_request_number() {
+        let targets = pull_targets_from_work(&[
+            "pull request team/alpha#4 from topic".to_owned(),
+            "pull request team/workspace#4 from topic".to_owned(),
+        ]);
+        assert_eq!(
+            targets,
+            vec![
+                ("team/alpha".to_owned(), 4),
+                ("team/workspace".to_owned(), 4)
+            ]
+        );
+        assert!(
+            pull_targets_from_work(&["pull request #4 from topic".to_owned()]).is_empty(),
+            "a legacy line with no repository guessed a target"
+        );
+    }
+
+    #[test]
     fn the_cards_summary_prefers_the_newest_run_that_did_work() {
         let root = scratch_root("engine-last-work-result");
         let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
@@ -5941,7 +6028,7 @@ mod tests {
             frame.push('\n');
         }
         assert!(
-            frame.contains("last completed work: comment on #1"),
+            frame.contains("last completed work: comment on team/workspace#1"),
             "the card did not keep the newest completed work:\n{frame}"
         );
         assert!(
@@ -6093,7 +6180,7 @@ mod tests {
             after
                 .last_work
                 .iter()
-                .any(|line| line.contains("comment on #7")),
+                .any(|line| line.contains("comment on team/workspace#7")),
             "the previous last work was lost: {:?}",
             after.last_work
         );

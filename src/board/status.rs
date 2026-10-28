@@ -7,6 +7,9 @@
 
 use crate::board::theme;
 use crate::engine_api::{AgentView, Desired, ForgejoState, Provisioning, SessionEnd, SessionState};
+use crate::run::{
+    comment_work_reference, pull_work_reference, push_work_reference, work_reference,
+};
 use ratatui::style::Color;
 use std::time::SystemTime;
 
@@ -718,12 +721,13 @@ pub fn run_result_line(agent: &AgentView) -> Option<String> {
     }
 }
 
-/// The live state of one pull request, when the engine has read it.
-pub fn pull_state(agent: &AgentView, number: u64) -> Option<&str> {
+/// The live state of one pull request in one repository, when the engine has read
+/// it. Numbering is per repository, so the number alone is never enough.
+pub fn pull_state<'a>(agent: &'a AgentView, repository: &str, number: u64) -> Option<&'a str> {
     agent
         .pull_states
         .iter()
-        .find(|pull| pull.number == number)
+        .find(|pull| pull.repository == repository && pull.number == number)
         .map(|pull| pull.state.as_str())
 }
 
@@ -737,26 +741,57 @@ pub fn newest_work_phrase(agent: &AgentView) -> Option<String> {
         if line.starts_with("issue #") {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("pull request #") {
-            let number = leading_number(rest);
-            let state = number
-                .parse::<u64>()
-                .ok()
-                .and_then(|number| pull_state(agent, number))
+        if let Some((repository, number)) = pull_work_reference(line) {
+            let state = repository
+                .and_then(|repository| pull_state(agent, repository, number))
                 .unwrap_or("open");
-            return Some(format!("PR #{number} {state}"));
+            return Some(format!("PR {} {state}", work_reference(repository, number)));
         }
-        if let Some(rest) = line.strip_prefix("comment on #") {
-            let number = leading_number(rest);
-            return Some(format!("comment on #{number}"));
+        if let Some((repository, number)) = comment_work_reference(line) {
+            return Some(format!("comment on {}", work_reference(repository, number)));
         }
-        if let Some(rest) = line.strip_prefix("branch ") {
-            let branch = rest.split_whitespace().next().unwrap_or(rest);
-            return Some(format!("branch {branch}"));
+        if let Some((repository, branch)) = push_work_reference(line) {
+            return Some(match repository {
+                Some(repository) => format!("branch {branch} in {repository}"),
+                None => format!("branch {branch}"),
+            });
         }
         return Some(line.clone());
     }
     None
+}
+
+/// The work block ordered for the screen: remote work (pull requests, pushes and
+/// comments) first, then local work, then reads. The person acts on the remote fact;
+/// a read must never take its row.
+pub fn ordered_work_lines(agent: &AgentView) -> Vec<String> {
+    let mut remote = Vec::new();
+    let mut local = Vec::new();
+    let mut reads = Vec::new();
+    for line in &agent.last_work {
+        if pull_work_reference(line).is_some()
+            || comment_work_reference(line).is_some()
+            || push_work_reference(line).is_some()
+        {
+            remote.push(line.clone());
+        } else if line.starts_with("local change")
+            || line == "local commit"
+            || line == "local git change"
+        {
+            local.push(line.clone());
+        } else {
+            reads.push(line.clone());
+        }
+    }
+    remote.extend(local);
+    remote.extend(reads);
+    remote
+}
+
+/// Whether a work row is only a read, so the Agent screen can put remote work and
+/// a failure before it.
+pub fn is_read_work_line(line: &str) -> bool {
+    line.starts_with("issue #")
 }
 
 /// The mark that belongs with the last completed work word.
@@ -770,9 +805,9 @@ pub fn work_mark(agent: &AgentView) -> Option<char> {
         if line.starts_with("issue #") {
             continue;
         }
-        if line.starts_with("pull request #")
-            || line.starts_with("comment on #")
-            || line.starts_with("branch ")
+        if pull_work_reference(line).is_some()
+            || comment_work_reference(line).is_some()
+            || push_work_reference(line).is_some()
         {
             return Some('✓');
         }
@@ -918,34 +953,34 @@ pub fn last_work_word(agent: &AgentView) -> Option<String> {
     }
     let mut best: Option<String> = None;
     for line in agent.last_work.iter().rev() {
-        if let Some(rest) = line.strip_prefix("pull request #") {
-            // The number is the fact a person needs; the label is what gives way
+        if let Some((repository, number)) = pull_work_reference(line) {
+            // The reference is the fact a person needs; the label is what gives way
             // when a compact line is tight. `PR #100` stays `#100`, never `PR#10`.
             // A live state that is no longer `open` is kept beside it, so a merged
             // request does not look outstanding on the board.
-            let number = leading_number(rest);
-            let state = number
-                .parse::<u64>()
-                .ok()
-                .and_then(|number| pull_state(agent, number))
+            let state = repository
+                .and_then(|repository| pull_state(agent, repository, number))
                 .filter(|state| *state != "open");
+            let reference = work_reference(repository, number);
             best = Some(match state {
-                Some(state) => format!("#{number} {state}"),
-                None => format!("#{number}"),
+                Some(state) => format!("{reference} {state}"),
+                None => reference,
             });
             break;
         }
         if let Some(rest) = line.strip_prefix("issue #") {
             best = Some(format!("#{}", leading_number(rest)));
-        } else if let Some(rest) = line.strip_prefix("comment on #") {
-            best.get_or_insert_with(|| format!("#{}", leading_number(rest)));
-        } else if let Some(rest) = line.strip_prefix("branch ") {
-            let branch = rest.split_whitespace().next().unwrap_or(rest);
+        } else if let Some((repository, number)) = comment_work_reference(line) {
+            best.get_or_insert_with(|| work_reference(repository, number));
+        } else if let Some((repository, branch)) = push_work_reference(line) {
             // The card's bottom border has room for the branch when it fits; when
             // it does not, the border's whole-word fit appends `…`. Take the whole
             // value here: a fixed seven-character cut made `fix/readme-typo` read
             // `fix/rea` with no sign that anything was missing.
-            best.get_or_insert_with(|| branch.to_owned());
+            best.get_or_insert_with(|| match repository {
+                Some(repository) => format!("{branch} in {repository}"),
+                None => branch.to_owned(),
+            });
         } else if let Some(rest) = line.strip_prefix("local change ") {
             best.get_or_insert_with(|| rest.split(',').next().unwrap_or(rest).trim().to_owned());
         } else if line == "local commit" || line == "local git change" {
@@ -971,15 +1006,14 @@ pub fn last_work_is_failure(agent: &AgentView) -> bool {
 pub fn last_work_identity(agent: &AgentView) -> Option<String> {
     let mut best: Option<String> = None;
     for line in agent.last_work.iter().rev() {
-        if let Some(rest) = line.strip_prefix("pull request #") {
-            return Some(format!("#{}", leading_number(rest)));
+        if let Some((repository, number)) = pull_work_reference(line) {
+            return Some(work_reference(repository, number));
         }
         if let Some(rest) = line.strip_prefix("issue #") {
             best = Some(format!("#{}", leading_number(rest)));
-        } else if let Some(rest) = line.strip_prefix("comment on #") {
-            best.get_or_insert_with(|| format!("#{}", leading_number(rest)));
-        } else if let Some(rest) = line.strip_prefix("branch ") {
-            let branch = rest.split_whitespace().next().unwrap_or(rest);
+        } else if let Some((repository, number)) = comment_work_reference(line) {
+            best.get_or_insert_with(|| work_reference(repository, number));
+        } else if let Some((_repository, branch)) = push_work_reference(line) {
             // The list line and the cleanup code have seven cells for a branch.
             // A cut value says it was cut instead of silently reading as a whole
             // branch name.

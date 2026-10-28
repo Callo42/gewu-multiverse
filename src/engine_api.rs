@@ -176,6 +176,8 @@ pub struct RunProgramView {
 /// or `closed` instead of repeating the run's `open` forever.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullStateView {
+    /// `owner/name` of the repository the request belongs to.
+    pub repository: String,
     /// The request's number.
     pub number: u64,
     /// `open`, `closed` or `merged`.

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use gewu_multiverse::board::{Board, BoardForm, Screen};
+use gewu_multiverse::board::{Board, BoardForm, Screen, status};
 use gewu_multiverse::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
     ForgejoView, ProgramView, Provisioning, PullStateView, SessionEnd, SessionState,
@@ -287,6 +287,92 @@ fn a_stopped_run_shows_its_own_ending_and_labels_completed_work() {
 }
 
 #[test]
+fn a_stopped_run_keeps_completed_work_before_a_failure_at_the_small_sizes() {
+    let mut stopped = agent(1);
+    stopped.recent = vec![
+        SessionEnd::Succeeded,
+        SessionEnd::Stopped {
+            reason: "the run was stopped on request".to_owned(),
+            at: Some(SystemTime::now() - Duration::from_secs(180)),
+        },
+    ];
+    stopped.last_work = vec![
+        "issue #1".to_owned(),
+        "pull request team/workspace#4 from fix-readme-typo".to_owned(),
+        "comment on team/workspace#4".to_owned(),
+    ];
+    stopped.last_failure = Some(
+        "shell: exit 128: fatal: could not read from the remote repository because the \
+         recorded detail is long enough to need another row"
+            .to_owned(),
+    );
+    stopped.last_result = Some("the previous run's own summary".to_owned());
+    stopped.last_work_result = Some("Pull request opened".to_owned());
+    stopped.last_result_is_work = false;
+    stopped.activity = Some("opened pull request #4".to_owned());
+    stopped.activity_at = Some(SystemTime::now() - Duration::from_secs(180));
+    let mut board = mounted(vec![stopped]);
+    open_agent(&mut board);
+    for (width, height) in [(72, 18), (80, 24)] {
+        let frame = text(&draw(&mut board, width, height));
+        let heading = frame
+            .find("last completed work")
+            .unwrap_or_else(|| panic!("{width}x{height}: no completed-work heading:\n{frame}"));
+        let remote = frame
+            .find("team/workspace#4")
+            .unwrap_or_else(|| panic!("{width}x{height}: no remote work:\n{frame}"));
+        let failure = frame
+            .find("shell: exit 128")
+            .unwrap_or_else(|| panic!("{width}x{height}: no failure detail:\n{frame}"));
+        assert!(
+            heading < remote && remote < failure,
+            "{width}x{height}: work did not come before the failure:\n{frame}"
+        );
+        assert!(
+            frame.contains("instruction"),
+            "{width}x{height}: the instruction lost its heading:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn a_stopped_run_with_one_pull_request_keeps_it_before_a_failure() {
+    let mut stopped = agent(1);
+    stopped.recent = vec![
+        SessionEnd::Succeeded,
+        SessionEnd::Stopped {
+            reason: "the run was stopped on request".to_owned(),
+            at: Some(SystemTime::now() - Duration::from_secs(180)),
+        },
+    ];
+    stopped.last_work = vec![
+        "issue #1".to_owned(),
+        "pull request team/workspace#4 from fix-readme-typo".to_owned(),
+    ];
+    stopped.last_failure =
+        Some("shell: exit 128: fatal: could not read from the remote repository".to_owned());
+    stopped.last_result_is_work = false;
+    let mut board = mounted(vec![stopped]);
+    open_agent(&mut board);
+    for (width, height) in [(72, 18), (80, 24)] {
+        let frame = text(&draw(&mut board, width, height));
+        let heading = frame
+            .find("last completed work")
+            .unwrap_or_else(|| panic!("{width}x{height}: no completed-work heading:\n{frame}"));
+        let remote = frame
+            .find("pull request team/workspace#4")
+            .unwrap_or_else(|| panic!("{width}x{height}: no pull request row:\n{frame}"));
+        let failure = frame
+            .find("shell: exit 128")
+            .unwrap_or_else(|| panic!("{width}x{height}: no failure detail:\n{frame}"));
+        assert!(
+            heading < remote && remote < failure,
+            "{width}x{height}: the request did not come before the failure:\n{frame}"
+        );
+    }
+}
+
+#[test]
 fn a_local_change_warning_is_named_in_the_strip_and_the_legend() {
     let mut local = agent(1);
     local.recent = vec![SessionEnd::Warned {
@@ -296,6 +382,11 @@ fn a_local_change_warning_is_named_in_the_strip_and_the_legend() {
     local.last_result = Some("workspace changed: workspace/TODO.md".to_owned());
     local.last_work_result = Some("workspace changed: workspace/TODO.md".to_owned());
     local.last_result_is_work = true;
+    assert_eq!(
+        status::session_label(&local.recent[0]),
+        "local change",
+        "the newest warning label ignored the workspace reason"
+    );
     let mut board = mounted(vec![local]);
     open_agent(&mut board);
     for (width, height) in [(72, 18), (80, 24)] {
@@ -322,31 +413,44 @@ fn a_merged_or_closed_request_is_not_shown_open() {
         worked.recent = vec![SessionEnd::Succeeded];
         worked.last_work = vec![
             "issue #1".to_owned(),
-            "pull request #4 from fix-readme-typo".to_owned(),
+            "pull request team/workspace#4 from fix-readme-typo".to_owned(),
         ];
         worked.last_result = Some("Pull request opened".to_owned());
         worked.last_work_result = Some("Pull request opened".to_owned());
         worked.last_result_is_work = true;
-        worked.pull_states = vec![PullStateView {
-            number: 4,
-            state: state.to_owned(),
-        }];
+        worked.pull_states = vec![
+            // Same number in another repository: it must not supply this state.
+            PullStateView {
+                repository: "team/alpha".to_owned(),
+                number: 4,
+                state: "open".to_owned(),
+            },
+            PullStateView {
+                repository: "team/workspace".to_owned(),
+                number: 4,
+                state: state.to_owned(),
+            },
+        ];
         let mut board = mounted(vec![worked]);
         open_agent(&mut board);
         for (width, height) in [(72, 18), (80, 24), (120, 40)] {
             let frame = text(&draw(&mut board, width, height));
             assert!(
-                frame.contains(&format!("PR #4 {state}")),
+                frame.contains(&format!("PR team/workspace#4 {state}")),
                 "{width}x{height}: the live {state} state is missing:\n{frame}"
             );
             assert!(
-                !frame.contains("PR #4 open"),
+                !frame.contains("PR team/workspace#4 open"),
                 "{width}x{height}: the run's recorded open state survived the {state}:\n{frame}"
+            );
+            assert!(
+                !frame.contains("PR team/alpha#4"),
+                "{width}x{height}: another repository's #4 supplied the state:\n{frame}"
             );
         }
         let home = text(&draw(&mut board, 120, 40));
         assert!(
-            home.contains(&format!("#4 {state}")),
+            home.contains(&format!("team/workspace#4 {state}")),
             "the board card does not carry the live {state} state:\n{home}"
         );
     }
