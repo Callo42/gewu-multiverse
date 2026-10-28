@@ -824,15 +824,13 @@ fn fit_work_line(line: &str, max: usize) -> String {
     text_util::ellipsize_words(line, max)
 }
 
-/// How many rows a notice needs at this width, capped so a screen can reserve
-/// space without turning a transient sentence into a paragraph.
-fn notice_rows(board: &Board, width: usize, max_rows: u16) -> u16 {
+/// How many rows the current notice needs at this width. This is the one
+/// decision the layout and every draw path use, capped at two rows.
+fn notice_rows_for(board: &Board, width: usize) -> u16 {
     let Some(text) = board.notice() else {
         return 0;
     };
-    text_util::wrap(text, width)
-        .len()
-        .clamp(1, max_rows.max(1) as usize) as u16
+    text_util::wrap(text, width).len().clamp(1, 2) as u16
 }
 
 /// Wrap text into at most `max_rows` rows. A text longer than the reserved rows
@@ -854,23 +852,17 @@ fn wrap_limited(text: &str, width: usize, max_rows: u16) -> Vec<String> {
 }
 
 /// A notice's wrapped rows, empty when there is no notice.
-fn notice_lines(board: &Board, width: usize, max_rows: u16) -> Vec<String> {
+fn notice_lines(board: &Board, width: usize, rows: u16) -> Vec<String> {
     let Some(text) = board.notice() else {
         return Vec::new();
     };
-    wrap_limited(text, width, max_rows)
+    wrap_limited(text, width, rows)
 }
 
 /// Draw the board's notice from `bottom_row` upwards. Returns the rows used.
-fn draw_notice(
-    board: &Board,
-    buf: &mut Buffer,
-    clip: Rect,
-    width: usize,
-    bottom_row: u16,
-    max_rows: u16,
-) -> u16 {
-    let parts = notice_lines(board, width, max_rows);
+fn draw_notice(board: &Board, buf: &mut Buffer, clip: Rect, width: usize, bottom_row: u16) -> u16 {
+    let rows = notice_rows_for(board, width);
+    let parts = notice_lines(board, width, rows);
     let rows = parts.len() as u16;
     let start = bottom_row.saturating_add(1).saturating_sub(rows);
     for (offset, part) in parts.iter().enumerate() {
@@ -1140,6 +1132,9 @@ fn status_sentence(board: &Board) -> Option<String> {
 
 /// The rows the status sentence needs at this width, capped at two.
 fn status_rows_for(board: &Board, width: usize) -> u16 {
+    if board.notice().is_some() {
+        return notice_rows_for(board, width);
+    }
     status_sentence(board)
         .map(|line| text_util::wrap(&line, width).len().clamp(1, 2) as u16)
         .unwrap_or(0)
@@ -1226,18 +1221,16 @@ fn footer_rows_for(
 ) -> u16 {
     let width = inner.width.saturating_sub(2) as usize;
     if build {
-        return 1 + notice_rows(board, width, 2).max(1);
+        return 1 + notice_rows_for(board, width).max(1);
     }
     if let Some(name) = board.confirm_remove.as_deref() {
         let (consequence, _keys) = remove_confirmation(name);
-        return text_util::wrap(&consequence, width).len().max(1) as u16 + 1;
+        return text_util::wrap(&consequence, width).len().max(1) as u16
+            + 1
+            + notice_rows_for(board, width);
     }
     if board.confirm_quit {
-        let notice = if board.notice().is_some() {
-            notice_rows(board, width, 2).max(1)
-        } else {
-            0
-        };
+        let notice = notice_rows_for(board, width);
         let budget = inner.height.saturating_sub(notice + board_floor).max(1);
         let line = quit_warning_text(board, inner.width, budget);
         let warning = text_util::wrap(&line, width).len().max(1) as u16;
@@ -2326,11 +2319,12 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     let footer_rows = board.last.footer_rows;
     let footer_top = inner.bottom().saturating_sub(footer_rows);
     if board.confirm_quit {
-        let notice = board.notice();
         let width = inner.width.saturating_sub(2) as usize;
-        // The warning owns everything the geometry gave it except the notice's
-        // one row: consequence, reopen sentence and confirmation are whole.
-        let budget = footer_rows.saturating_sub(u16::from(notice.is_some()));
+        // The warning owns everything the geometry gave it except the rows the
+        // one notice decision says the notice needs: consequence, reopen sentence
+        // and confirmation stay whole above it.
+        let notice_rows = notice_rows_for(board, width);
+        let budget = footer_rows.saturating_sub(notice_rows);
         let line = quit_warning_text(board, inner.width, budget);
         let parts = text_util::wrap(&line, width);
         for (offset, part) in (0..budget).zip(parts) {
@@ -2343,36 +2337,25 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
                 theme::bold(theme::AMBER),
             );
         }
-        if notice.is_some() {
-            draw_notice(
-                board,
-                buf,
-                inner,
-                width,
-                inner.bottom().saturating_sub(1),
-                footer_rows.saturating_sub(budget),
-            );
-        }
+        draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
         return;
     }
 
     if let Some(name) = &board.confirm_remove {
-        // The consequences and the keys are both in the footer: a confirmation
-        // without its verb is a screen the person has to guess at (F6).
+        // The consequences, the keys and any current notice are all in the
+        // footer: a confirmation without its verb is a screen the person has to
+        // guess at, and hiding a notice would lose what the screen just said.
         let (consequence, keys) = remove_confirmation(name);
         let width = inner.width.saturating_sub(2) as usize;
-        let keys_row = footer_top + footer_rows.saturating_sub(1);
-        for (offset, part) in text_util::wrap(&consequence, width)
-            .into_iter()
-            .take(footer_rows.saturating_sub(1) as usize)
-            .enumerate()
-        {
+        let parts = text_util::wrap(&consequence, width);
+        let keys_row = footer_top + parts.len().max(1) as u16;
+        for (offset, part) in parts.iter().enumerate() {
             text_util::put(
                 buf,
                 inner,
                 inner.x + 1,
                 footer_top + offset as u16,
-                &part,
+                part,
                 theme::bold(theme::AMBER),
             );
         }
@@ -2384,6 +2367,7 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
             &keys,
             theme::bold(theme::AMBER),
         );
+        draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
         return;
     }
     text_util::put(
@@ -2476,10 +2460,12 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     // The status line owns the row the geometry reserved after the event, if
     // any was reserved; it is never written into an unreserved row.
     let status_rows = footer_rows.saturating_sub(2 + u16::from(event.is_some()));
-    if status_rows > 0
+    let width = inner.width.saturating_sub(2) as usize;
+    if board.notice().is_some() {
+        draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
+    } else if status_rows > 0
         && let Some(line) = status_sentence(board)
     {
-        let width = inner.width.saturating_sub(2) as usize;
         for (offset, part) in wrap_limited(&line, width, status_rows)
             .into_iter()
             .enumerate()
@@ -2490,11 +2476,7 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
                 inner.x + 1,
                 status_y + offset as u16,
                 &part,
-                if board.notice().is_some() {
-                    theme::fg(theme::FG)
-                } else {
-                    theme::fg(theme::AMBER)
-                },
+                theme::fg(theme::AMBER),
             );
         }
     }
@@ -2515,7 +2497,7 @@ fn waiting_sentence(board: &Board) -> Option<String> {
 
 fn draw_build_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     let width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, width, 2).max(1);
+    let notice_rows = notice_rows_for(board, width).max(1);
     let y = inner.bottom().saturating_sub(1 + notice_rows);
     let line = match &board.view.forgejo.state {
         ForgejoState::Failed { reason } => {
@@ -2531,21 +2513,14 @@ fn draw_build_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
         &text_util::ellipsize(&line, width),
         theme::fg(theme::MUTED),
     );
-    draw_notice(
-        board,
-        buf,
-        inner,
-        width,
-        inner.bottom().saturating_sub(1),
-        notice_rows,
-    );
+    draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
 }
 
 fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Before you start");
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
@@ -2665,7 +2640,6 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 
@@ -2680,7 +2654,7 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, &title);
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
@@ -2844,7 +2818,6 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 
@@ -2881,7 +2854,7 @@ fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "How many agents?");
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
@@ -3022,7 +2995,6 @@ fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 
@@ -3052,7 +3024,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, &agent_title);
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(2 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
@@ -3565,7 +3537,6 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 
@@ -3743,7 +3714,7 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Agent program");
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     // Start on the frame's first content row: an unknown saved program adds a line
     // above the list, and the 72x18 picture needs every row for the wrapped Codex
     // sentence and a two-row notice.
@@ -4113,7 +4084,6 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 
@@ -4121,7 +4091,7 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Forgejo");
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
@@ -4294,7 +4264,6 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 
@@ -4311,7 +4280,7 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
     };
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
@@ -4425,7 +4394,6 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 
@@ -4433,7 +4401,7 @@ fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Keys");
     let inner = inner(area);
     let notice_width = inner.width.saturating_sub(2) as usize;
-    let notice_rows = notice_rows(board, notice_width, 2).max(1);
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
     let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
@@ -4503,7 +4471,6 @@ fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
         inner,
         notice_width,
         inner.bottom().saturating_sub(1),
-        notice_rows,
     );
 }
 

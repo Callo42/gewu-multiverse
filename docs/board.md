@@ -430,7 +430,9 @@ on the first-run screen. The selected card carries `▸` before its name on the 
 can see which agent `←→` targets; the tint is only reinforcement. The newest event,
 when the box cannot hold it, is on its own footer row under the keys. `BoardView.notice`
 is drawn wrapped onto the status rows under the keys (up to two rows, with `…` if a
-still longer sentence had to be cut). It is cleaned before it
+still longer sentence had to be cut). A quit or remove confirmation keeps the
+current notice and reserves its rows, so the confirmation does not hide what the
+screen just said. It is cleaned before it
 is drawn: the engine writes names in backticks, the board removes them, so a notice
 reads `agent-4 is connected as gewu-agent-4` and never shows the marks.
 

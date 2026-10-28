@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gewu_multiverse::board::{Board, Screen, status};
 use gewu_multiverse::engine_api::{
@@ -433,6 +433,75 @@ fn the_rendered_key_clear_confirmation_says_it_was_cleared() {
         assert!(
             frame.contains("API key cleared"),
             "{width}x{height}: the rendered Agent confirmation lost the clear:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn every_footer_state_keeps_a_two_row_notice_whole() {
+    let notice =
+        "agent-1's API key cleared; connection saved for its next run; this run keeps its settings";
+    for (width, height) in [(72, 18), (80, 24)] {
+        // Normal footer.
+        let mut base = view(vec![agent(1, "pi")]);
+        base.notice = Some(notice.to_owned());
+        let mut normal = Board::new(ViewEngine {
+            view: base.clone(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let frame = flat(&draw(&mut normal, width, height));
+        assert!(
+            frame.contains("settings"),
+            "{width}x{height} normal footer:\n{frame}"
+        );
+
+        // Quit confirmation with a started agent.
+        let mut running = agent(1, "pi");
+        running.desired = Desired::Started;
+        running.session = SessionState::Running {
+            number: 1,
+            since: SystemTime::now(),
+        };
+        let mut quit = view(vec![running]);
+        quit.notice = Some(notice.to_owned());
+        let mut quit = Board::new(ViewEngine {
+            view: quit,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        press(&mut quit, KeyCode::Char('q'));
+        let frame = flat(&draw(&mut quit, width, height));
+        assert!(
+            frame.contains("q again quits") && frame.contains("settings"),
+            "{width}x{height} quit footer:\n{frame}"
+        );
+
+        // Remove confirmation on the board.
+        let mut remove = view(vec![agent(1, "pi"), agent(2, "pi")]);
+        remove.notice = Some(notice.to_owned());
+        let mut remove = Board::new(ViewEngine {
+            view: remove,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        press(&mut remove, KeyCode::Char('-'));
+        let frame = flat(&draw(&mut remove, width, height));
+        assert!(
+            frame.contains("remove agent-1?") && frame.contains("settings"),
+            "{width}x{height} board remove footer:\n{frame}"
+        );
+
+        // Remove confirmation on an Agent screen.
+        let mut agent_remove = view(vec![agent(1, "pi"), agent(2, "pi")]);
+        agent_remove.notice = Some(notice.to_owned());
+        let mut agent_remove = Board::new(ViewEngine {
+            view: agent_remove,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        open_agent(&mut agent_remove);
+        press(&mut agent_remove, KeyCode::Char('d'));
+        let frame = flat(&draw(&mut agent_remove, width, height));
+        assert!(
+            frame.contains("remove agent-1?") && frame.contains("settings"),
+            "{width}x{height} agent remove footer:\n{frame}"
         );
     }
 }
