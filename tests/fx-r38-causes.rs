@@ -558,3 +558,139 @@ fn the_model_test_keeps_its_action_at_72x18_and_80x24() {
         }
     }
 }
+
+fn failed_agent(reason: &str) -> AgentView {
+    let mut failed = agent(1);
+    failed.program = "dsh".to_owned();
+    failed.program_label = "DeepSeek Harness".to_owned();
+    failed.recent = vec![SessionEnd::Failed {
+        reason: reason.to_owned(),
+    }];
+    failed.last_error = Some(reason.to_owned());
+    failed.last_work.clear();
+    failed.last_result = None;
+    failed.last_work_result = None;
+    failed.last_result_is_work = false;
+    failed
+}
+
+#[test]
+fn a_dsh_401_keeps_status_message_and_key_repair_at_every_size() {
+    let raw = "AUTH: 401: {\"message\":\"Incorrect API key provided: sk-synthetic-provider-errors-0001\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}";
+    let words = status::failure_words(raw);
+    assert!(words.contains("HTTP 401"), "{words}");
+    assert!(words.contains("Incorrect API key provided"), "{words}");
+    assert!(words.contains("check the key"), "{words}");
+    assert!(!words.contains('{'), "{words}");
+    assert!(!words.contains("sk-synthetic"), "{words}");
+
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let mut board = mounted(vec![failed_agent(raw)]);
+        let home = text(&draw(&mut board, width, height));
+        assert!(
+            home.contains("401"),
+            "{width}x{height}: the board lost the status:\n{home}"
+        );
+        assert!(
+            home.contains("check key"),
+            "{width}x{height}: the board lost the repair:\n{home}"
+        );
+        open_agent(&mut board);
+        let frame = text(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("HTTP 401"),
+            "{width}x{height}: the Agent screen lost the status:\n{frame}"
+        );
+        assert!(
+            frame.contains("check the key"),
+            "{width}x{height}: the Agent screen lost the repair:\n{frame}"
+        );
+        assert!(
+            !frame.contains("sk-synthetic"),
+            "{width}x{height}: the credential echo survived:\n{frame}"
+        );
+        if width >= 80 {
+            assert!(
+                frame.contains("Incorrect API key provided"),
+                "{width}x{height}: the provider's sentence is gone:\n{frame}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_dsh_403_keeps_access_guidance_and_never_says_check_the_key_at_every_size() {
+    let raw = "AUTH: 403: {\"message\":\"You do not have permission to use this model.\",\"type\":\"permission_error\",\"code\":\"model_not_allowed\"}";
+    let words = status::failure_words(raw);
+    assert!(words.contains("HTTP 403"), "{words}");
+    assert!(words.contains("access denied"), "{words}");
+    assert!(words.contains("You do not have permission"), "{words}");
+    assert!(words.contains("check the model and its access"), "{words}");
+    assert!(!words.contains("check the key"), "{words}");
+
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let mut board = mounted(vec![failed_agent(raw)]);
+        let home = text(&draw(&mut board, width, height));
+        assert!(
+            home.contains("403"),
+            "{width}x{height}: the board lost the status:\n{home}"
+        );
+        assert!(
+            home.contains("check access"),
+            "{width}x{height}: the board lost the access repair:\n{home}"
+        );
+        open_agent(&mut board);
+        let frame = text(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("HTTP 403"),
+            "{width}x{height}: the Agent screen lost the status:\n{frame}"
+        );
+        assert!(
+            frame.contains("check the model and its access"),
+            "{width}x{height}: the Agent screen lost the access repair:\n{frame}"
+        );
+        assert!(
+            !frame.contains("check the key"),
+            "{width}x{height}: a 403 was still told as a key problem:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_failure_keeps_its_words_and_an_ordinary_number_is_not_a_refusal() {
+    let raw = "the native program exited with code 1";
+    assert_eq!(status::failure_words(raw), raw);
+    let words = status::failure_words("the model answered after 401 tokens and stopped");
+    assert!(
+        !words.contains("check the key") && !words.contains("HTTP 401"),
+        "{words}"
+    );
+    let mut board = mounted(vec![failed_agent(raw)]);
+    open_agent(&mut board);
+    for (width, height) in [(80, 24), (120, 40)] {
+        let frame = text(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("exited with code 1"),
+            "{width}x{height}: the useful unknown text is gone:\n{frame}"
+        );
+        assert!(
+            !frame.contains("check the key") && !frame.contains("HTTP 401"),
+            "{width}x{height}: invented provider advice:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn the_board_keeps_the_provider_repair_with_three_agents() {
+    let raw = "AUTH: 401: {\"message\":\"Incorrect API key provided: <redacted>\"}";
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let mut agents: Vec<AgentView> = (1..=3).map(agent).collect();
+        agents[0] = failed_agent(raw);
+        let mut board = mounted(agents);
+        let home = text(&draw(&mut board, width, height));
+        assert!(
+            home.contains("check key"),
+            "{width}x{height}: the board lost the repair with three agents:\n{home}"
+        );
+    }
+}

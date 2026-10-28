@@ -1397,21 +1397,12 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
         }
         ModelError::MissingKey => "the API key is empty".to_owned(),
         ModelError::BadKey { status, message } => {
-            let detail = if message.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", whole_message(message, 400))
-            };
             // 403 is the provider saying the request is not allowed: the key
             // authenticated, but the model or its access is not permitted. Calling
-            // that a refused key sent the reader to the wrong repair.
-            if *status == 403 {
-                format!(
-                    "the provider denied access to this model (HTTP {status}){detail} — check the model and its access"
-                )
-            } else {
-                format!("the provider refused the API key (HTTP {status}){detail} — check the key")
-            }
+            // that a refused key sent the reader to the wrong repair. The shared
+            // function is the one the run surfaces also use, so the two screens
+            // cannot drift again.
+            refusal_words(*status, message)
         }
         ModelError::ModelNotFound { status, .. } => {
             format!("no model called {model} at this address (HTTP {status})")
@@ -1644,6 +1635,391 @@ fn missing_model_key_agent(text: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// A provider failure recognized in a native program's reason or stderr line.
+///
+/// The envelope is parsed once here, so the model form, the run reason and the
+/// Agent screen all keep the same status and the same provider sentence. A plain
+/// number or a normal program sentence is not a provider failure: the caller only
+/// reaches [`provider_failure_in`] with a failed run's reason, and the shape still
+/// has to name a provider envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderFailure {
+    pub status: u16,
+    pub message: String,
+}
+
+/// The one sentence the model form shows for a refused key or denied access.
+pub fn refusal_words(status: u16, message: &str) -> String {
+    let message = scrub_credentials(message);
+    let detail = if message.trim().is_empty() {
+        String::new()
+    } else {
+        format!(": {}", whole_message(&message, 400))
+    };
+    if status == 403 {
+        format!(
+            "the provider denied access to this model (HTTP {status}){detail} — check the model and its access"
+        )
+    } else {
+        format!("the provider refused the API key (HTTP {status}){detail} — check the key")
+    }
+}
+
+/// The run surfaces' sentence for the same failure.
+///
+/// The model form wraps with its action reserved, so it keeps the model form's
+/// order. A run row can be the last row on a 72-column card; this order puts the
+/// status, the category and the action inside the first 58 cells so shortening
+/// secondary detail never drops the repair.
+pub(crate) fn run_refusal_words(status: u16, message: &str) -> String {
+    let detail = if message.trim().is_empty() {
+        String::new()
+    } else {
+        format!(": {}", whole_message(message, 400))
+    };
+    if status == 403 {
+        format!("HTTP 403: access denied — check the model and its access{detail}")
+    } else {
+        format!("HTTP 401: provider refused the API key — check the key{detail}")
+    }
+}
+
+/// Find a provider failure in one failed run's reason or a program's stderr line.
+///
+/// Real program envelopes differ: DSH writes `AUTH: 401: {json}`, Pi writes
+/// `401: {json}`, Codex writes `unexpected status 401 Unauthorized: …`, and the
+/// product's own model errors write `the model call failed (bad_key): HTTP 403: …`.
+/// A JSON body is replaced by its provider message; the framing never reaches a
+/// screen. A credential-shaped token in the useful sentence is redacted even when
+/// an older record predates the run's own redaction.
+pub(crate) fn provider_failure_in(text: &str) -> Option<ProviderFailure> {
+    let text = strip_program_prefix(text.trim());
+    let (status, rest) = provider_status_and_rest(text)?;
+    Some(ProviderFailure {
+        status,
+        message: provider_message_after(rest),
+    })
+}
+
+/// Whether a stderr line starts with a provider envelope, so the first-cause
+/// reader may keep it instead of a stack frame or a later generic exit sentence.
+pub(crate) fn provider_failure_line(line: &str) -> bool {
+    let line = strip_program_prefix(line.trim());
+    if let Some((code, rest)) = leading_code(line)
+        && code.chars().any(|ch| ch.is_ascii_alphabetic())
+        && status_after_code(rest).is_some()
+    {
+        return true;
+    }
+    strict_leading_status(line).is_some()
+}
+
+fn strip_program_prefix(mut text: &str) -> &str {
+    for _ in 0..2 {
+        let Some((prefix, rest)) = text.split_once(": ") else {
+            break;
+        };
+        if matches!(prefix, "dsh" | "pi" | "codex" | "opencode") {
+            text = rest;
+        } else {
+            break;
+        }
+    }
+    text
+}
+
+fn provider_status_and_rest(text: &str) -> Option<(u16, &str)> {
+    if let Some((code, rest)) = leading_code(text)
+        && code.chars().any(|ch| ch.is_ascii_alphabetic())
+        && let Some(found) = status_after_code(rest)
+    {
+        return Some(found);
+    }
+    if let Some(found) = leading_status(text) {
+        return Some(found);
+    }
+    for needle in [
+        "unexpected status ",
+        "last status: ",
+        "status: ",
+        "status_code=",
+        "status=",
+    ] {
+        if let Some(at) = text.find(needle)
+            && let Some(found) = leading_status(&text[at + needle.len()..])
+        {
+            return Some(found);
+        }
+    }
+    for marker in ["HTTP/1.1 ", "HTTP/1.0 ", "HTTP "] {
+        if let Some(at) = text.find(marker)
+            && provider_context(&text[..at])
+            && let Some(found) = leading_status(&text[at + marker.len()..])
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn provider_context(before: &str) -> bool {
+    if before.trim().is_empty() {
+        return true;
+    }
+    let lower = before.to_ascii_lowercase();
+    [
+        "provider",
+        "model",
+        "bad_key",
+        "auth",
+        "api key",
+        "unexpected",
+        "request",
+        "endpoint",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn leading_code(text: &str) -> Option<(&str, &str)> {
+    let mut end = 0;
+    for (at, ch) in text.char_indices() {
+        if ch == ':' {
+            end = at;
+            break;
+        }
+        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+            return None;
+        }
+        end = at + ch.len_utf8();
+    }
+    if end == 0 || !text[end..].starts_with(':') {
+        return None;
+    }
+    Some((&text[..end], &text[end + 1..]))
+}
+
+fn status_after_code(rest: &str) -> Option<(u16, &str)> {
+    let rest = rest.trim_start();
+    if let Some(after) = rest.strip_prefix("gewu API error (") {
+        if let Some((status, rest)) = leading_status(after) {
+            let rest = rest.trim_start().strip_prefix(')').unwrap_or(rest);
+            return Some((status, rest));
+        }
+    }
+    if let Some(after) = rest.strip_prefix('(')
+        && let Some((status, rest)) = leading_status(after)
+    {
+        let rest = rest.trim_start().strip_prefix(')').unwrap_or(rest);
+        return Some((status, rest));
+    }
+    for marker in ["HTTP/1.1 ", "HTTP/1.0 ", "HTTP "] {
+        if let Some(after) = rest.strip_prefix(marker)
+            && let Some(found) = leading_status(after)
+        {
+            return Some(found);
+        }
+    }
+    leading_status(rest)
+}
+
+fn leading_status(text: &str) -> Option<(u16, &str)> {
+    let digits: String = text.chars().take(3).collect();
+    if digits.len() != 3 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let status = digits.parse::<u16>().ok()?;
+    if !(400..=599).contains(&status) {
+        return None;
+    }
+    let rest = &text[3..];
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    Some((status, rest))
+}
+
+fn strict_leading_status(text: &str) -> Option<(u16, &str)> {
+    let (status, rest) = leading_status(text)?;
+    let after = rest.trim_start();
+    if rest.starts_with(':')
+        || after.starts_with('{')
+        || after.starts_with('(')
+        || after.starts_with('"')
+        || is_http_reason_phrase(after.split_whitespace().next().unwrap_or(""))
+    {
+        Some((status, rest))
+    } else {
+        None
+    }
+}
+
+fn is_http_reason_phrase(word: &str) -> bool {
+    let word = word.trim_end_matches(':');
+    matches!(
+        word,
+        "Unauthorized"
+            | "Forbidden"
+            | "Not"
+            | "Bad"
+            | "Too"
+            | "Internal"
+            | "Service"
+            | "Gateway"
+            | "Payment"
+            | "Conflict"
+            | "Unprocessable"
+    )
+}
+
+fn provider_message_after(rest: &str) -> String {
+    let mut rest = rest.trim_start_matches([':', '—', '-']).trim();
+    if let Some((word, after)) = rest.split_once(':') {
+        if is_http_reason_phrase(word.trim()) {
+            rest = after.trim();
+        }
+    } else if let Some((word, after)) = rest.split_once(' ') {
+        if is_http_reason_phrase(word) {
+            rest = after.trim();
+        }
+    }
+    for needle in [", url: ", " url: ", ", url=", " url="] {
+        if let Some(at) = rest.find(needle) {
+            rest = &rest[..at];
+        }
+    }
+    if let Some(start) = rest.find('{') {
+        let json = &rest[start..];
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
+            && let Some(message) = provider_message_value(&value)
+        {
+            return scrub_credentials(&message);
+        }
+        if let Some(message) = json_string_field(json, "message") {
+            return scrub_credentials(&message);
+        }
+        if let Some(message) = json_string_field(json, "error") {
+            return scrub_credentials(&message);
+        }
+        let before = rest[..start].trim();
+        if !before.is_empty() {
+            return scrub_credentials(before);
+        }
+        return String::new();
+    }
+    let rest = rest.trim_matches(|ch| ch == '{' || ch == '}' || ch == '"' || ch == '\'');
+    let rest = rest.trim();
+    let rest = rest
+        .strip_suffix("from the model")
+        .or_else(|| rest.strip_suffix("from the provider"))
+        .unwrap_or(rest)
+        .trim();
+    scrub_credentials(&rest.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn provider_message_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("error").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .filter(|message| !message.trim().is_empty())
+}
+
+/// Read a quoted JSON field without requiring the object to be whole, so a
+/// truncated provider body still yields its own sentence rather than its braces.
+fn json_string_field(text: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let at = text.find(&needle)?;
+    let rest = text[at + needle.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in rest.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            break;
+        } else {
+            out.push(ch);
+        }
+    }
+    (!out.trim().is_empty()).then_some(out)
+}
+
+/// Remove credential-shaped text that an older record or a third-party envelope
+/// might still carry. The run's own writer already replaces the exact key; this is
+/// the last belt for a screen that only has the saved sentence.
+pub(crate) fn scrub_credentials(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = find_credential_start(rest) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let lower = tail.to_ascii_lowercase();
+        if lower.starts_with("bearer ") {
+            out.push_str("Bearer <redacted>");
+            rest = skip_token(&tail["bearer ".len()..]);
+        } else if lower.starts_with("sk-") {
+            out.push_str("<redacted>");
+            rest = skip_token(tail);
+        } else {
+            // api_key / api-key / apikey followed by a separator.
+            let Some((before, after_key)) = tail.split_once(['=', ':']) else {
+                out.push_str(tail);
+                rest = "";
+                break;
+            };
+            out.push_str(before);
+            out.push_str("<redacted>");
+            rest = skip_token(after_key.trim_start().trim_start_matches('"'));
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn find_credential_start(text: &str) -> Option<usize> {
+    for (at, _) in text.char_indices() {
+        let tail = &text[at..];
+        let lower = tail.to_ascii_lowercase();
+        let boundary = at == 0
+            || text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        if !boundary {
+            continue;
+        }
+        if lower.starts_with("sk-") && tail.len() > 3 {
+            return Some(at);
+        }
+        if lower.starts_with("bearer ") {
+            return Some(at);
+        }
+        if lower.starts_with("api_key")
+            || lower.starts_with("api-key")
+            || lower.starts_with("apikey")
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+fn skip_token(text: &str) -> &str {
+    let at = text
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '}' | ']'))
+        .map(|(at, _)| at)
+        .unwrap_or(text.len());
+    &text[at..]
+}
+
 /// The provider's own message from an error reply, as one bounded line.
 ///
 /// A JSON error envelope is read for `error.message`, `message` or a string
@@ -1665,7 +2041,7 @@ fn provider_message(body: &str) -> Option<String> {
     if one_line.is_empty() {
         None
     } else {
-        Some(excerpt(&one_line, 400))
+        Some(excerpt(&scrub_credentials(&one_line), 400))
     }
 }
 
@@ -2305,5 +2681,98 @@ mod tests {
             let message = format!("{error} {error:?}");
             assert!(!message.contains("sk-test-key"), "{message}");
         }
+    }
+
+    #[test]
+    fn a_provider_envelope_is_parsed_once_for_every_surface() {
+        let dsh = "AUTH: 401: {\"message\":\"Incorrect API key provided: sk-synthetic-dsh-0001\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}";
+        let failure = provider_failure_in(dsh).expect("the dsh envelope");
+        assert_eq!(failure.status, 401);
+        assert_eq!(failure.message, "Incorrect API key provided: <redacted>");
+        assert!(provider_failure_line(
+            "dsh: AUTH: 401: {\"message\":\"Incorrect\"}"
+        ));
+
+        let nested =
+            "403: {\"error\":{\"message\":\"You do not have permission to use this model.\"}}";
+        let failure = provider_failure_in(nested).expect("the nested envelope");
+        assert_eq!(failure.status, 403);
+        assert_eq!(
+            failure.message,
+            "You do not have permission to use this model."
+        );
+
+        let rate = "dsh: RATE_LIMIT: 429: {\"message\":\"slow down\"}";
+        let failure = provider_failure_in(rate).expect("the rate envelope");
+        assert_eq!(failure.status, 429);
+        assert_eq!(failure.message, "slow down");
+
+        let codex =
+            "unexpected status 401 Unauthorized: synthetic status 401, url: http://127.0.0.1:1/v1";
+        let failure = provider_failure_in(codex).expect("the codex envelope");
+        assert_eq!(failure.status, 401);
+        assert_eq!(failure.message, "synthetic status 401");
+
+        let model = "the model call failed (bad_key): HTTP 403: You do not have permission to use this model";
+        let failure = provider_failure_in(model).expect("the model-call envelope");
+        assert_eq!(failure.status, 403);
+        assert!(failure.message.contains("permission"));
+
+        let busy = "the provider answered HTTP 503: temporarily unavailable";
+        let failure = provider_failure_in(busy).expect("the temporary envelope");
+        assert_eq!(failure.status, 503);
+        assert_eq!(failure.message, "temporarily unavailable");
+
+        let bare = provider_failure_in("HTTP 500 from the model").expect("the bare status");
+        assert_eq!(bare.status, 500);
+        assert!(bare.message.is_empty());
+    }
+
+    #[test]
+    fn a_plain_number_or_sentence_is_not_a_provider_failure() {
+        for text in [
+            "I counted 401 lines and the model answered normally",
+            "write refused: HTTP 403",
+            "the native program exited with code 1",
+            "the model answered after 503 tokens",
+        ] {
+            assert!(
+                provider_failure_in(text).is_none(),
+                "misread as a provider failure: {text}"
+            );
+        }
+        assert!(!provider_failure_line("401 files changed"));
+        assert!(!provider_failure_line("a log line mentions HTTP 401"));
+    }
+
+    #[test]
+    fn a_credential_echo_is_redacted_without_losing_the_sentence() {
+        let message = scrub_credentials(
+            "Incorrect API key provided: sk-synthetic-dsh-0001 and Bearer sk-other-12345678",
+        );
+        assert!(!message.contains("sk-"), "{message}");
+        assert!(message.contains("Incorrect API key provided"), "{message}");
+        assert_eq!(
+            scrub_credentials("the api_key is missing from this message"),
+            "the api_key is missing from this message"
+        );
+        assert!(!scrub_credentials("api_key=sk-another-12345678").contains("sk-another"));
+        let echoed = refusal_words(401, "Incorrect API key provided: sk-synthetic-0001");
+        assert!(!echoed.contains("sk-synthetic"), "{echoed}");
+        assert!(echoed.contains("Incorrect API key provided"), "{echoed}");
+        assert_eq!(
+            refusal_words(401, "Incorrect API key provided"),
+            "the provider refused the API key (HTTP 401): Incorrect API key provided — check the key"
+        );
+        assert_eq!(
+            refusal_words(403, "not allowed"),
+            "the provider denied access to this model (HTTP 403): not allowed — check the model and its access"
+        );
+        assert!(
+            run_refusal_words(401, "Incorrect API key provided")
+                .starts_with("HTTP 401: provider refused the API key — check the key:"),
+            "{}",
+            run_refusal_words(401, "Incorrect API key provided")
+        );
     }
 }

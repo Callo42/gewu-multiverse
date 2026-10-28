@@ -2000,6 +2000,7 @@ fn stderr_cause(lines: &[String]) -> Option<String> {
             || line.starts_with("Error ")
             || line.starts_with("error: ")
             || line.to_ascii_lowercase().contains("error:")
+            || crate::model::provider_failure_line(line)
     })?;
     let mut out = lines[index].trim().to_owned();
     for line in lines.iter().skip(index + 1).take(4) {
@@ -3076,6 +3077,19 @@ mod unconfirmed_work_tests {
         let reason = stderr_cause(&dsh).expect("the dsh overlay cause");
         assert!(reason.contains("failed to parse overlay"), "{reason}");
         assert!(!reason.contains("Node.js"), "{reason}");
+    }
+
+    #[test]
+    fn the_stderr_cause_keeps_a_dsh_provider_envelope() {
+        // DSH prints its provider refusal on stderr and exits before a JSON
+        // terminal event. The line is the cause, not the generic exit status.
+        let dsh = vec![
+            "dsh: AUTH: 401: {\"message\":\"Incorrect API key provided: <redacted>\",\"type\":\"invalid_request_error\"}"
+                .to_owned(),
+        ];
+        let reason = stderr_cause(&dsh).expect("the provider cause");
+        assert!(reason.contains("AUTH: 401"), "{reason}");
+        assert!(reason.contains("Incorrect API key provided"), "{reason}");
     }
 }
 
