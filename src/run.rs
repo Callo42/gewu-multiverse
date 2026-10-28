@@ -417,6 +417,11 @@ pub struct RunFacts {
     /// At least one read (or other non-write tool call) succeeded.
     #[serde(default)]
     pub read: bool,
+    /// At least one write succeeded, even when it is not a push, pull request or
+    /// comment (for example a shell command that wrote outside the workspace). It is
+    /// a work fact, not a read; the work line still names only typed work.
+    #[serde(default)]
+    pub wrote: bool,
     /// At least one tool call was recorded, even if it left no work fact.
     #[serde(default)]
     pub saw_tool: bool,

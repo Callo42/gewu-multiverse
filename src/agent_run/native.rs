@@ -1005,6 +1005,7 @@ pub(super) fn run(
     let facts = super::RunFacts {
         remote: state.pr_ok || state.pushed || state.comment_ok || push.is_some(),
         read: state.tool_ok || state.forgejo_read_ok,
+        wrote: state.wrote,
         saw_tool: state.saw_tool || state.outcome.saw_tool(),
         local: state.local_work.clone(),
         push,
@@ -1238,6 +1239,7 @@ fn decide_native_ending(
     let facts = super::RunFacts {
         remote: state.pr_ok || state.pushed || state.comment_ok || state.push.is_some(),
         read: state.tool_ok || state.forgejo_read_ok,
+        wrote: state.wrote,
         saw_tool: state.saw_tool || state.outcome.saw_tool(),
         local,
         push: state.push.clone(),

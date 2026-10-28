@@ -102,7 +102,7 @@ pub fn decide_ending(base: RunEnding, facts: &crate::run::RunFacts) -> RunEnding
         RunEnding::Warned
     } else if base == RunEnding::Succeeded && facts.read {
         RunEnding::NoWork
-    } else if base == RunEnding::Succeeded && !facts.saw_tool {
+    } else if base == RunEnding::Succeeded && !facts.wrote {
         RunEnding::Warned
     } else {
         base
@@ -2219,7 +2219,8 @@ pub fn execute(run_dir: &Path) -> RunEnd {
             } else if ending == RunEnding::Warned
                 && !end.facts.remote_work()
                 && !end.facts.read
-                && !end.facts.saw_tool
+                && !end.facts.wrote
+                && !end.facts.has_local()
             {
                 end.reason = Some(
                     "the run ended successfully but recorded no tool call or workspace change, so the requested work is unconfirmed"
@@ -2822,6 +2823,7 @@ fn model_loop(
             end.facts = Box::new(RunFacts {
                 remote: evidence.remote,
                 read: evidence.read,
+                wrote: evidence.wrote,
                 saw_tool: evidence.saw_tool,
                 local: crate::workspace::WorkspaceChanges::default(),
                 push: None,
