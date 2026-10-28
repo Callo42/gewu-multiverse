@@ -230,7 +230,7 @@ fn a_nested_shell_command_is_not_listed_twice() {
 }
 
 #[test]
-fn a_clean_compound_inside_a_pipeline_is_still_a_tick() {
+fn a_clean_compound_inside_a_pipeline_is_no_work() {
     for command in [
         "if true; then echo x; fi | cat",
         "while true; do break; done | cat",
@@ -239,8 +239,8 @@ fn a_clean_compound_inside_a_pipeline_is_still_a_tick() {
     ] {
         let (ending, outcome, failure, _segments, _had_output) =
             run_command("clean-pipeline", "Review the work.\n", command, |_| {});
-        assert_eq!(ending, RunEnding::Succeeded, "{command}: {ending:?}");
-        assert_eq!(outcome, "succeeded", "{command}");
+        assert_eq!(ending, RunEnding::NoWork, "{command}: {ending:?}");
+        assert_eq!(outcome, "no_work", "{command}");
         assert!(
             failure.is_empty(),
             "{command}: a clean run has a cause row: {failure:?}"
@@ -327,9 +327,9 @@ fn every_generated_failing_composition_is_never_a_tick() {
 }
 
 #[test]
-fn every_generated_clean_composition_is_a_tick() {
+fn every_generated_clean_composition_is_no_work() {
     // The other half of the property: a composition made only of succeeding
-    // commands is still `✓`; the rule must not turn every compound into a warning.
+    // read-only commands is `∅`; the rule must not turn every compound into a warning.
     let mut forms = clean_compositions(2);
     for form in forms.clone().into_iter().take(5) {
         forms.push(format!("if ( {form} ); then echo ok; fi"));
@@ -342,8 +342,8 @@ fn every_generated_clean_composition_is_a_tick() {
             command,
             |_| {},
         );
-        assert_eq!(ending, RunEnding::Succeeded, "{command}: {ending:?}");
-        assert_eq!(outcome, "succeeded", "{command}");
+        assert_eq!(ending, RunEnding::NoWork, "{command}: {ending:?}");
+        assert_eq!(outcome, "no_work", "{command}");
         assert!(
             failure.is_empty(),
             "{command}: a clean run has a cause row: {failure:?}"

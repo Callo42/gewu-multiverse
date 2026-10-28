@@ -568,8 +568,8 @@ fn a_refused_read_with_stderr_redirection_is_not_a_refusal() {
         "Forbidden",
         "The review is complete.",
     );
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(end.ending, RunEnding::NoWork, "{end:?}");
+    assert_eq!(outcome, "no_work");
 }
 
 #[test]
@@ -582,12 +582,12 @@ fn a_curl_get_with_data_is_a_read() {
         "Forbidden",
         "The search is complete.",
     );
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(end.ending, RunEnding::NoWork, "{end:?}");
+    assert_eq!(outcome, "no_work");
 }
 
 #[test]
-fn a_destructive_keep_success_is_a_tick() {
+fn a_destructive_keep_success_with_no_tool_is_unconfirmed() {
     // Review correction 3, non-blocking 4: a keep phrase beside a success verb for
     // the destructive act describes a success, not a refusal.
     let (end, outcome, _reason) = run_reply(
@@ -595,8 +595,8 @@ fn a_destructive_keep_success_is_a_tick() {
         "Delete the stale branch and keep the docs as is.\n",
         "I deleted the stale branch and kept the docs as is; the work is complete.",
     );
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(end.ending, RunEnding::Warned, "{end:?}");
+    assert_eq!(outcome, "warned");
 }
 
 #[test]
@@ -802,9 +802,9 @@ fn a_failed_command_hidden_in_a_compound_is_a_warning_not_a_tick() {
 }
 
 #[test]
-fn a_clean_compound_command_is_a_tick() {
+fn a_clean_compound_command_is_no_work() {
     // The other direction: every command the shell reported exited 0, so the run is
-    // a success even though it is a compound command.
+    // no work even though it is a compound command.
     let (end, outcome, _reason) = run_scripted(
         "compound-clean",
         "Review the work.\n",
@@ -815,7 +815,7 @@ fn a_clean_compound_command_is_a_tick() {
         "The review is complete.",
     );
     assert!(end.is_success(), "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(outcome, "no_work");
 }
 
 #[test]

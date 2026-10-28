@@ -49,7 +49,7 @@ use crate::credentials::{self, Secret};
 use crate::forgejo_tools::{self, ForgejoTools};
 use crate::model::{self, Message, ModelConfig, ToolCall};
 use crate::naming::agent_name_problem;
-use crate::run::{RunOutcome, RunPlan};
+use crate::run::{RunFacts, RunOutcome, RunPlan};
 use crate::transcript::{self, ModelToolCall, ModelUsage, Record, SkillRef, Transcript};
 use crate::words;
 
@@ -79,28 +79,7 @@ pub struct RunEnd {
     /// instruction or found no work. It is what the card marks instead of `✓`.
     pub ending: RunEnding,
     /// What the run's own tools and workspace proved, independent of its prose.
-    pub facts: RunFacts,
-}
-
-/// What a run's own records prove it did, independent of the model's last sentence
-/// and of the order its tool calls happened to take.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RunFacts {
-    /// A real remote write: a verified push, an opened or updated pull request, or a
-    /// comment. Remote work is the strongest fact a run can record.
-    pub remote: bool,
-    /// At least one read (or other non-write tool call) succeeded. The rule uses it
-    /// only when no remote or local work exists.
-    pub read: bool,
-    /// Changes left in the workspace: edited files, or a local commit.
-    pub local: crate::workspace::WorkspaceChanges,
-}
-
-impl RunFacts {
-    /// Whether the run left work only in its workspace.
-    pub fn has_local(&self) -> bool {
-        !self.local.is_empty()
-    }
+    pub facts: Box<RunFacts>,
 }
 
 /// The one rule that turns a clean finish and the run's own facts into its mark.
@@ -108,14 +87,23 @@ impl RunFacts {
 /// Real remote work outranks a failed command, a refused write and a last sentence
 /// that claims failure. A change left only in the workspace is a warning that names
 /// the local work. A run that only read is no work, with its own sentence as the
-/// reason. Everything else keeps the ending the run's summary and failures produced.
-pub fn decide_ending(base: RunEnding, facts: &RunFacts) -> RunEnding {
-    if facts.remote {
+/// reason. A run that recorded no tool call at all is never a success: its requested
+/// work is unconfirmed. Everything else keeps the ending the run's summary and
+/// failures produced.
+pub fn decide_ending(base: RunEnding, facts: &crate::run::RunFacts) -> RunEnding {
+    if facts.remote_work() {
         RunEnding::Succeeded
+    } else if base == RunEnding::Refused {
+        // A refused write keeps its own mark even when the run also touched the
+        // workspace while attempting it; the local work is still named in the work
+        // block, but it is not "local-only".
+        RunEnding::Refused
     } else if facts.has_local() {
         RunEnding::Warned
     } else if base == RunEnding::Succeeded && facts.read {
         RunEnding::NoWork
+    } else if base == RunEnding::Succeeded && facts.requires_confirmation && !facts.saw_tool {
+        RunEnding::Warned
     } else {
         base
     }
@@ -141,7 +129,7 @@ impl RunEnd {
             exit_code: 0,
             reason: None,
             ending: RunEnding::Succeeded,
-            facts: RunFacts::default(),
+            facts: Box::default(),
         }
     }
 
@@ -154,7 +142,7 @@ impl RunEnd {
             exit_code: 0,
             reason: Some(reason.into()),
             ending: RunEnding::Succeeded,
-            facts: RunFacts::default(),
+            facts: Box::default(),
         }
     }
 
@@ -164,7 +152,7 @@ impl RunEnd {
             exit_code: 0,
             reason: Some(summary.into()),
             ending: RunEnding::Refused,
-            facts: RunFacts::default(),
+            facts: Box::default(),
         }
     }
 
@@ -174,7 +162,7 @@ impl RunEnd {
             exit_code: 0,
             reason: Some(summary.into()),
             ending: RunEnding::NoWork,
-            facts: RunFacts::default(),
+            facts: Box::default(),
         }
     }
 
@@ -185,7 +173,7 @@ impl RunEnd {
             exit_code: 0,
             reason: Some(reason.into()),
             ending: RunEnding::Warned,
-            facts: RunFacts::default(),
+            facts: Box::default(),
         }
     }
 
@@ -195,7 +183,7 @@ impl RunEnd {
             exit_code: 1,
             reason: Some(reason.into()),
             ending: RunEnding::Succeeded,
-            facts: RunFacts::default(),
+            facts: Box::default(),
         }
     }
 
@@ -233,6 +221,16 @@ pub struct RunEvidence {
     remote: bool,
     /// At least one read succeeded; a write success sets the remote fact instead.
     read: bool,
+    /// At least one tool call was recorded.
+    saw_tool: bool,
+    /// Pull requests this run opened or updated, oldest first.
+    pulls: Vec<crate::run::WorkPull>,
+    /// The agent's own request an open call found already open.
+    existing: Vec<crate::run::WorkPull>,
+    /// Issue or pull-request numbers this run commented on, oldest first.
+    comments: Vec<u64>,
+    /// The issue this run read, when it read one.
+    read_issue: Option<crate::run::IssueRead>,
 }
 
 impl RunEvidence {
@@ -277,6 +275,7 @@ impl RunEvidence {
     /// failed call, so the run is `⚠` and never `✓` ("every tool call" is true as
     /// written; correction 5, N1).
     fn note_forgejo(&mut self, tool: &str, problem: &str) {
+        self.saw_tool = true;
         if crate::forgejo_tools::is_write_tool(tool) {
             self.refused_write = Some(problem.to_owned());
         } else if self.failed_call.is_none() {
@@ -290,8 +289,54 @@ impl RunEvidence {
     /// not open or update it. With no other work it keeps the refused-write mark;
     /// with a push or comment it is outranked by that real work.
     fn note_forgejo_existing(&mut self, problem: &str) {
+        self.saw_tool = true;
         if self.refused_write.is_none() {
             self.refused_write = Some(problem.to_owned());
+        }
+    }
+
+    /// Record the details of a successful Forgejo read or write reply.
+    fn note_forgejo_reply(
+        &mut self,
+        tool: &str,
+        reply: &crate::forgejo_tools::ToolReply,
+        text: &str,
+    ) {
+        self.note_forgejo_success(tool, text);
+        if tool == crate::forgejo_tools::READ_ISSUE_OR_PULL
+            && let (Some(repository), Some(number)) = (reply.repository.as_ref(), reply.number)
+        {
+            self.read_issue = Some(crate::run::IssueRead {
+                repository: repository.clone(),
+                number,
+            });
+        }
+        if crate::forgejo_tools::is_write_tool(tool) {
+            if let Some(number) = reply.number {
+                if tool == crate::forgejo_tools::COMMENT {
+                    self.comments.push(number);
+                } else {
+                    self.pulls.push(crate::run::WorkPull {
+                        number,
+                        branch: reply.branch.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Record an already-open own request, including its number and branch.
+    fn note_forgejo_existing_reply(
+        &mut self,
+        problem: &str,
+        reply: &crate::forgejo_tools::ToolReply,
+    ) {
+        self.note_forgejo_existing(problem);
+        if let Some(number) = reply.number {
+            self.existing.push(crate::run::WorkPull {
+                number,
+                branch: reply.branch.clone(),
+            });
         }
     }
 
@@ -300,6 +345,7 @@ impl RunEvidence {
     /// checked and found nothing assigned is `∅`, not `✓` (U3). A successful write
     /// means the run did not merely check.
     pub fn note_forgejo_success(&mut self, tool: &str, text: &str) {
+        self.saw_tool = true;
         if tool == crate::forgejo_tools::LIST_ASSIGNED_ISSUES
             && text.trim_start().starts_with("no open issue is assigned")
         {
@@ -321,6 +367,7 @@ impl RunEvidence {
     /// the `⚠` row. A `curl` without `-f` is the one tool whose zero exit hides a
     /// 4xx/5xx, so its output is read for a status.
     fn note_shell(&mut self, command: &str, outcome: &ToolOutcome) -> bool {
+        self.saw_tool = true;
         let writes = shell_writes(command);
         let raw_failure = outcome
             .raw_failures
@@ -547,6 +594,8 @@ impl RunEvidence {
         }
         if writes && !wrapper_failed && failing.is_empty() {
             self.wrote = true;
+        } else if !writes && !wrapper_failed && failing.is_empty() {
+            self.read = true;
         }
         false
     }
@@ -2138,12 +2187,18 @@ pub fn execute(run_dir: &Path) -> RunEnd {
     // The push witness is written here, after the run, so a built-in run's own
     // evidence cannot have seen it. It is remote work and outranks the local commit
     // the same push left in `.git`.
-    if !end.facts.remote && crate::run::read_push_witness(run_dir).is_some() {
+    if let Some(witness) = crate::run::read_push_witness(run_dir) {
+        end.facts.push = Some(witness.branch);
         end.facts.remote = true;
+    }
+    // The facts record is the one input for both the mark and the work line.
+    if let Err(error) = crate::run::write_facts(run_dir, &end.facts) {
+        log.line(&format!("the run's facts cannot be recorded: {error}"));
     }
     // One rule decides the mark from the facts, after the run's own records are
     // complete. Remote work outranks a refused or failed write; a local-only change
-    // is a warning naming the work; a run that only read is no work.
+    // is a warning naming the work; a run that only read is no work; a run that
+    // recorded no tool call is never a success.
     if end.is_success() {
         let base = end.ending;
         let ending = decide_ending(base, &end.facts);
@@ -2161,6 +2216,15 @@ pub fn execute(run_dir: &Path) -> RunEnd {
                     }
                     _ => local_reason,
                 });
+            } else if ending == RunEnding::Warned
+                && !end.facts.remote_work()
+                && !end.facts.read
+                && !end.facts.saw_tool
+            {
+                end.reason = Some(
+                    "the run ended successfully but recorded no tool call or workspace change, so the requested work is unconfirmed"
+                        .to_owned(),
+                );
             }
         }
     }
@@ -2527,7 +2591,7 @@ fn run_declared_step(
                 "{output} — declared step {index} {end}: command `{command}` in {workspace}"
             )),
             ending: RunEnding::Succeeded,
-            facts: RunFacts::default(),
+            facts: Box::default(),
         });
     }
     Ok(())
@@ -2755,11 +2819,18 @@ fn model_loop(
                     summary
                 }),
             };
-            end.facts = RunFacts {
+            end.facts = Box::new(RunFacts {
                 remote: evidence.remote,
                 read: evidence.read,
+                saw_tool: evidence.saw_tool,
                 local: crate::workspace::WorkspaceChanges::default(),
-            };
+                push: None,
+                pulls: evidence.pulls.clone(),
+                existing: evidence.existing.clone(),
+                comments: evidence.comments.clone(),
+                read_issue: evidence.read_issue.clone(),
+                requires_confirmation: true,
+            });
             return end;
         }
 
@@ -3051,12 +3122,12 @@ fn run_forgejo_tool(
             let text = log.secret().redact(&reply.text);
             if reply.action == Some("already_open") {
                 // The agent's own request is already open. It is named in the work
-                // block, but it is not a write this run made; with no other work it
-                // keeps the refusal row.
+                // block only beside a push or comment, and it is not a write this
+                // run made; with no other work it keeps the refusal row.
                 log.tool_failure(&call.function.name, &text);
-                evidence.note_forgejo_existing(&text);
+                evidence.note_forgejo_existing_reply(&text, reply);
             } else {
-                evidence.note_forgejo_success(&call.function.name, &text);
+                evidence.note_forgejo_reply(&call.function.name, reply, &text);
             }
             log.block(&text);
             Ok(text)
@@ -4686,7 +4757,7 @@ mod tests {
     }
 
     #[test]
-    fn a_run_whose_model_finishes_succeeds_and_records_the_exchange() {
+    fn a_run_whose_model_finishes_without_a_tool_is_unconfirmed() {
         let (root, config, skills, credentials) = agent_source("agent-run-finish");
         let dir = run_dir(&root);
         fs::write(config.join("instruction.md"), "do nothing, carefully\n").expect("instruction");
@@ -4761,8 +4832,10 @@ mod tests {
         assert!(matches!(
             terminal,
             Record::RunFinished { ref outcome, ref reason, .. }
-                if outcome == "succeeded"
-                    && reason.as_deref() == Some("all done")
+                if outcome == "warned"
+                    && reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("recorded no tool call"))
         ));
     }
 
@@ -6316,7 +6389,8 @@ mod tests {
         ));
         assert_eq!(
             ending_with_evidence("The work is complete.", &clean),
-            RunEnding::Succeeded
+            RunEnding::NoWork,
+            "a run that only read is no work"
         );
     }
 
@@ -6626,7 +6700,8 @@ mod tests {
         assert!(words.refused_write().is_none());
         assert_eq!(
             ending_with_evidence("The review is complete.", &words),
-            RunEnding::Succeeded
+            RunEnding::NoWork,
+            "a run that only read is no work"
         );
     }
 

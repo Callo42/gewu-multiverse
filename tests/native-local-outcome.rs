@@ -681,3 +681,309 @@ fn a_native_push_then_an_existing_request_is_a_success_that_names_the_request() 
         "the work line did not name the request"
     );
 }
+
+fn fake_pi_script(install_root: &Path, tag: &str, body: &str) -> PathBuf {
+    let path = install_root.join("pi").join(format!("fake-pi-{tag}"));
+    fs::create_dir_all(path.parent().expect("the install directory"))
+        .expect("the install directory");
+    let script = format!(
+        r#"#!/usr/bin/python3
+import json, os, sys
+
+sys.stdin.read()
+{body}
+print(json.dumps({{"type": "message_end", "message": {{
+    "role": "assistant", "stopReason": "stop", "content": [
+        {{"type": "text", "text": "Done: the work is complete."}}]}}}}))
+print(json.dumps({{"type": "agent_settled", "aborted": False}}))
+"#
+    );
+    fs::write(&path, script).expect("the fixture program");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("the fixture mode");
+    path
+}
+
+fn run_pi_script(
+    tag: &str,
+    body: &str,
+) -> (
+    String,
+    String,
+    Vec<String>,
+    Option<gewu_multiverse::workspace::WorkspaceChanges>,
+) {
+    let root = scratch(tag);
+    let workspace = root.join("workspace");
+    let skills = root.join("skills");
+    fs::create_dir_all(&workspace).expect("the workspace");
+    fs::create_dir_all(&skills).expect("the skills");
+    fs::write(workspace.join("README.md"), "hello\n").expect("the README");
+    fs::write(root.join("instruction.md"), "Fix the README and report.\n").expect("instruction");
+    let credentials = root.join("credentials.toml");
+    mode::write_private(
+        &credentials,
+        b"[model_keys]\n\"scribe\" = \"gw-fixture-key-not-a-real-secret\"\n",
+    )
+    .expect("credentials");
+    let run_dir = root.join("state").join("scribe").join(format!("run-{tag}"));
+    fs::create_dir_all(&run_dir).expect("the run directory");
+    RunPlan {
+        run_id: format!("run-{tag}"),
+        agent: "scribe".to_owned(),
+        workspace: workspace.clone(),
+        instruction: root.join("instruction.md"),
+        skills_dir: skills,
+        endpoint: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        credentials,
+        max_turns: 4,
+        steps: Vec::new(),
+        timeout_secs: 30,
+        confinement: "landlock".to_owned(),
+        hide: Vec::new(),
+    }
+    .write(&run_dir)
+    .expect("the plan");
+    let install_root = root.join("install");
+    NativePlan {
+        harness: "pi".to_owned(),
+        version: "1.4.0".to_owned(),
+        program: fake_pi_script(&install_root, tag, body),
+        install_root,
+        protocol: "chat-completions".to_owned(),
+        base_url: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        codex_sandbox: String::new(),
+    }
+    .write(&run_dir)
+    .expect("the native plan");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--run-agent")
+        .arg(&run_dir)
+        .status()
+        .expect("the product runs the native run");
+    assert!(
+        status.success(),
+        "{tag}: the supervisor exited with {status:?}"
+    );
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let (outcome, reason) = match terminal {
+        Record::RunFinished {
+            outcome, reason, ..
+        } => (outcome, reason.unwrap_or_default()),
+        other => panic!("no terminal record: {other:?}"),
+    };
+    let local = run::read_local_work(&run_dir);
+    let work = run::work_summary(&run_dir);
+    let _ = fs::remove_dir_all(&root);
+    (outcome, reason, work, local)
+}
+
+#[test]
+fn a_native_run_with_no_recorded_fact_is_unconfirmed() {
+    let (outcome, reason, work, local) = run_pi_script("no-fact", "pass");
+    assert_eq!(outcome, "warned", "{reason}");
+    assert!(
+        reason.contains("no tool call or workspace change"),
+        "{reason}"
+    );
+    assert!(local.is_none(), "{local:?}");
+    assert!(work.is_empty(), "{work:?}");
+}
+
+#[test]
+fn a_native_workspace_change_the_old_snapshot_missed_is_local_work() {
+    let cases = [
+        ("chmod", "os.chmod(\"README.md\", 0o755)", "README.md"),
+        ("symlink", "os.symlink(\"README.md\", \"link\")", "link"),
+        ("empty-dir", "os.mkdir(\"empty\")", "empty"),
+        (
+            "same-length-same-time",
+            "st = os.stat(\"README.md\")\nwith open(\"README.md\", \"w\") as handle:\n    handle.write(\"world\\n\")\nos.utime(\"README.md\", ns=(st.st_atime_ns, st.st_mtime_ns))",
+            "README.md",
+        ),
+    ];
+    for (tag, body, named) in cases {
+        let (outcome, reason, work, local) = run_pi_script(tag, body);
+        let local = local.expect("the local work record");
+        assert_eq!(outcome, "warned", "{tag}: {reason}");
+        assert!(
+            local.files.iter().any(|file| file == named),
+            "{tag}: {local:?}"
+        );
+        assert!(
+            work.iter().any(|line| line.contains(named)),
+            "{tag}: the work line does not name {named}: {work:?}"
+        );
+        assert!(reason.contains(named), "{tag}: {reason}");
+    }
+}
+
+fn fake_pi_local_opener(install_root: &Path) -> PathBuf {
+    // Edit the workspace, then find the agent's own request already open. The
+    // request is not this run's work; the local edit is.
+    let path = install_root.join("pi").join("fake-pi-local-opener");
+    fs::create_dir_all(path.parent().expect("the install directory"))
+        .expect("the install directory");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/python3
+import json, os, socket, sys, time
+
+sys.stdin.read()
+with open("README.md", "a") as handle:
+    handle.write("local edit\n")
+root = os.environ["PI_CODING_AGENT_DIR"]
+with open(os.path.join(root, "mcp.json")) as handle:
+    config = json.load(handle)
+socket_path = config["mcpServers"]["gewu_forgejo"]["args"][1]
+stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+for _ in range(200):
+    try:
+        stream.connect(socket_path)
+        break
+    except OSError:
+        time.sleep(0.02)
+reader = stream.makefile("rb")
+
+def send(request):
+    stream.sendall((json.dumps(request) + "\n").encode())
+    return json.loads(reader.readline())
+
+send({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                 "clientInfo": {"name": "fixture", "version": "1"}}})
+send({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+      "params": {"name": "forgejo_open_pull_request", "arguments": {
+          "repository": "team/workspace", "title": "A pull request"}}})
+stream.close()
+print(json.dumps({"type": "message_end", "message": {
+    "role": "assistant", "stopReason": "stop", "content": [
+        {"type": "text", "text": "The pull request is open."}]}}))
+print(json.dumps({"type": "agent_settled", "aborted": False}))
+"#,
+    )
+    .expect("the fixture program");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("the fixture mode");
+    path
+}
+
+#[test]
+fn a_native_existing_request_does_not_replace_this_runs_local_work() {
+    use gewu_multiverse::test_stub::{Route, Stub, StubReply};
+
+    let root = scratch("pi-local-existing");
+    let workspace = root.join("workspace");
+    let skills = root.join("skills");
+    std::fs::create_dir_all(&workspace).expect("the workspace");
+    std::fs::create_dir_all(&skills).expect("the skills");
+    clone_fixture(&workspace);
+    std::fs::write(workspace.join("README.md"), "hello\n").expect("the README");
+    std::fs::write(
+        root.join("instruction.md"),
+        "Fix the README and open its pull request.\n",
+    )
+    .expect("instruction");
+    let credentials = root.join("credentials.toml");
+    mode::write_private(
+        &credentials,
+        b"[model_keys]\n\"scribe\" = \"gw-fixture-key-not-a-real-secret\"\n\n[forgejo_agent_tokens]\nscribe = \"gw-fixture-agent-token\"\n",
+    )
+    .expect("credentials");
+    let run_dir = root.join("state").join("scribe").join("run-local-existing");
+    std::fs::create_dir_all(&run_dir).expect("the run directory");
+    let pull = serde_json::json!({
+        "number": 3,
+        "title": "A pull request",
+        "state": "open",
+        "html_url": "http://forgejo.test/team/workspace/pulls/3",
+        "head": {"ref": "feature", "repo": {"full_name": "team/workspace"}},
+        "base": {"ref": "main", "repo": {"full_name": "team/workspace"}},
+        "user": {"login": "gewu-scribe"},
+    });
+    let forgejo = Stub::start_routed(vec![
+        Route::new(
+            "GET",
+            "/api/v1/repos/team/workspace/pulls",
+            StubReply::json(serde_json::json!([pull]).to_string()),
+        ),
+        Route::new(
+            "GET",
+            "/api/v1/repos/team/workspace",
+            StubReply::json(
+                serde_json::json!({
+                    "full_name": "team/workspace",
+                    "name": "workspace",
+                    "default_branch": "main",
+                })
+                .to_string(),
+            ),
+        ),
+    ]);
+    std::fs::write(
+        run_dir.join("forgejo.json"),
+        serde_json::json!({
+            "url": format!("http://{}", forgejo.addr()),
+            "login": "gewu-scribe",
+            "repositories": [{"full_name": "team/workspace", "directory": "workspace"}],
+        })
+        .to_string(),
+    )
+    .expect("the Forgejo context");
+    RunPlan {
+        run_id: "run-local-existing".to_owned(),
+        agent: "scribe".to_owned(),
+        workspace: workspace.clone(),
+        instruction: root.join("instruction.md"),
+        skills_dir: skills,
+        endpoint: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        credentials,
+        max_turns: 4,
+        steps: Vec::new(),
+        timeout_secs: 30,
+        confinement: "landlock".to_owned(),
+        hide: Vec::new(),
+    }
+    .write(&run_dir)
+    .expect("the plan");
+    let install_root = root.join("install");
+    NativePlan {
+        harness: "pi".to_owned(),
+        version: "1.4.0".to_owned(),
+        program: fake_pi_local_opener(&install_root),
+        install_root,
+        protocol: "chat-completions".to_owned(),
+        base_url: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        codex_sandbox: String::new(),
+    }
+    .write(&run_dir)
+    .expect("the native plan");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--run-agent")
+        .arg(&run_dir)
+        .env("TMPDIR", "/tmp")
+        .status()
+        .expect("the product runs the native run");
+    assert!(status.success(), "the supervisor exited with {status:?}");
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let (outcome, reason) = match terminal {
+        Record::RunFinished {
+            outcome, reason, ..
+        } => (outcome, reason.unwrap_or_default()),
+        other => panic!("no terminal record: {other:?}"),
+    };
+    let work = run::work_summary(&run_dir);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        outcome, "refused",
+        "the already-open no-op keeps its refusal: {reason}"
+    );
+    assert_eq!(
+        work,
+        vec!["local change README.md".to_owned()],
+        "the work line named a request this run did not write"
+    );
+}

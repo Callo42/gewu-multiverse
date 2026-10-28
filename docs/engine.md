@@ -577,8 +577,9 @@ marks the run `warned` (`⚠`), with the failed command's cause as its row; it i
 `no work`: if nothing was written, the run is `∅` even when the model's own sentence
 says everything is done (U3). A run that only read its issue and wrote nothing is
 also `∅` with its own sentence, whatever change word its instruction used. A change
-left only in the workspace is `⚠`, and its reason and work line name the recorded
-file or local commit. A real remote write — a verified push, an opened or updated
+left only in the workspace — content, mode, type, a link, a directory, a commit or a
+Git ref — is `⚠`, and its reason and work line name the recorded local work. A run
+that recorded no tool call at all is never `✓`; its requested work is unconfirmed. A real remote write — a verified push, an opened or updated
 pull request, or a comment — outranks a later refused write or failed command and
 keeps `✓`; the work block names the request or comment, not only the branch.
 Otherwise the last sentence decides between `refused` (when it names a write or the

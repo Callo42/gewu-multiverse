@@ -838,7 +838,7 @@ pub fn last_work_word(agent: &AgentView) -> Option<String> {
             best.get_or_insert_with(|| branch.chars().take(7).collect());
         } else if let Some(rest) = line.strip_prefix("local change ") {
             best.get_or_insert_with(|| rest.split(',').next().unwrap_or(rest).trim().to_owned());
-        } else if line == "local commit" {
+        } else if line == "local commit" || line == "local git change" {
             best.get_or_insert_with(|| "local".to_owned());
         }
     }
@@ -873,7 +873,7 @@ pub fn last_work_identity(agent: &AgentView) -> Option<String> {
             best.get_or_insert_with(|| branch.chars().take(7).collect());
         } else if let Some(rest) = line.strip_prefix("local change ") {
             best.get_or_insert_with(|| rest.split(',').next().unwrap_or(rest).trim().to_owned());
-        } else if line == "local commit" {
+        } else if line == "local commit" || line == "local git change" {
             best.get_or_insert_with(|| "local".to_owned());
         }
     }

@@ -20,11 +20,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::credentials;
 
@@ -576,33 +578,37 @@ pub fn push(repository: &Path, credential: &GitCredential<'_>) -> Result<(), Wor
     Ok(())
 }
 
-/// What a run changed in its workspace, and whether it made a local commit.
+/// What a run changed in its workspace, and whether it changed Git state.
 ///
-/// The snapshot keeps worktree files plus the few `.git` files that prove a commit:
-/// `HEAD`, the local branch refs and `HEAD`'s reflog. Objects, the index and
-/// remote-tracking refs are deliberately absent, so a fetch or a push is never
-/// mistaken for local work.
+/// The snapshot hashes every worktree file and records its mode and type, records
+/// directories (so an empty directory is visible) and symlink targets, and keeps the
+/// Git files that prove commits, refs and tags. `index` and `objects` are handled by
+/// the working-tree status comparison, so a refresh of the index does not look like
+/// work while a staged change does.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceChanges {
-    /// Worktree files that differ from the before-picture, sorted.
+    /// Worktree paths that differ from the before-picture, sorted.
     #[serde(default)]
     pub files: Vec<String>,
-    /// A local commit was made (a local branch ref or `HEAD`'s reflog changed).
+    /// A local commit was made (a local branch ref or `HEAD` changed).
     #[serde(default)]
     pub committed: bool,
+    /// Other Git state changed: staged changes, tags, remote-tracking refs, config.
+    #[serde(default)]
+    pub git_state: bool,
 }
 
 impl WorkspaceChanges {
     /// Whether the run left anything local.
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && !self.committed
+        self.files.is_empty() && !self.committed && !self.git_state
     }
 
     /// The work row this change is shown as, or `None` when nothing changed.
     ///
-    /// The row names the files rather than saying only "workspace changed": a
-    /// person needs to know which local work the warning is about.
+    /// The row names the paths rather than saying only "workspace changed": a person
+    /// needs to know which local work the warning is about.
     pub fn work_line(&self) -> Option<String> {
         if !self.files.is_empty() {
             let shown: Vec<&str> = self.files.iter().take(3).map(String::as_str).collect();
@@ -613,7 +619,10 @@ impl WorkspaceChanges {
             }
             return Some(line);
         }
-        self.committed.then(|| "local commit".to_owned())
+        if self.committed {
+            return Some("local commit".to_owned());
+        }
+        self.git_state.then(|| "local git change".to_owned())
     }
 
     /// The short reason sentence for a local-only run, naming the work.
@@ -629,77 +638,153 @@ impl WorkspaceChanges {
                 "workspace changed: {named}; the change is local and was not pushed"
             ));
         }
-        self.committed.then(|| {
-            "workspace changed: a local commit; the commit is local and was not pushed".to_owned()
+        if self.committed {
+            return Some(
+                "workspace changed: a local commit; the commit is local and was not pushed"
+                    .to_owned(),
+            );
+        }
+        self.git_state.then(|| {
+            "workspace changed: local Git state; the change is local and was not pushed".to_owned()
         })
     }
+}
+
+/// One file, directory, link or special entry in the before/after picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Entry {
+    File {
+        mode: u32,
+        modified: u128,
+        digest: [u8; 32],
+    },
+    Dir {
+        mode: u32,
+    },
+    Symlink {
+        target: PathBuf,
+    },
+    Other {
+        mode: u32,
+    },
 }
 
 /// The before-picture of an agent's workspace.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceSnapshot {
-    files: BTreeMap<PathBuf, (u64, u64)>,
+    entries: BTreeMap<PathBuf, Entry>,
+    /// The worktree status of every repository the run can touch, so a staged change
+    /// (which lives in the excluded index) is still a local fact.
+    git_status: BTreeMap<PathBuf, String>,
 }
 
 /// Take the before-picture of an agent's workspace.
 ///
-/// Worktree files are compared by length and modified time. Inside `.git` only the
-/// files that prove a local commit are kept, so walking a large object store is
-/// avoided and a fetch or push cannot look like local work.
+/// Worktree files are compared by content, mode, type and modification time.
+/// Directories are included so an empty directory is visible, and a symlink records
+/// its target. In `.git`, the files that prove commits, refs, tags and other state
+/// are included; `objects` and `index` are skipped because they are large and the
+/// index's meaningful changes appear in the worktree status comparison.
 pub fn snapshot_workspace(root: &Path) -> WorkspaceSnapshot {
-    fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, (u64, u64)>) {
+    fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
         };
         for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            let path = entry.path();
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            if git_skipped(&relative) {
+                continue;
+            }
+            let kind = meta.file_type();
+            let mode = meta.permissions().mode() & 0o7777;
             if kind.is_dir() {
-                let relative = path.strip_prefix(root).unwrap_or(&path);
-                let inside_git = relative
-                    .components()
-                    .any(|component| component.as_os_str() == ".git");
-                if inside_git {
-                    // Only the ref/log spine can prove a local commit. Objects and
-                    // the index are large and irrelevant, and skipping them keeps the
-                    // before/after snapshot cheap on a big repository.
-                    let name = entry.file_name();
-                    if !matches!(
-                        name.to_string_lossy().as_ref(),
-                        ".git" | "refs" | "heads" | "logs" | "remotes"
-                    ) {
-                        continue;
-                    }
-                }
+                out.insert(relative.clone(), Entry::Dir { mode });
                 walk(root, &path, out);
             } else if kind.is_file() {
-                let relative = path.strip_prefix(root).unwrap_or(&path);
-                let inside_git = relative
-                    .components()
-                    .any(|component| component.as_os_str() == ".git");
-                if inside_git && !git_fact(relative) {
-                    continue;
-                }
-                let Ok(meta) = entry.metadata() else { continue };
                 let modified = meta
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos() as u64)
-                    .unwrap_or(0);
-                out.insert(relative.to_path_buf(), (meta.len(), modified));
+                    .unwrap_or(0) as u128;
+                out.insert(
+                    relative,
+                    Entry::File {
+                        mode,
+                        modified,
+                        digest: digest_file(&path),
+                    },
+                );
+            } else if kind.is_symlink() {
+                if let Ok(target) = std::fs::read_link(&path) {
+                    out.insert(relative, Entry::Symlink { target });
+                }
+            } else {
+                out.insert(relative, Entry::Other { mode });
             }
         }
     }
-    let mut files = BTreeMap::new();
-    walk(root, root, &mut files);
-    WorkspaceSnapshot { files }
+    let mut entries = BTreeMap::new();
+    walk(root, root, &mut entries);
+    WorkspaceSnapshot {
+        entries,
+        git_status: git_status_snapshot(root),
+    }
 }
 
-/// Whether a path inside a `.git` directory is one of the commit facts.
-fn git_fact(relative: &Path) -> bool {
+/// Whether a path is a large Git file the worktree status already covers.
+fn git_skipped(relative: &Path) -> bool {
+    let text = relative.to_string_lossy().replace('\\', "/");
+    let Some((_before, after)) = text.split_once(".git/") else {
+        return false;
+    };
+    after == "index"
+        || after == "index.lock"
+        || after == "objects"
+        || after.starts_with("objects/")
+        || after == "lfs"
+        || after.starts_with("lfs/")
+}
+
+/// A stable digest of a file's content, used so a same-length edit with an
+/// unchanged modified time is still visible.
+fn digest_file(path: &Path) -> [u8; 32] {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return [0; 32];
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(_) => return [0; 32],
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// The worktree status of every repository a run can touch.
+fn git_status_snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
+    let mut out = BTreeMap::new();
+    for repository in push_repositories(root) {
+        let relative = repository
+            .strip_prefix(root)
+            .unwrap_or(&repository)
+            .to_path_buf();
+        if let Ok(status) = run_git(&["status", "--porcelain=v1", "-z"], &repository, None) {
+            out.insert(relative, status);
+        }
+    }
+    out
+}
+
+/// Whether a changed `.git` path proves a local commit.
+fn git_commit_fact(relative: &Path) -> bool {
     let text = relative.to_string_lossy().replace('\\', "/");
     let Some((_before, after)) = text.split_once(".git/") else {
         return false;
@@ -711,21 +796,35 @@ fn git_fact(relative: &Path) -> bool {
 pub fn changes_since(before: &WorkspaceSnapshot, root: &Path) -> WorkspaceChanges {
     let after = snapshot_workspace(root);
     let mut changes = WorkspaceChanges::default();
-    let mut paths: Vec<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
+    let mut paths: Vec<&PathBuf> = before.entries.keys().chain(after.entries.keys()).collect();
     paths.sort();
     paths.dedup();
     for path in paths {
-        if before.files.get(path) == after.files.get(path) {
+        if before.entries.get(path) == after.entries.get(path) {
             continue;
         }
         let relative = path.to_string_lossy().replace('\\', "/");
         if relative.split('/').any(|component| component == ".git") {
-            if git_fact(path) {
+            if git_commit_fact(path) {
                 changes.committed = true;
+            } else {
+                changes.git_state = true;
             }
             continue;
         }
         changes.files.push(relative);
+    }
+    let mut repositories: Vec<&PathBuf> = before
+        .git_status
+        .keys()
+        .chain(after.git_status.keys())
+        .collect();
+    repositories.sort();
+    repositories.dedup();
+    for repository in repositories {
+        if before.git_status.get(repository) != after.git_status.get(repository) {
+            changes.git_state = true;
+        }
     }
     changes
 }
@@ -1192,5 +1291,111 @@ mod detail_tests {
         let detail = error.detail();
         assert!(detail.starts_with("repository not found"), "{detail}");
         assert!(!detail.starts_with("`git"), "{detail}");
+    }
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+    use crate::test_support::scratch_root;
+    use std::fs;
+
+    fn changed(root: &Path, change: impl FnOnce()) -> WorkspaceChanges {
+        let before = snapshot_workspace(root);
+        change();
+        changes_since(&before, root)
+    }
+
+    #[test]
+    fn a_mode_only_change_is_local_work() {
+        let root = scratch_root("workspace-mode");
+        let file = root.join("README.md");
+        fs::write(&file, "hello\n").expect("the file");
+        let changes = changed(&root, || {
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).expect("the mode");
+        });
+        assert_eq!(changes.files, vec!["README.md".to_owned()]);
+        assert_eq!(
+            changes.work_line().as_deref(),
+            Some("local change README.md")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_same_length_same_time_content_edit_is_local_work() {
+        let root = scratch_root("workspace-content");
+        let file = root.join("README.md");
+        fs::write(&file, "aaaa\n").expect("the file");
+        let old = fs::metadata(&file)
+            .and_then(|meta| meta.modified())
+            .expect("the old time");
+        let changes = changed(&root, || {
+            fs::write(&file, "bbbb\n").expect("the edit");
+            let handle = fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .expect("the file opens");
+            handle
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .expect("the time is restored");
+        });
+        assert_eq!(changes.files, vec!["README.md".to_owned()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_symlink_and_an_empty_directory_are_local_work() {
+        let root = scratch_root("workspace-links");
+        let changes = changed(&root, || {
+            fs::create_dir(root.join("empty")).expect("the empty directory");
+            std::os::unix::fs::symlink("target", root.join("link")).expect("the symlink");
+        });
+        assert!(changes.files.contains(&"empty".to_owned()), "{changes:?}");
+        assert!(changes.files.contains(&"link".to_owned()), "{changes:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_staged_change_is_local_git_state() {
+        let root = scratch_root("workspace-staged");
+        git(&root, &["init", "-q", "--initial-branch=main"]);
+        fs::write(root.join("README.md"), "hello\n").expect("the file");
+        git(&root, &["add", "README.md"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=gewu test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "first",
+            ],
+        );
+        let changes = changed(&root, || {
+            fs::write(root.join("staged.txt"), "staged\n").expect("the staged file");
+            git(&root, &["add", "staged.txt"]);
+        });
+        assert!(changes.git_state, "{changes:?}");
+        assert!(changes.work_line().is_some(), "{changes:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

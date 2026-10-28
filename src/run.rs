@@ -405,6 +405,138 @@ pub struct RunSummary {
     pub dir: PathBuf,
 }
 
+/// The durable facts one run recorded: the mark and the work line are both read
+/// from this record, so they cannot disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFacts {
+    /// A real remote write: a verified push, an opened or updated pull request, or a
+    /// comment. Remote work is the strongest fact a run can record.
+    #[serde(default)]
+    pub remote: bool,
+    /// At least one read (or other non-write tool call) succeeded.
+    #[serde(default)]
+    pub read: bool,
+    /// At least one tool call was recorded, even if it left no work fact.
+    #[serde(default)]
+    pub saw_tool: bool,
+    /// Changes left in the workspace.
+    #[serde(default)]
+    pub local: crate::workspace::WorkspaceChanges,
+    /// The branch a push witness proved.
+    #[serde(default)]
+    pub push: Option<String>,
+    /// Pull requests this run opened or updated, oldest first.
+    #[serde(default)]
+    pub pulls: Vec<WorkPull>,
+    /// The agent's own request an open call found already open. This is a fact about
+    /// the request, not work this run did; it is named only beside a push or comment.
+    #[serde(default)]
+    pub existing: Vec<WorkPull>,
+    /// Issue or pull-request numbers this run commented on, oldest first.
+    #[serde(default)]
+    pub comments: Vec<u64>,
+    /// The issue this run read, when it read one.
+    #[serde(default)]
+    pub read_issue: Option<IssueRead>,
+    /// Whether a clean finish without a work fact needs confirmation. A run with no
+    /// recorded fact is never a success.
+    #[serde(default)]
+    pub requires_confirmation: bool,
+}
+
+/// One pull request a run named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPull {
+    /// The request's number.
+    pub number: u64,
+    /// The clone branch the request's own tool result named, when it named one.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// The issue a run read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueRead {
+    /// `owner/name`.
+    pub repository: String,
+    /// The issue or pull-request number.
+    pub number: u64,
+}
+
+impl RunFacts {
+    /// Whether the run made a verified remote write.
+    pub fn remote_work(&self) -> bool {
+        self.remote || self.push.is_some() || !self.pulls.is_empty() || !self.comments.is_empty()
+    }
+
+    /// Whether the run left work only in its workspace.
+    pub fn has_local(&self) -> bool {
+        !self.local.is_empty()
+    }
+
+    /// The work block built from these facts.
+    ///
+    /// A remotely successful run shows the request it opened or updated; an
+    /// already-open own request is shown only when the same run also pushed or
+    /// commented, because otherwise the run did not write it. With no remote work,
+    /// the local work is the run's row.
+    pub fn work_lines(&self) -> Vec<String> {
+        if !self.remote_work() {
+            return self.local.work_line().into_iter().collect::<Vec<String>>();
+        }
+        let mut lines = Vec::new();
+        let pull = self.pulls.last().cloned().or_else(|| {
+            (self.push.is_some() || !self.comments.is_empty())
+                .then(|| self.existing.last().cloned())
+                .flatten()
+        });
+        if let Some(read) = self.read_issue.as_ref()
+            && pull.as_ref().is_none_or(|pull| pull.number != read.number)
+        {
+            lines.push(format!("issue #{}", read.number));
+        }
+        if let Some(pull) = pull {
+            let shown = pull
+                .branch
+                .as_deref()
+                .filter(|branch| !branch.trim().is_empty());
+            match shown {
+                Some(branch) => lines.push(format!("pull request #{} from {branch}", pull.number)),
+                None => lines.push(format!("pull request #{}", pull.number)),
+            }
+        } else if let Some(branch) = self
+            .push
+            .as_deref()
+            .filter(|branch| !branch.trim().is_empty())
+        {
+            lines.push(format!("branch {branch}"));
+        }
+        if let Some(number) = self.comments.last() {
+            lines.push(format!("comment on #{number}"));
+        }
+        lines.truncate(3);
+        lines
+    }
+}
+
+/// The facts record's file name.
+pub const FACTS_FILE: &str = "facts.json";
+
+/// Write the run's facts, `0600` like every record, before its terminal record.
+pub fn write_facts(run_dir: &Path, facts: &RunFacts) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(facts).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(FACTS_FILE), text.as_bytes())
+}
+
+/// Read a run's facts, when the record exists and is readable.
+pub fn read_facts(run_dir: &Path) -> Option<RunFacts> {
+    let text = fs::read_to_string(run_dir.join(FACTS_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Every run recorded for one agent, in no particular order.
 pub fn runs_of_agent(state_root: &Path, agent: &str) -> Vec<RunSummary> {
     let dir = state_root.join(agent);
@@ -532,6 +664,11 @@ pub fn read_failure(run_dir: &Path) -> Option<String> {
 /// `comment on #N` for a comment it wrote. A run with no Forgejo write yields no
 /// lines, so the previous work block can stay until a later run does new work.
 pub fn work_summary(run_dir: &Path) -> Vec<String> {
+    // New runs record one facts file; the mark and this work line read it. The
+    // transcript fallback below keeps older run directories readable.
+    if let Some(facts) = read_facts(run_dir) {
+        return facts.work_lines();
+    }
     let Ok(file) = transcript::read_checked(run_dir) else {
         return Vec::new();
     };
@@ -542,6 +679,7 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     // Each request keeps the branch its own tool result read, so several pushes and
     // pull requests in one run do not borrow the first (or newest) push's branch.
     let mut pulls: Vec<(u64, Option<String>)> = Vec::new();
+    let mut existing: Vec<(u64, Option<String>)> = Vec::new();
     let mut comments: Vec<u64> = Vec::new();
     for record in &file.records {
         match record {
@@ -559,9 +697,16 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
                 branch,
                 ..
             } => match action.as_str() {
-                "opened" | "updated" | "already_open" => {
+                "opened" | "updated" => {
                     pulls.retain(|(seen, _)| seen != number);
                     pulls.push((
+                        *number,
+                        branch.clone().filter(|branch| !branch.trim().is_empty()),
+                    ));
+                }
+                "already_open" => {
+                    existing.retain(|(seen, _)| seen != number);
+                    existing.push((
                         *number,
                         branch.clone().filter(|branch| !branch.trim().is_empty()),
                     ));
@@ -583,20 +728,28 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     let local = read_local_work(run_dir).filter(|changes| !changes.is_empty());
     if pulls.is_empty() && comments.is_empty() && branch.is_none() {
         // No remote work: a change left only in the workspace is the run's work, and
-        // it is named here so the line never falls back to an older run's branch.
+        // it is named here so the line never falls back to an older run's branch. An
+        // already-open request alone is not this run's work.
         return local
             .as_ref()
             .and_then(crate::workspace::WorkspaceChanges::work_line)
             .into_iter()
             .collect();
     }
+    // An already-open request is named only when the same run also pushed or
+    // commented; otherwise it is not this run's work.
+    let pull = pulls.last().cloned().or_else(|| {
+        (branch.is_some() || !comments.is_empty())
+            .then(|| existing.last().cloned())
+            .flatten()
+    });
     let mut lines = Vec::new();
     if let Some((_repository, number)) = read
-        && !pulls.iter().any(|(seen, _)| *seen == number)
+        && pull.as_ref().is_none_or(|(seen, _)| *seen != number)
     {
         lines.push(format!("issue #{number}"));
     }
-    if let Some((number, pull_branch)) = pulls.last() {
+    if let Some((number, pull_branch)) = pull.as_ref() {
         // The request's own result is the only witness for its branch. An older
         // record that did not carry one makes no branch claim: pairing it with the
         // run's single push witness is exactly the wrong-branch bug for a multi-PR
@@ -1056,6 +1209,51 @@ mod tests {
     }
 
     #[test]
+    fn the_facts_record_decides_the_work_line_and_round_trips() {
+        let root = scratch_root("work-facts");
+        let run = root.join("run-1700000000009-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        let existing = WorkPull {
+            number: 3,
+            branch: Some("feature".to_owned()),
+        };
+        let local = crate::workspace::WorkspaceChanges {
+            files: vec!["README.md".to_owned()],
+            committed: false,
+            git_state: false,
+        };
+        let facts = RunFacts {
+            existing: vec![existing.clone()],
+            local: local.clone(),
+            requires_confirmation: true,
+            ..RunFacts::default()
+        };
+        write_facts(&run, &facts).expect("the facts");
+        assert_eq!(read_facts(&run), Some(facts));
+        assert_eq!(
+            work_summary(&run),
+            vec!["local change README.md".to_owned()],
+            "an existing request alone did not give way to the local work"
+        );
+
+        let pushed = RunFacts {
+            remote: true,
+            push: Some("feature".to_owned()),
+            existing: vec![existing],
+            local,
+            requires_confirmation: true,
+            ..RunFacts::default()
+        };
+        write_facts(&run, &pushed).expect("the pushed facts");
+        assert_eq!(
+            work_summary(&run),
+            vec!["pull request #3 from feature".to_owned()],
+            "a push beside an existing request did not name the request"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_change_left_only_in_the_workspace_names_the_local_work() {
         // A local-only run is warning work, and the work line names the files it
         // changed instead of falling back to an older run's branch.
@@ -1066,6 +1264,7 @@ mod tests {
         let changes = crate::workspace::WorkspaceChanges {
             files: vec!["README.md".to_owned(), "NOTES-local.md".to_owned()],
             committed: false,
+            git_state: false,
         };
         write_local_work(&run, &changes).expect("the local record");
         assert_eq!(

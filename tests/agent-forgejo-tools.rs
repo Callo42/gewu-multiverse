@@ -666,6 +666,10 @@ fn a_duplicate_open_keeps_the_refusal_and_names_the_existing_request() {
         outcome, "refused",
         "with no other work, the agent's already-open request keeps the refusal mark"
     );
+    assert!(
+        gewu_multiverse::run::work_summary(&run_dir).is_empty(),
+        "an already-open request alone is not this run's work"
+    );
 }
 
 #[test]

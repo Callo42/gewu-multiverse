@@ -184,7 +184,8 @@ decide what a clean finish means:
 | How it ended | Outcome |
 |---|---|
 | exited 0, and a real remote write was recorded (a verified push, an opened or updated pull request, or a comment) | `succeeded`, naming that work |
-| exited 0, and a change was left only in the workspace (edited files or a local commit) | `warned`, naming the local work |
+| exited 0, and a change was left only in the workspace (content, mode, type, link, directory, commit or Git ref) | `warned`, naming the local work |
+| exited 0, and no tool call was recorded | `warned`, the requested work is unconfirmed |
 | exited 0, and the run only read its issue and wrote nothing | `no_work`, with its own sentence |
 | exited 0, and a write tool refused a write with no other work, or the summary says it could not do the instruction | `refused` |
 | exited 0, and a tool call failed (non-zero exit or a signal) without being a refused write | `warned` |

@@ -217,7 +217,7 @@ fn a_mixed_failure_names_the_failed_write() {
 }
 
 #[test]
-fn a_clean_command_quoting_a_system_error_is_still_a_tick() {
+fn a_clean_command_quoting_a_system_error_is_no_work() {
     // A false `⚠` is accepted (boundary c), but an ordinary success is not lowered
     // without the POSIX diagnostic form, even when it quotes the full vocabulary.
     for command in [
@@ -227,8 +227,8 @@ fn a_clean_command_quoting_a_system_error_is_still_a_tick() {
     ] {
         let (ending, outcome, failure, _segments) =
             run_command("clean-diagnostic", "Review the work.\n", command, |_| {});
-        assert_eq!(ending, RunEnding::Succeeded, "{command}: {ending:?}");
-        assert_eq!(outcome, "succeeded", "{command}");
+        assert_eq!(ending, RunEnding::NoWork, "{command}: {ending:?}");
+        assert_eq!(outcome, "no_work", "{command}");
         assert!(
             failure.is_empty(),
             "{command}: a clean run has a cause row: {failure:?}"
