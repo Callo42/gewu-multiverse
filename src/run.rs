@@ -15,6 +15,7 @@
 //!     skills/           the skill set this run had installed
 //! ```
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -405,6 +406,307 @@ pub struct RunSummary {
     pub dir: PathBuf,
 }
 
+/// The durable facts one run recorded: the mark and the work line are both read
+/// from this record, so they cannot disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunFacts {
+    /// A real remote write: a verified push, an opened or updated pull request, or a
+    /// comment. Remote work is the strongest fact a run can record.
+    #[serde(default)]
+    pub remote: bool,
+    /// At least one read (or other non-write tool call) succeeded.
+    #[serde(default)]
+    pub read: bool,
+    /// At least one write succeeded, even when it is not a push, pull request or
+    /// comment (for example a shell command that wrote outside the workspace). It is
+    /// a work fact, not a read; the work line still names only typed work.
+    #[serde(default)]
+    pub wrote: bool,
+    /// At least one tool call was recorded, even if it left no work fact.
+    #[serde(default)]
+    pub saw_tool: bool,
+    /// Changes left in the workspace.
+    #[serde(default)]
+    pub local: crate::workspace::WorkspaceChanges,
+    /// The branch a push witness proved.
+    #[serde(default)]
+    pub push: Option<String>,
+    /// Pull requests this run opened or updated, oldest first.
+    #[serde(default)]
+    pub pulls: Vec<WorkPull>,
+    /// The agent's own request an open call found already open. This is a fact about
+    /// the request, not work this run did; it is named only beside a push or comment.
+    #[serde(default)]
+    pub existing: Vec<WorkPull>,
+    /// Issue or pull-request numbers this run commented on, oldest first.
+    #[serde(default)]
+    pub comments: Vec<u64>,
+    /// The issue this run read, when it read one.
+    #[serde(default)]
+    pub read_issue: Option<IssueRead>,
+}
+
+/// One pull request a run named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPull {
+    /// The request's number.
+    pub number: u64,
+    /// The clone branch the request's own tool result named, when it named one.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// The issue a run read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueRead {
+    /// `owner/name`.
+    pub repository: String,
+    /// The issue or pull-request number.
+    pub number: u64,
+}
+
+impl RunFacts {
+    /// Whether the run made a verified remote write.
+    pub fn remote_work(&self) -> bool {
+        self.remote || self.push.is_some() || !self.pulls.is_empty() || !self.comments.is_empty()
+    }
+
+    /// Whether the run left work only in its workspace.
+    pub fn has_local(&self) -> bool {
+        !self.local.is_empty()
+    }
+
+    /// The work block built from these facts.
+    ///
+    /// A remotely successful run shows the request it opened or updated; an
+    /// already-open own request is shown only when the same run also pushed or
+    /// commented, because otherwise the run did not write it. With no remote work,
+    /// the local work is the run's row.
+    pub fn work_lines(&self) -> Vec<String> {
+        if !self.remote_work() {
+            return self.local.work_line().into_iter().collect::<Vec<String>>();
+        }
+        let mut lines = Vec::new();
+        // An already-open request is this run's work only when the push or comment
+        // that made the run remote is about that request.
+        let existing = self.existing.iter().rev().find(|pull| {
+            (self.push.is_some() && self.push.as_deref() == pull.branch.as_deref())
+                || self.comments.contains(&pull.number)
+        });
+        let pull = self.pulls.last().cloned().or_else(|| existing.cloned());
+        if let Some(read) = self.read_issue.as_ref()
+            && pull.as_ref().is_none_or(|pull| pull.number != read.number)
+        {
+            lines.push(format!("issue #{}", read.number));
+        }
+        if let Some(pull) = pull {
+            let shown = pull
+                .branch
+                .as_deref()
+                .filter(|branch| !branch.trim().is_empty());
+            match shown {
+                Some(branch) => lines.push(format!("pull request #{} from {branch}", pull.number)),
+                None => lines.push(format!("pull request #{}", pull.number)),
+            }
+        } else if let Some(branch) = self
+            .push
+            .as_deref()
+            .filter(|branch| !branch.trim().is_empty())
+        {
+            lines.push(format!("branch {branch}"));
+        }
+        if let Some(number) = self.comments.last() {
+            lines.push(format!("comment on #{number}"));
+        }
+        lines.truncate(3);
+        lines
+    }
+}
+
+/// Derive one run's facts from the records it actually wrote.
+///
+/// This is the one function both the mark and the work line use. It reads the
+/// transcript's tool calls and results (declared steps, the built-in loop and native
+/// programs all write the same records), the push witness and the local-work record.
+/// It is called on every exit, including failures, turn limits and timeouts, so work
+/// recorded before the ending is never lost.
+pub fn facts_from_records(run_dir: &Path) -> RunFacts {
+    let mut facts = RunFacts {
+        local: read_local_work(run_dir).unwrap_or_default(),
+        ..RunFacts::default()
+    };
+    if let Some(witness) = read_push_witness(run_dir) {
+        facts.push = Some(witness.branch);
+        facts.remote = true;
+    }
+    let Ok(file) = transcript::read_checked(run_dir) else {
+        return facts;
+    };
+    let Some(file) = file else {
+        return facts;
+    };
+    let mut calls: HashMap<u32, (String, String)> = HashMap::new();
+    for record in &file.records {
+        match record {
+            Record::ToolCall {
+                index,
+                tool,
+                command,
+                ..
+            } => {
+                facts.saw_tool = true;
+                calls.insert(*index, (tool.clone(), command.clone()));
+            }
+            Record::ToolResult {
+                index,
+                tool,
+                exit_code,
+                signal,
+                segments,
+                ..
+            } => {
+                facts.saw_tool = true;
+                if crate::forgejo_tools::is_forgejo_tool(tool) {
+                    // The ForgejoResult record carries the typed action and number.
+                    continue;
+                }
+                let success = signal.is_none()
+                    && exit_code == &Some(0)
+                    && segments.iter().all(|segment| segment.status == 0);
+                if !success {
+                    continue;
+                }
+                let (command, call_tool) = calls
+                    .get(index)
+                    .map(|(call_tool, command)| (command.as_str(), call_tool.as_str()))
+                    .unwrap_or(("", tool.as_str()));
+                let explicit_command = native_command(command);
+                let command = explicit_command.as_deref().unwrap_or(command);
+                let shell = tool == "shell"
+                    || tool == "bash"
+                    || tool.contains("shell")
+                    || explicit_command.is_some();
+                if shell {
+                    if crate::agent_run::shell_writes(command) {
+                        facts.wrote = true;
+                    } else {
+                        facts.read = true;
+                    }
+                } else if tool_writes(call_tool) {
+                    facts.wrote = true;
+                } else {
+                    facts.read = true;
+                }
+            }
+            Record::ForgejoCall {
+                tool,
+                repository: Some(repository),
+                number: Some(number),
+                ..
+            } if tool == crate::forgejo_tools::READ_ISSUE_OR_PULL => {
+                facts.saw_tool = true;
+                facts.read_issue = Some(IssueRead {
+                    repository: repository.clone(),
+                    number: *number,
+                });
+            }
+            Record::ForgejoResult {
+                tool,
+                repository,
+                number,
+                outcome,
+                action,
+                branch,
+                ..
+            } => {
+                facts.saw_tool = true;
+                match action.as_deref() {
+                    Some("opened" | "updated") => {
+                        if let Some(number) = number {
+                            facts.pulls.push(WorkPull {
+                                number: *number,
+                                branch: branch.clone().filter(|branch| !branch.trim().is_empty()),
+                            });
+                            facts.remote = true;
+                            facts.wrote = true;
+                        }
+                    }
+                    Some("commented") => {
+                        if let Some(number) = number {
+                            facts.comments.push(*number);
+                            facts.remote = true;
+                            facts.wrote = true;
+                        }
+                    }
+                    Some("already_open") => {
+                        if let Some(number) = number {
+                            facts.existing.push(WorkPull {
+                                number: *number,
+                                branch: branch.clone().filter(|branch| !branch.trim().is_empty()),
+                            });
+                        }
+                    }
+                    _ => {
+                        if outcome == "ok" {
+                            facts.read = true;
+                            if tool == crate::forgejo_tools::READ_ISSUE_OR_PULL
+                                && let (Some(repository), Some(number)) = (repository, number)
+                            {
+                                facts.read_issue = Some(IssueRead {
+                                    repository: repository.clone(),
+                                    number: *number,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    facts
+}
+
+/// A native program records its shell tool's arguments as JSON (`{"command":...}`);
+/// read the command out so the write/read classification sees the command itself.
+fn native_command(command: &str) -> Option<String> {
+    let serde_json::Value::Object(args) =
+        serde_json::from_str::<serde_json::Value>(command).ok()?
+    else {
+        return None;
+    };
+    args.get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Whether a native tool name is a write, when no command text is available.
+fn tool_writes(tool: &str) -> bool {
+    let lower = tool.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "write" | "edit" | "apply_patch" | "patch" | "file_change"
+    )
+}
+
+/// The facts record's file name.
+pub const FACTS_FILE: &str = "facts.json";
+
+/// Write the run's facts, `0600` like every record, before its terminal record.
+pub fn write_facts(run_dir: &Path, facts: &RunFacts) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(facts).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(FACTS_FILE), text.as_bytes())
+}
+
+/// Read a run's facts, when the record exists and is readable.
+pub fn read_facts(run_dir: &Path) -> Option<RunFacts> {
+    let text = fs::read_to_string(run_dir.join(FACTS_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Every run recorded for one agent, in no particular order.
 pub fn runs_of_agent(state_root: &Path, agent: &str) -> Vec<RunSummary> {
     let dir = state_root.join(agent);
@@ -476,6 +778,7 @@ pub fn forgejo_actions(run_dir: &Path) -> Vec<ForgejoAction> {
                     },
                     "opened" => format!("opened {number}"),
                     "updated" => format!("updated {number}"),
+                    "already_open" => format!("pull request {number} already open"),
                     other => format!("{other} {number}"),
                 };
                 Some(ForgejoAction {
@@ -531,6 +834,16 @@ pub fn read_failure(run_dir: &Path) -> Option<String> {
 /// `comment on #N` for a comment it wrote. A run with no Forgejo write yields no
 /// lines, so the previous work block can stay until a later run does new work.
 pub fn work_summary(run_dir: &Path) -> Vec<String> {
+    // New runs record one facts file; the mark and this work line read it. The
+    // transcript fallback below keeps older run directories readable.
+    if let Some(facts) = read_facts(run_dir) {
+        let lines = facts.work_lines();
+        if !lines.is_empty() {
+            return lines;
+        }
+        // An older facts record written before an early exit can be empty while the
+        // transcript still carries the work; fall through so that work is not lost.
+    }
     let Ok(file) = transcript::read_checked(run_dir) else {
         return Vec::new();
     };
@@ -541,6 +854,7 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     // Each request keeps the branch its own tool result read, so several pushes and
     // pull requests in one run do not borrow the first (or newest) push's branch.
     let mut pulls: Vec<(u64, Option<String>)> = Vec::new();
+    let mut existing: Vec<(u64, Option<String>)> = Vec::new();
     let mut comments: Vec<u64> = Vec::new();
     for record in &file.records {
         match record {
@@ -565,6 +879,13 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
                         branch.clone().filter(|branch| !branch.trim().is_empty()),
                     ));
                 }
+                "already_open" => {
+                    existing.retain(|(seen, _)| seen != number);
+                    existing.push((
+                        *number,
+                        branch.clone().filter(|branch| !branch.trim().is_empty()),
+                    ));
+                }
                 "commented" => {
                     comments.retain(|seen| seen != number);
                     comments.push(*number);
@@ -579,16 +900,31 @@ pub fn work_summary(run_dir: &Path) -> Vec<String> {
     let branch = read_push_witness(run_dir)
         .map(|witness| witness.branch)
         .filter(|branch| !branch.trim().is_empty());
+    let local = read_local_work(run_dir).filter(|changes| !changes.is_empty());
     if pulls.is_empty() && comments.is_empty() && branch.is_none() {
-        return Vec::new();
+        // No remote work: a change left only in the workspace is the run's work, and
+        // it is named here so the line never falls back to an older run's branch. An
+        // already-open request alone is not this run's work.
+        return local
+            .as_ref()
+            .and_then(crate::workspace::WorkspaceChanges::work_line)
+            .into_iter()
+            .collect();
     }
+    // An already-open request is named only when this run pushed its branch or
+    // commented on it; otherwise it is not this run's work.
+    let matched_existing = existing.iter().rev().find(|(number, pull_branch)| {
+        (branch.is_some() && branch.as_deref() == pull_branch.as_deref())
+            || comments.contains(number)
+    });
+    let pull = pulls.last().cloned().or_else(|| matched_existing.cloned());
     let mut lines = Vec::new();
     if let Some((_repository, number)) = read
-        && !pulls.iter().any(|(seen, _)| *seen == number)
+        && pull.as_ref().is_none_or(|(seen, _)| *seen != number)
     {
         lines.push(format!("issue #{number}"));
     }
-    if let Some((number, pull_branch)) = pulls.last() {
+    if let Some((number, pull_branch)) = pull.as_ref() {
         // The request's own result is the only witness for its branch. An older
         // record that did not carry one makes no branch claim: pairing it with the
         // run's single push witness is exactly the wrong-branch bug for a multi-PR
@@ -653,6 +989,28 @@ pub fn says_no_assigned_work(run_dir: &Path, login: &str) -> bool {
 /// Read a run's push witness, when one was written.
 pub fn read_push_witness(run_dir: &Path) -> Option<PushWitness> {
     let text = fs::read_to_string(run_dir.join(PUSH_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The file that records the local work a run left in its workspace.
+///
+/// It is written from the workspace's own before/after state, never from a command's
+/// text: a file the run edited, created or deleted, or a commit it made without
+/// pushing. A run that pushed has a remote fact and does not need this row.
+pub const LOCAL_FILE: &str = "local.json";
+
+/// Write the local work a run left, `0600` like every record.
+pub fn write_local_work(
+    run_dir: &Path,
+    changes: &crate::workspace::WorkspaceChanges,
+) -> io::Result<()> {
+    let text = serde_json::to_string_pretty(changes).map_err(io::Error::other)?;
+    crate::mode::write_private(run_dir.join(LOCAL_FILE), text.as_bytes())
+}
+
+/// Read the local work a run left, when the record exists and is readable.
+pub fn read_local_work(run_dir: &Path) -> Option<crate::workspace::WorkspaceChanges> {
+    let text = fs::read_to_string(run_dir.join(LOCAL_FILE)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -1021,6 +1379,199 @@ mod tests {
             work_summary(&run),
             vec!["pull request #4".to_owned()],
             "a legacy multi-PR record borrowed the single push witness"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_old_facts_record_does_not_hide_a_recorded_comment() {
+        let root = scratch_root("work-empty-facts");
+        let run = root.join("run-1700000000010-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        let mut transcript = transcript::Transcript::open(&run).expect("the transcript");
+        transcript
+            .append(&Record::forgejo_result(
+                1,
+                1,
+                crate::forgejo_tools::COMMENT,
+                Some("team/workspace"),
+                Some(12),
+                "ok",
+                Some("http://127.0.0.1:3000/team/workspace/issues/12#issuecomment-31"),
+                Some("commented"),
+            ))
+            .expect("the comment");
+        write_facts(&run, &RunFacts::default()).expect("an empty old facts record");
+        assert_eq!(
+            work_summary(&run),
+            vec!["comment on #12".to_owned()],
+            "an empty facts record hid a recorded comment"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_existing_request_is_named_only_for_its_own_push_or_comment() {
+        let existing = WorkPull {
+            number: 3,
+            branch: Some("feature".to_owned()),
+        };
+        let unrelated = RunFacts {
+            remote: true,
+            comments: vec![5],
+            existing: vec![existing.clone()],
+            ..RunFacts::default()
+        };
+        assert_eq!(
+            unrelated.work_lines(),
+            vec!["comment on #5".to_owned()],
+            "an unrelated already-open request became work"
+        );
+        let matching_comment = RunFacts {
+            remote: true,
+            comments: vec![3],
+            existing: vec![existing.clone()],
+            ..RunFacts::default()
+        };
+        assert_eq!(
+            matching_comment.work_lines(),
+            vec![
+                "pull request #3 from feature".to_owned(),
+                "comment on #3".to_owned()
+            ]
+        );
+        let matching_push = RunFacts {
+            remote: true,
+            push: Some("feature".to_owned()),
+            existing: vec![existing],
+            ..RunFacts::default()
+        };
+        assert_eq!(
+            matching_push.work_lines(),
+            vec!["pull request #3 from feature".to_owned()]
+        );
+        let other_push = RunFacts {
+            remote: true,
+            push: Some("other".to_owned()),
+            existing: vec![WorkPull {
+                number: 3,
+                branch: Some("feature".to_owned()),
+            }],
+            ..RunFacts::default()
+        };
+        assert_eq!(
+            other_push.work_lines(),
+            vec!["branch other".to_owned()],
+            "a different push named an unrelated request"
+        );
+    }
+
+    #[test]
+    fn the_facts_record_decides_the_work_line_and_round_trips() {
+        let root = scratch_root("work-facts");
+        let run = root.join("run-1700000000009-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        let existing = WorkPull {
+            number: 3,
+            branch: Some("feature".to_owned()),
+        };
+        let local = crate::workspace::WorkspaceChanges {
+            files: vec!["README.md".to_owned()],
+            committed: false,
+            git_state: false,
+        };
+        let facts = RunFacts {
+            existing: vec![existing.clone()],
+            local: local.clone(),
+            ..RunFacts::default()
+        };
+        write_facts(&run, &facts).expect("the facts");
+        assert_eq!(read_facts(&run), Some(facts));
+        assert_eq!(
+            work_summary(&run),
+            vec!["local change README.md".to_owned()],
+            "an existing request alone did not give way to the local work"
+        );
+
+        let pushed = RunFacts {
+            remote: true,
+            push: Some("feature".to_owned()),
+            existing: vec![existing],
+            local,
+            ..RunFacts::default()
+        };
+        write_facts(&run, &pushed).expect("the pushed facts");
+        assert_eq!(
+            work_summary(&run),
+            vec!["pull request #3 from feature".to_owned()],
+            "a push beside an existing request did not name the request"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_change_left_only_in_the_workspace_names_the_local_work() {
+        // A local-only run is warning work, and the work line names the files it
+        // changed instead of falling back to an older run's branch.
+        let root = scratch_root("work-local");
+        let run = root.join("run-1700000000006-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        transcript::Transcript::open(&run).expect("the transcript");
+        let changes = crate::workspace::WorkspaceChanges {
+            files: vec!["README.md".to_owned(), "NOTES-local.md".to_owned()],
+            committed: false,
+            git_state: false,
+        };
+        write_local_work(&run, &changes).expect("the local record");
+        assert_eq!(
+            work_summary(&run),
+            vec!["local change README.md, NOTES-local.md".to_owned()]
+        );
+        assert!(
+            latest_work(&[RunSummary {
+                run_id: "run-1700000000006-0001".to_owned(),
+                outcome: Some(RunOutcome::Warned),
+                reason: Some("workspace changed: README.md".to_owned()),
+                dir: run.clone(),
+            }])
+            .iter()
+            .any(|line| line.contains("README.md"))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_existing_own_pull_request_is_named_as_the_work_it_is() {
+        // The duplicate-open answer is a successful no-op carrying the request's
+        // number and branch; the run that pushed before it must name the request.
+        let root = scratch_root("work-existing-pr");
+        let run = root.join("run-1700000000007-0001");
+        fs::create_dir_all(&run).expect("a run directory");
+        let mut transcript = transcript::Transcript::open(&run).expect("transcript");
+        transcript
+            .append(&Record::forgejo_result_with_branch(
+                0,
+                1,
+                crate::forgejo_tools::OPEN_PULL_REQUEST,
+                Some("team/workspace"),
+                Some(4),
+                "ok",
+                Some("http://127.0.0.1:3000/team/workspace/pulls/4"),
+                Some("already_open"),
+                Some("fix/readme-typo"),
+            ))
+            .expect("the existing request");
+        write_push_witness_at(
+            &run,
+            "fix/readme-typo",
+            "refs/remotes/origin/fix/readme-typo",
+            Some("team/workspace"),
+            Some("main"),
+        )
+        .expect("the witness");
+        assert_eq!(
+            work_summary(&run),
+            vec!["pull request #4 from fix/readme-typo".to_owned()]
         );
         let _ = fs::remove_dir_all(&root);
     }

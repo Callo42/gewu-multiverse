@@ -290,7 +290,7 @@ fn a_sourced_command_failure_is_seen() {
 #[test]
 fn words_without_the_shell_prefix_are_still_a_tick() {
     // The clean control: quoting the words — or a different program's `name:` line —
-    // is not the shell's voice, so an ordinary success stays `✓`.
+    // is not the shell's voice, and a run that only read is no work.
     for command in [
         "printf '%s\\n' 'the shell said ambiguous redirect'",
         "printf '%s\\n' 'bashful: line 1: ambiguous redirect'",
@@ -298,8 +298,8 @@ fn words_without_the_shell_prefix_are_still_a_tick() {
     ] {
         let (ending, outcome, failure, _segments) =
             run_command("clean-voice", "Review the work.\n", command, |_| {});
-        assert_eq!(ending, RunEnding::Succeeded, "{command}: {ending:?}");
-        assert_eq!(outcome, "succeeded", "{command}");
+        assert_eq!(ending, RunEnding::NoWork, "{command}: {ending:?}");
+        assert_eq!(outcome, "no_work", "{command}");
         assert!(
             failure.is_empty(),
             "{command}: a clean run has a cause row: {failure:?}"

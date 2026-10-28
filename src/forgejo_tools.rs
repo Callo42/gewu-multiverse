@@ -654,12 +654,12 @@ impl ForgejoTools {
             .iter()
             .find(|pull| pull_gate::matches_pair(pull, &repository, &branch, &base))
         {
-            return Err(self.duplicate_sentence(
+            return self.existing_open_reply(
                 repository.as_str(),
                 branch.as_str(),
                 base.as_str(),
                 existing,
-            ));
+            );
         }
         client.begin_write();
         let opened = client.open_pull_request(&owner, &name, &title, &body, &branch, &base);
@@ -690,12 +690,12 @@ impl ForgejoTools {
                     .iter()
                     .find(|pull| pull_gate::matches_pair(pull, &repository, &branch, &base))
                 {
-                    Some(existing) => Err(self.duplicate_sentence(
+                    Some(existing) => self.existing_open_reply(
                         repository.as_str(),
                         branch.as_str(),
                         base.as_str(),
                         existing,
-                    )),
+                    ),
                     None => Err(sentence(format!(
                         "the Forgejo refused the pull request as a duplicate (conflict, HTTP 409) for `{branch}` -> `{base}` in `{repository}`, and the request it names could not be listed"
                     ))),
@@ -703,6 +703,41 @@ impl ForgejoTools {
             }
             Err(error) => Err(self.error_sentence(error)),
         }
+    }
+
+    /// The agent's own request for this branch is already open.
+    ///
+    /// This is the desired end state, not a refused write: the push that preceded
+    /// the call is on the request. The reply carries the request's number, URL and
+    /// branch so the run's work line can name it. Another account's request stays a
+    /// refusal, because this agent may not write to it.
+    fn existing_open_reply(
+        &self,
+        repository: &str,
+        branch: &str,
+        base: &str,
+        existing: &PullRequest,
+    ) -> Result<ToolReply, String> {
+        let authorship =
+            PullRequestAuthorship::of(existing.author.as_deref(), Some(self.config.login.as_str()));
+        if !authorship.is_own() {
+            return Err(self.duplicate_sentence(repository, branch, base, existing));
+        }
+        let url = existing
+            .html_url
+            .clone()
+            .unwrap_or_else(|| self.web_url(repository, existing.number, None));
+        Ok(ToolReply {
+            text: sentence(format!(
+                "the pull request for `{branch}` -> `{base}` in `{repository}` is already open: {repository}#{} `{}` — it is the agent's own request; the pushed branch is on it",
+                existing.number, existing.title
+            )),
+            repository: Some(repository.to_owned()),
+            number: Some(existing.number),
+            action: Some("already_open"),
+            url: Some(url),
+            branch: Some(branch.to_owned()),
+        })
     }
 
     fn duplicate_sentence(

@@ -252,7 +252,7 @@ fn an_unlisted_program_failing_under_a_piped_condition_is_never_a_tick() {
 }
 
 #[test]
-fn a_clean_command_whose_output_quotes_an_error_is_still_a_tick() {
+fn a_clean_command_whose_output_quotes_an_error_is_no_work() {
     // A false `⚠` is accepted (boundary c), but an ordinary success is not lowered
     // without the POSIX diagnostic form.
     for command in [
@@ -262,8 +262,8 @@ fn a_clean_command_whose_output_quotes_an_error_is_still_a_tick() {
     ] {
         let (ending, outcome, failure, _segments, _had_output, _output) =
             run_command("clean-diagnostic", "Review the work.\n", command, |_| {});
-        assert_eq!(ending, RunEnding::Succeeded, "{command}: {ending:?}");
-        assert_eq!(outcome, "succeeded", "{command}");
+        assert_eq!(ending, RunEnding::NoWork, "{command}: {ending:?}");
+        assert_eq!(outcome, "no_work", "{command}");
         assert!(
             failure.is_empty(),
             "{command}: a clean run has a cause row: {failure:?}"
@@ -364,7 +364,7 @@ fn every_generated_redirection_composition_is_never_a_tick() {
 }
 
 #[test]
-fn every_generated_clean_composition_is_still_a_tick() {
+fn every_generated_clean_composition_is_no_work() {
     for (index, command) in clean_compositions(2).iter().enumerate() {
         let (ending, outcome, failure, _segments, _had_output, _output) = run_command(
             &format!("generated-clean-{index}"),
@@ -372,8 +372,8 @@ fn every_generated_clean_composition_is_still_a_tick() {
             command,
             |_| {},
         );
-        assert_eq!(ending, RunEnding::Succeeded, "{command}: {ending:?}");
-        assert_eq!(outcome, "succeeded", "{command}");
+        assert_eq!(ending, RunEnding::NoWork, "{command}: {ending:?}");
+        assert_eq!(outcome, "no_work", "{command}");
         assert!(
             failure.is_empty(),
             "{command}: a clean run has a cause row: {failure:?}"

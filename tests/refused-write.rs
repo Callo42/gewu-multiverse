@@ -407,10 +407,53 @@ fn a_successful_write_listing_a_file_named_refused_is_still_a_tick() {
     ]);
     endpoint(&run_dir, &model.url());
     let end = agent_run::execute(&run_dir);
-    let (outcome, _reason) = terminal(&run_dir);
+    let (outcome, reason) = terminal(&run_dir);
+    let local = gewu_multiverse::run::read_local_work(&run_dir).expect("the local work record");
     let _ = fs::remove_dir_all(&root);
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded", "a filename is not a refusal");
+    assert_eq!(
+        end.ending,
+        RunEnding::Warned,
+        "a change left only in the workspace is a warning: {end:?}"
+    );
+    assert_eq!(outcome, "warned", "a filename is not a refusal");
+    assert!(local.files.contains(&"refused".to_owned()), "{local:?}");
+    assert!(reason.contains("refused"), "{reason}");
+    assert!(reason.contains("README.md"), "{reason}");
+}
+
+#[test]
+fn a_local_only_change_is_warned_and_names_the_file() {
+    // Walk B F1: the run edited README.md and did not commit or push it. The mark
+    // must be a warning, and the work line must name the local file rather than
+    // falling back to an older run's branch.
+    let root = scratch_root("local-only");
+    let run_dir = prepare(&root, "Edit the README and report.\n");
+    let workspace = root.join("agents").join("scribe").join("workspace");
+    fs::write(workspace.join("README.md"), "hello\n").expect("a README");
+    let model = Stub::start(vec![
+        StubReply::json(tool_call("printf 'local edit\n' >> README.md")),
+        StubReply::json(final_reply(
+            "I edited README.md locally but did not commit or push it.",
+        )),
+    ]);
+    endpoint(&run_dir, &model.url());
+    let end = agent_run::execute(&run_dir);
+    let (outcome, reason) = terminal(&run_dir);
+    let local = gewu_multiverse::run::read_local_work(&run_dir).expect("the local record");
+    let work = gewu_multiverse::run::work_summary(&run_dir);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        end.ending,
+        RunEnding::Warned,
+        "a local-only change is a warning: {end:?}"
+    );
+    assert_eq!(outcome, "warned");
+    assert!(reason.contains("README.md"), "{reason}");
+    assert!(local.files.contains(&"README.md".to_owned()), "{local:?}");
+    assert!(
+        work.iter().any(|line| line.contains("README.md")),
+        "the work line did not name the local file: {work:?}"
+    );
 }
 
 #[test]
@@ -525,8 +568,8 @@ fn a_refused_read_with_stderr_redirection_is_not_a_refusal() {
         "Forbidden",
         "The review is complete.",
     );
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(end.ending, RunEnding::NoWork, "{end:?}");
+    assert_eq!(outcome, "no_work");
 }
 
 #[test]
@@ -539,12 +582,12 @@ fn a_curl_get_with_data_is_a_read() {
         "Forbidden",
         "The search is complete.",
     );
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(end.ending, RunEnding::NoWork, "{end:?}");
+    assert_eq!(outcome, "no_work");
 }
 
 #[test]
-fn a_destructive_keep_success_is_a_tick() {
+fn a_destructive_keep_success_with_no_tool_is_unconfirmed() {
     // Review correction 3, non-blocking 4: a keep phrase beside a success verb for
     // the destructive act describes a success, not a refusal.
     let (end, outcome, _reason) = run_reply(
@@ -552,8 +595,8 @@ fn a_destructive_keep_success_is_a_tick() {
         "Delete the stale branch and keep the docs as is.\n",
         "I deleted the stale branch and kept the docs as is; the work is complete.",
     );
-    assert_eq!(end.ending, RunEnding::Succeeded, "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(end.ending, RunEnding::Warned, "{end:?}");
+    assert_eq!(outcome, "warned");
 }
 
 #[test]
@@ -759,9 +802,9 @@ fn a_failed_command_hidden_in_a_compound_is_a_warning_not_a_tick() {
 }
 
 #[test]
-fn a_clean_compound_command_is_a_tick() {
+fn a_clean_compound_command_is_no_work() {
     // The other direction: every command the shell reported exited 0, so the run is
-    // a success even though it is a compound command.
+    // no work even though it is a compound command.
     let (end, outcome, _reason) = run_scripted(
         "compound-clean",
         "Review the work.\n",
@@ -772,7 +815,7 @@ fn a_clean_compound_command_is_a_tick() {
         "The review is complete.",
     );
     assert!(end.is_success(), "{end:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(outcome, "no_work");
 }
 
 #[test]
@@ -883,4 +926,28 @@ fn a_failed_write_behind_a_later_success_is_not_a_green_tick() {
             "{command} lost its result row:\n{frame}"
         );
     }
+}
+
+#[test]
+fn a_successful_declared_read_step_is_no_work() {
+    // A declared step is a real tool result in the transcript. It must not be read
+    // as "no tool call" just because the model made no further call.
+    let root = scratch_root("declared-read");
+    let run_dir = prepare(&root, "Check the environment and report.\n");
+    let mut plan = RunPlan::read(&run_dir).expect("the plan reads");
+    plan.steps = vec!["env".to_owned()];
+    plan.write(&run_dir).expect("the plan writes");
+    let model = Stub::start(vec![StubReply::json(final_reply("Done: checked."))]);
+    endpoint(&run_dir, &model.url());
+    let end = agent_run::execute(&run_dir);
+    let (outcome, reason) = terminal(&run_dir);
+    let work = gewu_multiverse::run::work_summary(&run_dir);
+    let _ = fs::remove_dir_all(&root);
+    assert!(end.is_success(), "{end:?}");
+    assert_eq!(
+        outcome, "no_work",
+        "a read-only declared step is no work: {reason}"
+    );
+    assert_eq!(reason, "Done: checked.");
+    assert!(work.is_empty(), "{work:?}");
 }

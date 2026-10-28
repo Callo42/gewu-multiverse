@@ -91,20 +91,26 @@ requests are its own. The board shows the whole thing at a glance:
   nested interpreter that does not load the recorder (a non-bash interpreter, or
   `bash` in POSIX or privileged mode), a failure that leaves neither a status nor any
   diagnostic text, and a failure inside a piped or negated condition reported only by
-  a program's own free-form message.) A run that exited 0 but whose own
-  summary says it could not do the instruction, or whose tool results show a refused
-  write, is `⊘ refused`; a refused **read** is `⚠`, never `⊘`. One whose assigned-issues
-  list came back empty and that wrote nothing is `∅ no work`, even when its own
-  sentence says everything is done; a check that read its issue and wrote nothing and
-  says `nothing new to add` is the same neutral `∅ no work`, not a green tick; one
-  whose tool results include a failed command but no recorded write is `⚠` with the
-  command's cause as its row. A run that actually pushed, opened a pull request or
-  commented stays `✓` even if a test failed first, reused the branch an interrupted
-  run left, or ended with a sentence claiming failure; the work block keeps the
-  product-observed fact. A refused write's
-  cause row says `⊘ write refused: …`, matching the strip. The
+  a program's own free-form message.) A run that exited 0 with a refused or failed
+  write and no other work is `⊘ refused` (or `⚠` when the failed call is a read);
+  the refused write's cause row says `⊘ write refused: …`, matching the strip. A run
+  that only read its issue and wrote nothing is `∅ no work` with its own sentence,
+  even when its instruction used a change word; the same is true when its
+  assigned-issues list came back empty. A change left only in the workspace — a
+  content edit, a mode change, a new link, an empty directory, or a local commit,
+  tag, index, config or local ref change — is `⚠`, and its work line names the
+  recorded local work (`local change README.md`) instead of borrowing an older run's
+  branch. A fetch that only moves remote-tracking refs, their logs or `FETCH_HEAD` is
+  reading, not local work. A declared step is a real tool result, not an absent call.
+  A run that recorded no tool call at all is never `✓`: its requested work is
+  unconfirmed. A run
+  that actually pushed, opened or updated a pull request, or commented stays `✓` even
+  if a later write was refused, a test failed first, it reused the branch an
+  interrupted run left, or it ended with a sentence claiming failure; the work block
+  keeps the product-observed fact, including the pull request. The
   summary line prefers the newest run that did work (`last work: comment on #2`,
-  `last work: PR #3 open`); a later no-op's reason is labelled `no work: …`. Started agents keep
+  `last work: PR #3 open`, `last work: local change README.md`); a later no-op's
+  reason is labelled `no work: …`. Started agents keep
   a visible idle between runs (the Agent screen says `next run in 5s`; a card's shorter
   form is `next 5s`); a no-work or warned run's longer wait says
   `next run in 20s · no work` (`next 20s·no work` on a card). A 503 is named as

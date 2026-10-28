@@ -840,6 +840,10 @@ pub fn last_work_word(agent: &AgentView) -> Option<String> {
             // value here: a fixed seven-character cut made `fix/readme-typo` read
             // `fix/rea` with no sign that anything was missing.
             best.get_or_insert_with(|| branch.to_owned());
+        } else if let Some(rest) = line.strip_prefix("local change ") {
+            best.get_or_insert_with(|| rest.split(',').next().unwrap_or(rest).trim().to_owned());
+        } else if line == "local commit" || line == "local git change" {
+            best.get_or_insert_with(|| "local".to_owned());
         }
     }
     best
@@ -880,6 +884,10 @@ pub fn last_work_identity(agent: &AgentView) -> Option<String> {
                     branch.to_owned()
                 }
             });
+        } else if let Some(rest) = line.strip_prefix("local change ") {
+            best.get_or_insert_with(|| rest.split(',').next().unwrap_or(rest).trim().to_owned());
+        } else if line == "local commit" || line == "local git change" {
+            best.get_or_insert_with(|| "local".to_owned());
         }
     }
     best

@@ -243,12 +243,12 @@ fn a_denied_write_in_a_nested_bash_is_not_a_green_tick() {
 }
 
 #[test]
-fn a_clean_compound_command_is_still_a_tick() {
+fn a_clean_compound_command_is_no_work() {
     // The correction must not turn every compound command into a warning.
     let (ending, outcome, failure, _) =
         run_command("clean-compound", "echo checked; printf 'ok\\n'", |_| {});
-    assert_eq!(ending, RunEnding::Succeeded, "{ending:?}");
-    assert_eq!(outcome, "succeeded");
+    assert_eq!(ending, RunEnding::NoWork, "{ending:?}");
+    assert_eq!(outcome, "no_work");
     assert!(
         failure.is_empty(),
         "a clean run has no cause row: {failure:?}"

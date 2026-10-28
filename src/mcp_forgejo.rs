@@ -321,24 +321,7 @@ fn call_tool(
         tools.set_writes(reserved);
     }
     let accepted = if write { tools.last_accepted() } else { false };
-    let (ok, text, action, url) = match &result {
-        Ok(reply) => (true, reply.text.clone(), reply.action, reply.url.clone()),
-        Err(error) => (false, error.clone(), None, None),
-    };
-    let outcome = redactor.redact(&text);
-    let record = json!({
-        "ts": crate::time::rfc3339(crate::time::now_unix_ms()),
-        "tool": name,
-        "repository": facts.repository.as_deref().map(|text| redactor.redact(text)),
-        "number": facts.number,
-        "detail": redactor.redact(&facts.detail),
-        "ok": ok,
-        "outcome": outcome,
-        "action": action.map(|text| redactor.redact(text)),
-        "url": url.as_deref().map(|text| redactor.redact(text)),
-        "write": write,
-        "accepted": accepted,
-    });
+    let record = ledger_record(name, &facts, &result, accepted, redactor, write);
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -347,12 +330,62 @@ fn call_tool(
         .map_err(|error| format!("the protected MCP ledger cannot be written: {error}"))?;
     writeln!(file, "{record}")
         .map_err(|error| format!("the protected MCP ledger cannot be written: {error}"))?;
-    let content = json!([{ "type": "text", "text": outcome }]);
-    if ok {
-        Ok(json!({"content": content, "isError": false}))
-    } else {
-        Ok(json!({"content": content, "isError": true}))
-    }
+    let content = json!([{ "type": "text", "text": record["outcome"] }]);
+    let is_error = !record["ok"].as_bool().unwrap_or(false);
+    Ok(json!({"content": content, "isError": is_error}))
+}
+
+/// The ledger line for one call.
+///
+/// The result, not the call's arguments, names what was written: opening a pull
+/// request has no number in its arguments, but its reply carries the number, URL and
+/// branch that the run's work line needs. A refusal keeps the call's facts.
+fn ledger_record(
+    name: &str,
+    facts: &forgejo_tools::CallFacts,
+    result: &Result<forgejo_tools::ToolReply, String>,
+    accepted: bool,
+    redactor: &Secret,
+    write: bool,
+) -> Value {
+    let (ok, text, action, url, repository, number, branch) = match result {
+        Ok(reply) => (
+            true,
+            reply.text.clone(),
+            reply.action,
+            reply.url.clone(),
+            reply
+                .repository
+                .clone()
+                .or_else(|| facts.repository.clone()),
+            reply.number.or(facts.number),
+            reply.branch.clone(),
+        ),
+        Err(error) => (
+            false,
+            error.clone(),
+            None,
+            None,
+            facts.repository.clone(),
+            facts.number,
+            None,
+        ),
+    };
+    let outcome = redactor.redact(&text);
+    json!({
+        "ts": crate::time::rfc3339(crate::time::now_unix_ms()),
+        "tool": name,
+        "repository": repository.as_deref().map(|text| redactor.redact(text)),
+        "number": number,
+        "detail": redactor.redact(&facts.detail),
+        "ok": ok,
+        "outcome": outcome,
+        "action": action.map(|text| redactor.redact(text)),
+        "url": url.as_deref().map(|text| redactor.redact(text)),
+        "branch": branch.as_deref().map(|text| redactor.redact(text)),
+        "write": write,
+        "accepted": accepted,
+    })
 }
 
 fn write_counter(path: &Path, writes: u32) -> std::io::Result<()> {
@@ -375,6 +408,42 @@ fn write_error(stdout: &mut impl Write, id: Value, code: i64, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_successful_open_records_the_replys_own_number_url_and_branch() {
+        // Opening a pull request carries no number in its arguments; the number,
+        // URL and branch exist only in the reply. The ledger is what the supervisor
+        // later reads, so losing them makes the work line show only the branch.
+        let facts = forgejo_tools::CallFacts {
+            repository: Some("team/workspace".to_owned()),
+            number: None,
+            detail: "title \"A note\"".to_owned(),
+        };
+        let reply = forgejo_tools::ToolReply {
+            text: "opened team/workspace#6 — http://127.0.0.1:3000/team/workspace/pulls/6"
+                .to_owned(),
+            repository: Some("team/workspace".to_owned()),
+            number: Some(6),
+            action: Some("opened"),
+            url: Some("http://127.0.0.1:3000/team/workspace/pulls/6".to_owned()),
+            branch: Some("agent-1/pr-only".to_owned()),
+        };
+        let record = ledger_record(
+            forgejo_tools::OPEN_PULL_REQUEST,
+            &facts,
+            &Ok(reply),
+            false,
+            &Secret::new("fixture-key".to_owned()),
+            true,
+        );
+        assert_eq!(record["number"], 6);
+        assert_eq!(
+            record["url"],
+            "http://127.0.0.1:3000/team/workspace/pulls/6"
+        );
+        assert_eq!(record["branch"], "agent-1/pr-only");
+        assert_eq!(record["action"], "opened");
+    }
 
     #[test]
     fn the_bridge_lists_exactly_the_six_existing_tools() {
