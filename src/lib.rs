@@ -18,6 +18,7 @@
 //! - [`transcript`] — the append-only record of a run;
 //! - [`run`] — a run's identity, its plan and its outcome;
 //! - [`model`] — the model client, and its error words;
+//! - [`model_proxy`] — the run-private bridge from Codex's namespaced tools to plain functions;
 //! - [`forgejo`] — the one Forgejo's client and its error taxonomy;
 //! - [`forgejo_tools`] — the six Forgejo tools a run may declare, and their refusals;
 //! - [`identity`] — one Forgejo account per agent, derived from its name;
@@ -53,6 +54,7 @@ mod installer;
 pub mod mcp_forgejo;
 pub mod mode;
 pub mod model;
+pub mod model_proxy;
 pub mod naming;
 pub mod paths;
 pub mod pull_gate;

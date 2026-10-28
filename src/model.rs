@@ -555,6 +555,16 @@ pub enum ModelError {
         /// What was wrong with it.
         problem: String,
     },
+    /// The endpoint answered, but the model did not call the tool the agent's
+    /// program needs. A text-only reply proves the connection cannot run that
+    /// program's tools, even though the endpoint answered.
+    #[error("the model did not call {tool}: {detail}")]
+    ToolCallMissing {
+        /// The tool the program would use.
+        tool: String,
+        /// What the reply carried instead, in product words.
+        detail: String,
+    },
     /// The exchange ran out of time.
     #[error("the request timed out after {secs} s")]
     Timeout {
@@ -586,6 +596,7 @@ impl ModelError {
             ModelError::RateLimited { .. } => "rate_limited",
             ModelError::Server { .. } => "server_error",
             ModelError::MalformedReply { .. } => "malformed_reply",
+            ModelError::ToolCallMissing { .. } => "tool_call_missing",
             ModelError::Timeout { .. } => "timeout",
             ModelError::Transport { .. } => "transport",
         }
@@ -806,29 +817,92 @@ pub fn protocol_endpoint(base: &str, protocol: crate::harness::Protocol) -> Stri
     }
 }
 
-/// Test one per-agent connection with the smallest real request its protocol accepts.
+/// The tool one program's model test asks the model to call.
+struct ProbeTool {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+    prompt: String,
+}
+
+/// The tool a program's own run would call: the Forgejo list tool in the name
+/// shape that program uses.
 ///
-/// The shared first-run form is always Chat Completions and uses [`probe`]. An agent
-/// may have chosen Responses or Anthropic Messages; sending a Chat Completions body
-/// to those routes would test a connection the agent will never use and invent a
-/// failure the provider did not give. The status and the provider's own message are
-/// mapped by the same [`failure_words`] as every other model screen.
-pub fn probe_protocol(
-    base_url: &str,
+/// Codex sees the canonical flat name because the run's Responses bridge sends
+/// every MCP namespace as plain functions. The other programs see the same flat
+/// MCP name over their own protocols. The built-in engine declares the six tools
+/// without the MCP prefix.
+fn probe_tool(program: crate::harness::Program) -> ProbeTool {
+    if program == crate::harness::Program::Opencode {
+        // OpenCode exposes MCP tools through its code-mode `execute` tool, not as
+        // direct functions. The probe must use the shape its runs use.
+        return ProbeTool {
+            name: "execute".to_owned(),
+            description: "Run JavaScript code to orchestrate tool calls.".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "JavaScript source to run."
+                    }
+                },
+                "required": ["code"],
+                "additionalProperties": false
+            }),
+            prompt: "Call the tool execute with JavaScript that calls                 `tools.gewu_forgejo.forgejo_list_assigned_issues({})` and returns its result.                 Do not answer in text."
+                .to_owned(),
+        };
+    }
+    let function = forgejo_tools()
+        .into_iter()
+        .next()
+        .expect("the Forgejo list tool is always declared")
+        .function;
+    let name = if program == crate::harness::Program::Builtin {
+        function.name.to_owned()
+    } else {
+        crate::model_proxy::flat_name("mcp__gewu_forgejo", function.name)
+    };
+    ProbeTool {
+        prompt: format!(
+            "Call the tool {name} with an empty JSON object as its arguments. Do not answer in text."
+        ),
+        name,
+        description: function.description.to_owned(),
+        parameters: function.parameters,
+    }
+}
+
+/// The sentence the tool probe asks the model to act on.
+fn probe_prompt(tool: &ProbeTool) -> String {
+    tool.prompt.clone()
+}
+
+/// Which wire shape one probe request uses.
+#[derive(Clone, Copy)]
+enum ProbeShape {
+    Chat,
+    Responses,
+    Anthropic,
+}
+
+/// Test one per-agent connection with a real tool call in the shape that agent's
+/// program will use.
+///
+/// The test is not a text reply: it declares the Forgejo list tool, asks the model
+/// to call it, and requires a function call back. A provider that can answer text
+/// but cannot call a plain function cannot run the agent, so its test fails here
+/// instead of failing later in the run.
+pub fn probe_agent(
+    program: crate::harness::Program,
     protocol: crate::harness::Protocol,
+    base_url: &str,
     model: &str,
     api_key: &Secret,
     timeout: Duration,
 ) -> Result<Reply, ModelError> {
-    if protocol == crate::harness::Protocol::ChatCompletions {
-        let config = ModelConfig {
-            endpoint: protocol_endpoint(base_url, protocol),
-            model: model.to_owned(),
-            api_key: api_key.clone(),
-            timeout,
-        };
-        return probe(&config);
-    }
+    let tool = probe_tool(program);
     let endpoint = protocol_endpoint(base_url, protocol);
     if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
         return Err(ModelError::BadUrl {
@@ -839,22 +913,59 @@ pub fn probe_protocol(
     if api_key.is_empty() {
         return Err(ModelError::MissingKey);
     }
-    let body = match protocol {
-        crate::harness::Protocol::Responses => serde_json::json!({
-            "model": model,
-            "input": [{
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Reply with the single word: ok"}]
-            }],
-            "max_output_tokens": 4,
-            "stream": false,
-        }),
-        crate::harness::Protocol::AnthropicMessages => serde_json::json!({
-            "model": model,
-            "max_tokens": 4,
-            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
-        }),
-        crate::harness::Protocol::ChatCompletions => unreachable!("handled above"),
+    let prompt = probe_prompt(&tool);
+    let (body, shape) = match protocol {
+        crate::harness::Protocol::ChatCompletions => (
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters
+                    }
+                }],
+                "tool_choice": "auto",
+                "max_tokens": 1024,
+                "stream": false,
+            }),
+            ProbeShape::Chat,
+        ),
+        crate::harness::Protocol::Responses => (
+            serde_json::json!({
+                "model": model,
+                "input": [{
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}]
+                }],
+                "tools": [{
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                    "strict": false
+                }],
+                "tool_choice": "auto",
+                "max_output_tokens": 2048,
+                "stream": true,
+            }),
+            ProbeShape::Responses,
+        ),
+        crate::harness::Protocol::AnthropicMessages => (
+            serde_json::json!({
+                "model": model,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [{
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters
+                }],
+            }),
+            ProbeShape::Anthropic,
+        ),
     };
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
@@ -887,33 +998,316 @@ pub fn probe_protocol(
             message: api_key.redact(&format!("the reply body cannot be read: {error}")),
         })?;
     let redacted = api_key.redact(&text);
+    if !(200..=299).contains(&status) {
+        return Err(probe_status(endpoint, status, &redacted));
+    }
+    match shape {
+        ProbeShape::Chat => chat_probe_reply(&redacted, &tool.name, program),
+        ProbeShape::Responses => responses_probe_reply(&redacted, &tool.name, program),
+        ProbeShape::Anthropic => anthropic_probe_reply(&redacted, &tool.name, program),
+    }
+}
+
+/// Map one non-success probe status to the same classes every model screen uses.
+fn probe_status(endpoint: String, status: u16, body: &str) -> ModelError {
     match status {
-        200..=299 => Ok(Reply {
-            content: Some("ok".to_owned()),
-            tool_calls: Vec::new(),
-            usage: None,
-            finish_reason: None,
-            model: Some(model.to_owned()),
-            body: redacted,
-        }),
-        401 | 403 => Err(ModelError::BadKey {
+        401 | 403 => ModelError::BadKey {
             status,
-            message: provider_message(&redacted).unwrap_or_default(),
-        }),
-        429 => Err(ModelError::RateLimited {
+            message: provider_message(body).unwrap_or_default(),
+        },
+        429 => ModelError::RateLimited {
             status,
             retry_after_secs: None,
-        }),
-        404 => Err(ModelError::RouteNotFound {
+        },
+        404 => ModelError::RouteNotFound {
             endpoint,
             status,
-            message: provider_message(&redacted).unwrap_or_default(),
-        }),
-        status => Err(ModelError::Server {
+            message: provider_message(body).unwrap_or_default(),
+        },
+        status => ModelError::Server {
             status,
-            message: provider_message(&redacted).unwrap_or_default(),
-        }),
+            message: provider_message(body).unwrap_or_default(),
+        },
     }
+}
+
+/// The failure a model test shows when the reply has no call to the required tool.
+fn missing_tool(tool: &str, detail: String, program: crate::harness::Program) -> ModelError {
+    ModelError::ToolCallMissing {
+        tool: tool.to_owned(),
+        detail: format!(
+            "{detail}, so this connection cannot run {}'s tools",
+            program.label()
+        ),
+    }
+}
+
+fn probe_reply(
+    content: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    body: String,
+    model: &str,
+) -> Reply {
+    Reply {
+        content,
+        tool_calls,
+        usage: None,
+        finish_reason: None,
+        model: Some(model.to_owned()),
+        body,
+    }
+}
+
+fn chat_probe_reply(
+    text: &str,
+    expected: &str,
+    program: crate::harness::Program,
+) -> Result<Reply, ModelError> {
+    let wire: WireReply =
+        serde_json::from_str(text).map_err(|error| ModelError::MalformedReply {
+            problem: format!("the body is not JSON of the expected shape: {error}"),
+        })?;
+    let Some(choice) = wire.choices.into_iter().next() else {
+        return Err(missing_tool(
+            expected,
+            "the reply held no choices".to_owned(),
+            program,
+        ));
+    };
+    let content = choice.message.content.clone();
+    if let Some(calls) = choice.message.tool_calls {
+        if let Some(call) = calls.iter().find(|call| call.function.name == *expected) {
+            return Ok(probe_reply(
+                content,
+                vec![call.clone()],
+                text.to_owned(),
+                expected,
+            ));
+        }
+        if let Some(call) = calls.first() {
+            return Err(missing_tool(
+                expected,
+                format!("it called `{}` instead", call.function.name),
+                program,
+            ));
+        }
+    }
+    if let Some(call) = choice.message.function_call {
+        if call.name == *expected {
+            return Ok(probe_reply(
+                content,
+                vec![ToolCall {
+                    id: "call_probe".to_owned(),
+                    kind: "function".to_owned(),
+                    function: call,
+                }],
+                text.to_owned(),
+                expected,
+            ));
+        }
+        return Err(missing_tool(
+            expected,
+            format!("it called `{}` instead", call.name),
+            program,
+        ));
+    }
+    Err(missing_tool(
+        expected,
+        if content.is_some_and(|content| !content.trim().is_empty()) {
+            "it answered with text only".to_owned()
+        } else {
+            "the reply held no function call".to_owned()
+        },
+        program,
+    ))
+}
+
+/// The `data:` payloads of a standard SSE body, joined per event.
+///
+/// The parser follows the framing rules rather than the first bytes of the body:
+/// `event:`, `id:`, `retry:` and comment lines are ignored, and blank lines
+/// dispatch the data lines collected so far. This is what OpenAI's own
+/// `/v1/responses` stream sends.
+fn sse_data_events(text: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut data = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            if !data.is_empty() {
+                events.push(data.join("\n"));
+                data.clear();
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value).to_owned());
+        }
+    }
+    if !data.is_empty() {
+        events.push(data.join("\n"));
+    }
+    events
+}
+
+fn responses_probe_reply(
+    text: &str,
+    expected: &str,
+    program: crate::harness::Program,
+) -> Result<Reply, ModelError> {
+    let mut calls = Vec::new();
+    let json = serde_json::from_str::<serde_json::Value>(text);
+    if let Ok(value) = &json {
+        collect_response_calls(value, &mut calls);
+    }
+    let events = sse_data_events(text);
+    if calls.is_empty() {
+        if json.is_err() && events.is_empty() {
+            let error = json.expect_err("the body is neither JSON nor SSE");
+            return Err(ModelError::MalformedReply {
+                problem: format!("the body is not JSON or SSE of the expected shape: {error}"),
+            });
+        }
+        for event in events {
+            if event == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event) {
+                collect_response_calls(&value, &mut calls);
+            }
+        }
+    }
+    finish_tool_probe(text, expected, program, calls)
+}
+
+fn collect_response_calls(value: &serde_json::Value, calls: &mut Vec<ToolCall>) {
+    if let Some(output) = value.get("output").and_then(serde_json::Value::as_array) {
+        for item in output {
+            collect_response_call(item, calls);
+        }
+    }
+    if let Some(item) = value.get("item") {
+        collect_response_call(item, calls);
+    }
+    if let Some(response) = value.get("response") {
+        collect_response_calls(response, calls);
+    }
+}
+
+fn collect_response_call(item: &serde_json::Value, calls: &mut Vec<ToolCall>) {
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+        return;
+    }
+    let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let arguments = item
+        .get("arguments")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("call_probe")
+        .to_owned();
+    calls.push(ToolCall {
+        id,
+        kind: "function".to_owned(),
+        function: FunctionCall {
+            name: name.to_owned(),
+            arguments,
+        },
+    });
+}
+
+fn anthropic_probe_reply(
+    text: &str,
+    expected: &str,
+    program: crate::harness::Program,
+) -> Result<Reply, ModelError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| ModelError::MalformedReply {
+            problem: format!("the body is not JSON of the expected shape: {error}"),
+        })?;
+    let mut calls = Vec::new();
+    let mut content = String::new();
+    if let Some(blocks) = value.get("content").and_then(serde_json::Value::as_array) {
+        for block in blocks {
+            match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_use") => {
+                    let name = block
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let arguments = block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}))
+                        .to_string();
+                    let id = block
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("call_probe");
+                    calls.push(ToolCall {
+                        id: id.to_owned(),
+                        kind: "function".to_owned(),
+                        function: FunctionCall {
+                            name: name.to_owned(),
+                            arguments,
+                        },
+                    });
+                }
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+                        content.push_str(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    finish_tool_probe(text, expected, program, calls).map(|mut reply| {
+        if reply.content.is_none() && !content.trim().is_empty() {
+            reply.content = Some(content);
+        }
+        reply
+    })
+}
+
+fn finish_tool_probe(
+    text: &str,
+    expected: &str,
+    program: crate::harness::Program,
+    calls: Vec<ToolCall>,
+) -> Result<Reply, ModelError> {
+    if let Some(call) = calls.iter().find(|call| call.function.name == expected) {
+        return Ok(probe_reply(
+            None,
+            vec![call.clone()],
+            text.to_owned(),
+            expected,
+        ));
+    }
+    if let Some(call) = calls.first() {
+        return Err(missing_tool(
+            expected,
+            format!("it called `{}` instead", call.function.name),
+            program,
+        ));
+    }
+    Err(missing_tool(
+        expected,
+        if text.contains("output_text") || text.contains("\"type\":\"text\"") {
+            "it answered with text only".to_owned()
+        } else {
+            "the reply held no function call".to_owned()
+        },
+        program,
+    ))
 }
 
 /// The provider's first clause, bounded and ending at a word boundary.
@@ -1067,6 +1461,9 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
         }
         ModelError::Timeout { secs } => format!("no answer within {secs} s"),
         ModelError::MalformedReply { .. } => "the model's answer could not be read".to_owned(),
+        ModelError::ToolCallMissing { tool, detail } => {
+            format!("the model did not call {tool} — {detail}")
+        }
         ModelError::Transport { .. } => {
             "the model could not be reached — check the internet connection".to_owned()
         }
@@ -1097,6 +1494,8 @@ struct WireMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    function_call: Option<FunctionCall>,
 }
 
 /// Whether the configured address names the completions route.
@@ -1305,6 +1704,19 @@ mod tests {
             api_key: Secret::new("sk-test-key-1234567890"),
             timeout: Duration::from_secs(5),
         }
+    }
+
+    /// One streamed Responses reply, the shape a real run uses.
+    fn sse_reply(events: Vec<serde_json::Value>) -> StubReply {
+        let mut body = String::new();
+        for event in events {
+            if let Some(kind) = event.get("type").and_then(serde_json::Value::as_str) {
+                body.push_str(&format!("event: {kind}\n"));
+            }
+            body.push_str(&format!("data: {event}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        StubReply::sse(body)
     }
 
     const COMPLETION: &str = r#"{"id":"c1","model":"example-model",
@@ -1628,17 +2040,71 @@ mod tests {
     }
 
     #[test]
-    fn c2_each_protocol_tests_its_own_route() {
-        for (protocol, path) in [
-            (crate::harness::Protocol::Responses, "/v1/responses"),
-            (crate::harness::Protocol::AnthropicMessages, "/v1/messages"),
+    fn c2_each_protocol_tests_its_own_route_with_a_tool_call() {
+        for (protocol, path, reply) in [
+            (
+                crate::harness::Protocol::ChatCompletions,
+                "/v1/chat/completions",
+                StubReply::json(
+                    serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "mcp__gewu_forgejo__forgejo_list_assigned_issues",
+                                        "arguments": "{}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    })
+                    .to_string(),
+                ),
+            ),
+            (
+                crate::harness::Protocol::Responses,
+                "/v1/responses",
+                sse_reply(vec![
+                    serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "name": "mcp__gewu_forgejo__forgejo_list_assigned_issues",
+                            "arguments": "{}",
+                            "call_id": "call_1"
+                        }
+                    }),
+                ]),
+            ),
+            (
+                crate::harness::Protocol::AnthropicMessages,
+                "/v1/messages",
+                StubReply::json(
+                    serde_json::json!({
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "mcp__gewu_forgejo__forgejo_list_assigned_issues",
+                            "input": {}
+                        }]
+                    })
+                    .to_string(),
+                ),
+            ),
         ] {
-            let stub = Stub::start(vec![StubReply::json("{}")]);
+            let stub = Stub::start(vec![reply]);
             let base = stub.url().trim_end_matches("/chat/completions").to_owned();
             let key = Secret::new("sk-test-key-1234567890");
-            probe_protocol(
-                &base,
+            probe_agent(
+                crate::harness::Program::Pi,
                 protocol,
+                &base,
                 "example-model",
                 &key,
                 Duration::from_secs(5),
@@ -1648,11 +2114,177 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].path, path);
             assert!(
+                requests[0]
+                    .body
+                    .contains("mcp__gewu_forgejo__forgejo_list_assigned_issues"),
+                "{}",
+                requests[0].body
+            );
+            assert!(
                 !requests[0].body.contains("sk-test-key"),
                 "{}",
                 requests[0].body
             );
         }
+    }
+
+    #[test]
+    fn a_standard_sse_frame_is_read_without_a_leading_data_line() {
+        let text = concat!(
+            ": keep-alive\n",
+            "\n",
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n",
+            "\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"name\":\"mcp__gewu_forgejo__forgejo_list_assigned_issues\",\"arguments\":\"{}\",\"call_id\":\"call_1\"}}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n",
+            "\n",
+            "data: [DONE]\n",
+            "\n",
+        );
+        let reply = responses_probe_reply(
+            text,
+            "mcp__gewu_forgejo__forgejo_list_assigned_issues",
+            crate::harness::Program::Codex,
+        )
+        .expect("the standard SSE frame");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(
+            reply.tool_calls[0].function.name,
+            "mcp__gewu_forgejo__forgejo_list_assigned_issues"
+        );
+    }
+
+    #[test]
+    fn a_text_only_model_test_names_the_missing_tool_call() {
+        let stub = Stub::start(vec![sse_reply(vec![
+            serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }
+            }),
+        ])]);
+        let base = stub.url().trim_end_matches("/chat/completions").to_owned();
+        let key = Secret::new("sk-test-key-1234567890");
+        let error = probe_agent(
+            crate::harness::Program::Codex,
+            crate::harness::Protocol::Responses,
+            &base,
+            "example-model",
+            &key,
+            Duration::from_secs(5),
+        )
+        .expect_err("a text reply is not a tool call");
+        let words = failure_words(&error, "example-model");
+        assert!(words.contains("the model did not call"), "{words}");
+        assert!(
+            words.contains("mcp__gewu_forgejo__forgejo_list_assigned_issues"),
+            "{words}"
+        );
+        assert!(words.contains("cannot run Codex's tools"), "{words}");
+        assert!(words.contains("text only"), "{words}");
+    }
+
+    #[test]
+    fn the_opencode_model_test_uses_its_code_mode_tool() {
+        let stub = Stub::start(vec![StubReply::json(
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "execute",
+                                "arguments": "{\"code\":\"return 1\"}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )]);
+        let key = Secret::new("sk-test-key-1234567890");
+        probe_agent(
+            crate::harness::Program::Opencode,
+            crate::harness::Protocol::ChatCompletions,
+            stub.url().trim_end_matches("/chat/completions"),
+            "example-model",
+            &key,
+            Duration::from_secs(5),
+        )
+        .expect("the OpenCode code-mode tool call");
+        let requests = stub.requests();
+        assert!(
+            requests[0].body.contains("\"name\":\"execute\""),
+            "{}",
+            requests[0].body
+        );
+        assert!(
+            requests[0].body.contains("\"code\""),
+            "{}",
+            requests[0].body
+        );
+        assert!(
+            !requests[0].body.contains("mcp__gewu_forgejo"),
+            "{}",
+            requests[0].body
+        );
+    }
+
+    #[test]
+    fn the_builtin_model_test_uses_its_unprefixed_tool_name() {
+        let stub = Stub::start(vec![StubReply::json(
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "forgejo_list_assigned_issues",
+                                "arguments": "{}"
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        )]);
+        let key = Secret::new("sk-test-key-1234567890");
+        probe_agent(
+            crate::harness::Program::Builtin,
+            crate::harness::Protocol::ChatCompletions,
+            stub.url().trim_end_matches("/chat/completions"),
+            "example-model",
+            &key,
+            Duration::from_secs(5),
+        )
+        .expect("the built-in tool call");
+        let requests = stub.requests();
+        assert!(
+            requests[0]
+                .body
+                .contains("\"name\":\"forgejo_list_assigned_issues\""),
+            "{}",
+            requests[0].body
+        );
+        assert!(
+            !requests[0].body.contains("mcp__gewu_forgejo"),
+            "{}",
+            requests[0].body
+        );
     }
 
     #[test]
