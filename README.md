@@ -97,10 +97,13 @@ requests are its own. The board shows the whole thing at a glance:
   that only read its issue and wrote nothing is `∅ no work` with its own sentence,
   even when its instruction used a change word; the same is true when its
   assigned-issues list came back empty. A change left only in the workspace — a
-  content edit, a mode change, a new link, an empty directory, or a local commit or
-  Git ref change — is `⚠`, and its work line names the recorded local work
-  (`local change README.md`) instead of borrowing an older run's branch. A run that
-  recorded no tool call at all is never `✓`: its requested work is unconfirmed. A run
+  content edit, a mode change, a new link, an empty directory, or a local commit,
+  tag, index, config or local ref change — is `⚠`, and its work line names the
+  recorded local work (`local change README.md`) instead of borrowing an older run's
+  branch. A fetch that only moves remote-tracking refs, their logs or `FETCH_HEAD` is
+  reading, not local work. A declared step is a real tool result, not an absent call.
+  A run that recorded no tool call at all is never `✓`: its requested work is
+  unconfirmed. A run
   that actually pushed, opened or updated a pull request, or commented stays `✓` even
   if a later write was refused, a test failed first, it reused the branch an
   interrupted run left, or it ended with a sentence claiming failure; the work block

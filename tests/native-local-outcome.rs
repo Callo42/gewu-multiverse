@@ -987,3 +987,126 @@ fn a_native_existing_request_does_not_replace_this_runs_local_work() {
         "the work line named a request this run did not write"
     );
 }
+
+fn fake_pi_fetch(install_root: &Path) -> PathBuf {
+    let path = install_root.join("pi").join("fake-pi-fetch");
+    fs::create_dir_all(path.parent().expect("the install directory"))
+        .expect("the install directory");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/python3
+import json, os, subprocess, sys
+
+sys.stdin.read()
+subprocess.run(["git", "fetch", "origin"], cwd=os.path.join(os.getcwd(), "workspace"), check=True)
+print(json.dumps({"type": "tool_execution_start", "toolCallId": "fetch1",
+                  "toolName": "bash", "args": {"command": "git fetch origin"}}))
+print(json.dumps({"type": "tool_execution_end", "toolCallId": "fetch1",
+                  "toolName": "bash", "result": {"content": [{"type": "text", "text": "fetched"}],
+                  "structuredContent": {"exit_code": 0}}}))
+print(json.dumps({"type": "message_end", "message": {
+    "role": "assistant", "stopReason": "stop", "content": [
+        {"type": "text", "text": "Done: checked the remote."}]}}))
+print(json.dumps({"type": "agent_settled", "aborted": False}))
+"#,
+    )
+    .expect("the fixture program");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("the fixture mode");
+    path
+}
+
+#[test]
+fn a_native_fetch_is_no_work_not_a_local_git_change() {
+    let root = scratch("pi-fetch");
+    let workspace = root.join("workspace");
+    let skills = root.join("skills");
+    fs::create_dir_all(&workspace).expect("the workspace");
+    fs::create_dir_all(&skills).expect("the skills");
+    clone_fixture(&workspace);
+    fs::write(
+        root.join("instruction.md"),
+        "Fetch the remote and report.\n",
+    )
+    .expect("instruction");
+    let credentials = root.join("credentials.toml");
+    mode::write_private(
+        &credentials,
+        b"[model_keys]\n\"scribe\" = \"gw-fixture-key-not-a-real-secret\"\n",
+    )
+    .expect("credentials");
+    let run_dir = root.join("state").join("scribe").join("run-native-fetch");
+    fs::create_dir_all(&run_dir).expect("the run directory");
+    RunPlan {
+        run_id: "run-native-fetch".to_owned(),
+        agent: "scribe".to_owned(),
+        workspace: workspace.clone(),
+        instruction: root.join("instruction.md"),
+        skills_dir: skills,
+        endpoint: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        credentials,
+        max_turns: 4,
+        steps: Vec::new(),
+        timeout_secs: 30,
+        confinement: "landlock".to_owned(),
+        hide: Vec::new(),
+    }
+    .write(&run_dir)
+    .expect("the plan");
+    let install_root = root.join("install");
+    NativePlan {
+        harness: "pi".to_owned(),
+        version: "1.4.0".to_owned(),
+        program: fake_pi_fetch(&install_root),
+        install_root,
+        protocol: "chat-completions".to_owned(),
+        base_url: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        codex_sandbox: String::new(),
+    }
+    .write(&run_dir)
+    .expect("the native plan");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--run-agent")
+        .arg(&run_dir)
+        .status()
+        .expect("the product runs the native run");
+    assert!(status.success(), "the supervisor exited with {status:?}");
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let (outcome, reason) = match terminal {
+        Record::RunFinished {
+            outcome, reason, ..
+        } => (outcome, reason.unwrap_or_default()),
+        other => panic!("no terminal record: {other:?}"),
+    };
+    let work = run::work_summary(&run_dir);
+    let local = run::read_local_work(&run_dir);
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(
+        outcome, "no_work",
+        "a read-only fetch is not a local change: {reason}"
+    );
+    assert!(work.is_empty(), "a fetch is not work: {work:?}");
+    assert!(local.is_none(), "a fetch was recorded as local: {local:?}");
+}
+
+#[test]
+fn an_unrelated_existing_request_is_not_work() {
+    use gewu_multiverse::run::{RunFacts, WorkPull};
+
+    let facts = RunFacts {
+        remote: true,
+        comments: vec![5],
+        existing: vec![WorkPull {
+            number: 3,
+            branch: Some("feature".to_owned()),
+        }],
+        ..RunFacts::default()
+    };
+    assert_eq!(
+        facts.work_lines(),
+        vec!["comment on #5".to_owned()],
+        "an already-open request from another branch became this run's work"
+    );
+}

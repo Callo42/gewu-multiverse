@@ -705,18 +705,30 @@ pub fn snapshot_workspace(root: &Path) -> WorkspaceSnapshot {
                 out.insert(relative.clone(), Entry::Dir { mode });
                 walk(root, &path, out);
             } else if kind.is_file() {
+                let packed_refs = relative.to_string_lossy().ends_with(".git/packed-refs");
                 let modified = meta
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_nanos() as u64)
                     .unwrap_or(0) as u128;
+                let (mode, modified, digest) = if packed_refs {
+                    // A fetch may rewrite the pack while only remote-tracking refs
+                    // change. Compare the filtered refs, not the file's timestamp.
+                    let digest = packed_refs_digest(&path);
+                    if digest == [0; 32] {
+                        continue;
+                    }
+                    (0, 0, digest)
+                } else {
+                    (mode, modified, digest_file(&path))
+                };
                 out.insert(
                     relative,
                     Entry::File {
                         mode,
                         modified,
-                        digest: digest_file(&path),
+                        digest,
                     },
                 );
             } else if kind.is_symlink() {
@@ -748,6 +760,57 @@ fn git_skipped(relative: &Path) -> bool {
         || after.starts_with("objects/")
         || after == "lfs"
         || after.starts_with("lfs/")
+        || after == "FETCH_HEAD"
+        || after == "ORIG_HEAD"
+        || after == "refs/remotes"
+        || after.starts_with("refs/remotes/")
+        || after == "logs/refs/remotes"
+        || after.starts_with("logs/refs/remotes/")
+}
+
+/// A digest of `packed-refs` with remote-tracking lines removed.
+///
+/// A fetch can rewrite the pack while only the remote-tracking refs change; that is
+/// a read, not local work. Local heads and tags stay in the digest.
+fn packed_refs_digest(path: &Path) -> [u8; 32] {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return [0; 32];
+    };
+    let mut filtered = String::new();
+    let mut keep_peeled = false;
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('^') {
+            if keep_peeled {
+                filtered.push_str(line);
+                filtered.push('\n');
+            }
+            continue;
+        }
+        let remote = line
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|name| name.starts_with("refs/remotes/"));
+        keep_peeled = !remote;
+        if !remote {
+            filtered.push_str(line);
+            filtered.push('\n');
+        }
+    }
+    if filtered.is_empty() {
+        [0; 32]
+    } else {
+        digest_bytes(filtered.as_bytes())
+    }
+}
+
+/// A stable digest of a byte string.
+fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
 }
 
 /// A stable digest of a file's content, used so a same-length edit with an
@@ -771,7 +834,7 @@ fn digest_file(path: &Path) -> [u8; 32] {
 /// The worktree status of every repository a run can touch.
 fn git_status_snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
     let mut out = BTreeMap::new();
-    for repository in push_repositories(root) {
+    for repository in workspace_repositories(root) {
         let relative = repository
             .strip_prefix(root)
             .unwrap_or(&repository)
@@ -780,6 +843,40 @@ fn git_status_snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
             out.insert(relative, status);
         }
     }
+    out
+}
+
+/// Every repository in the workspace, at any depth, without following links or
+/// descending into a `.git` directory. The one-level helper is for push watching;
+/// a staged change must be seen wherever a clone lives.
+fn workspace_repositories(root: &Path) -> Vec<PathBuf> {
+    fn walk(path: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let child = entry.path();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if child.join(".git").exists() {
+                out.push(child.clone());
+            }
+            walk(&child, out);
+        }
+    }
+    let mut out = Vec::new();
+    if root.join(".git").exists() {
+        out.push(root.to_path_buf());
+    }
+    walk(root, &mut out);
+    out.sort();
     out
 }
 
@@ -1353,6 +1450,57 @@ mod change_tests {
         });
         assert!(changes.files.contains(&"empty".to_owned()), "{changes:?}");
         assert!(changes.files.contains(&"link".to_owned()), "{changes:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fetch_is_not_local_work_but_a_local_tag_is() {
+        let root = scratch_root("workspace-fetch");
+        git(&root, &["init", "-q", "--initial-branch=main"]);
+        fs::write(root.join("README.md"), "hello\n").expect("the file");
+        git(&root, &["add", "README.md"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=gewu test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "first",
+            ],
+        );
+        let before = snapshot_workspace(&root);
+        let git = root.join(".git");
+        fs::create_dir_all(git.join("refs/remotes/origin")).expect("the remote refs");
+        fs::write(
+            git.join("refs/remotes/origin/feature"),
+            "0123456789abcdef\n",
+        )
+        .expect("a remote ref");
+        fs::create_dir_all(git.join("logs/refs/remotes/origin")).expect("the remote log");
+        fs::write(git.join("logs/refs/remotes/origin/feature"), "fetch\n").expect("the remote log");
+        fs::write(
+            git.join("FETCH_HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\tfetch\n",
+        )
+        .expect("FETCH_HEAD");
+        fs::write(git.join("ORIG_HEAD"), "0123456789abcdef\n").expect("ORIG_HEAD");
+        fs::write(
+            git.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted\n0123456789abcdef0123456789abcdef01234567 refs/remotes/origin/feature\n",
+        )
+        .expect("a remote-only packed ref");
+        let fetch = changes_since(&before, &root);
+        assert!(fetch.is_empty(), "a fetch changed local work: {fetch:?}");
+
+        let before = snapshot_workspace(&root);
+        fs::create_dir_all(git.join("refs/tags")).expect("the tag refs");
+        fs::write(git.join("refs/tags/v1"), "0123456789abcdef\n").expect("a local tag");
+        let tag = changes_since(&before, &root);
+        assert!(tag.git_state, "a local tag is not local Git state: {tag:?}");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -927,3 +927,27 @@ fn a_failed_write_behind_a_later_success_is_not_a_green_tick() {
         );
     }
 }
+
+#[test]
+fn a_successful_declared_read_step_is_no_work() {
+    // A declared step is a real tool result in the transcript. It must not be read
+    // as "no tool call" just because the model made no further call.
+    let root = scratch_root("declared-read");
+    let run_dir = prepare(&root, "Check the environment and report.\n");
+    let mut plan = RunPlan::read(&run_dir).expect("the plan reads");
+    plan.steps = vec!["env".to_owned()];
+    plan.write(&run_dir).expect("the plan writes");
+    let model = Stub::start(vec![StubReply::json(final_reply("Done: checked."))]);
+    endpoint(&run_dir, &model.url());
+    let end = agent_run::execute(&run_dir);
+    let (outcome, reason) = terminal(&run_dir);
+    let work = gewu_multiverse::run::work_summary(&run_dir);
+    let _ = fs::remove_dir_all(&root);
+    assert!(end.is_success(), "{end:?}");
+    assert_eq!(
+        outcome, "no_work",
+        "a read-only declared step is no work: {reason}"
+    );
+    assert_eq!(reason, "Done: checked.");
+    assert!(work.is_empty(), "{work:?}");
+}

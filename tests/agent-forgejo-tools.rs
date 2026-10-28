@@ -728,6 +728,42 @@ fn a_push_then_an_existing_open_request_is_a_success_that_names_the_request() {
 }
 
 #[test]
+fn a_comment_survives_a_turn_limit() {
+    // A real comment is recorded before the run hits its turn bound. The mark is
+    // failed, but the work line must keep the product-observed comment.
+    let root = scratch("comment-limit");
+    write_credentials(&root.join("credentials.toml"));
+    let _ = clone_fixture(&root);
+    let model = Stub::start(vec![tool_reply(
+        "c1",
+        "forgejo_comment",
+        &serde_json::json!({"repository": REPO, "number": 12, "body": "a comment"}).to_string(),
+    )]);
+    let forgejo = Stub::start_routed(standard_routes(serde_json::json!([])));
+    let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+    let paths = layout.agent("scribe").expect("the agent path");
+    let run_dir = write_plan(&root, &paths, &model, "run-comment-limit-1", 1);
+    write_context(&run_dir, &forgejo);
+    let _ = run_binary(&run_dir);
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let (outcome, reason) = match terminal {
+        Record::RunFinished {
+            outcome, reason, ..
+        } => (outcome, reason.unwrap_or_default()),
+        other => panic!("no terminal record: {other:?}"),
+    };
+    assert_eq!(
+        outcome, "failed",
+        "the turn limit is still a failed run: {reason}"
+    );
+    assert_eq!(
+        gewu_multiverse::run::work_summary(&run_dir),
+        vec!["comment on #12".to_owned()],
+        "the recorded comment was lost on the early exit"
+    );
+}
+
+#[test]
 fn a_comment_survives_a_later_refused_update_as_success() {
     // Real remote work outranks a later refused write: the comment is on Forgejo,
     // so the run is a success and its work line names the comment, not a refusal.

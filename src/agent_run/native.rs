@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use crate::credentials::{self, Secret};
 use crate::harness::{Program, Protocol};
 use crate::model;
-use crate::run::{IssueRead, NativePlan, WorkPull};
+use crate::run::NativePlan;
 use crate::transcript::{Record, Transcript};
 
 use super::{RunEnd, RunEnding, RunEvidence, RunLog, Shell};
@@ -412,12 +412,6 @@ struct NativeState {
     comment_ok: bool,
     forgejo_read_ok: bool,
     pushed: bool,
-    push: Option<String>,
-    pulls: Vec<WorkPull>,
-    existing: Vec<WorkPull>,
-    comments: Vec<u64>,
-    read_issue: Option<IssueRead>,
-    saw_tool: bool,
     uncertain_write: bool,
     tool_ok: bool,
     checked_empty: bool,
@@ -445,12 +439,6 @@ impl NativeState {
             comment_ok: false,
             forgejo_read_ok: false,
             pushed: false,
-            push: None,
-            pulls: Vec::new(),
-            existing: Vec::new(),
-            comments: Vec::new(),
-            read_issue: None,
-            saw_tool: false,
             uncertain_write: false,
             tool_ok: false,
             checked_empty: false,
@@ -905,7 +893,6 @@ pub(super) fn run(
         );
         state.wrote = true;
         state.pushed = true;
-        state.push = Some(pushed.branch.clone());
     }
     apply_ledger(&files, transcript, &mut state);
     let local = crate::workspace::changes_since(&workspace_before, &plan.workspace);
@@ -998,50 +985,31 @@ pub(super) fn run(
         .as_deref()
         .map(|text| model::whole_message(text, 4000))
         .unwrap_or_default();
-    let push = state
-        .push
-        .clone()
-        .or_else(|| crate::run::read_push_witness(&shell.run_dir).map(|witness| witness.branch));
-    let facts = super::RunFacts {
-        remote: state.pr_ok || state.pushed || state.comment_ok || push.is_some(),
-        read: state.tool_ok || state.forgejo_read_ok,
-        wrote: state.wrote,
-        saw_tool: state.saw_tool || state.outcome.saw_tool(),
-        local: state.local_work.clone(),
-        push,
-        pulls: state.pulls.clone(),
-        existing: state.existing.clone(),
-        comments: state.comments.clone(),
-        read_issue: state.read_issue.clone(),
-    };
     let evidence = RunEvidence {
         failed_call: state.failed_call.clone(),
         refused_write: state.refused_write.clone(),
         wrote: state.wrote,
         checked_empty: state.checked_empty,
-        remote: facts.remote,
-        read: facts.read && !facts.has_local(),
-        saw_tool: facts.saw_tool,
-        pulls: facts.pulls.clone(),
-        existing: facts.existing.clone(),
-        comments: facts.comments.clone(),
-        read_issue: facts.read_issue.clone(),
+        remote: state.pr_ok || state.pushed || state.comment_ok,
+        read: (state.tool_ok || state.forgejo_read_ok) && state.local_work.is_empty(),
         ..RunEvidence::default()
     };
     let instruction = String::from_utf8_lossy(instruction);
     let requested = requested_work(&instruction, &plan.steps);
-    let base = if state.uncertain_write {
+    // The transcript-derived facts in `execute` decide the final mark and work
+    // line. This is the summary/failure base only: a declared step, a native tool
+    // event and an early failure are all recorded in the transcript and are read by
+    // the one facts function from there.
+    let ending = if state.uncertain_write {
         RunEnding::Warned
     } else {
         crate::agent_run::ending_for_instruction(&instruction, &summary, &evidence)
     };
-    let ending = decide_native_ending(base, requested, &state);
     let reason = run_reason(ending, &summary, &state, requested);
     RunEnd {
         exit_code: 0,
         reason,
         ending,
-        facts: Box::new(facts),
     }
 }
 
@@ -1223,30 +1191,26 @@ fn observed_work(state: &NativeState) -> bool {
     state.wrote || state.comment_ok || state.pr_ok || state.pushed || state.workspace_wrote
 }
 
+/// The decision helper for the unit tests: the production path derives its facts
+/// from the transcript in `execute`.
+#[cfg(test)]
 fn decide_native_ending(
     base: RunEnding,
     _requested: RequestedWork,
     state: &NativeState,
 ) -> RunEnding {
-    // The same rule as every other run: the mark comes from the facts the run
-    // recorded, not from the instruction's prose or from one failing tool call.
     let mut local = state.local_work.clone();
     if state.workspace_wrote && local.is_empty() {
-        // Older callers/tests set only the boolean. A changed workspace is still a
-        // local fact even when the paths were not carried.
+        // Older tests set only the boolean. A changed workspace is still local.
         local.committed = true;
     }
-    let facts = super::RunFacts {
-        remote: state.pr_ok || state.pushed || state.comment_ok || state.push.is_some(),
+    let facts = crate::run::RunFacts {
+        remote: state.pr_ok || state.pushed || state.comment_ok,
         read: state.tool_ok || state.forgejo_read_ok,
         wrote: state.wrote,
-        saw_tool: state.saw_tool || state.outcome.saw_tool(),
+        saw_tool: state.outcome.saw_tool(),
         local,
-        push: state.push.clone(),
-        pulls: state.pulls.clone(),
-        existing: state.existing.clone(),
-        comments: state.comments.clone(),
-        read_issue: state.read_issue.clone(),
+        ..crate::run::RunFacts::default()
     };
     super::decide_ending(base, &facts)
 }
@@ -1719,7 +1683,6 @@ fn finish_call(
     log: &mut RunLog,
     state: &mut NativeState,
 ) {
-    state.saw_tool = true;
     let stored_output = model::excerpt(&output, 8000);
     let duration = call.started.elapsed().as_millis() as u64;
     log.tool_finished();
@@ -1803,7 +1766,6 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
         let action = record.get("action").and_then(Value::as_str);
         let url = record.get("url").and_then(Value::as_str);
         let branch = record.get("branch").and_then(Value::as_str);
-        state.saw_tool = true;
         // The ledger now carries the reply's own number, URL and branch. Older
         // ledgers that only carried the call's arguments leave them absent, and the
         // work line then makes no claim it cannot prove.
@@ -1820,14 +1782,6 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
         ));
         if ok && !crate::forgejo_tools::is_write_tool(tool) {
             state.forgejo_read_ok = true;
-            if tool.ends_with(crate::forgejo_tools::READ_ISSUE_OR_PULL)
-                && let (Some(repository), Some(number)) = (repository, number)
-            {
-                state.read_issue = Some(IssueRead {
-                    repository: repository.to_owned(),
-                    number,
-                });
-            }
         }
         if tool.ends_with(crate::forgejo_tools::LIST_ASSIGNED_ISSUES)
             && ok
@@ -1842,30 +1796,15 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
         if crate::forgejo_tools::is_write_tool(tool) {
             if ok && action == Some("already_open") {
                 // The agent's own request is already open. The transcript names it
-                // for the work block, but this run did not open or update it; with
-                // no other work it stays a refused-write mark.
+                // for the work block only when this run also pushed its branch or
+                // commented on it; with no other work it stays a refused-write mark.
                 state.refused_write = Some(format!("{tool}: {outcome}"));
-                if let Some(number) = number {
-                    state.existing.push(WorkPull {
-                        number,
-                        branch: branch.map(str::to_owned),
-                    });
-                }
             } else if ok {
                 state.wrote = true;
                 if tool.ends_with(crate::forgejo_tools::COMMENT) {
                     state.comment_ok = true;
-                    if let Some(number) = number {
-                        state.comments.push(number);
-                    }
                 } else {
                     state.pr_ok = true;
-                    if let Some(number) = number {
-                        state.pulls.push(WorkPull {
-                            number,
-                            branch: branch.map(str::to_owned),
-                        });
-                    }
                     if tool.ends_with(crate::forgejo_tools::UPDATE_PULL_REQUEST) {
                         state.pr_updated = true;
                     }
@@ -2371,30 +2310,29 @@ mod native_proof_tests {
             "the no-op was called a write"
         );
         assert!(!state.pr_ok, "the no-op was called remote work");
+        let facts = crate::run::facts_from_records(&run_dir);
+        assert!(facts.existing.iter().any(|pull| pull.number == 4));
         assert!(
-            crate::run::work_summary(&run_dir).is_empty(),
+            facts.work_lines().is_empty(),
             "an already-open request alone is not this run's work"
         );
-        // A verified push in the same run is real remote work and names the request.
-        let pushed = NativeState {
-            pushed: true,
-            push: Some("fix/readme-typo".to_owned()),
-            refused_write: state.refused_write.clone(),
-            ..NativeState::default()
-        };
+        // A verified push of that branch in the same run names the request.
+        crate::run::write_push_witness_at(
+            &run_dir,
+            "fix/readme-typo",
+            "refs/remotes/origin/fix/readme-typo",
+            Some("team/workspace"),
+            Some("main"),
+        )
+        .expect("the push witness");
+        let facts = crate::run::facts_from_records(&run_dir);
         assert_eq!(
-            decide_native_ending(RunEnding::Refused, RequestedWork::PullRequest, &pushed),
-            RunEnding::Succeeded
-        );
-        let pushed_facts = crate::run::RunFacts {
-            remote: true,
-            push: Some("fix/readme-typo".to_owned()),
-            existing: state.existing.clone(),
-            ..crate::run::RunFacts::default()
-        };
-        assert_eq!(
-            pushed_facts.work_lines(),
+            facts.work_lines(),
             vec!["pull request #4 from fix/readme-typo".to_owned()]
+        );
+        assert_eq!(
+            crate::agent_run::decide_ending(RunEnding::Refused, &facts),
+            RunEnding::Succeeded
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2500,8 +2438,9 @@ mod native_proof_tests {
         let mut state = NativeState::default();
         apply_ledger(&files, &mut transcript, &mut state);
         assert!(state.pr_ok);
+        let facts = crate::run::facts_from_records(&run_dir);
         assert_eq!(
-            crate::run::work_summary(&run_dir),
+            facts.work_lines(),
             vec!["pull request #6 from agent-1/pr-only".to_owned()]
         );
         let _ = std::fs::remove_dir_all(&root);
