@@ -102,7 +102,7 @@ pub fn decide_ending(base: RunEnding, facts: &crate::run::RunFacts) -> RunEnding
         RunEnding::Warned
     } else if base == RunEnding::Succeeded && facts.read {
         RunEnding::NoWork
-    } else if base == RunEnding::Succeeded && facts.requires_confirmation && !facts.saw_tool {
+    } else if base == RunEnding::Succeeded && !facts.saw_tool {
         RunEnding::Warned
     } else {
         base
@@ -2829,7 +2829,6 @@ fn model_loop(
                 existing: evidence.existing.clone(),
                 comments: evidence.comments.clone(),
                 read_issue: evidence.read_issue.clone(),
-                requires_confirmation: true,
             });
             return end;
         }

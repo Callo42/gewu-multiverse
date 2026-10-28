@@ -439,10 +439,6 @@ pub struct RunFacts {
     /// The issue this run read, when it read one.
     #[serde(default)]
     pub read_issue: Option<IssueRead>,
-    /// Whether a clean finish without a work fact needs confirmation. A run with no
-    /// recorded fact is never a success.
-    #[serde(default)]
-    pub requires_confirmation: bool,
 }
 
 /// One pull request a run named.
@@ -1225,7 +1221,6 @@ mod tests {
         let facts = RunFacts {
             existing: vec![existing.clone()],
             local: local.clone(),
-            requires_confirmation: true,
             ..RunFacts::default()
         };
         write_facts(&run, &facts).expect("the facts");
@@ -1241,7 +1236,6 @@ mod tests {
             push: Some("feature".to_owned()),
             existing: vec![existing],
             local,
-            requires_confirmation: true,
             ..RunFacts::default()
         };
         write_facts(&run, &pushed).expect("the pushed facts");

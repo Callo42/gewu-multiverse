@@ -1012,7 +1012,6 @@ pub(super) fn run(
         existing: state.existing.clone(),
         comments: state.comments.clone(),
         read_issue: state.read_issue.clone(),
-        requires_confirmation: true,
     };
     let evidence = RunEvidence {
         failed_call: state.failed_call.clone(),
@@ -1246,7 +1245,6 @@ fn decide_native_ending(
         existing: state.existing.clone(),
         comments: state.comments.clone(),
         read_issue: state.read_issue.clone(),
-        requires_confirmation: true,
     };
     super::decide_ending(base, &facts)
 }
@@ -2390,7 +2388,6 @@ mod native_proof_tests {
             remote: true,
             push: Some("fix/readme-typo".to_owned()),
             existing: state.existing.clone(),
-            requires_confirmation: true,
             ..crate::run::RunFacts::default()
         };
         assert_eq!(
