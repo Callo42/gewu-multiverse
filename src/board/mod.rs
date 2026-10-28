@@ -1197,9 +1197,9 @@ impl Board {
         if !self.codex_optin_confirmed {
             self.codex_optin_confirmed = true;
             self.set_notice(if current == "full-access" {
-                "Codex's own sandbox will be restored; the product Landlock boundary remains. Press f again to return this agent's next run to its native sandbox."
+                "Press f again to restore Codex's own sandbox; Landlock stays."
             } else {
-                "Codex's own sandbox will be removed; only the product Landlock boundary remains. Press f again to allow it for this agent's next run."
+                "Press f again to remove Codex's own sandbox; Landlock stays."
             });
         } else {
             let mode = if current == "full-access" {

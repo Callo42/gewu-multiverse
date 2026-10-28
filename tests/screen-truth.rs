@@ -12,7 +12,7 @@ use std::time::Duration;
 use gewu_multiverse::board::{Board, Screen, status};
 use gewu_multiverse::engine_api::{
     AgentView, BoardView, Command, Desired, EndpointTest, EndpointView, EngineApi, ForgejoState,
-    ForgejoView, ProgramView, Provisioning, SessionEnd, SessionState,
+    ForgejoView, ProgramView, Provisioning, SessionEnd, SessionState, UpgradeAgent, UpgradeView,
 };
 use gewu_multiverse::model::{ModelError, failure_words};
 use ratatui::Terminal;
@@ -56,10 +56,13 @@ impl EngineApi for ViewEngine {
         self.view.clone()
     }
     fn send(&mut self, command: Command) -> Result<(), String> {
-        if let Command::SetAgentModel { key, .. } = &command
+        if let Command::SetAgentModel { name, key, .. } = &command
             && key.as_deref() == Some("")
         {
             self.view.agents[0].key_present = false;
+            self.view.notice = Some(format!(
+                "{name}'s API key cleared; connection saved for its next run"
+            ));
         }
         self.sent.lock().expect("sent").push(command);
         Ok(())
@@ -385,6 +388,182 @@ fn the_codex_warning_key_works_on_the_agent_screen() {
 }
 
 #[test]
+fn the_first_sandbox_press_names_the_second_on_the_rendered_agent_screen() {
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let mut codex = agent(1, "codex");
+        codex.program_error = Some(
+            "Codex's sandbox cannot start (bwrap) — press f twice: removes Codex's own sandbox, keeps product Landlock"
+                .to_owned(),
+        );
+        let (mut board, _sent) = mounted(view(vec![codex]));
+        open_agent(&mut board);
+        press(&mut board, KeyCode::Char('f'));
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("Press f again"),
+            "{width}x{height}: the rendered Agent notice lost the second press:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn the_first_sandbox_press_names_the_second_on_the_rendered_program_screen() {
+    for (width, height) in [(72, 18), (80, 24), (120, 40)] {
+        let (mut board, _sent) = mounted(view(vec![agent(1, "codex")]));
+        open_program(&mut board);
+        press(&mut board, KeyCode::Char('f'));
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("Press f again"),
+            "{width}x{height}: the rendered Program notice lost the second press:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn the_rendered_key_clear_confirmation_says_it_was_cleared() {
+    for (width, height) in [(72, 18), (80, 24)] {
+        let (mut board, _sent) = mounted(view(vec![agent(1, "pi")]));
+        open_agent_model(&mut board);
+        press(&mut board, KeyCode::Down);
+        press(&mut board, KeyCode::Down);
+        press_ctrl(&mut board, 'u');
+        press(&mut board, KeyCode::Enter);
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("API key cleared"),
+            "{width}x{height}: the rendered Agent confirmation lost the clear:\n{frame}"
+        );
+    }
+}
+
+#[test]
+fn a_long_notice_is_wrapped_whole_on_every_screen() {
+    let notice =
+        "a deliberately long product notice that must reach its final actionable word ACTION";
+    for (width, height) in [(72, 18), (80, 24)] {
+        let mut base = view(vec![agent(1, "pi")]);
+        base.notice = Some(notice.to_owned());
+        let mut board = Board::new(ViewEngine {
+            view: base.clone(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let buffer = draw(&mut board, width, height);
+        let raw = text(&buffer);
+        let frame = flat(&buffer);
+        assert!(
+            frame.contains("ACTION"),
+            "{width}x{height} home (footer {}):\n{raw}",
+            board.layout().footer_rows
+        );
+
+        open_agent(&mut board);
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(frame.contains("ACTION"), "{width}x{height} agent:\n{frame}");
+
+        press(&mut board, KeyCode::Char('p'));
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("ACTION"),
+            "{width}x{height} program:\n{frame}"
+        );
+
+        press(&mut board, KeyCode::Esc);
+        press(&mut board, KeyCode::Char('m'));
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(frame.contains("ACTION"), "{width}x{height} model:\n{frame}");
+
+        press(&mut board, KeyCode::Esc);
+        press(&mut board, KeyCode::Esc);
+        press(&mut board, KeyCode::Char('f'));
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(
+            frame.contains("ACTION"),
+            "{width}x{height} forgejo:\n{frame}"
+        );
+
+        press(&mut board, KeyCode::Esc);
+        press(&mut board, KeyCode::Char('?'));
+        let frame = flat(&draw(&mut board, width, height));
+        assert!(frame.contains("ACTION"), "{width}x{height} help:\n{frame}");
+
+        let mut first = view(Vec::new());
+        first.terms_acknowledged = false;
+        first.notice = Some(notice.to_owned());
+        let mut terms = Board::new(ViewEngine {
+            view: first,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let frame = flat(&draw(&mut terms, width, height));
+        assert!(frame.contains("ACTION"), "{width}x{height} terms:\n{frame}");
+
+        let mut picker = view(Vec::new());
+        picker.notice = Some(notice.to_owned());
+        let mut picker = Board::new(ViewEngine {
+            view: picker,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        let frame = flat(&draw(&mut picker, width, height));
+        assert!(
+            frame.contains("ACTION"),
+            "{width}x{height} picker:\n{frame}"
+        );
+
+        let mut build = view(Vec::new());
+        build.notice = Some(notice.to_owned());
+        build.forgejo.state = ForgejoState::Failed {
+            reason: "a deliberately long Forgejo start failure reason that keeps its end"
+                .to_owned(),
+        };
+        let mut build = Board::new(ViewEngine {
+            view: build,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        assert_eq!(build.screen(), Screen::Picker);
+        press(&mut build, KeyCode::Enter);
+        assert_eq!(build.screen(), Screen::Build);
+        let frame = flat(&draw(&mut build, width, height));
+        assert!(
+            frame.contains("ACTION") && frame.contains("r retry"),
+            "{width}x{height} build:\n{frame}"
+        );
+
+        let mut upgrade = view(Vec::new());
+        upgrade.notice = Some(notice.to_owned());
+        upgrade.upgrade = Some(UpgradeView {
+            from_version: "0.1.38".to_owned(),
+            to_version: "0.1.39".to_owned(),
+            settings: true,
+            agents: 1,
+            instructions: 1,
+            runs: 3,
+            ignored_config: false,
+            kept_agents: vec![UpgradeAgent {
+                name: "agent-1".to_owned(),
+                program: "Pi".to_owned(),
+                model: "demo-model".to_owned(),
+                protocol: "Chat Completions".to_owned(),
+            }],
+            programs: 1,
+            release_url: "https://github.com/Callo42/gewu-multiverse/releases/tag/v0.1.39"
+                .to_owned(),
+            whats_new: "run marks name what was observed".to_owned(),
+            warnings_changed: false,
+        });
+        let mut upgrade = Board::new(ViewEngine {
+            view: upgrade,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        });
+        assert_eq!(upgrade.screen(), Screen::Upgrade);
+        let frame = flat(&draw(&mut upgrade, width, height));
+        assert!(
+            frame.contains("ACTION"),
+            "{width}x{height} upgrade:\n{frame}"
+        );
+    }
+}
+
+#[test]
 fn the_dsh_install_key_works_on_the_agent_screen() {
     for (width, height) in [(72, 18), (80, 24)] {
         let mut dsh = agent(1, "dsh");
@@ -528,8 +707,16 @@ fn a_403_is_an_access_problem_not_a_bad_key() {
     assert!(!words.contains("refused the API key"), "{words}");
     assert!(!words.contains("check the key"), "{words}");
 
-    let raw = "the model call failed (bad_key): HTTP 403: You do not have access to model mock-1. (permission_error)";
-    let board_words = status::failure_words(raw);
+    // This is the real run path: the reason is built from the error's Display, so
+    // the provider's sentence must already be in that text.
+    let raw = format!(
+        "the model call failed (bad_key): {} — model mock-1 at https://model.example/v1",
+        ModelError::BadKey {
+            status: 403,
+            message: "You do not have access to model mock-1.".to_owned(),
+        }
+    );
+    let board_words = status::failure_words(&raw);
     assert!(
         board_words.contains("You do not have access to model mock-1."),
         "{board_words}"
@@ -540,9 +727,9 @@ fn a_403_is_an_access_problem_not_a_bad_key() {
     let mut broken = agent(1, "pi");
     broken.session = SessionState::Idle;
     broken.recent = vec![SessionEnd::Failed {
-        reason: raw.to_owned(),
+        reason: raw.clone(),
     }];
-    broken.last_error = Some(raw.to_owned());
+    broken.last_error = Some(raw.clone());
     let (mut board, _sent) = mounted(view(vec![broken]));
     open_agent(&mut board);
     let frame = flat(&draw(&mut board, 80, 24));

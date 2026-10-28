@@ -479,7 +479,7 @@ pub enum ModelError {
     /// The endpoint refused the request with 401 (the key) or 403 (access to the
     /// model). The provider's own message is kept, because it is the one sentence
     /// that tells a mistyped key from a missing permission.
-    #[error("the endpoint refused the request (HTTP {status})")]
+    #[error("the endpoint refused the request (HTTP {status}){detail}", detail = if .message.is_empty() { String::new() } else { format!(": {}", .message) })]
     BadKey {
         /// The status the endpoint answered with.
         status: u16,

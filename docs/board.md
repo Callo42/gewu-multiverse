@@ -429,7 +429,8 @@ on the first-run screen. The selected card carries `▸` before its name on the 
 (and the selected list line before its mark), so a colour-blind or monochrome reader
 can see which agent `←→` targets; the tint is only reinforcement. The newest event,
 when the box cannot hold it, is on its own footer row under the keys. `BoardView.notice`
-is drawn once on the status line under the keys. It is cleaned before it
+is drawn wrapped onto the status rows under the keys (up to two rows, with `…` if a
+still longer sentence had to be cut). It is cleaned before it
 is drawn: the engine writes names in backticks, the board removes them, so a notice
 reads `agent-4 is connected as gewu-agent-4` and never shows the marks.
 
@@ -557,7 +558,7 @@ run (running or waiting for the next run):
 quits`. An agent that is started but has no instruction is not named.
 
 The footer geometry reserves exactly the rows the warning will draw: the wrapped
-warning itself plus one row for a notice, and the board above gives up those rows. The
+warning itself plus up to two rows for a notice, and the board above gives up those rows. The
 warning wraps on whole words, is never abbreviated, and the consequence, the reopen
 sentence and `q again quits` are always kept (at 72 and 80 columns with twelve agents
 it takes three rows). If a home past twelve had names so long that the warning would

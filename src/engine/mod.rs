@@ -2939,19 +2939,22 @@ impl EngineApi for Engine {
                     None
                 };
                 inner.agents[index].program_hint = hint;
-                let cleared = if clear_key {
-                    "; its API key was cleared"
-                } else {
-                    ""
-                };
-                if inner.agents[index].running.is_some() {
+                if clear_key {
+                    if inner.agents[index].running.is_some() {
+                        inner.note(format!(
+                            "`{name}`'s API key cleared; connection saved for its next run; this run keeps its settings"
+                        ));
+                    } else {
+                        inner.note(format!(
+                            "`{name}`'s API key cleared; connection saved for its next run"
+                        ));
+                    }
+                } else if inner.agents[index].running.is_some() {
                     inner.note(format!(
-                        "`{name}`'s connection is saved for its next run{cleared}; this run keeps its settings"
+                        "`{name}`'s connection is saved for its next run; this run keeps its settings"
                     ));
                 } else {
-                    inner.note(format!(
-                        "`{name}`'s connection is saved for its next run{cleared}"
-                    ));
+                    inner.note(format!("`{name}`'s connection is saved for its next run"));
                 }
                 Ok(())
             }
