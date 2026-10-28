@@ -395,6 +395,26 @@ impl Board {
         !self.model_fields[2].trim().is_empty() || self.view.endpoint.key_present
     }
 
+    /// Whether this save is the explicit clear of an agent's stored key.
+    ///
+    /// The key field starts empty and the stored key is not read back, so an empty
+    /// field alone means "keep the stored key". Only `ctrl-u` (or pasting nothing)
+    /// while the field is focused marks a clear, and only an agent with a stored key
+    /// has something to clear.
+    fn key_clearable(&self) -> bool {
+        let Some(name) = self.model_agent.as_deref() else {
+            return false;
+        };
+        self.model_fields[2].is_empty()
+            && self.model_key_cleared
+            && self
+                .view
+                .agents
+                .iter()
+                .find(|agent| agent.name == name)
+                .is_some_and(|agent| agent.key_present)
+    }
+
     /// The protocol named by a full route at the end of an address, if any.
     fn address_route(url: &str) -> Option<Protocol> {
         let path = url.split(['?', '#']).next().unwrap_or(url);
@@ -437,8 +457,11 @@ impl Board {
         if route == self.model_protocol {
             return None;
         }
+        // Name the route and the protocol to choose within the 72-column notice
+        // line. The older sentence put the target after `to…`, so a narrow screen
+        // said only that something must change.
         Some(format!(
-            "✗ this address is the {} route — change the protocol to {} or use the base address",
+            "✗ {} route — change the protocol to {}",
             route.label(),
             route.label()
         ))
@@ -631,7 +654,7 @@ impl Board {
                     self.set_notice(problem);
                     return;
                 }
-                if !self.key_available() {
+                if !self.key_available() && !self.key_clearable() {
                     self.model_key_cleared = true;
                     self.set_notice("✗ the API key is empty");
                     return;
@@ -639,6 +662,7 @@ impl Board {
                 let tested = self.endpoint_tested();
                 self.send(self.endpoint_command());
                 if self.model_agent.is_some() {
+                    self.codex_optin_confirmed = false;
                     self.screen = Screen::Agent;
                 } else {
                     self.screen = match self.model_origin {
@@ -651,6 +675,9 @@ impl Board {
                 }
             }
             KeyCode::Esc => {
+                if self.model_agent.is_some() {
+                    self.codex_optin_confirmed = false;
+                }
                 self.screen = if self.model_agent.is_some() {
                     Screen::Agent
                 } else {
@@ -914,6 +941,7 @@ impl Board {
                 } else if let Some(agent) = self.view.agents.get(self.selection) {
                     self.agent_name = agent.name.clone();
                     self.confirm_remove = None;
+                    self.codex_optin_confirmed = false;
                     self.screen = Screen::Agent;
                 }
             }
@@ -980,6 +1008,17 @@ impl Board {
                 Some('s') => {
                     let name = self.agent_name.clone();
                     self.toggle_named(&name);
+                }
+                Some('f') => self.codex_sandbox_step(),
+                Some('i') => {
+                    let program = self
+                        .view
+                        .agents
+                        .iter()
+                        .find(|agent| agent.name == self.agent_name)
+                        .and_then(|agent| Program::parse(&agent.program))
+                        .unwrap_or(Program::Builtin);
+                    self.toggle_install(program);
                 }
                 Some('p') => {
                     let current = self
@@ -1115,9 +1154,73 @@ impl Board {
         self.program_protocol_chosen = true;
     }
 
+    /// Install or cancel the highlighted native program. The Agent screen's
+    /// prerequisite sentence says `then press i`, so the same action is available
+    /// there and on the Program screen.
+    fn toggle_install(&mut self, program: Program) {
+        if !program.is_native() {
+            self.set_notice("the built-in engine needs no install");
+            return;
+        }
+        let installing = self
+            .view
+            .programs
+            .iter()
+            .any(|view| view.id == program.id() && view.installing.is_some());
+        if installing {
+            self.send(Command::CancelInstallProgram {
+                id: program.id().to_owned(),
+            });
+        } else {
+            self.send(Command::InstallProgram {
+                id: program.id().to_owned(),
+            });
+        }
+    }
+
+    /// The two-press Codex sandbox opt-in, shared by the Agent and Program
+    /// screens. The Agent warning names `f`; binding it there makes that an
+    /// instruction the screen keeps.
+    fn codex_sandbox_step(&mut self) {
+        let Some(agent) = self
+            .view
+            .agents
+            .iter()
+            .find(|agent| agent.name == self.agent_name)
+        else {
+            return;
+        };
+        let current = agent
+            .codex_sandbox
+            .clone()
+            .unwrap_or_else(|| "native".to_owned());
+        if !self.codex_optin_confirmed {
+            self.codex_optin_confirmed = true;
+            self.set_notice(if current == "full-access" {
+                "Press f again to restore Codex's own sandbox; Landlock stays."
+            } else {
+                "Press f again to remove Codex's own sandbox; Landlock stays."
+            });
+        } else {
+            let mode = if current == "full-access" {
+                "native"
+            } else {
+                "full-access"
+            };
+            self.codex_optin_confirmed = false;
+            self.send(Command::SetAgentCodexSandbox {
+                name: self.agent_name.clone(),
+                mode: mode.to_owned(),
+            });
+        }
+    }
+
     fn keys_program(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.screen = Screen::Agent,
+            KeyCode::Esc => {
+                self.codex_optin_confirmed = false;
+                self.screen = Screen::Agent;
+            }
             KeyCode::Up => {
                 self.program_unknown = None;
                 self.program_index = (self.program_index + 4) % 5;
@@ -1185,57 +1288,13 @@ impl Board {
                     program: program.id().to_owned(),
                     protocol: Some(self.program_protocol.id().to_owned()),
                 });
+                self.codex_optin_confirmed = false;
                 self.screen = Screen::Agent;
             }
             _ => match plain(key) {
-                Some('i') => {
-                    let program = self.selected_program();
-                    if program.is_native() {
-                        let installing = self
-                            .view
-                            .programs
-                            .iter()
-                            .any(|view| view.id == program.id() && view.installing.is_some());
-                        if installing {
-                            self.send(Command::CancelInstallProgram {
-                                id: program.id().to_owned(),
-                            });
-                        } else {
-                            self.send(Command::InstallProgram {
-                                id: program.id().to_owned(),
-                            });
-                        }
-                    } else {
-                        self.set_notice("the built-in engine needs no install");
-                    }
-                }
+                Some('i') => self.toggle_install(self.selected_program()),
                 Some('f') if self.selected_program() == Program::Codex => {
-                    let current = self
-                        .view
-                        .agents
-                        .iter()
-                        .find(|agent| agent.name == self.agent_name)
-                        .and_then(|agent| agent.codex_sandbox.clone())
-                        .unwrap_or_else(|| "native".to_owned());
-                    if !self.codex_optin_confirmed {
-                        self.codex_optin_confirmed = true;
-                        self.set_notice(if current == "full-access" {
-                            "Codex's own sandbox will be restored; the product Landlock boundary remains. Press f again to return this agent's next run to its native sandbox."
-                        } else {
-                            "Codex's own sandbox will be removed; only the product Landlock boundary remains. Press f again to allow it for this agent's next run."
-                        });
-                    } else {
-                        let mode = if current == "full-access" {
-                            "native"
-                        } else {
-                            "full-access"
-                        };
-                        self.codex_optin_confirmed = false;
-                        self.send(Command::SetAgentCodexSandbox {
-                            name: self.agent_name.clone(),
-                            mode: mode.to_owned(),
-                        });
-                    }
+                    self.codex_sandbox_step();
                 }
                 Some('?') => {
                     self.help_back = Screen::Program;
