@@ -215,6 +215,56 @@ print(json.dumps({"type": "agent_settled", "aborted": False}))
     path
 }
 
+fn fake_pi_pusher(install_root: &Path) -> PathBuf {
+    // A Pi-shaped program that pushes a commit and then asks the bridge to open the
+    // request. The request is already open, so the push is the run's real work.
+    let path = install_root.join("pi").join("fake-pi-pusher");
+    fs::create_dir_all(path.parent().expect("the install directory"))
+        .expect("the install directory");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/python3
+import json, os, socket, subprocess, sys, time
+
+sys.stdin.read()
+clone = os.path.join(os.getcwd(), "workspace")
+subprocess.run(["git", "commit", "--allow-empty", "-q", "-m", "second"], cwd=clone, check=True)
+subprocess.run(["git", "push", "-q", "origin", "feature"], cwd=clone, check=True)
+root = os.environ["PI_CODING_AGENT_DIR"]
+with open(os.path.join(root, "mcp.json")) as handle:
+    config = json.load(handle)
+socket_path = config["mcpServers"]["gewu_forgejo"]["args"][1]
+stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+for _ in range(200):
+    try:
+        stream.connect(socket_path)
+        break
+    except OSError:
+        time.sleep(0.02)
+reader = stream.makefile("rb")
+
+def send(request):
+    stream.sendall((json.dumps(request) + "\n").encode())
+    return json.loads(reader.readline())
+
+send({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+      "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                 "clientInfo": {"name": "fixture", "version": "1"}}})
+send({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+      "params": {"name": "forgejo_open_pull_request", "arguments": {
+          "repository": "team/workspace", "title": "A pull request"}}})
+stream.close()
+print(json.dumps({"type": "message_end", "message": {
+    "role": "assistant", "stopReason": "stop", "content": [
+        {"type": "text", "text": "Opened the pull request for the README wording fix."}]}}))
+print(json.dumps({"type": "agent_settled", "aborted": False}))
+"#,
+    )
+    .expect("the fixture program");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("the fixture mode");
+    path
+}
+
 #[test]
 fn a_native_read_only_check_is_no_work_with_its_own_sentence() {
     use gewu_multiverse::test_stub::{Route, Stub, StubReply};
@@ -351,13 +401,18 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 fn clone_fixture(workspace: &Path) {
-    let root = workspace.parent().expect("the workspace parent");
-    let remote = root.join("remote.git");
-    git(root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+    // The bare remote lives inside the workspace, below `.git`, so the confined
+    // native program can read and write it with the same grant as the clone. The
+    // workspace snapshot ignores `.git` internals, so the push is not local work.
+    let remote = workspace.join(".git").join("remote.git");
+    git(
+        workspace,
+        &["init", "-q", "--bare", "-b", "main", ".git/remote.git"],
+    );
     let destination = workspace.join("workspace");
     std::fs::create_dir_all(&destination).expect("the clone directory");
     git(
-        root,
+        workspace,
         &[
             "clone",
             "-q",
@@ -503,5 +558,126 @@ fn a_native_opened_request_is_named_in_the_work_line() {
         work,
         vec!["pull request #6 from feature".to_owned()],
         "the work line did not name the opened request"
+    );
+}
+
+#[test]
+fn a_native_push_then_an_existing_request_is_a_success_that_names_the_request() {
+    use gewu_multiverse::test_stub::{Route, Stub, StubReply};
+
+    let root = scratch("pi-push-pr");
+    let workspace = root.join("workspace");
+    let skills = root.join("skills");
+    std::fs::create_dir_all(&workspace).expect("the workspace");
+    std::fs::create_dir_all(&skills).expect("the skills");
+    clone_fixture(&workspace);
+    std::fs::write(
+        root.join("instruction.md"),
+        "Push the checked-out branch and open its pull request.\n",
+    )
+    .expect("instruction");
+    let credentials = root.join("credentials.toml");
+    mode::write_private(
+        &credentials,
+        b"[model_keys]\n\"scribe\" = \"gw-fixture-key-not-a-real-secret\"\n\n[forgejo_agent_tokens]\nscribe = \"gw-fixture-agent-token\"\n",
+    )
+    .expect("credentials");
+    let run_dir = root.join("state").join("scribe").join("run-native-push-pr");
+    std::fs::create_dir_all(&run_dir).expect("the run directory");
+    let pull = serde_json::json!({
+        "number": 3,
+        "title": "A pull request",
+        "state": "open",
+        "html_url": "http://forgejo.test/team/workspace/pulls/3",
+        "head": {"ref": "feature", "repo": {"full_name": "team/workspace"}},
+        "base": {"ref": "main", "repo": {"full_name": "team/workspace"}},
+        "user": {"login": "gewu-scribe"},
+    });
+    let forgejo = Stub::start_routed(vec![
+        Route::new(
+            "GET",
+            "/api/v1/repos/team/workspace/pulls",
+            StubReply::json(serde_json::json!([pull]).to_string()),
+        ),
+        Route::new(
+            "GET",
+            "/api/v1/repos/team/workspace",
+            StubReply::json(
+                serde_json::json!({
+                    "full_name": "team/workspace",
+                    "name": "workspace",
+                    "default_branch": "main",
+                })
+                .to_string(),
+            ),
+        ),
+    ]);
+    std::fs::write(
+        run_dir.join("forgejo.json"),
+        serde_json::json!({
+            "url": format!("http://{}", forgejo.addr()),
+            "login": "gewu-scribe",
+            "repositories": [{"full_name": "team/workspace", "directory": "workspace"}],
+        })
+        .to_string(),
+    )
+    .expect("the Forgejo context");
+    RunPlan {
+        run_id: "run-native-push-pr".to_owned(),
+        agent: "scribe".to_owned(),
+        workspace: workspace.clone(),
+        instruction: root.join("instruction.md"),
+        skills_dir: skills,
+        endpoint: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        credentials,
+        max_turns: 4,
+        steps: Vec::new(),
+        timeout_secs: 30,
+        confinement: "landlock".to_owned(),
+        hide: Vec::new(),
+    }
+    .write(&run_dir)
+    .expect("the plan");
+    let install_root = root.join("install");
+    NativePlan {
+        harness: "pi".to_owned(),
+        version: "1.4.0".to_owned(),
+        program: fake_pi_pusher(&install_root),
+        install_root,
+        protocol: "chat-completions".to_owned(),
+        base_url: "http://127.0.0.1:1/v1".to_owned(),
+        model: "fixture-model".to_owned(),
+        codex_sandbox: String::new(),
+    }
+    .write(&run_dir)
+    .expect("the native plan");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--run-agent")
+        .arg(&run_dir)
+        .env("TMPDIR", "/tmp")
+        .status()
+        .expect("the product runs the native run");
+    assert!(status.success(), "the supervisor exited with {status:?}");
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let (outcome, reason) = match terminal {
+        Record::RunFinished {
+            outcome, reason, ..
+        } => (outcome, reason.unwrap_or_default()),
+        other => panic!("no terminal record: {other:?}"),
+    };
+    let work = run::work_summary(&run_dir);
+    let pushed = run::read_push_witness(&run_dir).is_some();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(pushed, "the fixture push was not recorded");
+    assert_eq!(
+        outcome, "succeeded",
+        "the push is real work even though the request was already open: {reason}"
+    );
+    assert_eq!(
+        work,
+        vec!["pull request #3 from feature".to_owned()],
+        "the work line did not name the request"
     );
 }
