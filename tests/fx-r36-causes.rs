@@ -351,28 +351,28 @@ fn c3_the_per_agent_form_shows_and_changes_the_protocol() {
 }
 
 #[test]
-fn c3_clearing_the_key_refuses_the_save_instead_of_saving_it_silently() {
-    let one = agent(1);
+fn c3_clearing_the_key_saves_the_clear_instead_of_keeping_the_old_key() {
+    let mut one = agent(1);
+    one.program = "pi".to_owned();
+    one.program_label = "Pi".to_owned();
     let (mut board, sent) = board(view(vec![one]));
     open_agent(&mut board);
     press(&mut board, KeyCode::Char('m'));
     // The key field is the third one, and the stored key is still present; ctrl-u
-    // clears it explicitly.
+    // clears it explicitly, and the save carries that empty value.
     press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     press_ctrl(&mut board, 'u');
     press(&mut board, KeyCode::Enter);
-    assert!(
-        sent.lock().expect("sent").is_empty(),
-        "an empty key was saved: {:?}",
-        sent.lock().expect("sent")
-    );
-    assert!(
-        board
-            .notice()
-            .is_some_and(|notice| notice.contains("API key is empty")),
-        "the form did not say the key is empty: {:?}",
-        board.notice()
+    let sent = sent.lock().expect("sent");
+    let cleared = sent.iter().find_map(|command| match command {
+        Command::SetAgentModel { key, .. } => Some(key.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        cleared,
+        Some(Some(String::new())),
+        "the emptied key was not saved as a clear: {sent:?}"
     );
 }
 

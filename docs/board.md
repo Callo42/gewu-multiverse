@@ -116,7 +116,7 @@ because it describes every mechanism:
 Agents use this computer with your permissions.
 When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.
 Each has its own login on your Forgejo.
-Started agents keep going until you stop them.
+Started agents keep running while the product is open; quitting stops them, and they start again on reopen.
 Their work is sent to your model provider.
 ```
 
@@ -162,6 +162,7 @@ the model and tests it: `✓ the model answered`, or `✗` with one short reason
 Every other line is the provider's refusal and names its status and its own message
 (`✗ the provider answered HTTP 404: Add /v1 to the base URL`,
 `✗ the provider refused the API key (HTTP 401)`,
+`✗ the provider denied access to this model (HTTP 403)`,
 `✗ no model called <name> at this address (HTTP 404)`, `✗ no answer within 15 s`). A
 404 on a `/chat/completions` path whose address has no `/v1` says the repair first —
 `✗ add /v1 — the provider answered HTTP 404: …` — so the correction is on screen at
@@ -171,8 +172,11 @@ the provider's whole answer, not its first clause.
 `⏎` when no field is being edited saves and goes on. The verb is always `⏎ next`,
 whether the screen was opened on the first run or by `m`. An empty key with no stored
 key is its own error — `✗ the API key is empty` — and sends nothing; a provider that
-never saw a request is never said to have refused it. The same notice line never says
-the model is saved when its own validation failed. `esc` leaves.
+never saw a request is never said to have refused it. On a per-agent form an emptied
+key is the explicit clear the release promises: the save removes that agent's stored
+key instead of keeping it, and the field stays empty when the form is reopened. The
+same notice line never says the model is saved when its own validation failed. `esc`
+leaves.
 
 ### 3. How many agents?
 

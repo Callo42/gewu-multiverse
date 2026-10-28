@@ -804,6 +804,26 @@ fn card_bottom_text_fitted(agent: &AgentView, card_h: u16, max_width: usize) -> 
     full
 }
 
+/// Fit a card's work line without losing the value the sentence exists for.
+///
+/// A branch name is one long token, so a whole-word cut after `branch` would say
+/// `last work: branch…` and drop the branch. When the line is a labelled branch,
+/// keep the label and cut the value itself with an ellipsis; every other line keeps
+/// the whole-word rule.
+fn fit_work_line(line: &str, max: usize) -> String {
+    if text_util::width(line) <= max {
+        return line.to_owned();
+    }
+    if let Some(value) = line.strip_prefix("last work: branch ") {
+        let prefix = "last work: branch ";
+        let room = max.saturating_sub(text_util::width(prefix) + 1);
+        if room >= 4 {
+            return format!("{prefix}{}", text_util::ellipsize(value, room));
+        }
+    }
+    text_util::ellipsize_words(line, max)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     buf: &mut Buffer,
@@ -973,7 +993,7 @@ fn draw_card(
                 interior,
                 interior.x + 1,
                 rect.y + 3,
-                &text_util::ellipsize_words(&line, width),
+                &fit_work_line(&line, width),
                 theme::card(colour, selected),
             );
         }
@@ -1389,12 +1409,22 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             bus_ys.push(bus_y);
             row_tops.push(bus_y + 1);
         }
-        let trunk_x = if columns == 1 {
-            card_junction_for(grid_start, card_w, card_h, board)
+        // Every card junction is fixed card geometry: no title, state word or
+        // selection marker can move a wire. A lone card drops straight from the
+        // Forgejo box, so the trunk is that card's own fixed junction; a stack
+        // drops from the box's centre into the gutter spine.
+        let single_column_rows = agent_count.div_ceil(columns).max(1);
+        let trunk_x = if columns == 1 && single_column_rows == 1 {
+            card_junction_for(Rect::new(grid_start, 0, card_w, card_h), card_h)
         } else {
             inner.x + inner.width / 2
         };
-        let spine_x = if columns == 1 {
+        let spine_x = if columns == 1 && single_column_rows > 1 {
+            // A vertical stack owns a gutter left of the cards. The spine runs
+            // there and each card is fed by its own bus row; the wire never enters
+            // or leaves a card's frame.
+            grid_start.saturating_sub(2).max(inner.x + 1)
+        } else if columns == 1 {
             trunk_x
         } else {
             choose_spine_x(inner, columns, card_w, gap, trunk_x, grid_start)
@@ -1429,33 +1459,6 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
 /// between columns, and the one-cell margin inside the box.
 fn list_text_width(box_w: u16, columns: usize) -> u16 {
     box_w.saturating_sub(2).saturating_sub(columns as u16 - 1) / columns.max(1) as u16
-}
-
-/// The wire junction for a single-column grid.
-///
-/// The trunk is centred when the card's bottom label is short enough; when the
-/// label would reach the centre (the floor's identity, run count and failure
-/// word), the junction moves to just after the label. A connector is never drawn
-/// through a word (F-14), and the picture keeps one straight trunk.
-fn card_junction_for(x: u16, width: u16, card_h: u16, board: &Board) -> u16 {
-    let mut junction = x + width / 2 + 2;
-    for agent in &board.view.agents {
-        let label = card_bottom_text(agent, card_h);
-        // The label starts on x+1 with a cap. The tight three-row label has no
-        // padding; every other label has a space on each side.
-        let after = if card_h == 3 { 3 } else { 5 };
-        junction = junction.max(x + text_util::width(&label) as u16 + after);
-        if card_h <= 2 {
-            // A two-row card puts the name and state on the top border. A waiting
-            // state is longer than the bottom label, so the junction must clear both
-            // labels; otherwise the wait word is ellipsized on a card with room to
-            // spare (F3/F8).
-            let face = status::agent_face(agent);
-            let top = format!("{} {} · {}", face.symbol, agent.name, board_state(&face));
-            junction = junction.max(x + text_util::width(&top) as u16 + 5);
-        }
-    }
-    junction.clamp(x + 2, x + width.saturating_sub(2))
 }
 
 /// Choose a gap between full-row cards for the wrapped rows' vertical spine.
@@ -1510,6 +1513,18 @@ fn choose_spine_x(
 
 fn card_junction(rect: Rect) -> u16 {
     rect.x + rect.width / 2 + 2
+}
+
+/// The fixed junction for a card form. A two-row card carries the whole state
+/// line on its top border (including `next 251s · no work`), so its fixed drop
+/// leaves six cells of extra label room. The wider three-to-five-row cards carry
+/// only the name on that border and keep the centre junction.
+fn card_junction_for(rect: Rect, card_h: u16) -> u16 {
+    if card_h <= 2 {
+        rect.x + rect.width / 2 + 6
+    } else {
+        card_junction(rect)
+    }
 }
 
 /// The trunk leaves the Forgejo box at the window's centre when that is a gap, or
@@ -2000,9 +2015,10 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     let layout = if geometry.form == BoardForm::List {
         draw_agent_list(board, buf, &geometry, forgejo_rect, wire_style, area.x)
     } else {
-        if geometry.columns > 1
-            && let Some(first_bus) = geometry.bus_ys.first()
-        {
+        if let Some(first_bus) = geometry.bus_ys.first() {
+            // The Forgejo drop reaches its own centre. The rows between the box and
+            // the first bus are wire, at every column count; on the compact board
+            // the gap is zero and the bus row itself carries the joint.
             for y in forgejo_rect.bottom()..*first_bus {
                 put_arms(buf, buf.area, geometry.trunk_x, y, U | D, wire_style);
             }
@@ -2044,18 +2060,15 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                 } else {
                     agent.name.clone()
                 };
-                let junction = if geometry.columns == 1 {
+                // One junction rule at every size: the drop is a fixed point on
+                // the card's top border. It does not follow the title text, so
+                // moving the selection cannot move the line. A lone card sits
+                // under the Forgejo box's own centre, so the wire is one straight
+                // drop with no bus stub beside it.
+                let junction = if geometry.columns == 1 && geometry.visible_rows == 1 {
                     geometry.trunk_x
                 } else {
-                    // On a short card the top border also carries the state (and the
-                    // compact form's work word), so the wire must clear the whole
-                    // visible label, not just the name.
-                    let top_label = if geometry.card_h <= 2 {
-                        format!("{} {}", agent.name, board_state(&status::agent_face(agent)))
-                    } else {
-                        title.clone()
-                    };
-                    card_junction_after_title(rect, &top_label)
+                    card_junction_for(rect, rect.height)
                 };
                 junctions.push(junction);
                 rects.push((agent_index, rect, selected, title, junction));
@@ -2084,45 +2097,14 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                     wire_style,
                 );
             }
-            if geometry.columns == 1 {
-                let from = if row == 0 {
-                    forgejo_rect.bottom()
-                } else {
-                    geometry.row_tops[row - 1] + geometry.card_h
-                };
-                for wire_y in from..y {
-                    put_arms(buf, buf.area, junctions[0], wire_y, U | D, wire_style);
-                }
-                if row > 0 {
-                    put_arms(
-                        buf,
-                        buf.area,
-                        junctions[0],
-                        geometry.row_tops[row - 1] + geometry.card_h - 1,
-                        L | R | D,
-                        wire_style,
-                    );
-                }
-            }
             for (agent_index, rect, selected, _title, junction) in rects {
                 let Some(agent) = board.view.agents.get(agent_index) else {
                     continue;
                 };
-                // The number of content cells the bottom label may use. On a
-                // single-column grid the wire lands on that border, so the label
-                // stops before the junction; there the three-row card uses the
-                // tight (unpadded) label so it keeps the state and HTTP status.
-                // On a multi-column grid the bottom border keeps its full width.
-                let label_room = if geometry.columns == 1 {
-                    if rect.height == 3 {
-                        junction.saturating_sub(rect.x + 3) as usize
-                    } else {
-                        junction.saturating_sub(rect.x + 5) as usize
-                    }
-                } else if rect.height == 3 {
-                    // A three-row card's bottom border has no junction on a
-                    // multi-column grid: use its whole inner width, so the wait
-                    // word and the short last-work word both fit.
+                // The connector lands on the top border only. The bottom border
+                // therefore has its whole inner width for the last-work word, at
+                // every size and in both board forms.
+                let label_room = if rect.height == 3 {
                     rect.width.saturating_sub(2) as usize
                 } else if rect.height <= 2 {
                     rect.width.saturating_sub(8) as usize
@@ -2161,14 +2143,6 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     } else {
         draw_home_footer(board, buf, inner);
     }
-}
-
-/// The junction on a card's top border, just after its title. Placing it after
-/// the name (rather than half-way across the card) keeps the whole title and the
-/// whole state word even when a crowded row makes the cards narrow.
-fn card_junction_after_title(rect: Rect, title: &str) -> u16 {
-    let width = text_util::width(title) as u16;
-    (rect.x + 2 + 1 + width + 3).clamp(rect.x + 6, rect.right().saturating_sub(3))
 }
 
 /// The picker's bus: the same drawing as the board's, with the old argument list.
@@ -3177,9 +3151,9 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     }
     if let Some(failure) = failure_lines.first() {
         extras.push((failure.clone(), theme::card(theme::RED, true)));
-        // A 401/403 sentence keeps its provider clause and its `check the key`
-        // action at 80 columns: the rest of the wrapped refusal gets its own row
-        // before the result, rather than being cut at the right edge.
+        // A refusal keeps its provider clause and its action at 80 columns: the
+        // rest of the wrapped sentence gets its own row before the result, rather
+        // than being cut at the right edge.
         for line in failure_lines.iter().skip(1) {
             extras.push((line.clone(), theme::card(theme::RED, true)));
         }
@@ -3237,7 +3211,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             card,
             interior_x,
             extra_top + index as u16,
-            &text_util::ellipsize_words(notice, width),
+            &fit_work_line(notice, width),
             *style,
         );
     }
@@ -3487,7 +3461,13 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         );
     } else {
         let line1 = "s start/stop  e instruction  p program  m model";
-        let line2 = "l log  t transcript  j raw  d remove  esc back";
+        // Only a Codex agent has the sandbox toggle, so only that screen promises
+        // the key. The Agent warning names the same key and now works here too.
+        let line2 = if agent.program == "codex" {
+            "l log  t transcript  j raw  d remove  f sandbox  esc back"
+        } else {
+            "l log  t transcript  j raw  d remove  esc back"
+        };
         text_util::put(
             buf,
             inner,
@@ -3690,7 +3670,14 @@ fn draw_instruction_rows(
 fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Agent program");
     let inner = inner(area);
-    let mut y = inner.y + 1;
+    // An unknown saved program adds a line above the list; start it on the frame's
+    // first content row so the 72x18 picture still has room for the wrapped Codex
+    // sentence below the list.
+    let mut y = if board.program_unknown.is_some() {
+        inner.y
+    } else {
+        inner.y + 1
+    };
     if let Some(unknown) = board.program_unknown.as_ref() {
         text_util::put(
             buf,
@@ -3801,15 +3788,21 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
         } else {
             "Codex sandbox: its own default · press f twice: removes Codex's own sandbox, keeps product Landlock"
         };
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            y,
-            &text_util::ellipsize_words(text, inner.width.saturating_sub(2) as usize),
-            theme::fg(theme::AMBER),
-        );
-        y += 1;
+        // This is a promise with two operative words: `press f twice` and what it
+        // removes. Wrap it rather than cutting either one at the 72-column floor
+        //.
+        let parts = text_util::wrap(text, inner.width.saturating_sub(2) as usize);
+        for (row, part) in parts.iter().take(2).enumerate() {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                y + row as u16,
+                part,
+                theme::fg(theme::AMBER),
+            );
+        }
+        y += parts.len().min(2) as u16;
     }
     let width = inner.width.saturating_sub(2) as usize;
     if let Some(view) = board
@@ -4004,13 +3997,17 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
     // One sentence about what moving does, in the same place on every program and
     // above the keys. It stays on the 72x18 floor, where the extra explanation is
     // exactly what a wary person needs before pressing Enter.
-    let keeps = "keeps the instruction, workspace, login and history; applies to the next run";
-    let keeps_top = inner.bottom().saturating_sub(4);
-    for (row, part) in text_util::wrap(keeps, width)
-        .into_iter()
-        .take(2)
-        .enumerate()
-    {
+    // At 72 columns the wrapped Codex line spends the one spare row above this
+    // sentence, so the sentence is one shorter but still whole; wider screens keep
+    // the full wording and its second row.
+    let keeps = if inner.width < 80 {
+        "keeps instruction, workspace, login and history; applies next run"
+    } else {
+        "keeps the instruction, workspace, login and history; applies to the next run"
+    };
+    let keeps_parts = text_util::wrap(keeps, width);
+    let keeps_top = inner.bottom().saturating_sub(2 + keeps_parts.len() as u16);
+    for (row, part) in keeps_parts.into_iter().take(2).enumerate() {
         text_util::put(
             buf,
             inner,

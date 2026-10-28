@@ -45,7 +45,9 @@ requests are its own. The board shows the whole thing at a glance:
   program owns its model turns, tools, retries, compaction and session; the product
   owns the run boundary, the Forgejo tools and the record. If Codex's own sandbox
   cannot start on this computer, the Agent screen keeps the cause and names the
-  double-`f` opt-out; the product Landlock boundary stays.
+  double-`f` opt-out; pressing `f` twice there performs it and the product Landlock
+  boundary stays. A missing native-program prerequisite names `i`, and pressing it on
+  that screen starts the install.
 - **One default connection, and a saved choice per agent.** The first-run model
   address and key are the default. Each agent can save its own compatible
   provider/protocol/address/model/key; the protocol is shown beside the address and
@@ -239,6 +241,7 @@ and you can change any of them later.
 2. **Set the model.** Give the full model address (it ends in `/chat/completions`), the
    model name, and the key. Press `t` to test it; `✓ the model answered` means it
    works. The address suffix and an empty key are checked before anything is sent;
+   on a per-agent form `ctrl-u` then `⏎` clears that agent's stored key;
    every other failure names the provider's status and its own message, kept whole and
    wrapped to the form's rows at 80 columns (a 404 on a `/chat/completions` address
    without `/v1` says so first). `↑`/`↓` moves between fields; `⏎` keeps a field and
@@ -365,7 +368,8 @@ Nothing else is installed: no service, no system-wide file, no other account.
 - **The model test fails.** The board gives one line. `✗ wrong address — it should end
   in /chat/completions` and `✗ the API key is empty` mean nothing was sent. Any other
   line is the provider's answer: `✗ the provider refused the API key (HTTP 401)`
-  (check the key), `✗ no model called <name> at this address (HTTP 404)` (check the
+  (check the key), `✗ the provider denied access to this model (HTTP 403)` (check the
+  model and its access), `✗ no model called <name> at this address (HTTP 404)` (check the
   model name), `✗ the provider answered HTTP 404: …` (check the address; on a
   `/chat/completions` path without `/v1`, add `/v1`), or `✗ no answer within 15 s`
   (the provider did not answer; try again).

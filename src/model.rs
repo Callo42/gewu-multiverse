@@ -476,9 +476,10 @@ pub enum ModelError {
     /// The credentials file records no key for this agent.
     #[error("the credentials file records no model key for this agent")]
     MissingKey,
-    /// The endpoint refused the key. The provider's own message is kept, because it
-    /// is the one sentence that tells a mistyped key from a missing permission.
-    #[error("the endpoint refused the key (HTTP {status})")]
+    /// The endpoint refused the request with 401 (the key) or 403 (access to the
+    /// model). The provider's own message is kept, because it is the one sentence
+    /// that tells a mistyped key from a missing permission.
+    #[error("the endpoint refused the request (HTTP {status})")]
     BadKey {
         /// The status the endpoint answered with.
         status: u16,
@@ -1007,7 +1008,16 @@ pub fn failure_words(error: &ModelError, model: &str) -> String {
             } else {
                 format!(": {}", whole_message(message, 400))
             };
-            format!("the provider refused the API key (HTTP {status}){detail} — check the key")
+            // 403 is the provider saying the request is not allowed: the key
+            // authenticated, but the model or its access is not permitted. Calling
+            // that a refused key sent the reader to the wrong repair.
+            if *status == 403 {
+                format!(
+                    "the provider denied access to this model (HTTP {status}){detail} — check the model and its access"
+                )
+            } else {
+                format!("the provider refused the API key (HTTP {status}){detail} — check the key")
+            }
         }
         ModelError::ModelNotFound { status, .. } => {
             format!("no model called {model} at this address (HTTP {status})")
