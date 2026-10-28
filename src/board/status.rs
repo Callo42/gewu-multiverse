@@ -891,29 +891,38 @@ pub fn agent_rows(agent: &AgentView, width: usize) -> Vec<AgentRow> {
 
 /// The failure rows, fitted to the card width. The mark and the cause are the same
 /// ones every other surface uses.
+///
+/// A provider refusal gets two rows on the Agent screen: the status, category and
+/// repair whole, then the provider's own sentence. The repair is never shortened
+/// by a 72-column card's row budget; only secondary detail is.
 fn failure_rows(agent: &AgentView, width: usize) -> Vec<String> {
     let mark = failure_mark(agent);
-    let text = if let Some(leftover) = agent.leftover.as_deref() {
-        Some(format!("{mark} {}", leftover_words(leftover)))
-    } else {
-        agent
-            .last_failure
-            .as_deref()
-            .map(|failure| {
-                format!(
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(leftover) = agent.leftover.as_deref() {
+        lines.push(format!("{mark} {}", leftover_words(leftover)));
+    } else if let Some(failure) = agent.last_failure.as_deref() {
+        lines.push(format!(
+            "{mark} {}",
+            fit_tool_failure(failure, width.saturating_sub(2))
+        ));
+    } else if let Some(error) = agent.last_error.as_deref() {
+        match crate::model::provider_failure_in(error) {
+            Some(provider) if matches!(provider.status, 401 | 403) => {
+                lines.push(format!(
                     "{mark} {}",
-                    fit_tool_failure(failure, width.saturating_sub(2))
-                )
-            })
-            .or_else(|| {
-                agent
-                    .last_error
-                    .as_deref()
-                    .map(|error| format!("✗ {}", failure_words(error)))
-            })
-    };
-    text.map(|text| super::text::wrap(&text, width))
-        .unwrap_or_default()
+                    crate::model::run_refusal_words(provider.status, "")
+                ));
+                if !provider.message.trim().is_empty() {
+                    lines.push(provider.message);
+                }
+            }
+            _ => lines.push(format!("✗ {}", failure_words(error))),
+        }
+    }
+    lines
+        .into_iter()
+        .flat_map(|line| super::text::wrap(&line, width))
+        .collect()
 }
 
 /// The live state of one pull request in one repository, when the engine has read
@@ -1278,18 +1287,26 @@ pub fn newest_failure_word(agent: &AgentView) -> Option<String> {
     }
 }
 
-/// The shortest failure word that still carries an HTTP status, for the one
-/// three-row card form whose bottom border must also hold the state word:
-/// `✗ HTTP 500`. Other failures reuse [`newest_failure_word`] (`✗ net`,
-/// `◷ timeout`, `⚠ leftover`).
+/// The shortest failure word that still carries an HTTP status and, for a
+/// provider refusal, the one repair the reader has to take.
+///
+/// `✗ HTTP 401 check key` / `✗ HTTP 403 check access`. Unknown failures keep the
+/// old tight words (`✗ net`, `◷ timeout`, `⚠ leftover`).
 pub fn tight_failure_word(agent: &AgentView) -> Option<String> {
     if let Some(leftover) = agent.leftover.as_deref() {
         return Some(leftover_short(leftover).to_owned());
     }
-    if let Some(SessionEnd::Failed { reason }) = agent.recent.last()
-        && let Some(code) = http_status_in(reason)
-    {
-        return Some(format!("✗ HTTP {code}"));
+    if let Some(SessionEnd::Failed { reason }) = agent.recent.last() {
+        if let Some(failure) = crate::model::provider_failure_in(reason) {
+            match failure.status {
+                401 => return Some("✗ HTTP 401 check key".to_owned()),
+                403 => return Some("✗ HTTP 403 check access".to_owned()),
+                _ => {}
+            }
+        }
+        if let Some(code) = http_status_in(reason) {
+            return Some(format!("✗ HTTP {code}"));
+        }
     }
     newest_failure_word(agent)
 }
@@ -1325,6 +1342,13 @@ pub fn card_word(agent: &AgentView) -> Option<String> {
 }
 
 fn short_failure(reason: &str) -> String {
+    if let Some(failure) = crate::model::provider_failure_in(reason) {
+        match failure.status {
+            401 => return "401 check key".to_owned(),
+            403 => return "403 check access".to_owned(),
+            _ => {}
+        }
+    }
     if let Some(code) = http_status_in(reason) {
         return code.to_string();
     }
@@ -1340,38 +1364,32 @@ fn short_failure(reason: &str) -> String {
 /// One whole-word failure line for a card: keep the HTTP status first (the fact a
 /// person needs to tell a provider problem from a bad model name), then the
 /// shortest honest phrase for the transport cases.
+///
+/// A provider envelope is parsed once, so `AUTH: 401: {json}` from DSH, `401: …`
+/// from Pi, `unexpected status 401 …` from Codex and `… HTTP 403 …` from the
+/// product's own model call all reach the same category, provider sentence and
+/// repair as the model form. A number or a sentence without an envelope is not a
+/// provider failure and keeps its own words.
 pub fn failure_words(reason: &str) -> String {
-    if let Some(code) = http_status_in(reason) {
-        // A status alone is not an error message. Keep the provider's own sentence
-        // and add the one action that follows from each class: a refused key is
-        // checked, a 503 is temporary and is retried. The walkers saw both bodies
-        // dropped, leaving `HTTP 401 from the model` and `HTTP 503` with nothing to
-        // do.
-        if code == 503 || code == 502 || code == 504 {
-            return format!("the model is temporarily unavailable (HTTP {code})");
-        }
-        let detail = provider_detail_after_status(reason, code);
-        // A 403 is the provider denying access, not refusing the key; say so
-        // before the provider's own sentence.
-        let mut word = if code == 403 {
-            format!("access denied (HTTP {code})")
-        } else {
-            format!("HTTP {code}")
-        };
-        match detail {
-            Some(detail) => {
-                word.push_str(": ");
-                word.push_str(&detail);
+    if let Some(failure) = crate::model::provider_failure_in(reason) {
+        return match failure.status {
+            401 | 403 => crate::model::run_refusal_words(failure.status, &failure.message),
+            code @ 502..=504 => {
+                let detail = if failure.message.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", failure.message)
+                };
+                format!("the model is temporarily unavailable (HTTP {code}){detail}")
             }
-            None => word.push_str(" from the model"),
-        }
-        if code == 403 {
-            // Access to the model was denied; the key may be perfectly good.
-            word.push_str(" — check the model and its access");
-        } else if code == 401 {
-            word.push_str(" — check the key");
-        }
-        return word;
+            code => {
+                if failure.message.trim().is_empty() {
+                    format!("HTTP {code} from the model")
+                } else {
+                    format!("HTTP {code}: {}", failure.message)
+                }
+            }
+        };
     }
     let lower = reason.to_ascii_lowercase();
     if lower.contains("cannot reach the model") {
@@ -1410,24 +1428,6 @@ fn http_status_in(text: &str) -> Option<u16> {
         }
     }
     None
-}
-
-/// The provider's own message that follows an HTTP status in a run's reason.
-///
-/// The reason shapes differ by program (`HTTP 401: Incorrect API key provided`,
-/// `the provider answered HTTP 503: ...`, `model_not_found: HTTP 404: ...`); this
-/// takes the text after the status marker, drops punctuation, and keeps one bounded
-/// line. It makes no message up when the harness did not carry one.
-fn provider_detail_after_status(text: &str, code: u16) -> Option<String> {
-    let marker = format!("HTTP {code}");
-    let rest = text.split(&marker).nth(1)?;
-    let rest = rest.strip_prefix(')').unwrap_or(rest);
-    let rest = rest.trim_start_matches([':', ' ', '—', '-']).trim();
-    if rest.is_empty() {
-        return None;
-    }
-    let line = rest.lines().next().unwrap_or(rest).trim();
-    Some(super::text::ellipsize(line, 160))
 }
 
 fn errno_in(text: &str) -> Option<String> {
@@ -1780,6 +1780,71 @@ mod tests {
             })
             .0,
             '∅'
+        );
+    }
+
+    #[test]
+    fn a_native_auth_envelope_keeps_its_status_message_and_repair() {
+        let raw = "AUTH: 401: {\"message\":\"Incorrect API key provided: sk-synthetic-dsh-0001\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}";
+        let words = failure_words(raw);
+        assert!(words.contains("HTTP 401"), "{words}");
+        assert!(words.contains("provider refused the API key"), "{words}");
+        assert!(words.contains("Incorrect API key provided"), "{words}");
+        assert!(words.contains("check the key"), "{words}");
+        assert!(!words.contains('{'), "{words}");
+        assert!(!words.contains("sk-synthetic"), "{words}");
+
+        let forbidden =
+            "AUTH: 403: {\"message\":\"You do not have permission to use this model.\"}";
+        let words = failure_words(forbidden);
+        assert!(words.contains("HTTP 403"), "{words}");
+        assert!(words.contains("access denied"), "{words}");
+        assert!(words.contains("check the model and its access"), "{words}");
+        assert!(words.contains("You do not have permission"), "{words}");
+        assert!(!words.contains("check the key"), "{words}");
+    }
+
+    #[test]
+    fn tight_words_keep_the_provider_repair_for_a_refusal() {
+        let mut refused = agent(SessionState::Idle, Desired::Stopped);
+        refused.recent = vec![SessionEnd::Failed {
+            reason: "AUTH: 401: {\"message\":\"Incorrect API key provided: <redacted>\"}"
+                .to_owned(),
+        }];
+        assert_eq!(
+            tight_failure_word(&refused).as_deref(),
+            Some("✗ HTTP 401 check key")
+        );
+        assert_eq!(list_word(&refused).as_deref(), Some("✗ 401 check key"));
+
+        refused.recent = vec![SessionEnd::Failed {
+            reason: "AUTH: 403: {\"message\":\"You do not have permission to use this model.\"}"
+                .to_owned(),
+        }];
+        assert_eq!(
+            tight_failure_word(&refused).as_deref(),
+            Some("✗ HTTP 403 check access")
+        );
+        assert_eq!(list_word(&refused).as_deref(), Some("✗ 403 check access"));
+    }
+
+    #[test]
+    fn an_ordinary_sentence_or_number_is_not_a_provider_failure() {
+        for reason in [
+            "I counted 401 lines and the model answered normally",
+            "the native program exited with code 1",
+            "write refused: HTTP 403",
+        ] {
+            let words = failure_words(reason);
+            assert!(!words.contains("check the key"), "{reason} -> {words}");
+            assert!(
+                !words.contains("check the model and its access"),
+                "{reason} -> {words}"
+            );
+        }
+        assert_eq!(
+            failure_words("the native program exited with code 1"),
+            "the native program exited with code 1"
         );
     }
 }
