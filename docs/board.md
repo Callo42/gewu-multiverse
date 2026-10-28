@@ -287,7 +287,7 @@ the run records, not a session counter: it does not reset when an agent starts a
 or the program reopens. `⏎` on a card opens the Agent screen, which carries the last
 work block (`work` + up to three typed rows: `issue #4`,
 `pull request team/workspace#5 from fix/x`, `comment on team/workspace#1`, or
-`branch fix/x in team/workspace` when the run pushed
+`branch team/workspace#fix/x` when the run pushed
 without opening a request or commenting; an older request record with no branch result
 keeps `pull request team/workspace#5` and claims no branch), a tool in flight (`shell · 12s`), a
 failed tool call (`⚠ shell: …`, or `✗` when the run itself failed), the newest run's
@@ -478,8 +478,9 @@ run's own. A pull request's word follows its live state (`PR team/workspace#4 me
 or `PR team/workspace#4 closed`), refreshed while the board is open, so a run's
 recorded `open` does not outlive a merge or close. The work fact keeps its
 repository, so a same-numbered request in another repository cannot supply it. At
-72×18 the run's own ending and the completed-work heading and its remote rows are
-allocated before failure detail and reads; the failure wraps or shortens after them.
+72×18 the run's own ending or result is the first row, then the completed-work
+heading and its remote rows, then failure detail and reads; the failure wraps or
+shortens after the work it must not hide.
 
 `s` starts or stops; `e` hands `instruction_path` to `$EDITOR`; `l` hands the newest
 run's log to the pager; `t` writes and shows a readable transcript (turns, tools and

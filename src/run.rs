@@ -504,17 +504,34 @@ where
         .collect())
 }
 
-/// `repository#number`, or the older `#number` when the record named no repository.
-pub fn work_reference(repository: Option<&str>, number: u64) -> String {
-    match repository.filter(|repository| !repository.trim().is_empty()) {
-        Some(repository) => format!("{repository}#{number}"),
-        None => format!("#{number}"),
+/// The one identity formatter for a work item: `repository#number` for a pull
+/// request or comment, or `branch in repository` for a push. A legacy record with no
+/// repository keeps the older `#number` / bare branch form.
+pub fn work_identity(
+    repository: Option<&str>,
+    number: Option<u64>,
+    branch: Option<&str>,
+) -> String {
+    let repository = repository.filter(|repository| !repository.trim().is_empty());
+    if let Some(number) = number {
+        return match repository {
+            Some(repository) => format!("{repository}#{number}"),
+            None => format!("#{number}"),
+        };
+    }
+    match (
+        repository,
+        branch.filter(|branch| !branch.trim().is_empty()),
+    ) {
+        (Some(repository), Some(branch)) => format!("{repository}#{branch}"),
+        (None, Some(branch)) => branch.to_owned(),
+        _ => String::new(),
     }
 }
 
 /// The work line for a pull request, with the repository that owns its number.
 pub fn pull_work_line(repository: Option<&str>, number: u64, branch: Option<&str>) -> String {
-    let reference = work_reference(repository, number);
+    let reference = work_identity(repository, Some(number), None);
     match branch.filter(|branch| !branch.trim().is_empty()) {
         Some(branch) => format!("pull request {reference} from {branch}"),
         None => format!("pull request {reference}"),
@@ -523,15 +540,15 @@ pub fn pull_work_line(repository: Option<&str>, number: u64, branch: Option<&str
 
 /// The work line for a comment, with the repository that owns its number.
 pub fn comment_work_line(repository: Option<&str>, number: u64) -> String {
-    format!("comment on {}", work_reference(repository, number))
+    format!(
+        "comment on {}",
+        work_identity(repository, Some(number), None)
+    )
 }
 
 /// The work line for a push, with the repository whose branch moved.
 pub fn push_work_line(repository: Option<&str>, branch: &str) -> String {
-    match repository.filter(|repository| !repository.trim().is_empty()) {
-        Some(repository) => format!("branch {branch} in {repository}"),
-        None => format!("branch {branch}"),
-    }
+    format!("branch {}", work_identity(repository, None, Some(branch)))
 }
 
 /// Split `repository#number` or the older `#number` reference.
@@ -570,6 +587,14 @@ pub fn comment_work_reference(line: &str) -> Option<(Option<&str>, u64)> {
 /// The repository and branch a push work line names.
 pub fn push_work_reference(line: &str) -> Option<(Option<&str>, &str)> {
     let rest = line.strip_prefix("branch ")?;
+    // `branch repository#branch` is the current form; `branch branch in repository`
+    // and a bare branch keep older records readable.
+    if let Some((repository, branch)) = rest.split_once('#')
+        && !repository.trim().is_empty()
+        && !branch.trim().is_empty()
+    {
+        return Some((Some(repository.trim()), branch.trim()));
+    }
     match rest.rsplit_once(" in ") {
         Some((branch, repository))
             if !branch.trim().is_empty() && !repository.trim().is_empty() =>
@@ -1668,7 +1693,7 @@ mod tests {
         };
         assert_eq!(
             other_repository.work_lines(),
-            vec!["branch feature in team/alpha".to_owned()],
+            vec!["branch team/alpha#feature".to_owned()],
             "a push borrowed a same-numbered request from another repository"
         );
         let other_comment = RunFacts {
@@ -1852,7 +1877,7 @@ mod tests {
         .expect("the witness");
         assert_eq!(
             work_summary(&run),
-            vec!["branch fix/only-push in team/website".to_owned()]
+            vec!["branch team/website#fix/only-push".to_owned()]
         );
 
         let empty = root.join("run-1700000000003-0002");

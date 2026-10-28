@@ -7,9 +7,7 @@
 
 use crate::board::theme;
 use crate::engine_api::{AgentView, Desired, ForgejoState, Provisioning, SessionEnd, SessionState};
-use crate::run::{
-    comment_work_reference, pull_work_reference, push_work_reference, work_reference,
-};
+use crate::run::{comment_work_reference, pull_work_reference, push_work_reference, work_identity};
 use ratatui::style::Color;
 use std::time::SystemTime;
 
@@ -721,6 +719,203 @@ pub fn run_result_line(agent: &AgentView) -> Option<String> {
     }
 }
 
+/// The role one row plays for the Agent screen. The order of these variants is the
+/// one priority order every Agent layout uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AgentRowKind {
+    /// The run's own ending or result.
+    EndingOrResult,
+    /// The `last completed work` (or `work`) heading.
+    Heading,
+    /// A pull request, push or comment.
+    Remote,
+    /// Failure detail, after the work it must not hide.
+    Failure,
+    /// A read-only work line.
+    Read,
+    /// Lower-priority facts: the work summary, activity, active/next.
+    Extra,
+}
+
+/// One Agent-screen row, already ordered and fitted to the card width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    pub kind: AgentRowKind,
+    pub text: String,
+}
+
+/// The one ordered row plan for the Agent screen. Every Agent layout asks this
+/// function instead of building its own order: ending/result, completed-work heading,
+/// remote work, failure detail, reads, then lower-priority facts.
+pub fn agent_rows(agent: &AgentView, width: usize) -> Vec<AgentRow> {
+    let mut rows = Vec::new();
+    let newest = agent.recent.last();
+    let running = matches!(agent.session, SessionState::Running { .. });
+    let mut own: Option<String> = None;
+
+    if running {
+        if let Some(retrying) = retry_line(agent) {
+            own = Some(retrying);
+        } else if let Some(activity) = activity(agent) {
+            own = Some(activity);
+        } else if let Some(changed) = active_next_line(agent) {
+            own = Some(changed);
+        }
+    } else if newest.is_some() {
+        let result = if matches!(
+            newest,
+            Some(SessionEnd::Succeeded | SessionEnd::Warned { .. })
+        ) && agent.last_result_is_work
+        {
+            agent
+                .last_work_result
+                .as_deref()
+                .or(agent.last_result.as_deref())
+                .map(|summary| format!("result: {}", first_clause(summary)))
+        } else {
+            None
+        };
+        own = result.or_else(|| run_result_line(agent));
+    }
+    if let Some(line) = own.clone() {
+        rows.push(AgentRow {
+            kind: AgentRowKind::EndingOrResult,
+            text: line,
+        });
+    }
+
+    let stopped = matches!(newest, Some(SessionEnd::Stopped { .. }));
+    if !agent.last_work.is_empty() {
+        let newest_work = if stopped {
+            newest_work_phrase(agent)
+        } else {
+            None
+        };
+        let heading = match newest_work.as_deref() {
+            Some(work) => format!("last completed work: {work}"),
+            None if stopped => "last completed work".to_owned(),
+            None => "work".to_owned(),
+        };
+        rows.push(AgentRow {
+            kind: AgentRowKind::Heading,
+            text: heading,
+        });
+        let work = ordered_work_lines(agent);
+        let mut remote = Vec::new();
+        let mut reads = Vec::new();
+        for line in work {
+            if is_read_work_line(&line) {
+                reads.push(line);
+            } else {
+                remote.push(line);
+            }
+        }
+        // The stopped heading already names the newest work word; do not spend a
+        // second row repeating that same request/comment when another remote row
+        // still identifies the rest of the work.
+        if stopped
+            && remote.len() >= 2
+            && newest_work.as_deref().is_some_and(|work| {
+                work.starts_with("PR ")
+                    || work.starts_with("comment on ")
+                    || work.starts_with("branch ")
+            })
+        {
+            remote.pop();
+        }
+        for line in remote {
+            rows.push(AgentRow {
+                kind: AgentRowKind::Remote,
+                text: display_work_line(agent, &line),
+            });
+        }
+        // Failure follows the remote work it must not hide. Reads stay below it so a
+        // read can never take the row of the run's own result or of a failure.
+        for line in failure_rows(agent, width) {
+            rows.push(AgentRow {
+                kind: AgentRowKind::Failure,
+                text: line,
+            });
+        }
+        for line in reads {
+            rows.push(AgentRow {
+                kind: AgentRowKind::Read,
+                text: line,
+            });
+        }
+    } else {
+        if agent.no_assigned_work {
+            rows.push(AgentRow {
+                kind: AgentRowKind::Remote,
+                text: format!("no issues assigned to {} yet", agent.login),
+            });
+        }
+        for line in failure_rows(agent, width) {
+            rows.push(AgentRow {
+                kind: AgentRowKind::Failure,
+                text: line,
+            });
+        }
+    }
+
+    // Lower-priority facts. The `last work` summary stays available on a roomy card
+    // even when the run's own `result:` took the first row.
+    let run_line = run_result_line(agent);
+    if own.as_deref() != run_line.as_deref()
+        && let Some(line) = run_line
+    {
+        rows.push(AgentRow {
+            kind: AgentRowKind::Extra,
+            text: line,
+        });
+    }
+    if (!running || own.as_deref() != retry_line(agent).as_deref())
+        && let Some(activity) = activity(agent)
+        && own.as_deref() != Some(activity.as_str())
+    {
+        rows.push(AgentRow {
+            kind: AgentRowKind::Extra,
+            text: activity,
+        });
+    }
+    if let Some(changed) = active_next_line(agent)
+        && own.as_deref() != Some(changed.as_str())
+    {
+        rows.push(AgentRow {
+            kind: AgentRowKind::Extra,
+            text: changed,
+        });
+    }
+    rows
+}
+
+/// The failure rows, fitted to the card width. The mark and the cause are the same
+/// ones every other surface uses.
+fn failure_rows(agent: &AgentView, width: usize) -> Vec<String> {
+    let mark = failure_mark(agent);
+    let text = if let Some(leftover) = agent.leftover.as_deref() {
+        Some(format!("{mark} {}", leftover_words(leftover)))
+    } else {
+        agent
+            .last_failure
+            .as_deref()
+            .map(|failure| {
+                format!(
+                    "{mark} {}",
+                    fit_tool_failure(failure, width.saturating_sub(2))
+                )
+            })
+            .or_else(|| {
+                agent
+                    .last_error
+                    .as_deref()
+                    .map(|error| format!("✗ {}", failure_words(error)))
+            })
+    };
+    text.map(|text| super::text::wrap(&text, width))
+        .unwrap_or_default()
+}
+
 /// The live state of one pull request in one repository, when the engine has read
 /// it. Numbering is per repository, so the number alone is never enough.
 pub fn pull_state<'a>(agent: &'a AgentView, repository: &str, number: u64) -> Option<&'a str> {
@@ -745,16 +940,22 @@ pub fn newest_work_phrase(agent: &AgentView) -> Option<String> {
             let state = repository
                 .and_then(|repository| pull_state(agent, repository, number))
                 .unwrap_or("open");
-            return Some(format!("PR {} {state}", work_reference(repository, number)));
+            return Some(format!(
+                "PR {} {state}",
+                work_identity(repository, Some(number), None)
+            ));
         }
         if let Some((repository, number)) = comment_work_reference(line) {
-            return Some(format!("comment on {}", work_reference(repository, number)));
+            return Some(format!(
+                "comment on {}",
+                work_identity(repository, Some(number), None)
+            ));
         }
         if let Some((repository, branch)) = push_work_reference(line) {
-            return Some(match repository {
-                Some(repository) => format!("branch {branch} in {repository}"),
-                None => format!("branch {branch}"),
-            });
+            return Some(format!(
+                "branch {}",
+                work_identity(repository, None, Some(branch))
+            ));
         }
         return Some(line.clone());
     }
@@ -788,10 +989,50 @@ pub fn ordered_work_lines(agent: &AgentView) -> Vec<String> {
     remote
 }
 
+/// A work row as the Agent screen shows it. A pull request carries its live state
+/// beside the repository/number identity; other work is already complete.
+fn display_work_line(agent: &AgentView, line: &str) -> String {
+    let Some((repository, number)) = pull_work_reference(line) else {
+        return line.to_owned();
+    };
+    let Some(state) = repository
+        .and_then(|repository| pull_state(agent, repository, number))
+        .filter(|state| *state != "open")
+    else {
+        return line.to_owned();
+    };
+    let reference = work_identity(repository, Some(number), None);
+    let rest = line.strip_prefix("pull request ").unwrap_or(line);
+    let suffix = rest.strip_prefix(&reference).unwrap_or("").trim();
+    match suffix.is_empty() {
+        true => format!("pull request {reference} {state}"),
+        false => format!("pull request {reference} {state} {suffix}"),
+    }
+}
+
 /// Whether a work row is only a read, so the Agent screen can put remote work and
 /// a failure before it.
 pub fn is_read_work_line(line: &str) -> bool {
     line.starts_with("issue #")
+}
+
+/// Fit a work identity to `max` cells while keeping its repository. A push identity
+/// is `repository#branch`; when the branch is too long, only the branch is cut.
+pub fn fit_work_identity(identity: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if super::text::width(identity) <= max {
+        return identity.to_owned();
+    }
+    if let Some((repository, rest)) = identity.split_once('#') {
+        let prefix = format!("{repository}#");
+        let room = max.saturating_sub(super::text::width(&prefix));
+        if room >= 2 {
+            return format!("{prefix}{}", super::text::ellipsize(rest, room));
+        }
+    }
+    super::text::ellipsize_words(identity, max)
 }
 
 /// The mark that belongs with the last completed work word.
@@ -961,7 +1202,7 @@ pub fn last_work_word(agent: &AgentView) -> Option<String> {
             let state = repository
                 .and_then(|repository| pull_state(agent, repository, number))
                 .filter(|state| *state != "open");
-            let reference = work_reference(repository, number);
+            let reference = work_identity(repository, Some(number), None);
             best = Some(match state {
                 Some(state) => format!("{reference} {state}"),
                 None => reference,
@@ -971,16 +1212,13 @@ pub fn last_work_word(agent: &AgentView) -> Option<String> {
         if let Some(rest) = line.strip_prefix("issue #") {
             best = Some(format!("#{}", leading_number(rest)));
         } else if let Some((repository, number)) = comment_work_reference(line) {
-            best.get_or_insert_with(|| work_reference(repository, number));
+            best.get_or_insert_with(|| work_identity(repository, Some(number), None));
         } else if let Some((repository, branch)) = push_work_reference(line) {
-            // The card's bottom border has room for the branch when it fits; when
+            // The card's bottom border has room for the identity when it fits; when
             // it does not, the border's whole-word fit appends `…`. Take the whole
             // value here: a fixed seven-character cut made `fix/readme-typo` read
             // `fix/rea` with no sign that anything was missing.
-            best.get_or_insert_with(|| match repository {
-                Some(repository) => format!("{branch} in {repository}"),
-                None => branch.to_owned(),
-            });
+            best.get_or_insert_with(|| work_identity(repository, None, Some(branch)));
         } else if let Some(rest) = line.strip_prefix("local change ") {
             best.get_or_insert_with(|| rest.split(',').next().unwrap_or(rest).trim().to_owned());
         } else if line == "local commit" || line == "local git change" {
@@ -1001,29 +1239,23 @@ pub fn last_work_is_failure(agent: &AgentView) -> bool {
     newest_failure_word(agent).is_some()
 }
 
-/// The last-work identity (`#4`, `#3` or a short branch) without letting a later
-/// failure replace it. The compact floor uses this beside a cleanup code.
+/// The last-work identity (`repository#4`, a branch in its repository, or the older
+/// `#4`/bare branch) without letting a later failure replace it. The compact floor
+/// uses this beside a cleanup code.
 pub fn last_work_identity(agent: &AgentView) -> Option<String> {
     let mut best: Option<String> = None;
     for line in agent.last_work.iter().rev() {
         if let Some((repository, number)) = pull_work_reference(line) {
-            return Some(work_reference(repository, number));
+            return Some(work_identity(repository, Some(number), None));
         }
         if let Some(rest) = line.strip_prefix("issue #") {
             best = Some(format!("#{}", leading_number(rest)));
         } else if let Some((repository, number)) = comment_work_reference(line) {
-            best.get_or_insert_with(|| work_reference(repository, number));
-        } else if let Some((_repository, branch)) = push_work_reference(line) {
-            // The list line and the cleanup code have seven cells for a branch.
-            // A cut value says it was cut instead of silently reading as a whole
-            // branch name.
-            best.get_or_insert_with(|| {
-                if branch.chars().count() > 7 {
-                    format!("{}…", branch.chars().take(6).collect::<String>())
-                } else {
-                    branch.to_owned()
-                }
-            });
+            best.get_or_insert_with(|| work_identity(repository, Some(number), None));
+        } else if let Some((repository, branch)) = push_work_reference(line) {
+            // The dense floor row keeps the repository with the branch; the row's
+            // own fit decides how much of the identity is visible.
+            best.get_or_insert_with(|| work_identity(repository, None, Some(branch)));
         } else if let Some(rest) = line.strip_prefix("local change ") {
             best.get_or_insert_with(|| rest.split(',').next().unwrap_or(rest).trim().to_owned());
         } else if line == "local commit" || line == "local git change" {

@@ -63,8 +63,9 @@ requests are its own. The board shows the whole thing at a glance:
   `OpenCode`), its Forgejo login, its state, its newest work or failure mark and its run
   count. `run N` is the total from the run records, so it does not reset when an
   agent starts again or the program reopens. Open it with `⏎` for the Agent screen:
-  the last work block (typed, and kept until a later run does new work), the
-  instruction's first line, always, and `… (N more lines)` where N counts the
+  the run's own ending or result first, then the completed-work heading and its
+  remote work, then failure detail and reads; the last work block (typed, and kept
+  until a later run does new work), the instruction's first line, always, and `… (N more lines)` where N counts the
   document's **file** lines (not wrapped display rows); where no count row fits, the
   visible cut itself ends in `…`, the bounded run marks with
   their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ warning ■ stopped ◷ timed out`,
@@ -120,7 +121,7 @@ requests are its own. The board shows the whole thing at a glance:
   word follows its live state (`PR team/workspace#4 merged`,
   `PR team/workspace#4 closed`), refreshed from Forgejo while the board is open. The
   work fact keeps its repository, so a `#4` in another repository can never supply
-  this state. A request the product has not refreshed keeps the run's recorded word.
+  this state; a pushed branch is identified as `team/workspace#fix/x`. A request the product has not refreshed keeps the run's recorded word.
   Started agents keep
   a visible idle between runs (the Agent screen says `next run in 5s`; a card's shorter
   form is `next 5s`); a no-work or warned run's longer wait says

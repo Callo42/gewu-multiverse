@@ -65,7 +65,7 @@ fn a_push_with_no_comment_or_pull_request_is_work() {
     .expect("the push witness");
     assert_eq!(
         run::work_summary(&run_dir),
-        vec!["branch fix/only-push in team/website".to_owned()],
+        vec!["branch team/website#fix/only-push".to_owned()],
         "a push without a comment or pull request left no work row"
     );
     let _ = fs::remove_dir_all(&root);

@@ -336,6 +336,72 @@ fn a_stopped_run_keeps_completed_work_before_a_failure_at_the_small_sizes() {
 }
 
 #[test]
+fn a_successful_runs_result_stays_above_a_read_at_72x18() {
+    let mut worked = agent(1);
+    worked.recent = vec![SessionEnd::Succeeded];
+    worked.last_work = vec![
+        "issue #1".to_owned(),
+        "pull request team/workspace#4 from fix-readme-typo".to_owned(),
+    ];
+    worked.last_result = Some("Pull request opened".to_owned());
+    worked.last_work_result = Some("Pull request opened".to_owned());
+    worked.last_result_is_work = true;
+    worked.pull_states = vec![PullStateView {
+        repository: "team/workspace".to_owned(),
+        number: 4,
+        state: "merged".to_owned(),
+    }];
+    let mut board = mounted(vec![worked]);
+    open_agent(&mut board);
+    let frame = text(&draw(&mut board, 72, 18));
+    let result = frame
+        .find("result: Pull request opened")
+        .unwrap_or_else(|| panic!("72x18: the success result was pushed out:\n{frame}"));
+    let read = frame
+        .find("issue #1")
+        .unwrap_or_else(|| panic!("72x18: the read row is missing:\n{frame}"));
+    assert!(
+        result < read,
+        "72x18: a read outranked the run's own result:\n{frame}"
+    );
+    assert!(
+        frame.contains("team/workspace#4 merged"),
+        "72x18: the live request state was lost:\n{frame}"
+    );
+}
+
+#[test]
+fn the_dense_mixed_login_floor_row_keeps_a_push_repository() {
+    let mut board_view = view((1..=4).map(agent).collect());
+    board_view.agents[1].login = "alice".to_owned();
+    board_view.agents[1].last_work = vec!["branch team/workspace#fix/readme".to_owned()];
+    let mut board = Board::new(ViewEngine {
+        view: board_view,
+        sent: Arc::new(Mutex::new(Vec::new())),
+    });
+    let buffer = draw(&mut board, 72, 18);
+    let slot = board
+        .layout()
+        .listed
+        .iter()
+        .find(|slot| slot.agent == 1)
+        .expect("the mixed-login row")
+        .rect;
+    let mut row = String::new();
+    for x in slot.x..slot.right() {
+        row.push_str(buffer.cell((x, slot.y)).expect("a cell").symbol());
+    }
+    assert!(
+        row.contains("team/workspace"),
+        "the dense floor row lost the push repository: {row:?}"
+    );
+    assert!(
+        row.contains("fix/read"),
+        "the dense floor row lost the push branch: {row:?}"
+    );
+}
+
+#[test]
 fn a_stopped_run_with_one_pull_request_keeps_it_before_a_failure() {
     let mut stopped = agent(1);
     stopped.recent = vec![
@@ -436,11 +502,11 @@ fn a_merged_or_closed_request_is_not_shown_open() {
         for (width, height) in [(72, 18), (80, 24), (120, 40)] {
             let frame = text(&draw(&mut board, width, height));
             assert!(
-                frame.contains(&format!("PR team/workspace#4 {state}")),
+                frame.contains(&format!("team/workspace#4 {state}")),
                 "{width}x{height}: the live {state} state is missing:\n{frame}"
             );
             assert!(
-                !frame.contains("PR team/workspace#4 open"),
+                !frame.contains("team/workspace#4 open"),
                 "{width}x{height}: the run's recorded open state survived the {state}:\n{frame}"
             );
             assert!(
