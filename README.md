@@ -246,7 +246,10 @@ and you can change any of them later.
    proven on a real user-namespace host. Press `y` after you have read every one.
 2. **Set the model.** Give the full model address (it ends in `/chat/completions`), the
    model name, and the key. Press `t` to test it; `✓ the model answered` means it
-   works. The address suffix and an empty key are checked before anything is sent;
+   works. On an agent's own form the test also declares one Forgejo tool and requires
+   a tool call: `✓ the model called a tool` means that agent's tools work on the
+   connection, and a text-only answer fails with the tool the model did not call.
+   The address suffix and an empty key are checked before anything is sent;
    on a per-agent form `ctrl-u` then `⏎` clears that agent's stored key;
    every other failure names the provider's status and its own message, kept whole and
    wrapped to the form's rows at 80 columns (a 404 on a `/chat/completions` address

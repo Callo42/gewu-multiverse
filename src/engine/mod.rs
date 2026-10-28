@@ -3113,6 +3113,7 @@ impl EngineApi for Engine {
                 let Some(saved) = inner.settings.agent(&name).cloned() else {
                     return Err(format!("there is no agent named `{name}`"));
                 };
+                let program = saved.harness();
                 let protocol = saved
                     .provider()
                     .map(|provider| provider.protocol())
@@ -3140,9 +3141,10 @@ impl EngineApi for Engine {
                 let inner_arc = Arc::clone(&self.inner);
                 drop(inner);
                 std::thread::spawn(move || {
-                    let result = crate::model::probe_protocol(
-                        &base_url,
+                    let result = crate::model::probe_agent(
+                        program,
                         protocol,
+                        &base_url,
                         &model,
                         &key,
                         crate::model::PROBE_TIMEOUT,
@@ -3153,7 +3155,7 @@ impl EngineApi for Engine {
                             name,
                             match result {
                                 Ok(_) => EndpointTest::Passed {
-                                    answer: "the model answered".to_owned(),
+                                    answer: "the model called a tool".to_owned(),
                                 },
                                 Err(reason) => EndpointTest::Failed { reason },
                             },
@@ -7217,22 +7219,25 @@ mod tests {
     fn c3_the_per_agent_test_uses_that_agents_own_connection() {
         let root = scratch_root("engine-agent-test");
         let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
-        let stub = crate::test_stub::Stub::start(vec![crate::test_stub::StubReply::status(
-            200,
+        let stub = crate::test_stub::Stub::start(vec![crate::test_stub::StubReply::sse(format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
             serde_json::json!({
-                "model": "lab-chat-1",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "ok"}
-                }]
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "name": "mcp__gewu_forgejo__forgejo_list_assigned_issues",
+                    "arguments": "{}",
+                    "call_id": "call_1"
+                }
             })
-            .to_string(),
-        )]);
+        ))]);
         let base = stub.url().trim_end_matches("/chat/completions").to_owned();
-        settings.agent_mut("agent-1").expect("agent").provider = Some(settings::AgentProvider {
+        let agent = settings.agent_mut("agent-1").expect("agent");
+        agent.harness = "codex".to_owned();
+        agent.provider = Some(settings::AgentProvider {
             base_url: base,
-            protocol: "chat-completions".to_owned(),
+            protocol: "responses".to_owned(),
             model: "lab-chat-1".to_owned(),
         });
         settings
@@ -7253,7 +7258,7 @@ mod tests {
         wait_until("the per-agent model test", || {
             match &engine.board().agents[0].model_test {
                 EndpointTest::Passed { answer } => {
-                    assert_eq!(answer, "the model answered");
+                    assert_eq!(answer, "the model called a tool");
                     true
                 }
                 EndpointTest::Failed { reason } => panic!("the agent test failed: {reason}"),
@@ -7262,11 +7267,76 @@ mod tests {
         });
         let requests = stub.requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/v1/chat/completions");
+        assert_eq!(requests[0].path, "/v1/responses");
         assert_eq!(
             requests[0].header("authorization").as_deref(),
             Some("Bearer gw-test-key")
         );
+        assert!(
+            requests[0]
+                .body
+                .contains("mcp__gewu_forgejo__forgejo_list_assigned_issues"),
+            "{}",
+            requests[0].body
+        );
+    }
+
+    #[test]
+    fn c3_a_text_only_per_agent_test_names_the_missing_tool_call() {
+        let root = scratch_root("engine-agent-test-no-tool");
+        let mut settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
+        let stub = crate::test_stub::Stub::start(vec![crate::test_stub::StubReply::sse(format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"type": "response.created", "response": {"id": "resp_1"}}),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }
+            })
+        ))]);
+        let base = stub.url().trim_end_matches("/chat/completions").to_owned();
+        let agent = settings.agent_mut("agent-1").expect("agent");
+        agent.harness = "codex".to_owned();
+        agent.provider = Some(settings::AgentProvider {
+            base_url: base,
+            protocol: "responses".to_owned(),
+            model: "lab-chat-1".to_owned(),
+        });
+        settings
+            .save(&settings::path_in(
+                Layout::rooted_at(root.clone())
+                    .expect("the test layout is absolute")
+                    .root(),
+            ))
+            .expect("settings");
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, clock, fake);
+        engine
+            .send(Command::TestAgentModel {
+                name: "agent-1".to_owned(),
+            })
+            .expect("test");
+        wait_until("the failed per-agent model test", || {
+            match &engine.board().agents[0].model_test {
+                EndpointTest::Failed { reason } => {
+                    eprintln!("text-only model test: {reason}");
+                    assert!(reason.contains("did not call"), "{reason}");
+                    assert!(
+                        reason.contains("mcp__gewu_forgejo__forgejo_list_assigned_issues"),
+                        "{reason}"
+                    );
+                    true
+                }
+                EndpointTest::Passed { .. } => {
+                    panic!("a text-only answer passed a program test")
+                }
+                _ => false,
+            }
+        });
     }
 
     #[test]

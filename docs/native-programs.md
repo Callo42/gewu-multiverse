@@ -20,7 +20,19 @@ rewrite the native prompt, or write into a native session store.
 | `dsh` | 0.2.1-rc.2 | `@deepseek-ai/dsh` npm package, locked closure | MIT | Chat Completions, Responses, Anthropic Messages |
 | `opencode` | 2.1.4 | `@opencode/cli` npm package | MIT | Chat Completions, Responses, Anthropic Messages |
 
-Codex is Responses-only. Every package is installed by the product into
+Codex is Responses-only. Codex 0.164.0 declares MCP tools inside the Responses
+`namespace` extension, which a connection that speaks only plain function calling
+cannot see. For a Codex run the supervisor opens a second loopback transport in front
+of the configured model address: each nested tool is sent as a plain function named
+`<namespace>__<tool>`, and a plain function call is restored to the namespace shape
+Codex routes. The program keeps its internal tool identity while the connection sees
+only the plain protocol. A one-model catalog built from Codex's own metadata keeps a
+known model id on direct function tools rather than Responses Lite or code mode, so
+the same bridge covers both. The per-agent model test sends one Forgejo tool in that
+flat shape and requires a call back, so a text-only endpoint fails the test before a
+run.
+
+Every package is installed by the product into
 `<data-root>/harnesses/<id>/<version>/`, with `install.json` recording the exact
 program, version, official checksum/integrity, licence and entrypoint. An existing
 version is left alone. No program is downloaded unless the installer flag or the

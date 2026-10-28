@@ -42,6 +42,10 @@ struct NativeFiles {
     skills: Vec<PathBuf>,
     mcp_state: Option<PathBuf>,
     mcp_socket: Option<PathBuf>,
+    /// The run-private Responses bridge Codex should use, when one is running.
+    model_url: Option<String>,
+    /// The one-model catalog that keeps Codex on direct, plain-function tools.
+    model_catalog: Option<PathBuf>,
 }
 
 /// A supervisor-owned MCP server outside the native Landlock writable roots.
@@ -643,6 +647,42 @@ pub(super) fn run(
             return RunEnd::failed(format!(
                 "the native Git transport config cannot be written: {error}"
             ));
+        }
+    }
+
+    // Codex declares MCP tools inside the Responses `namespace` extension. The
+    // bridge makes the same tools plain functions on the wire and restores the
+    // namespace on the reply, so the connection needs only the plain protocol.
+    let model_proxy = if program == Program::Codex && protocol == Protocol::Responses {
+        // Codex's own stream-idle bound is 120 s. Keep the bridge's upstream
+        // read shorter so a stalled endpoint returns a plain 502 before Codex's
+        // timer fires, instead of leaving the supervisor waiting on the socket.
+        let bridge_timeout = Duration::from_secs(plan.timeout_secs.clamp(1, 110));
+        match crate::model_proxy::ModelProxy::start(&native.base_url, bridge_timeout) {
+            Ok(proxy) => {
+                files.model_url = Some(proxy.url());
+                log.line("Responses bridge: plain function tools");
+                Some(proxy)
+            }
+            Err(reason) => return RunEnd::failed(reason),
+        }
+    } else {
+        None
+    };
+    let _model_proxy = model_proxy;
+
+    // Codex reads model metadata by id; a known id can select Responses Lite or
+    // code mode, whose tool lists are not plain functions either. A one-model
+    // catalog keeps Codex's own instructions but pins the tool surface to direct
+    // function tools, which is the surface the bridge presents.
+    if program == Program::Codex && protocol == Protocol::Responses {
+        match write_codex_catalog(&files, &native.model) {
+            Ok(Some(path)) => {
+                files.model_catalog = Some(path);
+                log.line("Codex model metadata: direct function tools");
+            }
+            Ok(None) => {}
+            Err(reason) => log.line(&format!("Codex model metadata: {reason}")),
         }
     }
 
@@ -1266,6 +1306,8 @@ fn prepare_files(
         skills,
         mcp_state: None,
         mcp_socket: None,
+        model_url: None,
+        model_catalog: None,
     })
 }
 
@@ -1312,6 +1354,111 @@ fn opencode_request_ms(timeout_secs: u64) -> u64 {
 
 /// Build the program command, its extra environment and a short config description.
 type Launch = (Vec<String>, Vec<(String, String)>, String);
+
+/// Write a one-model Codex catalog that keeps the model's own instructions but
+/// selects direct function tools.
+///
+/// Codex's bundled metadata can choose Responses Lite or code mode for a known
+/// model id. Those shapes carry tools outside the plain `tools` array, so a plain
+/// endpoint cannot see them. The catalog is built from Codex's own
+/// `debug models` output, which keeps the base instructions and the
+/// `apply_patch` tool; only the transport-shaping flags change.
+fn write_codex_catalog(files: &NativeFiles, model: &str) -> Result<Option<PathBuf>, String> {
+    let home = files.root.join("codex");
+    std::fs::create_dir_all(&home)
+        .map_err(|error| format!("the Codex home cannot be created: {error}"))?;
+    let output = Command::new(&files.program)
+        .arg("debug")
+        .arg("models")
+        .env_clear()
+        .env("HOME", &files.home)
+        .env("CODEX_HOME", &home)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .output()
+        .map_err(|error| format!("Codex cannot list its models: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let catalog: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Codex's model list is not JSON: {error}"))?;
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let exact = models
+        .iter()
+        .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(model));
+    let direct = models.iter().find(|entry| {
+        entry.get("tool_mode").is_none_or(Value::is_null)
+            && entry.get("use_responses_lite") != Some(&Value::Bool(true))
+            && entry
+                .get("apply_patch_tool_type")
+                .is_some_and(|kind| !kind.is_null())
+    });
+    let Some(template) = exact.or(direct).or_else(|| models.first()) else {
+        return Ok(None);
+    };
+    let Some(entry) = template.as_object().cloned() else {
+        return Ok(None);
+    };
+    let mut entry = Value::Object(entry);
+    let object = entry.as_object_mut().expect("the entry is an object");
+    for (key, value) in [
+        ("slug", Value::String(model.to_owned())),
+        ("display_name", Value::String(model.to_owned())),
+        ("description", Value::String(model.to_owned())),
+        ("visibility", Value::String("list".to_owned())),
+        ("supported_in_api", Value::Bool(true)),
+        ("priority", Value::from(1)),
+        (
+            "apply_patch_tool_type",
+            Value::String("freeform".to_owned()),
+        ),
+        ("shell_type", Value::String("unified_exec".to_owned())),
+        ("web_search_tool_type", Value::String("text".to_owned())),
+        ("supports_search_tool", Value::Bool(false)),
+        ("supports_reasoning_summary_parameter", Value::Bool(false)),
+        (
+            "default_reasoning_summary",
+            Value::String("none".to_owned()),
+        ),
+        ("default_reasoning_level", Value::Null),
+        ("supported_reasoning_levels", Value::Array(Vec::new())),
+        ("support_verbosity", Value::Bool(false)),
+        ("default_verbosity", Value::Null),
+        ("use_responses_lite", Value::Bool(false)),
+        ("tool_mode", Value::Null),
+        ("multi_agent_version", Value::Null),
+        ("multi_agent_reasoning_effort", Value::Null),
+        ("supports_experimental_context", Value::Bool(false)),
+        ("supports_reasoning_effort_updates", Value::Bool(false)),
+        ("experimental_supported_tools", Value::Array(Vec::new())),
+        ("service_tiers", Value::Array(Vec::new())),
+        ("default_service_tier", Value::Null),
+        ("additional_speed_tiers", Value::Array(Vec::new())),
+        ("available_access_programs", Value::Null),
+        ("availability_nux", Value::Null),
+        ("upgrade", Value::Null),
+        ("guardian", Value::Null),
+        ("auto_compact_token_limit", Value::Null),
+        ("comp_hash", Value::Null),
+        ("node_repl_auto_review_required", Value::Bool(false)),
+        ("node_repl_disabled", Value::Bool(false)),
+        ("auto_review_model_override", Value::Null),
+        ("model_specialty", Value::Null),
+        ("include_plugin_usage_instructions", Value::Bool(false)),
+        ("include_apps_usage_instructions", Value::Bool(false)),
+    ] {
+        object.insert(key.to_owned(), value);
+    }
+    let path = home.join("model-catalog.json");
+    let text = serde_json::to_vec(&json!({"models": [entry]}))
+        .map_err(|error| format!("the Codex catalog cannot be written: {error}"))?;
+    crate::mode::write_private(&path, &text)
+        .map_err(|error| format!("the Codex catalog cannot be written: {error}"))?;
+    Ok(Some(path))
+}
 
 fn build_launch(
     plan: &crate::run::RunPlan,
@@ -1406,11 +1553,27 @@ fn build_launch(
             } else {
                 "workspace-write"
             };
+            // Codex declares MCP tools inside the Responses `namespace`
+            // extension. The run's bridge presents those tools as plain functions
+            // to the connection the person configured, so a plain endpoint sees
+            // callable tools; the socket is this run's own loopback address.
+            let base_url = files.model_url.as_deref().unwrap_or(&native.base_url);
+            let catalog = files
+                .model_catalog
+                .as_ref()
+                .map(|path| {
+                    format!(
+                        "model_catalog_json = {}\n",
+                        toml_string(&path.display().to_string())
+                    )
+                })
+                .unwrap_or_default();
             let mut config = format!(
-                "model = {}\nmodel_provider = \"gewu\"\napproval_policy = \"never\"\nsandbox_mode = {}\n\n[sandbox_workspace_write]\nnetwork_access = true\n\n[features]\nplugins = false\nrecommended_plugins = false\n\n[model_providers.gewu]\nname = \"gewu\"\nbase_url = {}\nwire_api = \"responses\"\nrequest_max_retries = 2\nstream_max_retries = 2\nstream_idle_timeout_ms = {}\n\n[model_providers.gewu.auth]\ncommand = {}\nargs = [\"--print-native-key\", {}]\n",
+                "{}model = {}\nmodel_provider = \"gewu\"\napproval_policy = \"never\"\nsandbox_mode = {}\nweb_search = \"disabled\"\n\n[sandbox_workspace_write]\nnetwork_access = true\n\n[features]\nplugins = false\nrecommended_plugins = false\nmulti_agent = false\n\n[model_providers.gewu]\nname = \"gewu\"\nbase_url = {}\nwire_api = \"responses\"\nrequest_max_retries = 2\nstream_max_retries = 2\nstream_idle_timeout_ms = {}\n\n[model_providers.gewu.auth]\ncommand = {}\nargs = [\"--print-native-key\", {}]\n",
+                catalog,
                 toml_string(&model),
                 toml_string(sandbox),
-                toml_string(&native.base_url),
+                toml_string(base_url),
                 budget.request_ms,
                 toml_string(&files.key_helper.display().to_string()),
                 toml_string(&files.key.display().to_string())
@@ -2301,6 +2464,8 @@ mod native_proof_tests {
             skills: Vec::new(),
             mcp_state: Some(state),
             mcp_socket: None,
+            model_url: None,
+            model_catalog: None,
         };
         let mut transcript = Transcript::open(&run_dir).expect("the transcript");
         let mut state = NativeState::default();
@@ -2433,6 +2598,8 @@ mod native_proof_tests {
             skills: Vec::new(),
             mcp_state: Some(state),
             mcp_socket: None,
+            model_url: None,
+            model_catalog: None,
         };
         let mut transcript = Transcript::open(&run_dir).expect("the transcript");
         let mut state = NativeState::default();
@@ -3039,5 +3206,55 @@ mod attempt_replay_tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    #[test]
+    fn a_codex_catalog_keeps_the_base_prompt_and_selects_direct_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "gewu-codex-catalog-{}-{}",
+            std::process::id(),
+            crate::time::now_unix_ms()
+        ));
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let program = root.join("fake-codex");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncat <<'EOF'\n{\"models\":[{\"slug\":\"gpt-5.6-sol\",\"tool_mode\":\"code_mode_only\",\"use_responses_lite\":true,\"apply_patch_tool_type\":\"freeform\",\"base_instructions\":\"You are Codex.\",\"model_messages\":{\"instructions_template\":\"You are Codex.\"}}]}\nEOF\n",
+        )
+        .expect("program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("program mode");
+        let files = NativeFiles {
+            root: root.clone(),
+            home,
+            tmp: root.join("tmp"),
+            config: root.join("config"),
+            key: root.join("model.key"),
+            key_helper: root.join("helper"),
+            program,
+            install_root: root.join("install"),
+            skills: Vec::new(),
+            mcp_state: None,
+            mcp_socket: None,
+            model_url: None,
+            model_catalog: None,
+        };
+        let path = write_codex_catalog(&files, "gpt-5.6-sol")
+            .expect("catalog")
+            .expect("one model");
+        let catalog: Value =
+            serde_json::from_slice(&std::fs::read(path).expect("catalog file")).expect("json");
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "gpt-5.6-sol");
+        assert_eq!(model["use_responses_lite"], false);
+        assert_eq!(model["tool_mode"], Value::Null);
+        assert_eq!(model["apply_patch_tool_type"], "freeform");
+        assert_eq!(
+            model["model_messages"]["instructions_template"],
+            "You are Codex."
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
