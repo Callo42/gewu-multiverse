@@ -577,7 +577,7 @@ fn the_terms_are_exact_and_all_shown_before_y_records_them() {
         "Agents use this computer with your permissions.",
         "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
         "Each has its own login on your Forgejo.",
-        "Started agents keep going until you stop them.",
+        "Started agents keep running while the product is open; quitting stops them, and they start again on reopen.",
         "Their work is sent to your model provider.",
     ];
     for (width, height) in SIZES {
@@ -1000,9 +1000,10 @@ fn the_72_column_board_keeps_every_agent_on_the_frame() {
                 .cell((wire_x, wire_y))
                 .expect("the wire above a card")
                 .symbol();
+            let below_arms = below.chars().next().map(arms).unwrap_or_default();
             assert!(
-                matches!(below, "│" | "┴" | "╵"),
-                "the vertical list has no spine above card {}: {below:?}",
+                below_arms & D != 0,
+                "the vertical list has no wire dropping into card {}: {below:?}",
                 card.agent
             );
         }

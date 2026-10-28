@@ -804,6 +804,80 @@ fn card_bottom_text_fitted(agent: &AgentView, card_h: u16, max_width: usize) -> 
     full
 }
 
+/// Fit a card's work line without losing the value the sentence exists for.
+///
+/// A branch name is one long token, so a whole-word cut after `branch` would say
+/// `last work: branch…` and drop the branch. When the line is a labelled branch,
+/// keep the label and cut the value itself with an ellipsis; every other line keeps
+/// the whole-word rule.
+fn fit_work_line(line: &str, max: usize) -> String {
+    if text_util::width(line) <= max {
+        return line.to_owned();
+    }
+    if let Some(value) = line.strip_prefix("last work: branch ") {
+        let prefix = "last work: branch ";
+        let room = max.saturating_sub(text_util::width(prefix) + 1);
+        if room >= 4 {
+            return format!("{prefix}{}", text_util::ellipsize(value, room));
+        }
+    }
+    text_util::ellipsize_words(line, max)
+}
+
+/// How many rows the current notice needs at this width. This is the one
+/// decision the layout and every draw path use, capped at two rows.
+fn notice_rows_for(board: &Board, width: usize) -> u16 {
+    let Some(text) = board.notice() else {
+        return 0;
+    };
+    text_util::wrap(text, width).len().clamp(1, 2) as u16
+}
+
+/// Wrap text into at most `max_rows` rows. A text longer than the reserved rows
+/// ends its last drawn row with `…`, so a reader is told the line was cut rather
+/// than shown a sentence that stops without a mark.
+fn wrap_limited(text: &str, width: usize, max_rows: u16) -> Vec<String> {
+    let mut parts = text_util::wrap(text, width);
+    if parts.len() > max_rows.max(1) as usize {
+        parts.truncate(max_rows.max(1) as usize);
+        if let Some(last) = parts.last_mut() {
+            if text_util::width(last) < width {
+                last.push('…');
+            } else {
+                *last = text_util::ellipsize(last, width);
+            }
+        }
+    }
+    parts
+}
+
+/// A notice's wrapped rows, empty when there is no notice.
+fn notice_lines(board: &Board, width: usize, rows: u16) -> Vec<String> {
+    let Some(text) = board.notice() else {
+        return Vec::new();
+    };
+    wrap_limited(text, width, rows)
+}
+
+/// Draw the board's notice from `bottom_row` upwards. Returns the rows used.
+fn draw_notice(board: &Board, buf: &mut Buffer, clip: Rect, width: usize, bottom_row: u16) -> u16 {
+    let rows = notice_rows_for(board, width);
+    let parts = notice_lines(board, width, rows);
+    let rows = parts.len() as u16;
+    let start = bottom_row.saturating_add(1).saturating_sub(rows);
+    for (offset, part) in parts.iter().enumerate() {
+        text_util::put(
+            buf,
+            clip,
+            clip.x + 1,
+            start + offset as u16,
+            part,
+            theme::bold(theme::AMBER),
+        );
+    }
+    rows
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     buf: &mut Buffer,
@@ -973,7 +1047,7 @@ fn draw_card(
                 interior,
                 interior.x + 1,
                 rect.y + 3,
-                &text_util::ellipsize_words(&line, width),
+                &fit_work_line(&line, width),
                 theme::card(colour, selected),
             );
         }
@@ -1044,10 +1118,26 @@ struct GridGeometry {
     grid_start: u16,
 }
 
-/// Whether the bottom footer row has something to say: a notice, a waiting
-/// sentence, or the negative confinement line.
-fn status_row_needed(board: &Board) -> bool {
-    board.notice().is_some() || waiting_sentence(board).is_some() || !board.view.confined
+/// The one bottom status sentence: a notice, a waiting cause, or the negative
+/// confinement line, in that order.
+fn status_sentence(board: &Board) -> Option<String> {
+    if let Some(notice) = board.notice() {
+        return Some(notice.to_owned());
+    }
+    if let Some(line) = waiting_sentence(board) {
+        return Some(line);
+    }
+    (!board.view.confined).then(|| "runs are not confined on this computer".to_owned())
+}
+
+/// The rows the status sentence needs at this width, capped at two.
+fn status_rows_for(board: &Board, width: usize) -> u16 {
+    if board.notice().is_some() {
+        return notice_rows_for(board, width);
+    }
+    status_sentence(board)
+        .map(|line| text_util::wrap(&line, width).len().clamp(1, 2) as u16)
+        .unwrap_or(0)
 }
 
 /// The agents the quit warning names: started, and running or restarting.
@@ -1129,23 +1219,25 @@ fn footer_rows_for(
     board_floor: u16,
     build: bool,
 ) -> u16 {
+    let width = inner.width.saturating_sub(2) as usize;
     if build {
-        return 2;
+        return 1 + notice_rows_for(board, width).max(1);
     }
-    if board.confirm_remove.is_some() {
-        return 2;
+    if let Some(name) = board.confirm_remove.as_deref() {
+        let (consequence, _keys) = remove_confirmation(name);
+        return text_util::wrap(&consequence, width).len().max(1) as u16
+            + 1
+            + notice_rows_for(board, width);
     }
     if board.confirm_quit {
-        let notice = u16::from(board.notice().is_some());
+        let notice = notice_rows_for(board, width);
         let budget = inner.height.saturating_sub(notice + board_floor).max(1);
         let line = quit_warning_text(board, inner.width, budget);
-        let warning = text_util::wrap(&line, inner.width.saturating_sub(2) as usize)
-            .len()
-            .max(1) as u16;
+        let warning = text_util::wrap(&line, width).len().max(1) as u16;
         return warning + notice;
     }
     let event = !board.view.forgejo.events.is_empty() && forgejo_h < 8;
-    2 + u16::from(status_row_needed(board)) + u16::from(event)
+    2 + status_rows_for(board, width) + u16::from(event)
 }
 
 /// How many agent rows fit inside the list box: the content rows minus the
@@ -1389,12 +1481,22 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
             bus_ys.push(bus_y);
             row_tops.push(bus_y + 1);
         }
-        let trunk_x = if columns == 1 {
-            card_junction_for(grid_start, card_w, card_h, board)
+        // Every card junction is fixed card geometry: no title, state word or
+        // selection marker can move a wire. A lone card drops straight from the
+        // Forgejo box, so the trunk is that card's own fixed junction; a stack
+        // drops from the box's centre into the gutter spine.
+        let single_column_rows = agent_count.div_ceil(columns).max(1);
+        let trunk_x = if columns == 1 && single_column_rows == 1 {
+            card_junction_for(Rect::new(grid_start, 0, card_w, card_h), card_h)
         } else {
             inner.x + inner.width / 2
         };
-        let spine_x = if columns == 1 {
+        let spine_x = if columns == 1 && single_column_rows > 1 {
+            // A vertical stack owns a gutter left of the cards. The spine runs
+            // there and each card is fed by its own bus row; the wire never enters
+            // or leaves a card's frame.
+            grid_start.saturating_sub(2).max(inner.x + 1)
+        } else if columns == 1 {
             trunk_x
         } else {
             choose_spine_x(inner, columns, card_w, gap, trunk_x, grid_start)
@@ -1429,33 +1531,6 @@ fn home_geometry(board: &Board, area: Rect, roomy: bool, build: bool) -> GridGeo
 /// between columns, and the one-cell margin inside the box.
 fn list_text_width(box_w: u16, columns: usize) -> u16 {
     box_w.saturating_sub(2).saturating_sub(columns as u16 - 1) / columns.max(1) as u16
-}
-
-/// The wire junction for a single-column grid.
-///
-/// The trunk is centred when the card's bottom label is short enough; when the
-/// label would reach the centre (the floor's identity, run count and failure
-/// word), the junction moves to just after the label. A connector is never drawn
-/// through a word (F-14), and the picture keeps one straight trunk.
-fn card_junction_for(x: u16, width: u16, card_h: u16, board: &Board) -> u16 {
-    let mut junction = x + width / 2 + 2;
-    for agent in &board.view.agents {
-        let label = card_bottom_text(agent, card_h);
-        // The label starts on x+1 with a cap. The tight three-row label has no
-        // padding; every other label has a space on each side.
-        let after = if card_h == 3 { 3 } else { 5 };
-        junction = junction.max(x + text_util::width(&label) as u16 + after);
-        if card_h <= 2 {
-            // A two-row card puts the name and state on the top border. A waiting
-            // state is longer than the bottom label, so the junction must clear both
-            // labels; otherwise the wait word is ellipsized on a card with room to
-            // spare (F3/F8).
-            let face = status::agent_face(agent);
-            let top = format!("{} {} · {}", face.symbol, agent.name, board_state(&face));
-            junction = junction.max(x + text_util::width(&top) as u16 + 5);
-        }
-    }
-    junction.clamp(x + 2, x + width.saturating_sub(2))
 }
 
 /// Choose a gap between full-row cards for the wrapped rows' vertical spine.
@@ -1510,6 +1585,18 @@ fn choose_spine_x(
 
 fn card_junction(rect: Rect) -> u16 {
     rect.x + rect.width / 2 + 2
+}
+
+/// The fixed junction for a card form. A two-row card carries the whole state
+/// line on its top border (including `next 251s · no work`), so its fixed drop
+/// leaves six cells of extra label room. The wider three-to-five-row cards carry
+/// only the name on that border and keep the centre junction.
+fn card_junction_for(rect: Rect, card_h: u16) -> u16 {
+    if card_h <= 2 {
+        rect.x + rect.width / 2 + 6
+    } else {
+        card_junction(rect)
+    }
 }
 
 /// The trunk leaves the Forgejo box at the window's centre when that is a gap, or
@@ -2000,9 +2087,10 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     let layout = if geometry.form == BoardForm::List {
         draw_agent_list(board, buf, &geometry, forgejo_rect, wire_style, area.x)
     } else {
-        if geometry.columns > 1
-            && let Some(first_bus) = geometry.bus_ys.first()
-        {
+        if let Some(first_bus) = geometry.bus_ys.first() {
+            // The Forgejo drop reaches its own centre. The rows between the box and
+            // the first bus are wire, at every column count; on the compact board
+            // the gap is zero and the bus row itself carries the joint.
             for y in forgejo_rect.bottom()..*first_bus {
                 put_arms(buf, buf.area, geometry.trunk_x, y, U | D, wire_style);
             }
@@ -2044,18 +2132,15 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                 } else {
                     agent.name.clone()
                 };
-                let junction = if geometry.columns == 1 {
+                // One junction rule at every size: the drop is a fixed point on
+                // the card's top border. It does not follow the title text, so
+                // moving the selection cannot move the line. A lone card sits
+                // under the Forgejo box's own centre, so the wire is one straight
+                // drop with no bus stub beside it.
+                let junction = if geometry.columns == 1 && geometry.visible_rows == 1 {
                     geometry.trunk_x
                 } else {
-                    // On a short card the top border also carries the state (and the
-                    // compact form's work word), so the wire must clear the whole
-                    // visible label, not just the name.
-                    let top_label = if geometry.card_h <= 2 {
-                        format!("{} {}", agent.name, board_state(&status::agent_face(agent)))
-                    } else {
-                        title.clone()
-                    };
-                    card_junction_after_title(rect, &top_label)
+                    card_junction_for(rect, rect.height)
                 };
                 junctions.push(junction);
                 rects.push((agent_index, rect, selected, title, junction));
@@ -2084,45 +2169,14 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
                     wire_style,
                 );
             }
-            if geometry.columns == 1 {
-                let from = if row == 0 {
-                    forgejo_rect.bottom()
-                } else {
-                    geometry.row_tops[row - 1] + geometry.card_h
-                };
-                for wire_y in from..y {
-                    put_arms(buf, buf.area, junctions[0], wire_y, U | D, wire_style);
-                }
-                if row > 0 {
-                    put_arms(
-                        buf,
-                        buf.area,
-                        junctions[0],
-                        geometry.row_tops[row - 1] + geometry.card_h - 1,
-                        L | R | D,
-                        wire_style,
-                    );
-                }
-            }
             for (agent_index, rect, selected, _title, junction) in rects {
                 let Some(agent) = board.view.agents.get(agent_index) else {
                     continue;
                 };
-                // The number of content cells the bottom label may use. On a
-                // single-column grid the wire lands on that border, so the label
-                // stops before the junction; there the three-row card uses the
-                // tight (unpadded) label so it keeps the state and HTTP status.
-                // On a multi-column grid the bottom border keeps its full width.
-                let label_room = if geometry.columns == 1 {
-                    if rect.height == 3 {
-                        junction.saturating_sub(rect.x + 3) as usize
-                    } else {
-                        junction.saturating_sub(rect.x + 5) as usize
-                    }
-                } else if rect.height == 3 {
-                    // A three-row card's bottom border has no junction on a
-                    // multi-column grid: use its whole inner width, so the wait
-                    // word and the short last-work word both fit.
+                // The connector lands on the top border only. The bottom border
+                // therefore has its whole inner width for the last-work word, at
+                // every size and in both board forms.
+                let label_room = if rect.height == 3 {
                     rect.width.saturating_sub(2) as usize
                 } else if rect.height <= 2 {
                     rect.width.saturating_sub(8) as usize
@@ -2161,14 +2215,6 @@ fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     } else {
         draw_home_footer(board, buf, inner);
     }
-}
-
-/// The junction on a card's top border, just after its title. Placing it after
-/// the name (rather than half-way across the card) keeps the whole title and the
-/// whole state word even when a crowded row makes the cards narrow.
-fn card_junction_after_title(rect: Rect, title: &str) -> u16 {
-    let width = text_util::width(title) as u16;
-    (rect.x + 2 + 1 + width + 3).clamp(rect.x + 6, rect.right().saturating_sub(3))
 }
 
 /// The picker's bus: the same drawing as the board's, with the old argument list.
@@ -2273,11 +2319,12 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     let footer_rows = board.last.footer_rows;
     let footer_top = inner.bottom().saturating_sub(footer_rows);
     if board.confirm_quit {
-        let notice = board.notice();
         let width = inner.width.saturating_sub(2) as usize;
-        // The warning owns everything the geometry gave it except the notice's
-        // one row: consequence, reopen sentence and confirmation are whole.
-        let budget = footer_rows.saturating_sub(u16::from(notice.is_some()));
+        // The warning owns everything the geometry gave it except the rows the
+        // one notice decision says the notice needs: consequence, reopen sentence
+        // and confirmation stay whole above it.
+        let notice_rows = notice_rows_for(board, width);
+        let budget = footer_rows.saturating_sub(notice_rows);
         let line = quit_warning_text(board, inner.width, budget);
         let parts = text_util::wrap(&line, width);
         for (offset, part) in (0..budget).zip(parts) {
@@ -2290,35 +2337,25 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
                 theme::bold(theme::AMBER),
             );
         }
-        if let Some(notice) = notice {
-            text_util::put(
-                buf,
-                inner,
-                inner.x + 1,
-                footer_top + footer_rows.saturating_sub(1),
-                &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
-                theme::fg(theme::FG),
-            );
-        }
+        draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
         return;
     }
 
     if let Some(name) = &board.confirm_remove {
-        // The consequences and the keys are both in the footer: a confirmation
-        // without its verb is a screen the person has to guess at (F6).
+        // The consequences, the keys and any current notice are all in the
+        // footer: a confirmation without its verb is a screen the person has to
+        // guess at, and hiding a notice would lose what the screen just said.
         let (consequence, keys) = remove_confirmation(name);
         let width = inner.width.saturating_sub(2) as usize;
-        for (offset, part) in text_util::wrap(&consequence, width)
-            .into_iter()
-            .take(1)
-            .enumerate()
-        {
+        let parts = text_util::wrap(&consequence, width);
+        let keys_row = footer_top + parts.len().max(1) as u16;
+        for (offset, part) in parts.iter().enumerate() {
             text_util::put(
                 buf,
                 inner,
                 inner.x + 1,
                 footer_top + offset as u16,
-                &part,
+                part,
                 theme::bold(theme::AMBER),
             );
         }
@@ -2326,10 +2363,11 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
             buf,
             inner,
             inner.x + 1,
-            footer_top + 1,
+            keys_row,
             &keys,
             theme::bold(theme::AMBER),
         );
+        draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
         return;
     }
     text_util::put(
@@ -2421,33 +2459,23 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
     }
     // The status line owns the row the geometry reserved after the event, if
     // any was reserved; it is never written into an unreserved row.
-    let status_reserved = footer_rows > 2 + u16::from(event.is_some());
-    if status_reserved {
-        if let Some(notice) = board.notice() {
+    let status_rows = footer_rows.saturating_sub(2 + u16::from(event.is_some()));
+    let width = inner.width.saturating_sub(2) as usize;
+    if board.notice().is_some() {
+        draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
+    } else if status_rows > 0
+        && let Some(line) = status_sentence(board)
+    {
+        for (offset, part) in wrap_limited(&line, width, status_rows)
+            .into_iter()
+            .enumerate()
+        {
             text_util::put(
                 buf,
                 inner,
                 inner.x + 1,
-                status_y,
-                &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
-                theme::fg(theme::FG),
-            );
-        } else if let Some(line) = waiting_sentence(board) {
-            text_util::put(
-                buf,
-                inner,
-                inner.x + 1,
-                status_y,
-                &text_util::ellipsize(&line, inner.width.saturating_sub(2) as usize),
-                theme::fg(theme::AMBER),
-            );
-        } else if !board.view.confined {
-            text_util::put(
-                buf,
-                inner,
-                inner.x + 1,
-                status_y,
-                "runs are not confined on this computer",
+                status_y + offset as u16,
+                &part,
                 theme::fg(theme::AMBER),
             );
         }
@@ -2468,10 +2496,12 @@ fn waiting_sentence(board: &Board) -> Option<String> {
 }
 
 fn draw_build_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
-    let y = inner.bottom().saturating_sub(2);
+    let width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, width).max(1);
+    let y = inner.bottom().saturating_sub(1 + notice_rows);
     let line = match &board.view.forgejo.state {
         ForgejoState::Failed { reason } => {
-            format!("✗ {}   r retry   q quit", status::plain(reason))
+            format!("r retry   q quit   ✗ {}", status::plain(reason))
         }
         _ => "q quit".to_owned(),
     };
@@ -2480,26 +2510,19 @@ fn draw_build_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
         inner,
         inner.x + 1,
         y,
-        &text_util::ellipsize(&line, inner.width.saturating_sub(2) as usize),
+        &text_util::ellipsize(&line, width),
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize(notice, inner.width.saturating_sub(2) as usize),
-            theme::fg(theme::FG),
-        );
-    }
+    draw_notice(board, buf, inner, width, inner.bottom().saturating_sub(1));
 }
 
 fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Before you start");
     let inner = inner(area);
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
-    let content_bottom = inner.bottom().saturating_sub(2);
+    let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
 
     let width = inner.width.saturating_sub(10) as usize;
@@ -2607,20 +2630,17 @@ fn draw_terms(board: &mut Board, buf: &mut Buffer, area: Rect) {
         buf,
         inner,
         inner.x + 1,
-        inner.bottom().saturating_sub(2),
+        content_bottom,
         &format!("{count} {wording}   y agree    n leave"),
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
@@ -2633,8 +2653,10 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
     };
     draw_outer(buf, area, &title);
     let inner = inner(area);
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
-    let content_bottom = inner.bottom().saturating_sub(2);
+    let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
     let form_width = inner.width.saturating_sub(8).clamp(40, 76).min(inner.width);
     let field_gap = if content_h >= 22 { 3 } else { 1 };
@@ -2786,20 +2808,17 @@ fn draw_model(board: &mut Board, buf: &mut Buffer, area: Rect) {
         buf,
         inner,
         inner.x + 1,
-        inner.bottom().saturating_sub(2),
-        &text_util::ellipsize_words(actions, inner.width.saturating_sub(2) as usize),
+        content_bottom,
+        &text_util::ellipsize_words(actions, notice_width),
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 fn field_text(board: &Board, index: usize, editing: bool) -> String {
@@ -2834,8 +2853,10 @@ fn field_text(board: &Board, index: usize, editing: bool) -> String {
 fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "How many agents?");
     let inner = inner(area);
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
-    let content_bottom = inner.bottom().saturating_sub(2);
+    let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
     let count = board.agent_count.max(1);
 
@@ -2964,20 +2985,17 @@ fn draw_picker(board: &mut Board, buf: &mut Buffer, area: Rect) {
         buf,
         inner,
         inner.x + 1,
-        inner.bottom().saturating_sub(2),
+        content_bottom,
         "⏎ create   ←→ count   esc back",
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 fn draw_preview_card(buf: &mut Buffer, rect: Rect) {
@@ -3005,8 +3023,10 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     let agent_title = format!("{} · {}", agent.name, agent.program_label);
     draw_outer(buf, area, &agent_title);
     let inner = inner(area);
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
-    let content_bottom = inner.bottom().saturating_sub(3);
+    let content_bottom = inner.bottom().saturating_sub(2 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
     let card_width = inner.width.saturating_sub(8).clamp(40, 90).min(inner.width);
     // The card is as tall as its content, not as tall as the window: the marks sit
@@ -3177,9 +3197,9 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
     }
     if let Some(failure) = failure_lines.first() {
         extras.push((failure.clone(), theme::card(theme::RED, true)));
-        // A 401/403 sentence keeps its provider clause and its `check the key`
-        // action at 80 columns: the rest of the wrapped refusal gets its own row
-        // before the result, rather than being cut at the right edge.
+        // A refusal keeps its provider clause and its action at 80 columns: the
+        // rest of the wrapped sentence gets its own row before the result, rather
+        // than being cut at the right edge.
         for line in failure_lines.iter().skip(1) {
             extras.push((line.clone(), theme::card(theme::RED, true)));
         }
@@ -3237,7 +3257,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             card,
             interior_x,
             extra_top + index as u16,
-            &text_util::ellipsize_words(notice, width),
+            &fit_work_line(notice, width),
             *style,
         );
     }
@@ -3459,7 +3479,7 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         }
     }
 
-    let actions_y = inner.bottom().saturating_sub(2);
+    let actions_y = inner.bottom().saturating_sub(1 + notice_rows);
     if let Some(name) = &board.confirm_remove {
         let (consequence, keys) = remove_confirmation(name);
         let width = inner.width.saturating_sub(2) as usize;
@@ -3487,7 +3507,13 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
         );
     } else {
         let line1 = "s start/stop  e instruction  p program  m model";
-        let line2 = "l log  t transcript  j raw  d remove  esc back";
+        // Only a Codex agent has the sandbox toggle, so only that screen promises
+        // the key. The Agent warning names the same key and now works here too.
+        let line2 = if agent.program == "codex" {
+            "l log  t transcript  j raw  d remove  f sandbox  esc back"
+        } else {
+            "l log  t transcript  j raw  d remove  esc back"
+        };
         text_util::put(
             buf,
             inner,
@@ -3505,16 +3531,13 @@ fn draw_agent(board: &mut Board, buf: &mut Buffer, area: Rect) {
             theme::fg(theme::MUTED),
         );
     }
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 /// Draw the instruction's first rows and a marker counted in **file** lines.
@@ -3690,7 +3713,12 @@ fn draw_instruction_rows(
 fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Agent program");
     let inner = inner(area);
-    let mut y = inner.y + 1;
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
+    // Start on the frame's first content row: an unknown saved program adds a line
+    // above the list, and the 72x18 picture needs every row for the wrapped Codex
+    // sentence and a two-row notice.
+    let mut y = inner.y;
     if let Some(unknown) = board.program_unknown.as_ref() {
         text_util::put(
             buf,
@@ -3801,15 +3829,21 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
         } else {
             "Codex sandbox: its own default · press f twice: removes Codex's own sandbox, keeps product Landlock"
         };
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            y,
-            &text_util::ellipsize_words(text, inner.width.saturating_sub(2) as usize),
-            theme::fg(theme::AMBER),
-        );
-        y += 1;
+        // This is a promise with two operative words: `press f twice` and what it
+        // removes. Wrap it rather than cutting either one at the 72-column floor
+        //.
+        let parts = text_util::wrap(text, inner.width.saturating_sub(2) as usize);
+        for (row, part) in parts.iter().take(2).enumerate() {
+            text_util::put(
+                buf,
+                inner,
+                inner.x + 1,
+                y + row as u16,
+                part,
+                theme::fg(theme::AMBER),
+            );
+        }
+        y += parts.len().min(2) as u16;
     }
     let width = inner.width.saturating_sub(2) as usize;
     if let Some(view) = board
@@ -4004,13 +4038,18 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
     // One sentence about what moving does, in the same place on every program and
     // above the keys. It stays on the 72x18 floor, where the extra explanation is
     // exactly what a wary person needs before pressing Enter.
-    let keeps = "keeps the instruction, workspace, login and history; applies to the next run";
-    let keeps_top = inner.bottom().saturating_sub(4);
-    for (row, part) in text_util::wrap(keeps, width)
-        .into_iter()
-        .take(2)
-        .enumerate()
-    {
+    // At 72 columns the wrapped Codex line spends the one spare row above this
+    // sentence, so the sentence is one shorter but still whole; wider screens keep
+    // the full wording and its second row.
+    let keeps = if inner.width < 80 {
+        "keeps instruction, workspace, login and history; applies next run"
+    } else {
+        "keeps the instruction, workspace, login and history; applies to the next run"
+    };
+    let keeps_parts = text_util::wrap(keeps, width);
+    let actions_y = inner.bottom().saturating_sub(1 + notice_rows);
+    let keeps_top = actions_y.saturating_sub(keeps_parts.len() as u16);
+    for (row, part) in keeps_parts.into_iter().take(2).enumerate() {
         text_util::put(
             buf,
             inner,
@@ -4035,27 +4074,26 @@ fn draw_program(board: &mut Board, buf: &mut Buffer, area: Rect) {
         buf,
         inner,
         inner.x + 1,
-        inner.bottom().saturating_sub(2),
-        &text_util::ellipsize_words(actions, inner.width.saturating_sub(2) as usize),
+        actions_y,
+        &text_util::ellipsize_words(actions, notice_width),
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Forgejo");
     let inner = inner(area);
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
-    let content_bottom = inner.bottom().saturating_sub(2);
+    let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
     let view = &board.view.forgejo;
     let label_x = inner.x + 2;
@@ -4216,20 +4254,17 @@ fn draw_forgejo(board: &mut Board, buf: &mut Buffer, area: Rect) {
         buf,
         inner,
         inner.x + 1,
-        inner.bottom().saturating_sub(2),
+        content_bottom,
         "p reset password   c copy   esc back",
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 /// The team's short name, from the one place that names it.
@@ -4244,8 +4279,10 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
         return;
     };
     let inner = inner(area);
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
-    let content_bottom = inner.bottom().saturating_sub(2);
+    let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
     let width = inner.width.saturating_sub(6) as usize;
     let mut lines: Vec<(String, Style, bool)> = vec![
@@ -4347,27 +4384,26 @@ fn draw_upgrade(board: &mut Board, buf: &mut Buffer, area: Rect) {
         buf,
         inner,
         inner.x + 1,
-        inner.bottom().saturating_sub(2),
+        content_bottom,
         "⏎ continue",
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
     draw_outer(buf, area, "Keys");
     let inner = inner(area);
+    let notice_width = inner.width.saturating_sub(2) as usize;
+    let notice_rows = notice_rows_for(board, notice_width).max(1);
     let content_top = inner.y;
-    let content_bottom = inner.bottom().saturating_sub(2);
+    let content_bottom = inner.bottom().saturating_sub(1 + notice_rows);
     let content_h = content_bottom.saturating_sub(content_top);
     let lines = [
         ("board", "←→ pick   ⏎ open   s start/stop"),
@@ -4425,20 +4461,17 @@ fn draw_help(board: &mut Board, buf: &mut Buffer, area: Rect) {
         buf,
         inner,
         inner.x + 1,
-        inner.bottom().saturating_sub(2),
+        content_bottom,
         "esc close",
         theme::fg(theme::MUTED),
     );
-    if let Some(notice) = board.notice() {
-        text_util::put(
-            buf,
-            inner,
-            inner.x + 1,
-            inner.bottom().saturating_sub(1),
-            &text_util::ellipsize_words(notice, inner.width.saturating_sub(2) as usize),
-            theme::bold(theme::AMBER),
-        );
-    }
+    draw_notice(
+        board,
+        buf,
+        inner,
+        notice_width,
+        inner.bottom().saturating_sub(1),
+    );
 }
 
 /// Paint the current screen.

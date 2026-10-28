@@ -116,7 +116,7 @@ because it describes every mechanism:
 Agents use this computer with your permissions.
 When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.
 Each has its own login on your Forgejo.
-Started agents keep going until you stop them.
+Started agents keep running while the product is open; quitting stops them, and they start again on reopen.
 Their work is sent to your model provider.
 ```
 
@@ -162,6 +162,7 @@ the model and tests it: `✓ the model answered`, or `✗` with one short reason
 Every other line is the provider's refusal and names its status and its own message
 (`✗ the provider answered HTTP 404: Add /v1 to the base URL`,
 `✗ the provider refused the API key (HTTP 401)`,
+`✗ the provider denied access to this model (HTTP 403)`,
 `✗ no model called <name> at this address (HTTP 404)`, `✗ no answer within 15 s`). A
 404 on a `/chat/completions` path whose address has no `/v1` says the repair first —
 `✗ add /v1 — the provider answered HTTP 404: …` — so the correction is on screen at
@@ -171,8 +172,11 @@ the provider's whole answer, not its first clause.
 `⏎` when no field is being edited saves and goes on. The verb is always `⏎ next`,
 whether the screen was opened on the first run or by `m`. An empty key with no stored
 key is its own error — `✗ the API key is empty` — and sends nothing; a provider that
-never saw a request is never said to have refused it. The same notice line never says
-the model is saved when its own validation failed. `esc` leaves.
+never saw a request is never said to have refused it. On a per-agent form an emptied
+key is the explicit clear the release promises: the save removes that agent's stored
+key instead of keeping it, and the field stays empty when the form is reopened. The
+same notice line never says the model is saved when its own validation failed. `esc`
+leaves.
 
 ### 3. How many agents?
 
@@ -425,7 +429,10 @@ on the first-run screen. The selected card carries `▸` before its name on the 
 (and the selected list line before its mark), so a colour-blind or monochrome reader
 can see which agent `←→` targets; the tint is only reinforcement. The newest event,
 when the box cannot hold it, is on its own footer row under the keys. `BoardView.notice`
-is drawn once on the status line under the keys. It is cleaned before it
+is drawn wrapped onto the status rows under the keys (up to two rows, with `…` if a
+still longer sentence had to be cut). A quit or remove confirmation keeps the
+current notice and reserves its rows, so the confirmation does not hide what the
+screen just said. It is cleaned before it
 is drawn: the engine writes names in backticks, the board removes them, so a notice
 reads `agent-4 is connected as gewu-agent-4` and never shows the marks.
 
@@ -553,7 +560,7 @@ run (running or waiting for the next run):
 quits`. An agent that is started but has no instruction is not named.
 
 The footer geometry reserves exactly the rows the warning will draw: the wrapped
-warning itself plus one row for a notice, and the board above gives up those rows. The
+warning itself plus up to two rows for a notice, and the board above gives up those rows. The
 warning wraps on whole words, is never abbreviated, and the consequence, the reopen
 sentence and `q again quits` are always kept (at 72 and 80 columns with twelve agents
 it takes three rows). If a home past twelve had names so long that the warning would

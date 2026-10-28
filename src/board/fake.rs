@@ -28,7 +28,7 @@ const TERMS: [&str; 5] = [
     "Agents use this computer with your permissions.",
     "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
     "Each has its own login on your Forgejo.",
-    "Started agents keep going until you stop them.",
+    "Started agents keep running while the product is open; quitting stops them, and they start again on reopen.",
     "Their work is sent to your model provider.",
 ];
 
@@ -767,7 +767,7 @@ mod tests {
                 "Agents use this computer with your permissions.",
                 "Where runs are confined, they cannot read the product's keys, your home or another agent's files; they start with a cleared environment and still see /etc, /proc, /sys, /run, the installed tools and the network. The automatic confinement is Landlock; bwrap and unshare need GEWU_CONFINEMENT and are tested, not yet proven on a real host.",
                 "Each has its own login on your Forgejo.",
-                "Started agents keep going until you stop them.",
+                "Started agents keep running while the product is open; quitting stops them, and they start again on reopen.",
                 "Their work is sent to your model provider.",
             ]
         );

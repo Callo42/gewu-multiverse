@@ -317,31 +317,42 @@ fn c3_the_403_sentence_and_its_action_are_whole_on_the_agent_screen() {
     let (mut board, _sent) = board(view(vec![broken], installed_programs()));
     press(&mut board, KeyCode::Enter);
     let frame = frame_text(&mut board, 80, 24);
+    let flat = frame
+        .replace(['│', '╭', '╮', '╰', '╯', '─', '├', '┤', '┬', '┴', '┼'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        frame.contains("You do not have permission to use this model"),
-        "{frame}"
+        flat.contains("You do not have permission to use this model"),
+        "the provider's sentence is cut:\n{frame}"
     );
-    assert!(frame.contains("check the key"), "{frame}");
+    assert!(
+        flat.contains("access denied") && flat.contains("check the model and its access"),
+        "a 403 is still told as a key problem:\n{frame}"
+    );
+    assert!(!flat.contains("check the key"), "{frame}");
 }
 
 #[test]
 fn c3_an_empty_key_clears_the_bullets_and_the_footer_is_not_cut_midword() {
-    let (mut board, _sent) = board(view(vec![agent("agent-1", "pi")], installed_programs()));
+    let (mut board, sent) = board(view(vec![agent("agent-1", "pi")], installed_programs()));
     open_agent_model(&mut board);
     press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     press_ctrl(&mut board, 'u');
-    press(&mut board, KeyCode::Enter);
     let frame = frame_text(&mut board, 72, 18);
-    assert!(frame.contains("the API key is empty"), "{frame}");
-    assert!(
-        !frame.contains("••••••••"),
-        "the empty field kept its bullets:\n{frame}"
-    );
+    assert!(!frame.contains("••••••••"), "{frame}");
     assert!(!frame.contains("Start is the t"), "{frame}");
     assert!(
         frame.contains("t test") && frame.contains("esc back"),
         "{frame}"
+    );
+    press(&mut board, KeyCode::Enter);
+    assert!(
+        sent.lock().expect("sent").iter().any(|command| {
+            matches!(command, Command::SetAgentModel { key, .. } if key.as_deref() == Some(""))
+        }),
+        "the emptied key was refused instead of clearing the stored one"
     );
 }
 

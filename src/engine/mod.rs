@@ -113,7 +113,7 @@ pub const TERMS: &[&str] = &[
     "Agents use this computer with your permissions.",
     "When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.",
     "Each has its own login on your Forgejo.",
-    "Started agents keep going until you stop them.",
+    "Started agents keep running while the product is open; quitting stops them, and they start again on reopen.",
     "Their work is sent to your model provider.",
 ];
 
@@ -2863,8 +2863,9 @@ impl EngineApi for Engine {
                 {
                     return Err(error);
                 }
-                if key.as_deref().is_some_and(|key| key.trim().is_empty()) {
-                    return Err("the API key is empty; type it, then press ⏎".to_owned());
+                let clear_key = key.as_deref().is_some_and(|key| key.trim().is_empty());
+                if clear_key && credentials::model_key(&inner.credentials, &name).is_err() {
+                    return Err("the API key is empty; there is nothing to clear".to_owned());
                 }
                 if key.is_none() && credentials::model_key(&inner.credentials, &name).is_err() {
                     return Err("the API key is empty; type it, then press ⏎".to_owned());
@@ -2885,7 +2886,25 @@ impl EngineApi for Engine {
                     ));
                 }
                 inner.settings = next;
-                if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
+                if clear_key {
+                    // `an empty key clears the field` is a product promise: remove
+                    // the agent's stored key instead of refusing the save and
+                    // leaving the old one in place.
+                    if let Err(error) =
+                        credentials::remove_secret(&inner.credentials, Some("model_keys"), &name)
+                    {
+                        inner.settings = settings_before;
+                        let restore = inner.save_settings();
+                        return Err(match restore {
+                            Ok(()) => format!(
+                                "the model change was rolled back: the key could not be cleared ({error})"
+                            ),
+                            Err(restore_error) => format!(
+                                "the model change could not be restored after a key-clear failure ({error}); the settings file also failed to restore ({restore_error})"
+                            ),
+                        });
+                    }
+                } else if let Some(key) = key.filter(|key| !key.trim().is_empty()) {
                     if let Err(error) = credentials::record_secret(
                         &inner.credentials,
                         Some("model_keys"),
@@ -2920,7 +2939,17 @@ impl EngineApi for Engine {
                     None
                 };
                 inner.agents[index].program_hint = hint;
-                if inner.agents[index].running.is_some() {
+                if clear_key {
+                    if inner.agents[index].running.is_some() {
+                        inner.note(format!(
+                            "`{name}`'s API key cleared; connection saved for its next run; this run keeps its settings"
+                        ));
+                    } else {
+                        inner.note(format!(
+                            "`{name}`'s API key cleared; connection saved for its next run"
+                        ));
+                    }
+                } else if inner.agents[index].running.is_some() {
                     inner.note(format!(
                         "`{name}`'s connection is saved for its next run; this run keeps its settings"
                     ));
@@ -5502,7 +5531,7 @@ mod tests {
                 "Agents use this computer with your permissions.",
                 "When runs are confined, they cannot read the product's keys, your home or another agent's files, and they start with a cleared environment.",
                 "Each has its own login on your Forgejo.",
-                "Started agents keep going until you stop them.",
+                "Started agents keep running while the product is open; quitting stops them, and they start again on reopen.",
                 "Their work is sent to your model provider.",
             ]
         );
@@ -6189,10 +6218,11 @@ mod tests {
     /// Wave 36 C1: a warned run is not a success, so it must not take the five-second
     /// success loop. It enters the ordinary twenty-second watch interval instead; a
     /// deterministic script then cannot replay the same comment every few seconds.
-    /// Wave 36 C3: the engine refuses the same empty key the first-run form
-    /// refuses. A UI check is not enough for a command that can be sent directly.
+    /// Wave 36 C3: an empty key sent by an agent form is the clear the form
+    /// promises; with nothing stored it is still refused, so a save cannot leave
+    /// an agent without the key it had.
     #[test]
-    fn an_empty_key_is_not_saved_for_an_agent() {
+    fn an_empty_key_clears_a_stored_agent_key_and_is_refused_without_one() {
         let root = scratch_root("engine-empty-agent-key");
         let settings = write_ready(&root, &[("agent-1", Desired::Stopped)]);
         let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
@@ -6239,6 +6269,27 @@ mod tests {
                 key: Some("gw-test-key".to_owned()),
             })
             .expect("a present key saves");
+        assert!(
+            credentials::agent_model_key(&layout.credentials_file(), "agent-1")
+                .expect("the credentials file is readable")
+                .is_some(),
+            "the present key was not stored"
+        );
+        engine
+            .send(Command::SetAgentModel {
+                name: "agent-1".to_owned(),
+                base_url: "http://127.0.0.1:9/v1".to_owned(),
+                protocol: "chat-completions".to_owned(),
+                model: "demo".to_owned(),
+                key: Some(String::new()),
+            })
+            .expect("an empty key clears a stored key");
+        assert!(
+            credentials::agent_model_key(&layout.credentials_file(), "agent-1")
+                .expect("the credentials file is readable")
+                .is_none(),
+            "the cleared key is still stored"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

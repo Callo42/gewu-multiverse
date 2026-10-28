@@ -835,7 +835,11 @@ pub fn last_work_word(agent: &AgentView) -> Option<String> {
             best.get_or_insert_with(|| format!("#{}", leading_number(rest)));
         } else if let Some(rest) = line.strip_prefix("branch ") {
             let branch = rest.split_whitespace().next().unwrap_or(rest);
-            best.get_or_insert_with(|| branch.chars().take(7).collect());
+            // The card's bottom border has room for the branch when it fits; when
+            // it does not, the border's whole-word fit appends `…`. Take the whole
+            // value here: a fixed seven-character cut made `fix/readme-typo` read
+            // `fix/rea` with no sign that anything was missing.
+            best.get_or_insert_with(|| branch.to_owned());
         }
     }
     best
@@ -866,7 +870,16 @@ pub fn last_work_identity(agent: &AgentView) -> Option<String> {
             best.get_or_insert_with(|| format!("#{}", leading_number(rest)));
         } else if let Some(rest) = line.strip_prefix("branch ") {
             let branch = rest.split_whitespace().next().unwrap_or(rest);
-            best.get_or_insert_with(|| branch.chars().take(7).collect());
+            // The list line and the cleanup code have seven cells for a branch.
+            // A cut value says it was cut instead of silently reading as a whole
+            // branch name.
+            best.get_or_insert_with(|| {
+                if branch.chars().count() > 7 {
+                    format!("{}…", branch.chars().take(6).collect::<String>())
+                } else {
+                    branch.to_owned()
+                }
+            });
         }
     }
     best
@@ -958,7 +971,13 @@ pub fn failure_words(reason: &str) -> String {
             return format!("the model is temporarily unavailable (HTTP {code})");
         }
         let detail = provider_detail_after_status(reason, code);
-        let mut word = format!("HTTP {code}");
+        // A 403 is the provider denying access, not refusing the key; say so
+        // before the provider's own sentence.
+        let mut word = if code == 403 {
+            format!("access denied (HTTP {code})")
+        } else {
+            format!("HTTP {code}")
+        };
         match detail {
             Some(detail) => {
                 word.push_str(": ");
@@ -966,7 +985,10 @@ pub fn failure_words(reason: &str) -> String {
             }
             None => word.push_str(" from the model"),
         }
-        if matches!(code, 401 | 403) {
+        if code == 403 {
+            // Access to the model was denied; the key may be perfectly good.
+            word.push_str(" — check the model and its access");
+        } else if code == 401 {
             word.push_str(" — check the key");
         }
         return word;
