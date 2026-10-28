@@ -765,6 +765,47 @@ fn a_comment_survives_a_later_refused_update_as_success() {
 }
 
 #[test]
+fn a_read_only_check_is_no_work_and_keeps_its_sentence() {
+    // Walk B F2 through the built-in loop: list and read the assigned issue, write
+    // nothing, and end with the run's own no-work sentence. The recorded read fact
+    // is what decides the mark; the instruction's prose does not.
+    let root = scratch("read-only");
+    write_credentials(&root.join("credentials.toml"));
+    let _ = clone_fixture(&root);
+    let model = Stub::start(vec![
+        tool_reply("c1", "forgejo_list_assigned_issues", "{}"),
+        tool_reply(
+            "c2",
+            "forgejo_read_issue_or_pull",
+            &serde_json::json!({"repository": REPO, "number": 12}).to_string(),
+        ),
+        final_reply("no work — I read issue #12 and nothing needed changing."),
+    ]);
+    let forgejo = Stub::start_routed(standard_routes(serde_json::json!([])));
+    let layout = Layout::rooted_at(root.clone()).expect("the test layout is absolute");
+    let paths = layout.agent("scribe").expect("the agent path");
+    let run_dir = write_plan(&root, &paths, &model, "run-read-only-1", 6);
+    write_context(&run_dir, &forgejo);
+    assert!(run_binary(&run_dir).success());
+    let terminal = transcript::terminal_record(&run_dir).expect("the terminal record");
+    let (outcome, reason) = match terminal {
+        Record::RunFinished {
+            outcome, reason, ..
+        } => (outcome, reason.unwrap_or_default()),
+        other => panic!("no terminal record: {other:?}"),
+    };
+    let work = gewu_multiverse::run::work_summary(&run_dir);
+    assert_eq!(
+        outcome, "no_work",
+        "a read-only check is no work, not a command failure: {reason}"
+    );
+    // The built-in loop keeps the model's first clause as the card reason; the
+    // native supervisor keeps the whole sentence (covered in native-local-outcome).
+    assert_eq!(reason, "no work");
+    assert!(work.is_empty(), "a read is not work: {work:?}");
+}
+
+#[test]
 fn a_repository_outside_the_workspace_is_refused_with_one_actionable_sentence() {
     let root = scratch("outside");
     write_credentials(&root.join("credentials.toml"));
