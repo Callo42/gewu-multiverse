@@ -347,3 +347,34 @@ exit 1
         "{stderr}"
     );
 }
+
+#[test]
+fn a_legacy_archive_whose_forgejo_install_exits_nonzero_reports_did_not_finish() {
+    let release = Release::new(
+        "legacy-forgejo-fail",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'gewu-multiverse 0.1.99'; exit 0; fi
+if [ "$1" = "--install-forgejo" ]; then exit 7; fi
+exit 1
+"#,
+    );
+    let output = release
+        .command()
+        .args(["--harness", "none"])
+        .output()
+        .expect("install.sh runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the Forgejo download did not finish"),
+        "expected honest unfinished message: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Forgejo 17.0.0 is ready"),
+        "must not falsely claim Forgejo is ready: {stderr}"
+    );
+}

@@ -13,11 +13,15 @@ streams a source to a temporary file beside the target, hashes what it wrote, an
 renames the file into place only when the digest matches; a mismatch removes the
 temporary file and keeps nothing.
 
-The sources are tried in order: this release's own GitHub asset (tagged with the crate
-version), then the official Codeberg release. A missing or wrong first source falls
-through to the second with no question. Only when the whole list fails does the install
-refuse, keep nothing, and say the next start tries again. `GEWU_FORGEJO_BINARY` names a
-local file whose SHA-256 is checked the same way, for tests.
+The sources are tried in order: first a bundled companion binary beside the running
+executable (`./forgejo/forgejo-17.0.0-linux-amd64` or `./forgejo-17.0.0-linux-amd64`,
+shipped inside every release archive so installation needs no network), then this
+release's own GitHub asset (tagged with the crate version), then the official Codeberg
+release. A missing companion falls through to the download list, and a missing or wrong
+first download source falls through to the second with no question; a tampered local
+companion is refused immediately. Only when the whole list fails does the install
+refuse, keep nothing, and say the next start tries again. `GEWU_FORGEJO_BINARY` names an
+explicit local file whose SHA-256 is checked the same way.
 
 The first start installs the binary by itself when it is missing, and the build picture
 reports `downloading n%`. `gewu-multiverse --install-forgejo` runs the installer on its

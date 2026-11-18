@@ -436,15 +436,14 @@ fn a_medium_denied_read_keeps_permission_denied_at_72_and_80() {
     );
 }
 
-/// The baked upgrade line stays inside the evidence boundary: observed marks and
-/// checked cleanup of an ordinary earlier run, not perfect history or unconditional
-/// containment.
+/// The baked upgrade line stays inside the evidence boundary: it states the observable
+/// release capabilities without claiming perfect history or unconditional containment.
 #[test]
 fn the_upgrade_line_does_not_claim_perfect_marks_or_unconditional_containment() {
     let line = gewu_multiverse::engine::WHATS_NEW;
     assert!(!line.contains("never outlive"), "{line}");
     assert!(!line.contains("exactly what happened"), "{line}");
-    assert!(line.contains("what was observed"), "{line}");
-    assert!(line.contains("ordinary earlier run"), "{line}");
-    assert!(line.contains("cleanup checked"), "{line}");
+    assert!(line.contains("bundle verified Forgejo 17.0.0"), "{line}");
+    assert!(line.contains("offline install"), "{line}");
+    assert!(line.contains("--configure, --headless and --status"), "{line}");
 }

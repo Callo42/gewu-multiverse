@@ -1,14 +1,13 @@
 # Forgejo 17.0.0 for Linux amd64
 
 This is the pinned Forgejo binary distributed unmodified alongside
-**gewu-multiverse** (both inside the `x86_64-linux` release archive under
+**gewu-multiverse 0.1.41** (both inside the `x86_64-linux` release archive under
 `forgejo/` as a separate executable aggregation and as a standalone release
 asset).
 
 - **Upstream version:** Forgejo v17.0.0 (release tag `v17.0.0`).
-- **Source:** <https://codeberg.org/forgejo/forgejo/tree/v17.0.0>
-  (the same tag and source are mirrored at
-  <https://github.com/forgejo/forgejo/tree/v17.0.0>).
+- **Source:** <https://codeberg.org/forgejo/forgejo/src/tag/v17.0.0>
+  (`git clone --branch v17.0.0 https://codeberg.org/forgejo/forgejo.git`).
 - **Upstream asset:** `forgejo-17.0.0-linux-amd64`.
 - **SHA-256:** `5a3b07e124ed70b4e46ee3939515f003bd3cc85352257a9a4607a527251042ca`.
 - **Signature:** `forgejo-17.0.0-linux-amd64.asc`, made by the Forgejo release

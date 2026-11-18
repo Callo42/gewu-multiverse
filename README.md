@@ -195,7 +195,7 @@ a single-column connector is placed after the label so it never crosses the word
 After an upgrade, the first open shows one screen: the version this installation was,
 the version this is, what was found (settings, agents, instructions and runs), what is
 reused or ignored, one line from this release's notes naming what changed, and the
-release page address for this exact build (`…/releases/tag/v0.1.40`). If the first-run warnings changed since this installation last
+release page address for this exact build (`…/releases/tag/v0.1.41`). If the first-run warnings changed since this installation last
 agreed to them, the screen says so and the next screen shows them again; after they are
 agreed the program returns to the board, never into the first-run model and picker
 flow. The next open goes straight to the board. The installer records the old version before it replaces the binary, and a
@@ -208,6 +208,8 @@ One line, no Rust:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
+# Air-gapped / offline install from a pre-downloaded release archive (no network fetch):
+sh install.sh --tarball ./gewu-multiverse-*-x86_64-linux.tar.gz [--checksum ./file.sha256] --harness none
 # Pi is installed by default. Other official programs are explicit:
 sh install.sh --harness pi,codex
 sh install.sh --harness none        # no agent program; a new agent still starts as Pi
@@ -221,9 +223,12 @@ The one-liner trusts the TLS connection to GitHub and the repository's release p
 the checksum detects a damaged download, not a replaced release — and the bundled
 Forgejo binary is additionally pinned by digest and signed upstream.
 
-It downloads the current prebuilt program to `~/.local/bin/gewu-multiverse`, the
-Forgejo it needs (about 122 MB), and the one agent program you named (Pi by default)
-to `~/.local/share/gewu-multiverse/`. Every package is checked against its published
+The release `.tar.gz` archive carries both the prebuilt `gewu-multiverse` binary
+(installed to `~/.local/bin/gewu-multiverse`) and the unmodified, GPG-verified
+`forgejo-17.0.0-linux-amd64` executable under `forgejo/` (installed into
+`~/.local/share/gewu-multiverse/` with zero second-stage Forgejo download). Unless you
+pass `--harness none` (for example on an offline host), the installer then fetches the
+one agent program you named (Pi by default) into `~/.local/share/gewu-multiverse/`. Every package is checked against its published
 SHA-256 or npm integrity. DeepSeek Harness needs Node 24.9 or newer and npm 11.16.0
 or newer (older npm ignores the reviewed install-script policy); its locked closure
 is about 613 packages and 753 MB. Nothing else is downloaded unless

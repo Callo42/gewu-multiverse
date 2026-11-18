@@ -102,10 +102,9 @@ pub const TERMS_VERSION: u32 = 2;
 
 /// The one line from this release's notes that the upgrade screen shows.
 ///
-/// It stays inside what the product can observe: marks name the evidence the run
-/// reported, and an ordinary earlier run is stopped with its cleanup checked. It does
-/// not promise perfect shell interpretation or containment of detached processes.
-pub const WHATS_NEW: &str = "run marks name what was observed; an ordinary earlier run is stopped and its cleanup checked before the board reopens";
+/// It stays inside what the product can observe and does not promise perfect shell
+/// interpretation or unconditional containment of detached processes.
+pub const WHATS_NEW: &str = "release archives bundle verified Forgejo 17.0.0 for offline install, and --configure, --headless and --status run without a terminal";
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.

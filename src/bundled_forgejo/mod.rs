@@ -170,19 +170,26 @@ pub fn install_forgejo_at(
 pub fn install_forgejo_at_with_exe(
     data_root: &Path,
     current_exe: Option<&Path>,
+    progress: impl FnMut(InstallProgress),
+) -> Result<PathBuf, String> {
+    let env_local = std::env::var_os("GEWU_FORGEJO_BINARY")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    install_forgejo_at_with_overrides(data_root, current_exe, env_local.as_deref(), progress)
+}
+
+fn install_forgejo_at_with_overrides(
+    data_root: &Path,
+    current_exe: Option<&Path>,
+    env_override: Option<&Path>,
     mut progress: impl FnMut(InstallProgress),
 ) -> Result<PathBuf, String> {
     let target = binary_path(data_root);
     if is_pinned(&target) {
         return Ok(target);
     }
-    if let Some(local) = std::env::var_os("GEWU_FORGEJO_BINARY") {
-        let local = PathBuf::from(local);
-        if local.as_os_str().is_empty() {
-            // An explicitly empty variable is the same as one that is not set.
-        } else {
-            return install_local(&local, &target, SHA256, &mut progress);
-        }
+    if let Some(local) = env_override {
+        return install_local(local, &target, SHA256, &mut progress);
     }
     if let Some(exe) = current_exe
         && let Some(candidates) = companion_binary_candidates(exe)
@@ -2048,7 +2055,7 @@ esac
         fs::write(&fake_exe, b"exe").expect("fake exe");
         fs::write(companion_dir.join(ASSET), b"tampered-forgejo-bytes").expect("tampered");
         let data_root = root.join("data");
-        let error = install_forgejo_at_with_exe(&data_root, Some(&fake_exe), |_| {})
+        let error = install_forgejo_at_with_overrides(&data_root, Some(&fake_exe), None, |_| {})
             .expect_err("tampered companion must be refused");
         assert!(error.contains("pinned SHA-256"), "{error}");
         assert!(!binary_path(&data_root).exists());

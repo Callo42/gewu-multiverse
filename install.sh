@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
 #
 #   sh install.sh v0.1.0            # a specific release tag instead of the latest
-#   sh install.sh --tarball ./gewu-multiverse-*-x86_64-linux.tar.gz
+#   sh install.sh --tarball ./gewu-multiverse-*-x86_64-linux.tar.gz [--checksum ./file.sha256]
 #   sh install.sh --harness pi,codex
 #   GEWU_HARNESSES=pi,opencode sh install.sh
 #   INSTALL_DIR=$HOME/bin sh install.sh
