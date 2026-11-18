@@ -86,6 +86,8 @@ jobs:
           DIST_DIR: ${{ github.workspace }}/dist-a
         run: |
           set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          [ -n "$version" ] || { echo "cannot read Cargo.toml version" >&2; exit 1; }
           archive="$(find "$DIST_DIR" -maxdepth 1 -type f -name '*.tar.gz')"
           [ -n "$archive" ] || { echo "build A produced no archive" >&2; exit 1; }
           ( cd "$DIST_DIR" && sha256sum -c "$(basename "$archive").sha256" )
@@ -93,7 +95,7 @@ jobs:
           tar -xzf "$archive" -C "$unpack"
           bin="$(find "$unpack" -maxdepth 2 -type f -name gewu-multiverse)"
           [ -n "$bin" ] || { echo "no gewu-multiverse binary in the archive" >&2; exit 1; }
-          "$bin" --version | grep -Fx 'gewu-multiverse 0.1.40'
+          "$bin" --version | grep -Fx "gewu-multiverse $version"
 
       - name: Upload build A
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -165,6 +167,8 @@ jobs:
           DIST_DIR: ${{ github.workspace }}/dist-b-with-a-longer-name
         run: |
           set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          [ -n "$version" ] || { echo "cannot read Cargo.toml version" >&2; exit 1; }
           archive="$(find "$DIST_DIR" -maxdepth 1 -type f -name '*.tar.gz')"
           [ -n "$archive" ] || { echo "build B produced no archive" >&2; exit 1; }
           ( cd "$DIST_DIR" && sha256sum -c "$(basename "$archive").sha256" )
@@ -172,7 +176,7 @@ jobs:
           tar -xzf "$archive" -C "$unpack"
           bin="$(find "$unpack" -maxdepth 2 -type f -name gewu-multiverse)"
           [ -n "$bin" ] || { echo "no gewu-multiverse binary in the archive" >&2; exit 1; }
-          "$bin" --version | grep -Fx 'gewu-multiverse 0.1.40'
+          "$bin" --version | grep -Fx "gewu-multiverse $version"
 
       - name: Upload build B
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

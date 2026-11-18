@@ -1,7 +1,9 @@
 # Forgejo 17.0.0 for Linux amd64
 
-This is the pinned Forgejo binary shipped as a release asset by
-**gewu-multiverse 0.1.35**.
+This is the pinned Forgejo binary distributed unmodified alongside
+**gewu-multiverse** (both inside the `x86_64-linux` release archive under
+`forgejo/` as a separate executable aggregation and as a standalone release
+asset).
 
 - **Upstream version:** Forgejo v17.0.0 (release tag `v17.0.0`).
 - **Source:** <https://codeberg.org/forgejo/forgejo/tree/v17.0.0>
@@ -14,16 +16,19 @@ This is the pinned Forgejo binary shipped as a release asset by
   Forgejo primary key `EB11 4F5E 6C0D C2BC DD18 3550 A4B6 1A2D C592 3710`
   (`Forgejo <contact@forgejo.org>`).
 - **Licence:** the GNU General Public License, version 3 or later; `LICENSE` is
-  the upstream file at tag `v17.0.0`.
+  the upstream file at tag `v17.0.0`. `gewu-multiverse` itself remains licensed
+  under `MIT OR Apache-2.0`; the two executables are separate programs in one
+  archive (mere aggregation) and communicate only over local CLI/HTTP.
 - **Unmodified:** the binary is byte-for-byte the upstream release asset. It was
   not rebuilt, patched, stripped or otherwise changed for this release.
 - **Checked before publication:** `sha256sum -c forgejo-17.0.0-linux-amd64.sha256`
   and `gpg --verify forgejo-17.0.0-linux-amd64.asc forgejo-17.0.0-linux-amd64`
   both pass against the digest and key above.
 
-The product pins the same digest in its source and checks every download against
-it before renaming the file into place. The first download source is this
-release's own asset at
-`https://github.com/Callo42/gewu-multiverse/releases/download/v0.1.35/forgejo-17.0.0-linux-amd64`;
-the second is the official Codeberg release
+The product pins the same digest in its source and checks every local companion
+copy or download against it before renaming the file into place. When the
+companion `forgejo/forgejo-17.0.0-linux-amd64` file from the release archive is
+present, installation completes offline without any network request; otherwise
+the fallback download sources are the matching GitHub release asset and the
+official Codeberg release
 `https://codeberg.org/forgejo/forgejo/releases/download/v17.0.0/forgejo-17.0.0-linux-amd64`.

@@ -5,10 +5,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
 #
 #   sh install.sh v0.1.0            # a specific release tag instead of the latest
+#   sh install.sh --tarball ./gewu-multiverse-*-x86_64-linux.tar.gz
 #   sh install.sh --harness pi,codex
 #   GEWU_HARNESSES=pi,opencode sh install.sh
 #   INSTALL_DIR=$HOME/bin sh install.sh
 #
+# Release archives include the verified Forgejo 17.0.0 binary under forgejo/, so
+# installing from a release archive (online or via --tarball) prepares Forgejo
+# without a second download.
 # The default program is Pi. --harness none installs no agent program.
 # A new agent still starts as Pi (not installed) until the built-in engine is chosen.
 # Ctrl-C during a download, unpack or program install cancels it; the binary that
@@ -21,6 +25,8 @@ set -eu
 
 repo=Callo42/gewu-multiverse
 tag=
+local_tarball=
+local_checksum=
 harnesses=${GEWU_HARNESSES:-pi}
 dir=${INSTALL_DIR:-$HOME/.local/bin}
 floor=2.39
@@ -42,6 +48,28 @@ while [ "$#" -gt 0 ]; do
             harnesses=${1#--harness=}
             shift
             ;;
+        --tarball)
+            [ "$#" -ge 2 ] || die "--tarball needs a path to a .tar.gz archive"
+            [ -n "$2" ] || die "--tarball needs a path to a .tar.gz archive"
+            local_tarball=$2
+            shift 2
+            ;;
+        --tarball=*)
+            local_tarball=${1#--tarball=}
+            [ -n "$local_tarball" ] || die "--tarball needs a path to a .tar.gz archive"
+            shift
+            ;;
+        --checksum)
+            [ "$#" -ge 2 ] || die "--checksum needs a path to a .sha256 file"
+            [ -n "$2" ] || die "--checksum needs a path to a .sha256 file"
+            local_checksum=$2
+            shift 2
+            ;;
+        --checksum=*)
+            local_checksum=${1#--checksum=}
+            [ -n "$local_checksum" ] || die "--checksum needs a path to a .sha256 file"
+            shift
+            ;;
         --)
             shift
             [ "$#" -ge 1 ] && tag=$1
@@ -56,6 +84,19 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ -n "$local_checksum" ] && [ -z "$local_tarball" ]; then
+    die "--checksum can only be used together with --tarball"
+fi
+if [ -n "$local_tarball" ] && [ -n "$tag" ]; then
+    die "--tarball installs a local archive and cannot be combined with a release tag"
+fi
+if [ -n "$local_tarball" ]; then
+    [ -f "$local_tarball" ] || die "tarball $local_tarball not found"
+    if [ -n "$local_checksum" ]; then
+        [ -f "$local_checksum" ] || die "checksum file $local_checksum not found"
+    fi
+fi
 
 # Reject an unknown choice before downloading anything. The words are the same
 # names the product accepts on its Program screen.
@@ -72,7 +113,11 @@ IFS=$old_ifs
 [ "$(uname -s)" = "Linux" ] || die "only Linux is supported today ($(uname -s) found); build from source: cargo install --git https://github.com/$repo"
 [ "$(uname -m)" = "x86_64" ] || die "only x86_64 is built today ($(uname -m) found); build from source: cargo install --git https://github.com/$repo"
 
-for tool in curl tar sha256sum; do
+required_tools="tar gzip sha256sum"
+if [ -z "$local_tarball" ]; then
+    required_tools="curl $required_tools"
+fi
+for tool in $required_tools; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
 done
 
@@ -131,25 +176,48 @@ fi
 printf '%s\n' "$$" > "$lock/pid" || die "the lock cannot be written"
 printf '%s\n' "gewu-install-lock-v1" > "$lock/token" || die "the lock cannot be written"
 
-if [ -z "$tag" ]; then
-    tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
-        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-    [ -n "$tag" ] || die "no published release found; pass one: sh install.sh v0.1.0"
-fi
-
-json=$(curl -fsSL "https://api.github.com/repos/$repo/releases/tags/$tag") \
-    || die "release $tag not found"
-tarball=$(printf '%s' "$json" | grep -o 'gewu-multiverse-[A-Za-z0-9._-]*-x86_64-linux\.tar\.gz' | head -1)
-[ -n "$tarball" ] || die "release $tag carries no x86_64 Linux tarball"
-
-base="https://github.com/$repo/releases/download/$tag"
 tmp=$(mktemp -d) || die "a temporary directory cannot be created"
 trap cleanup EXIT
 
-say "downloading $tarball ($tag)"
-curl -fsSL -o "$tmp/$tarball" "$base/$tarball" || die "download failed"
-curl -fsSL -o "$tmp/$tarball.sha256" "$base/$tarball.sha256" || die "checksum download failed"
-( cd "$tmp" && sha256sum -c "$tarball.sha256" >/dev/null 2>&1 ) || die "checksum verification failed — refusing to install"
+if [ -n "$local_tarball" ]; then
+    tarball=$(basename "$local_tarball")
+    case "$tarball" in
+        *.tar.gz) ;;
+        *) die "--tarball must name a .tar.gz archive (got $tarball)" ;;
+    esac
+    cp "$local_tarball" "$tmp/$tarball" || die "local archive $local_tarball cannot be read"
+    checksum_src=$local_checksum
+    if [ -z "$checksum_src" ] && [ -f "$local_tarball.sha256" ]; then
+        checksum_src="$local_tarball.sha256"
+    fi
+    if [ -n "$checksum_src" ]; then
+        expected_digest=$(awk 'NR==1 { print $1 }' "$checksum_src")
+        case "$expected_digest" in
+            ''|*[!0-9a-fA-F]*) die "checksum file $checksum_src is not a valid SHA-256 sidecar" ;;
+        esac
+        [ "${#expected_digest}" -eq 64 ] || die "checksum file $checksum_src is not a valid SHA-256 sidecar"
+        printf '%s  %s\n' "$expected_digest" "$tarball" > "$tmp/$tarball.sha256"
+        ( cd "$tmp" && sha256sum -c "$tarball.sha256" >/dev/null 2>&1 ) \
+            || die "checksum verification failed — refusing to install"
+    fi
+else
+    if [ -z "$tag" ]; then
+        tag=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        [ -n "$tag" ] || die "no published release found; pass one: sh install.sh v0.1.0"
+    fi
+
+    json=$(curl -fsSL "https://api.github.com/repos/$repo/releases/tags/$tag") \
+        || die "release $tag not found"
+    tarball=$(printf '%s' "$json" | grep -o 'gewu-multiverse-[A-Za-z0-9._-]*-x86_64-linux\.tar\.gz' | head -1)
+    [ -n "$tarball" ] || die "release $tag carries no x86_64 Linux tarball"
+
+    base="https://github.com/$repo/releases/download/$tag"
+    say "downloading $tarball ($tag)"
+    curl -fsSL -o "$tmp/$tarball" "$base/$tarball" || die "download failed"
+    curl -fsSL -o "$tmp/$tarball.sha256" "$base/$tarball.sha256" || die "checksum download failed"
+    ( cd "$tmp" && sha256sum -c "$tarball.sha256" >/dev/null 2>&1 ) || die "checksum verification failed — refusing to install"
+fi
 
 mkdir -p "$tmp/unpack"
 tar -xzf "$tmp/$tarball" -C "$tmp/unpack" || die "the archive could not be unpacked"
@@ -158,10 +226,18 @@ bin=$(find "$tmp/unpack" -maxdepth 2 -type f -name gewu-multiverse | head -1)
 
 # Check the new binary before replacing anything. A build that cannot run on this
 # machine must never remove the build that can.
-if ! "$bin" --version >/dev/null 2>&1; then
+if ! new_version=$("$bin" --version 2>/dev/null); then
     say "install.sh: the downloaded binary did not run here — it needs glibc >= $floor; the installed version is unchanged"
     say "install.sh: build from source on this machine instead: cargo install --git https://github.com/$repo"
     exit 1
+fi
+if [ -z "$tag" ]; then
+    reported_ver=$(printf '%s\n' "$new_version" | sed -n 's/^gewu-multiverse[[:space:]]*//p' | head -1)
+    if [ -n "$reported_ver" ]; then
+        tag="v$reported_ver"
+    else
+        tag="local"
+    fi
 fi
 
 config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/gewu-multiverse
@@ -199,28 +275,59 @@ run_product() {
     if wait "$child"; then
         child=
         return 0
+    else
+        status=$?
+        child=
+        return "$status"
     fi
-    status=$?
-    child=
-    return "$status"
 }
 
-# The product's own Forgejo is fetched now, once, so the first run does not have to
-# wait for it. A failure is not fatal: the product is installed, and its first start
-# tries again.
-say "fetching Forgejo 17.0.0 for gewu-multiverse (about 122 MB; progress is shown below)"
-# Keep the product's own progress on stderr: the 122 MB fetch is the longest step,
-# and a silent line makes a slow connection look stuck (F7). Standard output is the
-# product's ready line, which the installer replaces with its own.
-if run_product --install-forgejo >/dev/null; then
-    say "Forgejo 17.0.0 is ready"
-else
-    status=$?
-    if [ "$status" -eq 130 ]; then
-        say "install.sh: canceled; the product binary is installed and Forgejo is unchanged"
-        exit 130
+run_product_with_forgejo() {
+    GEWU_FORGEJO_BINARY="$1" "$dir/gewu-multiverse" --install-forgejo &
+    child=$!
+    if wait "$child"; then
+        child=
+        return 0
+    else
+        status=$?
+        child=
+        return "$status"
     fi
-    say "the Forgejo download did not finish — the product is installed; its first start will try again"
+}
+
+# Release archives bundle the pinned Forgejo binary under forgejo/. When present
+# (and the caller did not set GEWU_FORGEJO_BINARY), install directly from that
+# unpacked file through the product's own SHA-256 verification with zero network I/O.
+bundled_forgejo=$(find "$tmp/unpack" -maxdepth 3 -type f -name 'forgejo-*-linux-amd64' | head -1)
+if [ -n "$bundled_forgejo" ] && [ -z "${GEWU_FORGEJO_BINARY:-}" ]; then
+    say "installing bundled Forgejo 17.0.0 for gewu-multiverse (SHA-256 verified)"
+    if run_product_with_forgejo "$bundled_forgejo" >/dev/null; then
+        say "Forgejo 17.0.0 is ready"
+    else
+        status=$?
+        if [ "$status" -eq 130 ]; then
+            say "install.sh: canceled; the product binary is installed and Forgejo is unchanged"
+            exit 130
+        fi
+        die "bundled Forgejo verification failed — refusing to keep an unverified Forgejo binary"
+    fi
+else
+    # Legacy archives without forgejo/ inside: fetch once now so the first run does
+    # not have to wait for it. A failure is not fatal: the first start tries again.
+    say "fetching Forgejo 17.0.0 for gewu-multiverse (about 122 MB; progress is shown below)"
+    # Keep the product's own progress on stderr: the 122 MB fetch is the longest step,
+    # and a silent line makes a slow connection look stuck (F7). Standard output is the
+    # product's ready line, which the installer replaces with its own.
+    if run_product --install-forgejo >/dev/null; then
+        say "Forgejo 17.0.0 is ready"
+    else
+        status=$?
+        if [ "$status" -eq 130 ]; then
+            say "install.sh: canceled; the product binary is installed and Forgejo is unchanged"
+            exit 130
+        fi
+        say "the Forgejo download did not finish — the product is installed; its first start will try again"
+    fi
 fi
 
 if [ -n "$harnesses" ] && [ "$harnesses" != "none" ]; then
