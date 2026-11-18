@@ -1325,6 +1325,56 @@ impl Engine {
         pids
     }
 
+    /// Re-read agent `instruction.md` files without advancing the scheduler or starting
+    /// background jobs (used by offline `--configure`).
+    pub(crate) fn refresh_instructions(&self) {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let layout = inner.options.layout.clone();
+        for agent in &mut inner.agents {
+            let paths = layout.agent(&agent.name).ok();
+            agent.refresh_instruction(paths.as_ref());
+        }
+    }
+
+    /// Persist a `removal-requested` marker for an agent whose Forgejo login must be
+    /// revoked when Forgejo runs.
+    pub(crate) fn mark_removal_requested(&self, name: &str) -> Result<(), String> {
+        let inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        write_removal_requested(&inner, name).map(|_| ())
+    }
+
+    /// Immediately remove an agent that has never been provisioned against Forgejo.
+    pub(crate) fn remove_unprovisioned_agent(&self, name: &str) -> Result<(), String> {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(index) = inner.agent_index(name) else {
+            return Err(format!("there is no agent named `{name}`"));
+        };
+        inner.agent_tests.remove(name);
+        let grace = inner.options.stop_grace;
+        stop_agent(&mut inner.agents[index], grace)?;
+        let _ = credentials::remove_agent_token(&inner.credentials, name);
+        let _ = credentials::remove_secret(&inner.credentials, Some("model_keys"), name);
+        inner.commit_settings(|settings| {
+            settings.remove_agent(name);
+            Ok(())
+        })?;
+        inner.agents.remove(index);
+        clear_removal_marker(&inner.options.layout, name);
+        clear_removal_requested(&inner.options.layout, name);
+        inner.refresh_confinement();
+        inner.note(removed_note(name));
+        Ok(())
+    }
+
     /// The design's tick: reap, start due sessions, follow the Forgejo child.
     fn tick_at(&mut self) {
         let now = self.clock.now();
@@ -1335,6 +1385,70 @@ impl Engine {
             };
             inner.poll(now);
             inner.due_jobs(now)
+        };
+        for job in jobs {
+            self.run_job(job);
+        }
+    }
+
+    /// Advance only Forgejo startup/admin-token acquisition and `Job::RemoveAgent` for
+    /// `target_agent`, without scheduling any agent sessions or provisioning other
+    /// agents (used by `gewu-multiverse --configure --remove-agent <name>`).
+    pub(crate) fn tick_removal_only(&mut self, target_agent: &str) {
+        let now = self.clock.now();
+        let jobs = {
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !inner.stopping {
+                inner.poll_forgejo(now);
+            }
+            let mut jobs = Vec::new();
+            if !inner.stopping {
+                if !inner.forgejo.start_inflight
+                    && inner.forgejo.child.is_none()
+                    && inner.forgejo.start_requested
+                    && inner.forgejo.retry_at.is_none_or(|retry_at| now >= retry_at)
+                {
+                    inner.forgejo.start_inflight = true;
+                    inner.forgejo.start_requested = false;
+                    inner.forgejo.retry_at = None;
+                    inner.forgejo.state =
+                        if bundled_forgejo::binary_path(&inner.options.data_root).is_file() {
+                            ForgejoState::Preparing
+                        } else {
+                            ForgejoState::Fetching { percent: None }
+                        };
+                    jobs.push(Job::ForgejoStart);
+                }
+                if matches!(inner.forgejo.state, ForgejoState::Running)
+                    && !inner.forgejo.provision_inflight
+                    && !inner.forgejo.provisioned
+                    && inner
+                        .forgejo
+                        .provision_retry_at
+                        .is_none_or(|retry_at| now >= retry_at)
+                {
+                    inner.forgejo.provision_inflight = true;
+                    jobs.push(Job::ForgejoProvision);
+                }
+                if matches!(inner.forgejo.state, ForgejoState::Running)
+                    && inner.forgejo.admin_token.is_some()
+                    && let Some(index) = inner.agent_index(target_agent)
+                    && !inner.agents[index].removal_pending
+                    && inner.agents[index].running.is_none()
+                    && !inner.agents[index].starting
+                    && !inner.agents[index].provision_inflight
+                    && inner.agents[index]
+                        .removal_retry_at
+                        .is_none_or(|retry_at| now >= retry_at)
+                {
+                    inner.agents[index].removal_pending = true;
+                    jobs.push(Job::RemoveAgent(target_agent.to_owned()));
+                }
+            }
+            jobs
         };
         for job in jobs {
             self.run_job(job);
@@ -1811,6 +1925,7 @@ impl Inner {
                     (
                         agent.removal_pending
                             || removal_marked(&self.options.layout, &agent.name)
+                            || removal_requested(&self.options.layout, &agent.name)
                             || agent.provisioning == Provisioning::Ready
                             || agent.provision_inflight
                             || agent
@@ -1826,11 +1941,15 @@ impl Inner {
                 jobs.push(Job::ProvisionAgent(name));
             }
         }
+        let forgejo_ready_for_revoke =
+            matches!(self.forgejo.state, ForgejoState::Running) && self.forgejo.admin_token.is_some();
         for index in 0..self.agents.len() {
             let (removal, name, ready, due) = {
                 let agent = &self.agents[index];
                 (
-                    agent.removal_pending,
+                    agent.removal_pending
+                        || (forgejo_ready_for_revoke
+                            && removal_requested(&self.options.layout, &agent.name)),
                     agent.name.clone(),
                     agent.desired == Desired::Started
                         && agent.running.is_none()
@@ -1848,6 +1967,7 @@ impl Inner {
                     && !self.agents[index].provision_inflight
                     && due
                 {
+                    self.agents[index].removal_pending = true;
                     jobs.push(Job::RemoveAgent(name));
                 }
                 continue;
@@ -2722,7 +2842,12 @@ impl EngineApi for Engine {
                 model,
                 key,
             } => {
-                let base = base_url.trim().trim_end_matches('/').to_owned();
+                let base = base_url
+                    .trim()
+                    .trim_end_matches('/')
+                    .trim_end_matches("/chat/completions")
+                    .trim_end_matches('/')
+                    .to_owned();
                 let model = model.trim().to_owned();
                 let Some(protocol) = Protocol::parse(&protocol) else {
                     return Err("that connection type is not one this product knows".to_owned());
@@ -2781,7 +2906,11 @@ impl EngineApi for Engine {
                 {
                     return Err(error);
                 }
-                if program.is_native() && saved.provider.is_none() && !endpoint.configured() {
+                if program.is_native()
+                    && saved.provider.is_none()
+                    && !endpoint.configured()
+                    && requested.is_none()
+                {
                     return Err(
                         "set the default connection first, then choose this agent's program"
                             .to_owned(),
@@ -2792,7 +2921,10 @@ impl EngineApi for Engine {
                     if saved.provider.is_none() {
                         saved.provider = Some(settings::AgentProvider {
                             base_url: endpoint.base_url(),
-                            protocol: endpoint.protocol().id().to_owned(),
+                            protocol: requested
+                                .unwrap_or_else(|| endpoint.protocol())
+                                .id()
+                                .to_owned(),
                             model: endpoint.model.clone(),
                         });
                     }
@@ -3197,7 +3329,13 @@ impl EngineApi for Engine {
             Command::TestEndpoint => {
                 inner.endpoint_test = EndpointTest::Running;
                 let inner_arc = Arc::clone(&self.inner);
-                let endpoint = inner.settings.endpoint.url.clone();
+                let endpoint = if !inner.settings.endpoint.url.trim().is_empty() {
+                    inner.settings.endpoint.url.clone()
+                } else if !inner.settings.endpoint.base_url.trim().is_empty() {
+                    inner.settings.endpoint.chat_url()
+                } else {
+                    String::new()
+                };
                 let model = inner.settings.endpoint.model.clone();
                 let credentials = inner.credentials.clone();
                 drop(inner);
@@ -3325,6 +3463,14 @@ impl EngineApi for Engine {
                     inner.note(format!("not started — {reason}"));
                     return Ok(());
                 }
+                if removal_requested(&inner.options.layout, &name) {
+                    let reason = "queued for removal; its Forgejo sign-in will be cancelled once Forgejo runs";
+                    inner.agents[index].session = SessionState::Blocked {
+                        reason: reason.to_owned(),
+                    };
+                    inner.note(format!("not started — {reason}"));
+                    return Ok(());
+                }
                 // A cleanup that failed at open or at a run boundary is retried
                 // before any replacement run. Until it succeeds, Start reports the
                 // reason and does not start; once the old group is gone, the
@@ -3381,6 +3527,8 @@ impl EngineApi for Engine {
                     agent.session = SessionState::Blocked {
                         reason: "needs an instruction".to_owned(),
                     };
+                } else if agent.running.is_none() && !agent.starting {
+                    agent.session = SessionState::Idle;
                 }
                 inner.note(if no_instruction {
                     "not started — write an instruction first".to_owned()
@@ -4955,8 +5103,10 @@ fn remove_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
                     Ok(())
                 }) {
                     Ok(()) => {
+                        let _ = credentials::remove_secret(&credentials, Some("model_keys"), &name);
                         inner.agents.remove(index);
                         clear_removal_marker(&inner.options.layout, &name);
+                        clear_removal_requested(&inner.options.layout, &name);
                         inner.note(removed_note(&name));
                     }
                     Err(error) => {
@@ -5056,6 +5206,51 @@ fn write_removal_marker(inner: &Inner, name: &str) -> Result<PathBuf, String> {
 
 fn clear_removal_marker(layout: &Layout, name: &str) {
     if let Some(marker) = removal_marker_path(layout, name) {
+        let _ = fs::remove_file(marker);
+    }
+}
+
+fn removal_requested_path(layout: &Layout, name: &str) -> Option<PathBuf> {
+    layout
+        .agent(name)
+        .ok()
+        .map(|paths| paths.state_dir().join("removal-requested"))
+}
+
+pub(crate) fn removal_requested(layout: &Layout, name: &str) -> bool {
+    removal_requested_path(layout, name).is_some_and(|path| path.exists())
+}
+
+fn write_removal_requested(inner: &Inner, name: &str) -> Result<PathBuf, String> {
+    let paths = inner
+        .options
+        .layout
+        .agent(name)
+        .map_err(|error| format!("the agent's state directory is not available: {error}"))?;
+    fs::create_dir_all(paths.state_dir()).map_err(|error| {
+        format!(
+            "the removal request directory {} cannot be created: {error}",
+            paths.state_dir().display()
+        )
+    })?;
+    set_mode(paths.state_dir(), PRIVATE_DIR_MODE).map_err(|error| {
+        format!(
+            "the removal request directory {} cannot be made private: {error}",
+            paths.state_dir().display()
+        )
+    })?;
+    let marker = paths.state_dir().join("removal-requested");
+    crate::mode::write_private(&marker, b"removal requested\n").map_err(|error| {
+        format!(
+            "the removal request could not be recorded at {}: {error}",
+            marker.display()
+        )
+    })?;
+    Ok(marker)
+}
+
+fn clear_removal_requested(layout: &Layout, name: &str) {
+    if let Some(marker) = removal_requested_path(layout, name) {
         let _ = fs::remove_file(marker);
     }
 }

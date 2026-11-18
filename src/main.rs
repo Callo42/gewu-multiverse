@@ -36,7 +36,6 @@ use gewu_multiverse::confinement;
 use gewu_multiverse::editor;
 use gewu_multiverse::engine::{self, EngineOptions};
 use gewu_multiverse::mcp_forgejo;
-use gewu_multiverse::paths::Layout;
 use gewu_multiverse::workspace;
 use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -134,6 +133,35 @@ fn main() -> ExitCode {
         },
         Invocation::InstallForgejo => match install_forgejo() {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("gewu-multiverse: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Invocation::Configure(cli) => match gewu_multiverse::headless::run_configure(*cli) {
+            Ok(lines) => {
+                for line in lines {
+                    let _ = writeln!(io::stdout(), "gewu-multiverse: {line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("gewu-multiverse: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Invocation::Headless(cli) => match gewu_multiverse::headless::run_headless(cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("gewu-multiverse: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Invocation::Status(cli) => match gewu_multiverse::headless::run_status(cli) {
+            Ok(report) => {
+                let _ = writeln!(io::stdout(), "{report}");
+                ExitCode::SUCCESS
+            }
             Err(error) => {
                 eprintln!("gewu-multiverse: {error}");
                 ExitCode::FAILURE
@@ -325,23 +353,6 @@ fn install_forgejo() -> Result<(), StartupError> {
     }
 }
 
-/// The layout the command line asked for, or the user's own.
-fn layout_for(cli: &Cli) -> Result<Layout, StartupError> {
-    let layout = match &cli.root {
-        Some(root) => Layout::rooted_at(root.clone())
-            .map_err(|error| StartupError::Engine(error.to_string()))?,
-        None => {
-            Layout::in_user_config_dir().map_err(|error| StartupError::Engine(error.to_string()))?
-        }
-    };
-    Ok(match &cli.state_root {
-        Some(state) => layout
-            .with_state_root(state.clone())
-            .map_err(|error| StartupError::Engine(error.to_string()))?,
-        None => layout,
-    })
-}
-
 /// Open the real engine and run the board until the person leaves or the terminal
 /// closes. Returns the one line to print after the alternate screen is gone.
 fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
@@ -351,8 +362,12 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
     // The signal handlers are installed before the slow open: a terminal lost during
     // recovery records the request, and the loop ends and stops everything at once.
     let termination = Termination::install()?;
-    let layout = layout_for(&cli)?;
-    let data_root = bundled_forgejo::data_root().map_err(StartupError::Engine)?;
+    let (layout, data_root) = gewu_multiverse::headless::resolve_paths(
+        cli.root,
+        cli.state_root,
+        cli.data_root,
+    )
+    .map_err(StartupError::Engine)?;
     let options = EngineOptions::new(layout, data_root).map_err(StartupError::Engine)?;
     // Open the terminal before the slow recovery, so a killed run's cleanup is
     // visible as a sentence instead of a blank alternate screen. Only a live earlier

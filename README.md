@@ -331,9 +331,36 @@ clipboard with one OSC 52 sequence (base64) — never into a file, a log or a se
 plaintext line. A terminal without OSC 52 ignores the sequence, and the screen still
 shows the value for its ten seconds.
 
-`--config-dir <dir>` moves the settings, keys and agent folders; `--state-dir <dir>` moves the run records.
+`--config-dir <dir>` moves the settings, keys and agent folders; `--state-dir <dir>` moves the run records; `--data-dir <dir>` moves the bundled Forgejo and installed agent programs.
 A relative folder is taken from the folder you started the program in.
 `--demo` opens the board with a scripted example and no real Forgejo.
+
+## Headless and server deployments
+
+On unattended Linux hosts or under `systemd` (with no interactive terminal attached), configure the installation with `--configure`, run the engine loop with `--headless`, and inspect health with `--status`:
+
+```sh
+# 1. Non-interactive setup (API keys come from a file or stdin, never argv):
+gewu-multiverse --configure \
+  --accept-terms \
+  --agents 1 \
+  --agent agent-1 \
+  --program builtin \
+  --base-url https://api.example.com/v1 \
+  --model your-model-id \
+  --api-key-file /run/secrets/model.key \
+  --instruction-file ./agent-1.md \
+  --start-agent agent-1
+
+# 2. Run the daemon without a TTY (stops cleanly on SIGINT, SIGTERM or SIGHUP):
+gewu-multiverse --headless
+
+# 3. Read-only status without acquiring the daemon lock:
+gewu-multiverse --status
+gewu-multiverse --status --json
+```
+
+`--headless` checks that the terms are acknowledged and every started agent has a valid program, model key and non-empty instruction before entering the loop, exiting non-zero immediately instead of idling on an incomplete setup. `--configure --remove-agent <name>` revokes a provisioned agent's Forgejo tokens, deactivates its Forgejo login, and deletes its `forgejo_agent_tokens` and `model_keys` secrets without scheduling other agents (non-secret login and run history are kept so removed account numbers are never reused).
 
 ## Stopping, quitting, and opening again
 
