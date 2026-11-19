@@ -19,16 +19,20 @@ mismatch removes the temporary file and keeps nothing.
 
 The sources are tried in order:
 
-1. this release's own GitHub asset,
+1. a bundled companion binary beside `current_exe()`
+   (`./forgejo/forgejo-17.0.0-linux-amd64` or `./forgejo-17.0.0-linux-amd64`, shipped
+   inside the release archive for zero-network installation);
+2. this release's own GitHub asset,
    `https://github.com/Callo42/gewu-multiverse/releases/download/v<crate version>/forgejo-17.0.0-linux-amd64`;
-2. the official Codeberg release,
+3. the official Codeberg release,
    `https://codeberg.org/forgejo/forgejo/releases/download/v17.0.0/forgejo-17.0.0-linux-amd64`.
 
-Every answer is checked against the same pinned digest; a missing or wrong first
-source falls through to the second with no question. Only when the whole list fails
-does the install refuse, with one line saying the next start tries again. Nothing is
-kept from a failed source. `GEWU_FORGEJO_BINARY` names a local file, whose SHA-256 is
-checked the same way, so a test never needs the network.
+Every answer is checked against the same pinned digest; a missing companion falls
+through to the download list, a tampered local companion is refused immediately, and a
+missing or wrong first download source falls through to the second with no question.
+Only when the whole list fails does the install refuse, with one line saying the next
+start tries again. Nothing is kept from a failed source. `GEWU_FORGEJO_BINARY` names a
+local file, whose SHA-256 is checked the same way, so a test never needs the network.
 
 The first start installs the binary by itself when it is missing: the board's build
 picture reports `downloading n%` while it streams. `--install-forgejo` runs the same

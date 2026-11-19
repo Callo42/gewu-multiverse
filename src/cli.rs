@@ -2,6 +2,9 @@
 //!
 //! Without a flag the binary opens the board on the real engine. `--demo` opens the
 //! same board on the scripted engine in [`crate::board::fake`], for captures.
+//! `--headless` runs the real engine without a terminal UI, `--configure` applies
+//! non-interactive setup changes, and `--status` reports read-only state without
+//! acquiring the daemon lock.
 //! `--install-forgejo` fetches the pinned Forgejo and exits; the first start does the
 //! same install by itself when the binary is missing.
 //!
@@ -17,6 +20,12 @@ use std::path::PathBuf;
 pub enum Invocation {
     /// Open the board. `demo` selects the scripted engine.
     Run(Cli),
+    /// Run the real engine as a headless daemon without a terminal UI.
+    Headless(HeadlessCli),
+    /// Apply non-interactive setup and agent configuration changes, then exit.
+    Configure(Box<ConfigureCli>),
+    /// Print read-only status for operators and service health checks, then exit.
+    Status(StatusCli),
     /// Run one agent run and exit, without a terminal.
     RunAgent {
         /// The run directory holding the plan to execute.
@@ -95,8 +104,103 @@ pub struct Cli {
     pub root: Option<PathBuf>,
     /// The run-record directory, when it was given.
     pub state_root: Option<PathBuf>,
+    /// The Forgejo/program data directory, when it was given.
+    pub data_root: Option<PathBuf>,
     /// Run the board against the scripted engine.
     pub demo: bool,
+}
+
+/// Options for `--headless`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeadlessCli {
+    /// The configuration directory, when it was given.
+    pub root: Option<PathBuf>,
+    /// The run-record directory, when it was given.
+    pub state_root: Option<PathBuf>,
+    /// The Forgejo/program data directory, when it was given.
+    pub data_root: Option<PathBuf>,
+    /// Explicitly acknowledge the first-run terms before starting.
+    pub accept_terms: bool,
+}
+
+/// Options for `--configure`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConfigureCli {
+    /// The configuration directory, when it was given.
+    pub root: Option<PathBuf>,
+    /// The run-record directory, when it was given.
+    pub state_root: Option<PathBuf>,
+    /// The Forgejo/program data directory, when it was given.
+    pub data_root: Option<PathBuf>,
+    /// Acknowledge the current first-run terms.
+    pub accept_terms: bool,
+    /// API base URL (or full `/chat/completions` URL) for default or `--agent` model.
+    pub base_url: Option<String>,
+    /// Wire protocol (`chat-completions`, `responses`, or `anthropic-messages`).
+    pub protocol: Option<String>,
+    /// Model identifier.
+    pub model: Option<String>,
+    /// Read the model API key from a file (never from argv).
+    pub api_key_file: Option<PathBuf>,
+    /// Read the model API key from standard input.
+    pub api_key_stdin: bool,
+    /// Ensure `agent-1` .. `agent-N` exist.
+    pub agents: Option<usize>,
+    /// Add one new agent (`agent-N`).
+    pub add_agent: bool,
+    /// Remove one named agent.
+    pub remove_agent: Option<String>,
+    /// Target agent name for per-agent program/model/instruction changes.
+    pub agent: Option<String>,
+    /// Agent runtime program (`builtin`, `pi`, `codex`, `dsh`, or `opencode`).
+    pub program: Option<String>,
+    /// Codex sandbox mode (`native` or `full-access`).
+    pub codex_sandbox: Option<String>,
+    /// Path to markdown file to write as the target agent's `instruction.md`.
+    pub instruction_file: Option<PathBuf>,
+    /// Agents to mark `started` (verifying preconditions).
+    pub start_agents: Vec<String>,
+    /// Agents to mark `stopped`.
+    pub stop_agents: Vec<String>,
+    /// Mark all configured agents `started` (verifying preconditions).
+    pub start_all: bool,
+    /// Test the configured model connection before exiting.
+    pub test_model: bool,
+}
+
+impl ConfigureCli {
+    /// Whether at least one configuration mutation or check was requested.
+    pub fn has_action(&self) -> bool {
+        self.accept_terms
+            || self.base_url.is_some()
+            || self.protocol.is_some()
+            || self.model.is_some()
+            || self.api_key_file.is_some()
+            || self.api_key_stdin
+            || self.agents.is_some()
+            || self.add_agent
+            || self.remove_agent.is_some()
+            || self.program.is_some()
+            || self.codex_sandbox.is_some()
+            || self.instruction_file.is_some()
+            || !self.start_agents.is_empty()
+            || !self.stop_agents.is_empty()
+            || self.start_all
+            || self.test_model
+    }
+}
+
+/// Options for `--status`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusCli {
+    /// The configuration directory, when it was given.
+    pub root: Option<PathBuf>,
+    /// The run-record directory, when it was given.
+    pub state_root: Option<PathBuf>,
+    /// The Forgejo/program data directory, when it was given.
+    pub data_root: Option<PathBuf>,
+    /// Emit machine-readable JSON on standard output.
+    pub json: bool,
 }
 
 /// The help text.
@@ -104,19 +208,37 @@ pub const HELP: &str = "\
 gewu-multiverse — one Forgejo, the agents wired to it, few words
 
 Usage:
-    gewu-multiverse
+    gewu-multiverse [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
+    gewu-multiverse --headless [--accept-terms] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
+    gewu-multiverse --configure [setup options...] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
+    gewu-multiverse --status [--json] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
     gewu-multiverse --demo
     gewu-multiverse --install-forgejo
-    gewu-multiverse [--config-dir <dir>] [--state-dir <dir>]
+    gewu-multiverse --install-harness <pi|codex|dsh|opencode>
     gewu-multiverse --run-agent <run-dir>
 
 Options:
+    --headless    Run the real engine without a terminal UI (for systemd or
+                  unattended servers). Fails fast on missing setup; stops
+                  cleanly on SIGINT, SIGTERM or SIGHUP.
+    --configure   Apply non-interactive setup changes and stop:
+                    --accept-terms
+                    --base-url <url> --model <id> [--protocol <chat-completions|responses|anthropic-messages>]
+                    --api-key-file <file> | --api-key-stdin
+                    --agents <count> | --add-agent | --remove-agent <name>
+                    [--agent <name>] [--program <builtin|pi|codex|dsh|opencode>]
+                    [--codex-sandbox <native|full-access>] [--instruction-file <file>]
+                    [--start-agent <name>] [--stop-agent <name>] [--start-all]
+                    [--test-model]
+    --status      Print read-only daemon, Forgejo and agent state (--json for JSON).
     --demo        Open the board with the scripted engine, for captures. It
                   does not run an agent or start a real Forgejo.
-    --install-forgejo    Fetch the pinned Forgejo now and stop. The first start
-                  does this by itself when Forgejo is missing.
+    --install-forgejo    Fetch or verify the pinned Forgejo now and stop. The
+                  first start does this by itself when Forgejo is missing.
+    --install-harness <program>  Install a pinned native agent program and stop.
     --config-dir <dir>   Put the configuration under <dir>.
     --state-dir <dir>    Put run records under <dir>.
+    --data-dir <dir>     Put bundled Forgejo and installed programs under <dir>.
     --run-agent <dir>    Run the one agent run whose plan is in <dir>, then exit.
     -h, --help    Print this help and stop.
     -V, --version Print the version and stop.
@@ -124,17 +246,48 @@ Options:
 The board reads a BoardView and sends Commands. It never reads the configuration,
 starts a process or opens a socket itself. No secret is ever passed as an argument.";
 
+fn is_forbidden_secret_flag(argument: &str) -> bool {
+    argument == "--api-key"
+        || argument.starts_with("--api-key=")
+        || argument == "--model-key"
+        || argument.starts_with("--model-key=")
+        || argument == "--api_key"
+        || argument.starts_with("--api_key=")
+        || argument == "--model_key"
+        || argument.starts_with("--model_key=")
+}
+
 /// Read the arguments, without the program name.
 pub fn parse_args<I>(args: I) -> Result<Invocation, String>
 where
     I: IntoIterator<Item = String>,
 {
+    let raw_args: Vec<String> = args.into_iter().collect();
+    for token in &raw_args {
+        if token == "--git-askpass" {
+            break;
+        }
+        if is_forbidden_secret_flag(token) {
+            return Err(
+                "passing an API key on the command line is refused (other processes can read argv); use --api-key-file <file> or --api-key-stdin"
+                    .to_owned(),
+            );
+        }
+    }
+
     let mut root: Option<PathBuf> = None;
     let mut state_root: Option<PathBuf> = None;
+    let mut data_root: Option<PathBuf> = None;
     let mut run_agent: Option<PathBuf> = None;
     let mut demo = false;
     let mut install_forgejo = false;
-    let mut args = args.into_iter();
+    let mut headless = false;
+    let mut configure = false;
+    let mut status = false;
+    let mut status_json = false;
+
+    let mut cfg = ConfigureCli::default();
+    let mut args = raw_args.into_iter();
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -142,6 +295,15 @@ where
             "-V" | "--version" => return Ok(Invocation::Version),
             "--demo" => demo = true,
             "--install-forgejo" => install_forgejo = true,
+            "--headless" => headless = true,
+            "--configure" => configure = true,
+            "--status" => status = true,
+            "--json" => status_json = true,
+            "--accept-terms" => cfg.accept_terms = true,
+            "--api-key-stdin" => cfg.api_key_stdin = true,
+            "--add-agent" => cfg.add_agent = true,
+            "--start-all" => cfg.start_all = true,
+            "--test-model" => cfg.test_model = true,
             // `git` starts this program for a credential, passing the prompt as one
             // argument. This mode never prints help or an error: both would be noise
             // on git's side of the pipe.
@@ -185,9 +347,7 @@ where
             }
             "--install-harness" => {
                 return Ok(Invocation::InstallHarness {
-                    program: value_after(&mut args, "--install-harness")?
-                        .to_string_lossy()
-                        .into_owned(),
+                    program: string_after(&mut args, "--install-harness")?,
                 });
             }
             "--confined-shell" => {
@@ -215,22 +375,116 @@ where
                 }
                 state_root = Some(value_after(&mut args, "--state-dir")?);
             }
+            "--data-dir" => {
+                if data_root.is_some() {
+                    return Err("--data-dir was given twice".to_owned());
+                }
+                data_root = Some(value_after(&mut args, "--data-dir")?);
+            }
             "--run-agent" => {
                 if run_agent.is_some() {
                     return Err("--run-agent was given twice".to_owned());
                 }
                 run_agent = Some(value_after(&mut args, "--run-agent")?);
             }
+            "--base-url" => {
+                if cfg.base_url.is_some() {
+                    return Err("--base-url was given twice".to_owned());
+                }
+                cfg.base_url = Some(string_after(&mut args, "--base-url")?);
+            }
+            "--protocol" => {
+                if cfg.protocol.is_some() {
+                    return Err("--protocol was given twice".to_owned());
+                }
+                cfg.protocol = Some(string_after(&mut args, "--protocol")?);
+            }
+            "--model" => {
+                if cfg.model.is_some() {
+                    return Err("--model was given twice".to_owned());
+                }
+                cfg.model = Some(string_after(&mut args, "--model")?);
+            }
+            "--api-key-file" => {
+                if cfg.api_key_file.is_some() {
+                    return Err("--api-key-file was given twice".to_owned());
+                }
+                cfg.api_key_file = Some(file_after(&mut args, "--api-key-file")?);
+            }
+            "--agents" => {
+                if cfg.agents.is_some() {
+                    return Err("--agents was given twice".to_owned());
+                }
+                let raw = string_after(&mut args, "--agents")?;
+                let count = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("--agents needs a positive count (got `{raw}`)"))?;
+                cfg.agents = Some(count);
+            }
+            "--remove-agent" => {
+                if cfg.remove_agent.is_some() {
+                    return Err("--remove-agent was given twice".to_owned());
+                }
+                cfg.remove_agent = Some(string_after(&mut args, "--remove-agent")?);
+            }
+            "--agent" => {
+                if cfg.agent.is_some() {
+                    return Err("--agent was given twice".to_owned());
+                }
+                cfg.agent = Some(string_after(&mut args, "--agent")?);
+            }
+            "--program" => {
+                if cfg.program.is_some() {
+                    return Err("--program was given twice".to_owned());
+                }
+                cfg.program = Some(string_after(&mut args, "--program")?);
+            }
+            "--codex-sandbox" => {
+                if cfg.codex_sandbox.is_some() {
+                    return Err("--codex-sandbox was given twice".to_owned());
+                }
+                cfg.codex_sandbox = Some(string_after(&mut args, "--codex-sandbox")?);
+            }
+            "--instruction-file" => {
+                if cfg.instruction_file.is_some() {
+                    return Err("--instruction-file was given twice".to_owned());
+                }
+                cfg.instruction_file = Some(file_after(&mut args, "--instruction-file")?);
+            }
+            "--start-agent" => {
+                cfg.start_agents.push(string_after(&mut args, "--start-agent")?);
+            }
+            "--stop-agent" => {
+                cfg.stop_agents.push(string_after(&mut args, "--stop-agent")?);
+            }
             other => {
-                return Err(format!(
-                    "`{other}` is not accepted: the arguments are --demo, --install-forgejo, --config-dir <dir>, --state-dir <dir>, --run-agent <run-dir>, --help and --version"
-                ));
+                if other.starts_with('-') {
+                    let flag_only = other.split_once('=').map(|(flag, _)| flag).unwrap_or(other);
+                    return Err(format!(
+                        "`{flag_only}` is not accepted: the arguments are --headless, --configure, --status, --demo, --install-forgejo, --config-dir <dir>, --state-dir <dir>, --data-dir <dir>, --run-agent <run-dir>, --help and --version"
+                    ));
+                }
+                return Err(
+                    "unexpected positional argument (value omitted; secrets are never accepted on the command line — use --api-key-file <file> or --api-key-stdin): the arguments are --headless, --configure, --status, --demo, --install-forgejo, --config-dir <dir>, --state-dir <dir>, --data-dir <dir>, --run-agent <run-dir>, --help and --version"
+                        .to_owned(),
+                );
             }
         }
     }
 
     if install_forgejo {
-        if root.is_some() || state_root.is_some() || demo || run_agent.is_some() {
+        if root.is_some()
+            || state_root.is_some()
+            || data_root.is_some()
+            || demo
+            || headless
+            || configure
+            || status
+            || status_json
+            || run_agent.is_some()
+            || cfg.has_action()
+            || cfg.agent.is_some()
+        {
             return Err(
                 "--install-forgejo works on the default data directory on its own, so it cannot be combined with --demo, --config-dir, --state-dir or --run-agent"
                     .to_owned(),
@@ -240,7 +494,17 @@ where
     }
 
     if let Some(run_dir) = run_agent {
-        if root.is_some() || state_root.is_some() || demo {
+        if root.is_some()
+            || state_root.is_some()
+            || data_root.is_some()
+            || demo
+            || headless
+            || configure
+            || status
+            || status_json
+            || cfg.has_action()
+            || cfg.agent.is_some()
+        {
             return Err(
                 "--run-agent runs one run on its own, so it cannot be combined with --demo, --config-dir or --state-dir"
                     .to_owned(),
@@ -248,14 +512,83 @@ where
         }
         return Ok(Invocation::RunAgent { run_dir });
     }
+
+    let modes = usize::from(demo)
+        + usize::from(headless)
+        + usize::from(configure)
+        + usize::from(status);
+    if modes > 1 {
+        return Err(
+            "choose one mode at a time: --headless, --configure, --status or --demo".to_owned(),
+        );
+    }
+
+    if status_json && !status {
+        return Err("--json is only used with --status".to_owned());
+    }
+
+    if status {
+        if cfg.has_action() || cfg.agent.is_some() {
+            return Err(
+                "--status is read-only and cannot be combined with --configure options".to_owned(),
+            );
+        }
+        return Ok(Invocation::Status(StatusCli {
+            root,
+            state_root,
+            data_root,
+            json: status_json,
+        }));
+    }
+
+    if headless {
+        let mut rest = cfg.clone();
+        rest.accept_terms = false;
+        if rest.has_action() || rest.agent.is_some() {
+            return Err(
+                "pass setup options to `gewu-multiverse --configure ...` first, then start `gewu-multiverse --headless` (only --accept-terms may be combined directly with --headless)"
+                    .to_owned(),
+            );
+        }
+        return Ok(Invocation::Headless(HeadlessCli {
+            root,
+            state_root,
+            data_root,
+            accept_terms: cfg.accept_terms,
+        }));
+    }
+
+    if configure {
+        if cfg.api_key_file.is_some() && cfg.api_key_stdin {
+            return Err("pass either --api-key-file or --api-key-stdin, not both".to_owned());
+        }
+        cfg.root = root;
+        cfg.state_root = state_root;
+        cfg.data_root = data_root;
+        if !cfg.has_action() {
+            return Err(
+                "--configure needs at least one action (for example --accept-terms, --base-url/--model, --agents, --instruction-file or --start-agent)"
+                    .to_owned(),
+            );
+        }
+        return Ok(Invocation::Configure(Box::new(cfg)));
+    }
+
+    if cfg.has_action() || cfg.agent.is_some() {
+        return Err(
+            "setup flags require `--configure` (or `--headless --accept-terms`)".to_owned(),
+        );
+    }
+
     Ok(Invocation::Run(Cli {
         root,
         state_root,
+        data_root,
         demo,
     }))
 }
 
-/// The value that must follow an option.
+/// The directory value that must follow an option.
 fn value_after(args: &mut impl Iterator<Item = String>, option: &str) -> Result<PathBuf, String> {
     let value = args
         .next()
@@ -264,6 +597,28 @@ fn value_after(args: &mut impl Iterator<Item = String>, option: &str) -> Result<
         return Err(format!("{option} was given an empty directory"));
     }
     Ok(PathBuf::from(value))
+}
+
+/// The file path that must follow an option.
+fn file_after(args: &mut impl Iterator<Item = String>, option: &str) -> Result<PathBuf, String> {
+    let value = args
+        .next()
+        .ok_or_else(|| format!("{option} needs a file path after it"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{option} was given an empty file path"));
+    }
+    Ok(PathBuf::from(value))
+}
+
+/// The non-empty string that must follow an option.
+fn string_after(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
+    let value = args
+        .next()
+        .ok_or_else(|| format!("{option} needs a value after it"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{option} was given an empty value"));
+    }
+    Ok(value)
 }
 
 /// The help text, with one honest closing line naming the binary and how to remove
@@ -299,6 +654,47 @@ mod tests {
             }))
         );
         assert_eq!(parse(&[]), Ok(Invocation::Run(Cli::default())));
+    }
+
+    #[test]
+    fn headless_configure_and_status_parse_cleanly_and_refuse_cli_secrets() {
+        assert_eq!(
+            parse(&["--headless", "--accept-terms", "--config-dir", "/tmp/c"]),
+            Ok(Invocation::Headless(HeadlessCli {
+                root: Some(PathBuf::from("/tmp/c")),
+                state_root: None,
+                data_root: None,
+                accept_terms: true,
+            }))
+        );
+        assert_eq!(
+            parse(&["--status", "--json", "--data-dir", "/tmp/d"]),
+            Ok(Invocation::Status(StatusCli {
+                root: None,
+                state_root: None,
+                data_root: Some(PathBuf::from("/tmp/d")),
+                json: true,
+            }))
+        );
+        let refused = parse(&["--configure", "--api-key", "sk-secret"]).expect_err("refused");
+        assert!(refused.contains("refused"), "{refused}");
+        assert!(!refused.contains("sk-secret"), "{refused}");
+        let refused_eq = parse(&["--configure", "--api-key=sk-secret"]).expect_err("refused");
+        assert!(refused_eq.contains("refused"), "{refused_eq}");
+        assert!(!refused_eq.contains("sk-secret"), "{refused_eq}");
+        for argv in [
+            &["--configure", "--program", "--api-key", "sk-hidden-leak"][..],
+            &["--configure", "--program", "--api-key=sk-hidden-leak"][..],
+            &["--configure", "--remove-agent", "--model-key=sk-hidden-leak"][..],
+            &["--configure", "--secret=sk-hidden-leak"][..],
+            &["--configure", "sk-hidden-leak"][..],
+        ] {
+            let err = parse(argv).expect_err("refused");
+            assert!(
+                !err.contains("sk-hidden-leak"),
+                "secret echoed for {argv:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -352,6 +748,7 @@ mod tests {
             Ok(Invocation::Run(Cli {
                 root: Some(PathBuf::from("/tmp/example")),
                 state_root: Some(PathBuf::from("/tmp/state")),
+                data_root: None,
                 demo: true,
             }))
         );
@@ -370,6 +767,9 @@ mod tests {
     #[test]
     fn the_help_names_the_real_board_the_demo_and_the_installer() {
         assert!(HELP.contains("--demo"));
+        assert!(HELP.contains("--headless"));
+        assert!(HELP.contains("--configure"));
+        assert!(HELP.contains("--status"));
         assert!(HELP.contains("--install-forgejo"));
         assert!(!HELP.contains("real engine yet"));
         assert!(HELP.contains("scripted engine"));

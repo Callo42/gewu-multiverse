@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Stage the seven files published on a gewu-multiverse GitHub Release.
+# Stage the seven files published on a gewu-multiverse release, bundling the
+# verified Forgejo binary (with its GPLv3 licence and source notice as separate
+# files under forgejo/) directly inside the release .tar.gz archive so a single
+# unpacked archive installs and starts without a second network fetch.
 #
 # Usage:
 #   ci/stage-release-assets.sh \
@@ -13,16 +16,17 @@
 # forgejo-17.0.0-linux-amd64, its .sha256 and its .asc; otherwise they are
 # fetched from the official Codeberg release.  The pinned digest, the pinned
 # public key and the exact bytes of FORGEJO-SOURCE.md and LICENSE are checked
-# before anything is staged.  RELEASE-SHA256SUMS.txt is written separately from
-# the seven release assets.
+# before anything is bundled or staged.  RELEASE-SHA256SUMS.txt is written
+# separately from the seven release assets.
 set -euo pipefail
 umask 022
 export LC_ALL=C
+export TZ=UTC
 
 readonly FORGEJO_NAME="forgejo-17.0.0-linux-amd64"
 readonly FORGEJO_SHA256="5a3b07e124ed70b4e46ee3939515f003bd3cc85352257a9a4607a527251042ca"
 readonly FORGEJO_BASE_URL="${FORGEJO_BASE_URL:-https://codeberg.org/forgejo/forgejo/releases/download/v17.0.0}"
-readonly SOURCE_SHA256="21aae16bc0055c828f79b8b2584b11a0a3785e2a6a46015965117bda6b54a7c4"
+readonly SOURCE_SHA256="9d9636a3f2e6fa793fec976f8b5e52857e5681297cbd1435327e560f75d1be5f"
 readonly LICENSE_SHA256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
 readonly PRIMARY_FINGERPRINT="EB114F5E6C0DC2BCDD183550A4B61A2DC5923710"
 readonly SIGNING_FINGERPRINT="3BF4E813F84812411DA01E5BC4186DF66F4B6750"
@@ -39,10 +43,9 @@ log() {
 script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(CDPATH='' cd -- "$script_dir/.." && pwd -P)"
 
-command -v curl >/dev/null 2>&1 || die "curl is not on PATH"
-command -v gpg >/dev/null 2>&1 || die "gpg is not on PATH"
-command -v realpath >/dev/null 2>&1 || die "realpath is not on PATH"
-command -v sha256sum >/dev/null 2>&1 || die "sha256sum is not on PATH"
+for tool in gpg gzip realpath sha256sum stat tar; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is not on PATH"
+done
 
 build_dir=""
 forgejo_dir=""
@@ -55,7 +58,7 @@ while [ "$#" -gt 0 ]; do
         --out) [ "$#" -ge 2 ] || die "--out needs a value"; out_dir="$2"; shift 2 ;;
         --manifest) [ "$#" -ge 2 ] || die "--manifest needs a value"; manifest_dir="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,24p' "$0"
+            sed -n '2,22p' "$0"
             exit 0
             ;;
         *) die "unknown argument: $1" ;;
@@ -92,6 +95,7 @@ trap cleanup EXIT
 if [ -n "$forgejo_dir" ]; then
     forgejo_dir="$(CDPATH='' cd -- "$forgejo_dir" && pwd -P)"
 else
+    command -v curl >/dev/null 2>&1 || die "curl is not on PATH"
     forgejo_dir="$scratch/forgejo"
     mkdir -p "$forgejo_dir"
     for name in "$FORGEJO_NAME" "$FORGEJO_NAME.sha256" "$FORGEJO_NAME.asc"; do
@@ -137,9 +141,9 @@ grep -q 'Good signature' "$scratch/gpg.out" "$scratch/gpg.err" ||
 
 static_dir="$repo_root/ci/release-assets"
 [ "$(sha256sum "$static_dir/FORGEJO-SOURCE.md" | awk '{print $1}')" = "$SOURCE_SHA256" ] ||
-    die "ci/release-assets/FORGEJO-SOURCE.md does not match the 0.1.39 asset"
+    die "ci/release-assets/FORGEJO-SOURCE.md does not match the pinned SOURCE_SHA256"
 [ "$(sha256sum "$static_dir/LICENSE" | awk '{print $1}')" = "$LICENSE_SHA256" ] ||
-    die "ci/release-assets/LICENSE does not match the 0.1.39 asset"
+    die "ci/release-assets/LICENSE does not match the pinned LICENSE_SHA256"
 
 mkdir -p "$out_dir" "$manifest_dir"
 [ -z "$(find "$out_dir" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
@@ -147,8 +151,62 @@ mkdir -p "$out_dir" "$manifest_dir"
 [ -z "$(find "$manifest_dir" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
     die "$manifest_dir is not empty"
 
-install -m 0644 "$tarball" "$out_dir/$(basename "$tarball")"
-install -m 0644 "$tarball.sha256" "$out_dir/$(basename "$tarball").sha256"
+archive_name="$(basename "$tarball")"
+archive_base="${archive_name%.tar.gz}"
+[ "$archive_base" != "$archive_name" ] || die "unexpected archive name: $archive_name"
+
+pack_bundled_archive() {
+    local work="$1" dest="$2" epoch
+    mkdir -p "$work/unpack"
+    tar -xzf "$tarball" -C "$work/unpack"
+    [ -x "$work/unpack/$archive_base/gewu-multiverse" ] ||
+        die "unpacked archive lacks $archive_base/gewu-multiverse"
+    epoch="$(stat -c '%Y' "$work/unpack/$archive_base/gewu-multiverse")"
+    [[ "$epoch" =~ ^[0-9]+$ ]] || die "cannot read mtime epoch from unpacked binary"
+
+    mkdir -p "$work/unpack/$archive_base/forgejo"
+    chmod 0755 "$work/unpack/$archive_base/forgejo"
+    install -m 0644 "$static_dir/FORGEJO-SOURCE.md" \
+        "$work/unpack/$archive_base/forgejo/FORGEJO-SOURCE.md"
+    install -m 0644 "$static_dir/LICENSE" \
+        "$work/unpack/$archive_base/forgejo/LICENSE"
+    install -m 0755 "$forgejo_dir/$FORGEJO_NAME" \
+        "$work/unpack/$archive_base/forgejo/$FORGEJO_NAME"
+    find "$work/unpack/$archive_base" -exec touch -h -d "@$epoch" {} +
+
+    tar \
+        --sort=name \
+        --mtime="@${epoch}" \
+        --owner=0 \
+        --group=0 \
+        --numeric-owner \
+        --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+        -C "$work/unpack" -cf - "$archive_base" | gzip -n -9 > "$dest"
+}
+
+pack_bundled_archive "$scratch/pack-a" "$scratch/bundled-a.tar.gz"
+pack_bundled_archive "$scratch/pack-b-longer-path" "$scratch/bundled-b.tar.gz"
+cmp -s "$scratch/bundled-a.tar.gz" "$scratch/bundled-b.tar.gz" ||
+    die "bundled release archive repack is not deterministic"
+
+expected_members="$scratch/expected-members"
+printf '%s\n' \
+    "$archive_base/" \
+    "$archive_base/LICENSE-APACHE" \
+    "$archive_base/LICENSE-MIT" \
+    "$archive_base/README.md" \
+    "$archive_base/forgejo/" \
+    "$archive_base/forgejo/FORGEJO-SOURCE.md" \
+    "$archive_base/forgejo/LICENSE" \
+    "$archive_base/forgejo/$FORGEJO_NAME" \
+    "$archive_base/gewu-multiverse" > "$expected_members"
+tar -tzf "$scratch/bundled-a.tar.gz" > "$scratch/actual-members"
+diff -u "$expected_members" "$scratch/actual-members" >/dev/null ||
+    die "bundled archive members do not match expected layout"
+
+install -m 0644 "$scratch/bundled-a.tar.gz" "$out_dir/$archive_name"
+( cd "$out_dir" && sha256sum "$archive_name" > "$archive_name.sha256" && sha256sum -c "$archive_name.sha256" >/dev/null ) ||
+    die "bundled archive sidecar checksum failed"
 install -m 0755 "$forgejo_dir/$FORGEJO_NAME" "$out_dir/$FORGEJO_NAME"
 install -m 0644 "$forgejo_dir/$FORGEJO_NAME.sha256" "$out_dir/$FORGEJO_NAME.sha256"
 install -m 0644 "$forgejo_dir/$FORGEJO_NAME.asc" "$out_dir/$FORGEJO_NAME.asc"
@@ -163,8 +221,8 @@ mapfile -t asset_names < <(find "$out_dir" -maxdepth 1 -type f -printf '%f\n' | 
 ( cd "$out_dir" && sha256sum -c "$manifest_dir/RELEASE-SHA256SUMS.txt" >/dev/null ) ||
     die "RELEASE-SHA256SUMS.txt does not verify"
 
-log "staged $asset_count release assets in $out_dir"
+log "staged $asset_count release assets in $out_dir (bundled Forgejo inside $archive_name)"
 log "wrote $manifest_dir/RELEASE-SHA256SUMS.txt"
 printf 'RELEASE_ASSETS=%s\nRELEASE_MANIFEST=%s\nTARBALL_SHA256=%s\nFORGEJO_SHA256=%s\n' \
     "$out_dir" "$manifest_dir" \
-    "$(sha256sum "$tarball" | awk '{print $1}')" "$FORGEJO_SHA256"
+    "$(sha256sum "$out_dir/$archive_name" | awk '{print $1}')" "$FORGEJO_SHA256"
