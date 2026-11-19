@@ -309,6 +309,7 @@ why. `m` opens the model settings, `f` opens the Forgejo page, `?` lists every k
 | Your saved keys | `~/.config/gewu-multiverse/credentials.toml` (mode 0600, yours alone) |
 | Each agent's instruction, skills and workspace | `~/.config/gewu-multiverse/agents/<agent>/` |
 | Every run's log and record | `~/.local/state/gewu-multiverse/<agent>/<run>/` |
+| Headless daemon snapshot and control socket | `~/.local/state/gewu-multiverse/headless-status.json`, `headless.sock` and `headless.sock.cookie` (mode 0600, yours alone) |
 | Forgejo and its database | `~/.local/share/gewu-multiverse/forgejo/` |
 | The Forgejo administrator password | not on disk: `p` on the Forgejo page resets it through Forgejo's administration API and shows the new one |
 
@@ -342,7 +343,7 @@ A relative folder is taken from the folder you started the program in.
 
 ## Headless and server deployments
 
-On unattended Linux hosts or under `systemd` (with no interactive terminal attached), configure the installation with `--configure`, run the engine loop with `--headless`, and inspect health with `--status`:
+On unattended Linux hosts or under `systemd` (with no interactive terminal attached), configure the installation with `--configure`, run the engine loop with `--headless`, adjust running agents live with `--control`, and inspect health with `--status`:
 
 ```sh
 # 1. Non-interactive setup (API keys come from a file or stdin, never argv):
@@ -354,18 +355,29 @@ gewu-multiverse --configure \
   --base-url https://api.example.com/v1 \
   --model your-model-id \
   --api-key-file /run/secrets/model.key \
-  --instruction-file ./agent-1.md \
-  --start-agent agent-1
+  --instruction-file ./agent-1.md
 
-# 2. Run the daemon without a TTY (stops cleanly on SIGINT, SIGTERM or SIGHUP):
+# 2a. Standard daemon (requires >= 1 started agent; fails fast otherwise):
+gewu-multiverse --configure --start-agent agent-1
 gewu-multiverse --headless
 
-# 3. Read-only status without acquiring the daemon lock:
+# 2b. Event-driven warm standby (keeps local Forgejo and agent accounts ready at
+#     zero idle model calls while all agents remain stopped):
+gewu-multiverse --configure --stop-all
+gewu-multiverse --headless --allow-idle
+
+# 3. Wake or park individual agents live over the private Unix socket without
+#    restarting Forgejo (`instruction.md` on disk is re-read automatically):
+gewu-multiverse --control --start-agent agent-1 --stop-on-no-work
+gewu-multiverse --control --stop-agent agent-1
+gewu-multiverse --control --stop-all --json
+
+# 4. Read-only status without acquiring the daemon lock:
 gewu-multiverse --status
 gewu-multiverse --status --json
 ```
 
-`--headless` checks that the terms are acknowledged and every started agent has a valid program, model key and non-empty instruction before entering the loop, exiting non-zero immediately instead of idling on an incomplete setup. `--configure --remove-agent <name>` revokes a provisioned agent's Forgejo tokens, deactivates its Forgejo login, and deletes its `forgejo_agent_tokens` and `model_keys` secrets without scheduling other agents (non-secret login and run history are kept so removed account numbers are never reused).
+Without `--allow-idle`, `--headless` checks that the terms are acknowledged and at least one started agent has a valid program, model key and non-empty instruction before entering the loop, exiting non-zero immediately instead of idling on an incomplete setup. With `--allow-idle`, `--headless` boots the loopback Forgejo and provisions `team/workspace` plus every configured agent's Forgejo login while keeping stopped agents at strictly zero model calls. `--control` connects to the daemon's `0600` Unix domain socket (`~/.local/state/gewu-multiverse/headless.sock`, verified with same-UID `SO_PEERCRED` plus a `0600` `headless.sock.cookie` capability under the hidden state directory so Landlock- and namespace-confined agent shells cannot control the daemon) to start or stop agents in milliseconds; `--stop-on-no-work` lets a woken agent run across multiple sessions while doing real work and automatically parks it back to `stopped` as soon as a session finishes with `no work` (before the next idle poll). `--configure --remove-agent <name>` revokes a provisioned agent's Forgejo tokens, deactivates its Forgejo login, and deletes its `forgejo_agent_tokens` and `model_keys` secrets without scheduling other agents (non-secret login and run history are kept so removed account numbers are never reused).
 
 ## Stopping, quitting, and opening again
 

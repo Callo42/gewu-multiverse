@@ -3,8 +3,9 @@
 //! Without a flag the binary opens the board on the real engine. `--demo` opens the
 //! same board on the scripted engine in [`crate::board::fake`], for captures.
 //! `--headless` runs the real engine without a terminal UI, `--configure` applies
-//! non-interactive setup changes, and `--status` reports read-only state without
-//! acquiring the daemon lock.
+//! non-interactive setup changes, `--control` starts or stops agents on a running
+//! headless daemon over its local Unix socket, and `--status` reports read-only state
+//! without acquiring the daemon lock.
 //! `--install-forgejo` fetches the pinned Forgejo and exits; the first start does the
 //! same install by itself when the binary is missing.
 //!
@@ -24,6 +25,8 @@ pub enum Invocation {
     Headless(HeadlessCli),
     /// Apply non-interactive setup and agent configuration changes, then exit.
     Configure(Box<ConfigureCli>),
+    /// Adjust started/stopped agents on a running headless daemon over its local Unix socket.
+    Control(Box<ControlCli>),
     /// Print read-only status for operators and service health checks, then exit.
     Status(StatusCli),
     /// Run one agent run and exit, without a terminal.
@@ -121,6 +124,51 @@ pub struct HeadlessCli {
     pub data_root: Option<PathBuf>,
     /// Explicitly acknowledge the first-run terms before starting.
     pub accept_terms: bool,
+    /// Keep bundled Forgejo warm even when zero agents are marked `started`.
+    pub allow_idle: bool,
+    /// Automatically mark an agent `stopped` once a new run finishes with `NoWork`.
+    pub stop_on_no_work: bool,
+    /// Override the private Unix control socket path (default `<state-dir>/headless.sock`).
+    pub control_socket: Option<PathBuf>,
+}
+
+/// Options for `--control` (live commands sent to a running `--headless` daemon).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ControlCli {
+    /// The configuration directory, when it was given.
+    pub root: Option<PathBuf>,
+    /// The run-record directory, when it was given.
+    pub state_root: Option<PathBuf>,
+    /// The Forgejo/program data directory, when it was given.
+    pub data_root: Option<PathBuf>,
+    /// Override the private Unix control socket path (default `<state-dir>/headless.sock`).
+    pub control_socket: Option<PathBuf>,
+    /// Agents to wake/start immediately on the running daemon.
+    pub start_agents: Vec<String>,
+    /// Agents to stop politely on the running daemon without stopping Forgejo.
+    pub stop_agents: Vec<String>,
+    /// Wake/start every configured agent on the running daemon.
+    pub start_all: bool,
+    /// Stop every configured agent on the running daemon while keeping Forgejo warm.
+    pub stop_all: bool,
+    /// Automatically mark started agents `stopped` once a new run finishes with `NoWork`.
+    pub stop_on_no_work: bool,
+    /// Clear `--stop-on-no-work` so started agents continue polling on `NO_WORK_DELAY`.
+    pub keep_running: bool,
+    /// Emit machine-readable JSON on standard output.
+    pub json: bool,
+}
+
+impl ControlCli {
+    /// Whether at least one live daemon control action was requested.
+    pub fn has_action(&self) -> bool {
+        !self.start_agents.is_empty()
+            || !self.stop_agents.is_empty()
+            || self.start_all
+            || self.stop_all
+            || self.stop_on_no_work
+            || self.keep_running
+    }
 }
 
 /// Options for `--configure`.
@@ -164,6 +212,8 @@ pub struct ConfigureCli {
     pub stop_agents: Vec<String>,
     /// Mark all configured agents `started` (verifying preconditions).
     pub start_all: bool,
+    /// Mark all configured agents `stopped`.
+    pub stop_all: bool,
     /// Test the configured model connection before exiting.
     pub test_model: bool,
 }
@@ -186,6 +236,25 @@ impl ConfigureCli {
             || !self.start_agents.is_empty()
             || !self.stop_agents.is_empty()
             || self.start_all
+            || self.stop_all
+            || self.test_model
+    }
+
+    /// Whether any offline-only setup flag (not valid under `--control`) was given.
+    pub fn has_setup_only_action(&self) -> bool {
+        self.accept_terms
+            || self.base_url.is_some()
+            || self.protocol.is_some()
+            || self.model.is_some()
+            || self.api_key_file.is_some()
+            || self.api_key_stdin
+            || self.agents.is_some()
+            || self.add_agent
+            || self.remove_agent.is_some()
+            || self.agent.is_some()
+            || self.program.is_some()
+            || self.codex_sandbox.is_some()
+            || self.instruction_file.is_some()
             || self.test_model
     }
 }
@@ -199,6 +268,8 @@ pub struct StatusCli {
     pub state_root: Option<PathBuf>,
     /// The Forgejo/program data directory, when it was given.
     pub data_root: Option<PathBuf>,
+    /// Optional custom control socket path to include in status checks.
+    pub control_socket: Option<PathBuf>,
     /// Emit machine-readable JSON on standard output.
     pub json: bool,
 }
@@ -209,8 +280,9 @@ gewu-multiverse — one Forgejo, the agents wired to it, few words
 
 Usage:
     gewu-multiverse [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
-    gewu-multiverse --headless [--accept-terms] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
+    gewu-multiverse --headless [--accept-terms] [--allow-idle] [--stop-on-no-work] [--control-socket <file>] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
     gewu-multiverse --configure [setup options...] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
+    gewu-multiverse --control [control options...] [--json] [--control-socket <file>] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
     gewu-multiverse --status [--json] [--config-dir <dir>] [--state-dir <dir>] [--data-dir <dir>]
     gewu-multiverse --demo
     gewu-multiverse --install-forgejo
@@ -221,6 +293,7 @@ Options:
     --headless    Run the real engine without a terminal UI (for systemd or
                   unattended servers). Fails fast on missing setup; stops
                   cleanly on SIGINT, SIGTERM or SIGHUP.
+                    [--allow-idle] [--stop-on-no-work] [--control-socket <file>]
     --configure   Apply non-interactive setup changes and stop:
                     --accept-terms
                     --base-url <url> --model <id> [--protocol <chat-completions|responses|anthropic-messages>]
@@ -228,8 +301,12 @@ Options:
                     --agents <count> | --add-agent | --remove-agent <name>
                     [--agent <name>] [--program <builtin|pi|codex|dsh|opencode>]
                     [--codex-sandbox <native|full-access>] [--instruction-file <file>]
-                    [--start-agent <name>] [--stop-agent <name>] [--start-all]
+                    [--start-agent <name>] [--stop-agent <name>] [--start-all] [--stop-all]
                     [--test-model]
+    --control     Start or stop agents on a running --headless daemon without
+                  restarting Forgejo:
+                    [--start-agent <name>] [--stop-agent <name>] [--start-all] [--stop-all]
+                    [--stop-on-no-work | --keep-running] [--control-socket <file>] [--json]
     --status      Print read-only daemon, Forgejo and agent state (--json for JSON).
     --demo        Open the board with the scripted engine, for captures. It
                   does not run an agent or start a real Forgejo.
@@ -278,13 +355,18 @@ where
     let mut root: Option<PathBuf> = None;
     let mut state_root: Option<PathBuf> = None;
     let mut data_root: Option<PathBuf> = None;
+    let mut control_socket: Option<PathBuf> = None;
     let mut run_agent: Option<PathBuf> = None;
     let mut demo = false;
     let mut install_forgejo = false;
     let mut headless = false;
     let mut configure = false;
+    let mut control = false;
     let mut status = false;
     let mut status_json = false;
+    let mut allow_idle = false;
+    let mut stop_on_no_work = false;
+    let mut keep_running = false;
 
     let mut cfg = ConfigureCli::default();
     let mut args = raw_args.into_iter();
@@ -297,12 +379,17 @@ where
             "--install-forgejo" => install_forgejo = true,
             "--headless" => headless = true,
             "--configure" => configure = true,
+            "--control" => control = true,
             "--status" => status = true,
             "--json" => status_json = true,
+            "--allow-idle" => allow_idle = true,
+            "--stop-on-no-work" => stop_on_no_work = true,
+            "--keep-running" => keep_running = true,
             "--accept-terms" => cfg.accept_terms = true,
             "--api-key-stdin" => cfg.api_key_stdin = true,
             "--add-agent" => cfg.add_agent = true,
             "--start-all" => cfg.start_all = true,
+            "--stop-all" => cfg.stop_all = true,
             "--test-model" => cfg.test_model = true,
             // `git` starts this program for a credential, passing the prompt as one
             // argument. This mode never prints help or an error: both would be noise
@@ -380,6 +467,12 @@ where
                     return Err("--data-dir was given twice".to_owned());
                 }
                 data_root = Some(value_after(&mut args, "--data-dir")?);
+            }
+            "--control-socket" => {
+                if control_socket.is_some() {
+                    return Err("--control-socket was given twice".to_owned());
+                }
+                control_socket = Some(file_after(&mut args, "--control-socket")?);
             }
             "--run-agent" => {
                 if run_agent.is_some() {
@@ -461,11 +554,11 @@ where
                 if other.starts_with('-') {
                     let flag_only = other.split_once('=').map(|(flag, _)| flag).unwrap_or(other);
                     return Err(format!(
-                        "`{flag_only}` is not accepted: the arguments are --headless, --configure, --status, --demo, --install-forgejo, --config-dir <dir>, --state-dir <dir>, --data-dir <dir>, --run-agent <run-dir>, --help and --version"
+                        "`{flag_only}` is not accepted: the arguments are --headless, --configure, --control, --status, --demo, --install-forgejo, --config-dir <dir>, --state-dir <dir>, --data-dir <dir>, --run-agent <run-dir>, --help and --version"
                     ));
                 }
                 return Err(
-                    "unexpected positional argument (value omitted; secrets are never accepted on the command line — use --api-key-file <file> or --api-key-stdin): the arguments are --headless, --configure, --status, --demo, --install-forgejo, --config-dir <dir>, --state-dir <dir>, --data-dir <dir>, --run-agent <run-dir>, --help and --version"
+                    "unexpected positional argument (value omitted; secrets are never accepted on the command line — use --api-key-file <file> or --api-key-stdin): the arguments are --headless, --configure, --control, --status, --demo, --install-forgejo, --config-dir <dir>, --state-dir <dir>, --data-dir <dir>, --run-agent <run-dir>, --help and --version"
                         .to_owned(),
                 );
             }
@@ -476,11 +569,16 @@ where
         if root.is_some()
             || state_root.is_some()
             || data_root.is_some()
+            || control_socket.is_some()
             || demo
             || headless
             || configure
+            || control
             || status
             || status_json
+            || allow_idle
+            || stop_on_no_work
+            || keep_running
             || run_agent.is_some()
             || cfg.has_action()
             || cfg.agent.is_some()
@@ -497,11 +595,16 @@ where
         if root.is_some()
             || state_root.is_some()
             || data_root.is_some()
+            || control_socket.is_some()
             || demo
             || headless
             || configure
+            || control
             || status
             || status_json
+            || allow_idle
+            || stop_on_no_work
+            || keep_running
             || cfg.has_action()
             || cfg.agent.is_some()
         {
@@ -516,27 +619,58 @@ where
     let modes = usize::from(demo)
         + usize::from(headless)
         + usize::from(configure)
+        + usize::from(control)
         + usize::from(status);
     if modes > 1 {
         return Err(
-            "choose one mode at a time: --headless, --configure, --status or --demo".to_owned(),
+            "choose one mode at a time: --headless, --configure, --control, --status or --demo"
+                .to_owned(),
         );
     }
 
-    if status_json && !status {
-        return Err("--json is only used with --status".to_owned());
+    if status_json && !status && !control {
+        return Err("--json is only used with --status or --control".to_owned());
+    }
+    if allow_idle && !headless {
+        return Err("--allow-idle is only used with --headless".to_owned());
+    }
+    if stop_on_no_work && !headless && !control {
+        return Err("--stop-on-no-work is only used with --headless or --control".to_owned());
+    }
+    if keep_running && !control {
+        return Err("--keep-running is only used with --control".to_owned());
+    }
+    if stop_on_no_work && keep_running {
+        return Err("pass either --stop-on-no-work or --keep-running, not both".to_owned());
+    }
+    if control_socket.is_some() && !headless && !control && !status {
+        return Err(
+            "--control-socket is only used with --headless, --control or --status".to_owned(),
+        );
+    }
+    if cfg.start_all && cfg.stop_all {
+        return Err("pass either --start-all or --stop-all, not both".to_owned());
+    }
+    for agent_name in &cfg.start_agents {
+        if cfg.stop_agents.contains(agent_name) {
+            return Err(format!(
+                "agent `{agent_name}` cannot be both started and stopped in the same command"
+            ));
+        }
     }
 
     if status {
         if cfg.has_action() || cfg.agent.is_some() {
             return Err(
-                "--status is read-only and cannot be combined with --configure options".to_owned(),
+                "--status is read-only and cannot be combined with --configure or --control options"
+                    .to_owned(),
             );
         }
         return Ok(Invocation::Status(StatusCli {
             root,
             state_root,
             data_root,
+            control_socket,
             json: status_json,
         }));
     }
@@ -546,7 +680,7 @@ where
         rest.accept_terms = false;
         if rest.has_action() || rest.agent.is_some() {
             return Err(
-                "pass setup options to `gewu-multiverse --configure ...` first, then start `gewu-multiverse --headless` (only --accept-terms may be combined directly with --headless)"
+                "pass setup options to `gewu-multiverse --configure ...` first, then start `gewu-multiverse --headless` (only --accept-terms, --allow-idle, --stop-on-no-work and --control-socket may be combined directly with --headless)"
                     .to_owned(),
             );
         }
@@ -555,7 +689,39 @@ where
             state_root,
             data_root,
             accept_terms: cfg.accept_terms,
+            allow_idle,
+            stop_on_no_work,
+            control_socket,
         }));
+    }
+
+    if control {
+        if cfg.has_setup_only_action() {
+            return Err(
+                "--control only adjusts running agents (--start-agent, --stop-agent, --start-all, --stop-all, --stop-on-no-work, --keep-running); use --configure while the daemon is stopped for setup changes"
+                    .to_owned(),
+            );
+        }
+        let ctrl = ControlCli {
+            root,
+            state_root,
+            data_root,
+            control_socket,
+            start_agents: cfg.start_agents,
+            stop_agents: cfg.stop_agents,
+            start_all: cfg.start_all,
+            stop_all: cfg.stop_all,
+            stop_on_no_work,
+            keep_running,
+            json: status_json,
+        };
+        if !ctrl.has_action() {
+            return Err(
+                "--control needs at least one action (for example --start-agent <name>, --stop-agent <name>, --start-all, --stop-all, --stop-on-no-work or --keep-running)"
+                    .to_owned(),
+            );
+        }
+        return Ok(Invocation::Control(Box::new(ctrl)));
     }
 
     if configure {
@@ -576,7 +742,8 @@ where
 
     if cfg.has_action() || cfg.agent.is_some() {
         return Err(
-            "setup flags require `--configure` (or `--headless --accept-terms`)".to_owned(),
+            "setup and control flags require `--configure` or `--control` (or `--headless --accept-terms`)"
+                .to_owned(),
         );
     }
 
@@ -657,15 +824,51 @@ mod tests {
     }
 
     #[test]
-    fn headless_configure_and_status_parse_cleanly_and_refuse_cli_secrets() {
+    fn headless_configure_control_and_status_parse_cleanly_and_refuse_cli_secrets() {
         assert_eq!(
-            parse(&["--headless", "--accept-terms", "--config-dir", "/tmp/c"]),
+            parse(&[
+                "--headless",
+                "--accept-terms",
+                "--allow-idle",
+                "--stop-on-no-work",
+                "--control-socket",
+                "/tmp/s/headless.sock",
+                "--config-dir",
+                "/tmp/c",
+            ]),
             Ok(Invocation::Headless(HeadlessCli {
                 root: Some(PathBuf::from("/tmp/c")),
                 state_root: None,
                 data_root: None,
                 accept_terms: true,
+                allow_idle: true,
+                stop_on_no_work: true,
+                control_socket: Some(PathBuf::from("/tmp/s/headless.sock")),
             }))
+        );
+        assert_eq!(
+            parse(&[
+                "--control",
+                "--start-agent",
+                "agent-1",
+                "--stop-on-no-work",
+                "--json",
+                "--state-dir",
+                "/tmp/st",
+            ]),
+            Ok(Invocation::Control(Box::new(ControlCli {
+                root: None,
+                state_root: Some(PathBuf::from("/tmp/st")),
+                data_root: None,
+                control_socket: None,
+                start_agents: vec!["agent-1".to_owned()],
+                stop_agents: Vec::new(),
+                start_all: false,
+                stop_all: false,
+                stop_on_no_work: true,
+                keep_running: false,
+                json: true,
+            })))
         );
         assert_eq!(
             parse(&["--status", "--json", "--data-dir", "/tmp/d"]),
@@ -673,9 +876,16 @@ mod tests {
                 root: None,
                 state_root: None,
                 data_root: Some(PathBuf::from("/tmp/d")),
+                control_socket: None,
                 json: true,
             }))
         );
+        assert!(parse(&["--allow-idle"]).is_err());
+        assert!(parse(&["--control"]).is_err());
+        assert!(parse(&["--control", "--stop-on-no-work", "--keep-running"]).is_err());
+        assert!(parse(&["--control", "--start-all", "--stop-all"]).is_err());
+        assert!(parse(&["--control", "--start-agent", "agent-1", "--stop-agent", "agent-1"]).is_err());
+        assert!(parse(&["--control", "--agents", "1"]).is_err());
         let refused = parse(&["--configure", "--api-key", "sk-secret"]).expect_err("refused");
         assert!(refused.contains("refused"), "{refused}");
         assert!(!refused.contains("sk-secret"), "{refused}");
@@ -688,6 +898,8 @@ mod tests {
             &["--configure", "--remove-agent", "--model-key=sk-hidden-leak"][..],
             &["--configure", "--secret=sk-hidden-leak"][..],
             &["--configure", "sk-hidden-leak"][..],
+            &["--control", "--api-key", "sk-hidden-leak"][..],
+            &["--control", "sk-hidden-leak"][..],
         ] {
             let err = parse(argv).expect_err("refused");
             assert!(
@@ -768,6 +980,9 @@ mod tests {
     fn the_help_names_the_real_board_the_demo_and_the_installer() {
         assert!(HELP.contains("--demo"));
         assert!(HELP.contains("--headless"));
+        assert!(HELP.contains("--allow-idle"));
+        assert!(HELP.contains("--control"));
+        assert!(HELP.contains("--stop-on-no-work"));
         assert!(HELP.contains("--configure"));
         assert!(HELP.contains("--status"));
         assert!(HELP.contains("--install-forgejo"));

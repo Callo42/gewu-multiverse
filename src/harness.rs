@@ -236,8 +236,43 @@ impl Program {
         !matches!(self, Self::Builtin)
     }
 
-    /// The environment label for a missing prerequisite.
+    /// The environment label for a missing prerequisite (cached briefly per `PATH` so
+    /// `Engine::board` ticks and `--control` calls do not spawn `node`/`npm` V8
+    /// subprocesses multiple times per second while idling).
     pub fn prerequisite_missing(self) -> Option<&'static str> {
+        if self != Self::Dsh {
+            return None;
+        }
+        struct DshPrereqCache {
+            path: Option<std::ffi::OsString>,
+            checked_at: std::time::Instant,
+            missing: Option<&'static str>,
+        }
+        static CACHE: std::sync::Mutex<Option<DshPrereqCache>> = std::sync::Mutex::new(None);
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let current_path = std::env::var_os("PATH");
+        if let Ok(guard) = CACHE.lock()
+            && let Some(cached) = guard.as_ref()
+            && cached.path == current_path
+            && cached.checked_at.elapsed() < TTL
+        {
+            return cached.missing;
+        }
+        let fresh = self.prerequisite_missing_uncached();
+        if let Ok(mut guard) = CACHE.lock() {
+            *guard = Some(DshPrereqCache {
+                path: current_path,
+                checked_at: std::time::Instant::now(),
+                missing: fresh,
+            });
+        }
+        fresh
+    }
+
+    /// Re-probe host prerequisites directly without consulting the short-lived cache
+    /// (used right before installing a native program).
+    pub fn prerequisite_missing_uncached(self) -> Option<&'static str> {
         if self != Self::Dsh {
             return None;
         }
