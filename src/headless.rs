@@ -1,12 +1,18 @@
 //! Non-interactive configuration (`--configure`), unattended daemon execution
-//! (`--headless`), and lock-free read-only inspection (`--status`).
+//! (`--headless`), live runtime agent control (`--control`), and lock-free read-only
+//! inspection (`--status`).
 //!
-//! All three modes share the engine's layout, `0600` credentials boundary, Landlock
+//! All modes share the engine's layout, `0600` credentials boundary, Landlock
 //! detection and single-instance lock rules without requiring a terminal. Secrets
-//! never enter command-line arguments, status output, snapshots or logs.
+//! never enter command-line arguments, control socket messages, status output,
+//! snapshots or logs.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,22 +24,38 @@ use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use crate::bundled_forgejo::{self, InstancePaths};
-use crate::cli::{ConfigureCli, HeadlessCli, StatusCli};
+use crate::cli::{ConfigureCli, ControlCli, HeadlessCli, StatusCli};
 use crate::confinement;
 use crate::credentials;
 use crate::engine::settings::{self, Settings};
-use crate::engine::{self, EngineOptions, TERMS_VERSION};
+use crate::engine::{self, Engine, EngineOptions, TERMS_VERSION};
 use crate::engine_api::{
     BoardView, Command, Desired, EndpointTest, EngineApi, ForgejoState, Provisioning, SessionEnd,
     SessionState,
 };
 use crate::harness::{self, Program, Protocol};
+use crate::mode::{PRIVATE_DIR_MODE, SECRET_FILE_MODE, set_mode};
 use crate::paths::Layout;
 use crate::run::{self, process_alive};
 use crate::time::now_unix_ms;
 
 /// Private runtime heartbeat/snapshot written by `--headless` under the state root.
 pub const STATUS_SNAPSHOT_FILE: &str = "headless-status.json";
+
+/// Default private Unix control socket bound by `--headless` under the state root.
+pub const CONTROL_SOCKET_FILE: &str = "headless.sock";
+
+/// Upper bound on a single `--control` request payload.
+const MAX_CONTROL_REQUEST_BYTES: u64 = 16 * 1024;
+
+/// Upper bound on a single `--control` response payload.
+const MAX_CONTROL_RESPONSE_BYTES: u64 = 512 * 1024;
+
+/// Server-side socket read/write bound so a stalled client cannot block `run_headless`.
+const SERVER_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Client-side socket read/write bound (covers polite `stop_grace` when stopping a run).
+const CLIENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Resolved layout and data directory for one invocation.
 pub fn resolve_paths(
@@ -426,8 +448,29 @@ fn apply_configure(
         }
     }
 
-    for stop_name in &cli.stop_agents {
+    let mut to_stop = cli.stop_agents.clone();
+    if cli.stop_all {
+        let all: Vec<String> = engine
+            .board()
+            .agents
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        if all.is_empty() {
+            return Err("cannot `--stop-all`: no agents are configured".to_owned());
+        }
+        for name in all {
+            if !to_stop.contains(&name) {
+                to_stop.push(name);
+            }
+        }
+    }
+
+    for stop_name in &to_stop {
         if engine::removal_requested(layout, stop_name) {
+            if cli.stop_all {
+                continue;
+            }
             return Err(format!(
                 "agent `{stop_name}` is already stopped and queued for removal; finish removing it with `gewu-multiverse --configure --remove-agent {stop_name}`"
             ));
@@ -681,49 +724,689 @@ impl Drop for DaemonSignals {
     }
 }
 
-fn validate_headless_preconditions(layout: &Layout, view: &BoardView) -> Result<(), String> {
+/// Private Unix control socket and `0600` capability cookie bound by `--headless` and
+/// unlinked on exit. Pairing the socket with a filesystem-read capability cookie inside
+/// the hidden parent directory prevents same-UID Landlock-confined agent shells from
+/// issuing control requests even though Linux Landlock `AccessFs` does not hook
+/// pathname `AF_UNIX` `connect(2)`.
+struct ControlSocketGuard {
+    listener: UnixListener,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    cookie: String,
+    cookie_path: PathBuf,
+    cookie_dev: u64,
+    cookie_ino: u64,
+}
+
+pub fn resolve_control_socket_path(
+    layout: &Layout,
+    custom: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let Some(raw) = custom else {
+        return Ok(layout.state_root().join(CONTROL_SOCKET_FILE));
+    };
+    let abs = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("current directory cannot be read: {error}"))?
+            .join(raw)
+    };
+    let Some(name) = abs.file_name() else {
+        return Err(format!(
+            "--control-socket {} must name a socket file inside a private 0700 directory",
+            raw.display()
+        ));
+    };
+    if name == "." || name == ".." {
+        return Err(format!(
+            "--control-socket {} must name a socket file, not a directory",
+            raw.display()
+        ));
+    }
+    Ok(abs)
+}
+
+impl ControlSocketGuard {
+    fn bind(
+        layout: &Layout,
+        data_root: &Path,
+        custom: Option<&Path>,
+        view: &BoardView,
+    ) -> Result<Self, String> {
+        let requested = resolve_control_socket_path(layout, custom)?;
+        if custom.is_none() {
+            fs::create_dir_all(layout.state_root()).map_err(|error| {
+                format!("{} cannot be created: {error}", layout.state_root().display())
+            })?;
+            set_mode(layout.state_root(), PRIVATE_DIR_MODE).map_err(|error| {
+                format!(
+                    "{} permissions cannot be set to 0700: {error}",
+                    layout.state_root().display()
+                )
+            })?;
+        }
+
+        let Some(parent) = requested.parent() else {
+            return Err(format!(
+                "--control-socket {} has no parent directory",
+                requested.display()
+            ));
+        };
+        let Some(file_name) = requested.file_name() else {
+            return Err(format!(
+                "--control-socket {} must name a socket file",
+                requested.display()
+            ));
+        };
+
+        let my_uid = rustix::process::geteuid().as_raw();
+        let parent_sym = fs::symlink_metadata(parent).map_err(|error| {
+            format!(
+                "control socket parent directory {} cannot be inspected: {error} (create it first with mode 0700)",
+                parent.display()
+            )
+        })?;
+        if parent_sym.file_type().is_symlink() || !parent_sym.file_type().is_dir() {
+            return Err(format!(
+                "control socket parent {} must be a real directory (not a symlink or file)",
+                parent.display()
+            ));
+        }
+        if parent_sym.uid() != my_uid {
+            return Err(format!(
+                "control socket parent {} is owned by uid {} (expected {my_uid})",
+                parent.display(),
+                parent_sym.uid()
+            ));
+        }
+        if (parent_sym.mode() & 0o077) != 0 {
+            return Err(format!(
+                "control socket parent {} has mode {:04o}; it must be private to this user (0700) so other local users cannot reach the socket",
+                parent.display(),
+                parent_sym.mode() & 0o7777
+            ));
+        }
+
+        let canonical_parent = fs::canonicalize(parent).map_err(|error| {
+            format!(
+                "control socket parent {} cannot be canonicalized: {error}",
+                parent.display()
+            )
+        })?;
+        let canonical_meta = fs::metadata(&canonical_parent).map_err(|error| {
+            format!(
+                "control socket parent {} cannot be inspected: {error}",
+                canonical_parent.display()
+            )
+        })?;
+        if canonical_meta.uid() != my_uid || (canonical_meta.mode() & 0o077) != 0 {
+            return Err(format!(
+                "control socket parent {} must be owned by uid {my_uid} with mode 0700",
+                canonical_parent.display()
+            ));
+        }
+
+        // Never allow placing the control socket inside `agents/` or any agent workspace,
+        // regardless of whether kernel confinement is active.
+        let agents_dir = layout.agents_dir();
+        let canonical_agents = fs::canonicalize(&agents_dir).unwrap_or(agents_dir);
+        if canonical_parent == canonical_agents || canonical_parent.starts_with(&canonical_agents) {
+            return Err(format!(
+                "--control-socket {} lies inside the agents directory {}; place it outside agent workspaces (or omit --control-socket to use {}/{})",
+                requested.display(),
+                canonical_agents.display(),
+                layout.state_root().display(),
+                CONTROL_SOCKET_FILE
+            ));
+        }
+        let workspaces = confinement::agent_workspaces(&layout.agents_dir());
+        if confinement::layout_overlap(std::slice::from_ref(&canonical_parent), &workspaces)
+            .is_some()
+        {
+            return Err(format!(
+                "--control-socket {} overlaps an agent workspace; omit --control-socket to use {}/{}",
+                requested.display(),
+                layout.state_root().display(),
+                CONTROL_SOCKET_FILE
+            ));
+        }
+
+        // When runs are confined, ensure a custom `--control-socket` parent cannot be
+        // reached from inside a confined agent shell.
+        if custom.is_some() && view.confined {
+            if view.confinement.as_deref() == Some(confinement::Method::Landlock.label()) {
+                if confinement::landlock_overlap(
+                    std::slice::from_ref(&canonical_parent),
+                    &workspaces,
+                )
+                .is_some()
+                {
+                    return Err(format!(
+                        "--control-socket directory {} lies inside a tree granted to confined agent shells by Landlock; omit --control-socket to use {}/{} or choose a private 0700 directory outside system/runtime/workspace paths",
+                        canonical_parent.display(),
+                        layout.state_root().display(),
+                        CONTROL_SOCKET_FILE
+                    ));
+                }
+            } else {
+                let protected_roots: Vec<PathBuf> = [
+                    Some(layout.root().to_path_buf()),
+                    Some(layout.state_root().to_path_buf()),
+                    Some(data_root.to_path_buf()),
+                    Some(std::env::temp_dir()),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|p| fs::canonicalize(p).ok())
+                .collect();
+                let inside_hidden = protected_roots
+                    .iter()
+                    .any(|root| canonical_parent == *root || canonical_parent.starts_with(root));
+                if !inside_hidden {
+                    return Err(format!(
+                        "--control-socket directory {} is not hidden by `{}` confinement; omit --control-socket to use {}/{} (or place it inside a 0700 subdirectory of state/temp)",
+                        canonical_parent.display(),
+                        view.confinement.as_deref().unwrap_or("namespace"),
+                        layout.state_root().display(),
+                        CONTROL_SOCKET_FILE
+                    ));
+                }
+            }
+        }
+
+        let socket_path = canonical_parent.join(file_name);
+        match fs::symlink_metadata(&socket_path) {
+            Ok(existing) => {
+                if !existing.file_type().is_socket() {
+                    return Err(format!(
+                        "control socket path {} already exists and is not a Unix socket; refusing to overwrite it",
+                        socket_path.display()
+                    ));
+                }
+                if existing.uid() != my_uid {
+                    return Err(format!(
+                        "stale control socket {} is owned by uid {} (expected {my_uid}); refusing to remove it",
+                        socket_path.display(),
+                        existing.uid()
+                    ));
+                }
+                fs::remove_file(&socket_path).map_err(|error| {
+                    format!(
+                        "stale control socket {} cannot be removed: {error}",
+                        socket_path.display()
+                    )
+                })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "control socket path {} cannot be inspected: {error}",
+                    socket_path.display()
+                ));
+            }
+        }
+
+        let cookie_path = control_cookie_path(&socket_path)?;
+        let (cookie, cookie_dev, cookie_ino) = write_control_cookie_file(&cookie_path, my_uid)?;
+
+        let listener = match bind_unix_socket_at(&canonical_parent, file_name, &socket_path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = fs::remove_file(&cookie_path);
+                return Err(error);
+            }
+        };
+        set_mode(&socket_path, SECRET_FILE_MODE).map_err(|error| {
+            let _ = fs::remove_file(&socket_path);
+            let _ = fs::remove_file(&cookie_path);
+            format!(
+                "control socket {} permissions cannot be set to 0600: {error}",
+                socket_path.display()
+            )
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            let _ = fs::remove_file(&socket_path);
+            let _ = fs::remove_file(&cookie_path);
+            format!(
+                "control socket {} cannot be switched to non-blocking mode: {error}",
+                socket_path.display()
+            )
+        })?;
+        let sock_meta = fs::symlink_metadata(&socket_path).map_err(|error| {
+            let _ = fs::remove_file(&socket_path);
+            let _ = fs::remove_file(&cookie_path);
+            format!(
+                "control socket {} metadata cannot be verified: {error}",
+                socket_path.display()
+            )
+        })?;
+        if !sock_meta.file_type().is_socket() || (sock_meta.mode() & 0o777) != SECRET_FILE_MODE {
+            let _ = fs::remove_file(&socket_path);
+            let _ = fs::remove_file(&cookie_path);
+            return Err(format!(
+                "control socket {} did not retain mode 0600",
+                socket_path.display()
+            ));
+        }
+
+        Ok(Self {
+            listener,
+            path: socket_path,
+            dev: sock_meta.dev(),
+            ino: sock_meta.ino(),
+            cookie,
+            cookie_path,
+            cookie_dev,
+            cookie_ino,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cookie(&self) -> &str {
+        &self.cookie
+    }
+}
+
+impl Drop for ControlSocketGuard {
+    fn drop(&mut self) {
+        if let Ok(meta) = fs::symlink_metadata(&self.path)
+            && meta.file_type().is_socket()
+            && meta.dev() == self.dev
+            && meta.ino() == self.ino
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+        if let Ok(meta) = fs::symlink_metadata(&self.cookie_path)
+            && meta.file_type().is_file()
+            && !meta.file_type().is_symlink()
+            && meta.dev() == self.cookie_dev
+            && meta.ino() == self.cookie_ino
+        {
+            let _ = fs::remove_file(&self.cookie_path);
+        }
+    }
+}
+
+fn control_cookie_path(socket_path: &Path) -> Result<PathBuf, String> {
+    let Some(parent) = socket_path.parent() else {
+        return Err(format!(
+            "control socket path {} has no parent directory",
+            socket_path.display()
+        ));
+    };
+    let Some(file_name) = socket_path.file_name() else {
+        return Err(format!(
+            "control socket path {} has no filename",
+            socket_path.display()
+        ));
+    };
+    let mut cookie_name = file_name.to_os_string();
+    cookie_name.push(".cookie");
+    Ok(parent.join(cookie_name))
+}
+
+fn write_control_cookie_file(cookie_path: &Path, my_uid: u32) -> Result<(String, u64, u64), String> {
+    match fs::symlink_metadata(cookie_path) {
+        Ok(existing) => {
+            if existing.file_type().is_symlink() || !existing.file_type().is_file() {
+                return Err(format!(
+                    "control cookie path {} already exists and is not a regular file; refusing to overwrite it",
+                    cookie_path.display()
+                ));
+            }
+            if existing.uid() != my_uid {
+                return Err(format!(
+                    "stale control cookie {} is owned by uid {} (expected {my_uid}); refusing to overwrite it",
+                    cookie_path.display(),
+                    existing.uid()
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "control cookie path {} cannot be inspected: {error}",
+                cookie_path.display()
+            ));
+        }
+    }
+
+    let mut raw = [0u8; 32];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut urandom| urandom.read_exact(&mut raw))
+        .map_err(|error| format!("failed to read random bytes for control cookie: {error}"))?;
+    let mut cookie = String::with_capacity(64);
+    for byte in raw {
+        use std::fmt::Write as _;
+        let _ = write!(&mut cookie, "{byte:02x}");
+    }
+
+    let mut stage_os = cookie_path.as_os_str().to_os_string();
+    stage_os.push(format!(".part-{}", std::process::id()));
+    let stage = PathBuf::from(stage_os);
+    let write_res = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(SECRET_FILE_MODE)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&stage)?;
+        file.write_all(cookie.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        set_mode(&stage, SECRET_FILE_MODE)?;
+        fs::rename(&stage, cookie_path)
+    })();
+    if let Err(error) = write_res {
+        let _ = fs::remove_file(&stage);
+        return Err(format!(
+            "control cookie {} cannot be written: {error}",
+            cookie_path.display()
+        ));
+    }
+
+    let meta = fs::symlink_metadata(cookie_path).map_err(|error| {
+        let _ = fs::remove_file(cookie_path);
+        format!(
+            "control cookie {} metadata cannot be verified: {error}",
+            cookie_path.display()
+        )
+    })?;
+    if !meta.file_type().is_file()
+        || meta.file_type().is_symlink()
+        || meta.uid() != my_uid
+        || (meta.mode() & 0o777) != SECRET_FILE_MODE
+    {
+        let _ = fs::remove_file(cookie_path);
+        return Err(format!(
+            "control cookie {} did not retain regular file mode 0600",
+            cookie_path.display()
+        ));
+    }
+
+    Ok((cookie, meta.dev(), meta.ino()))
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Bind a Unix domain socket even when `parent` exceeds Linux `sockaddr_un.sun_path`
+/// (`SUN_LEN`, 107 bytes) by addressing `<file_name>` through `/proc/self/fd/<dir_fd>`.
+fn bind_unix_socket_at(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+    socket_path: &Path,
+) -> Result<UnixListener, String> {
+    const SAFE_SUN_PATH_BYTES: usize = 100;
+    const MAX_SUN_PATH_BYTES: usize = 107;
+
+    if socket_path.as_os_str().len() <= SAFE_SUN_PATH_BYTES {
+        return UnixListener::bind(socket_path).map_err(|error| {
+            format!(
+                "control socket {} cannot be bound: {error}",
+                socket_path.display()
+            )
+        });
+    }
+
+    if Path::new("/proc/self/fd").is_dir() {
+        let dir_file = fs::File::open(parent).map_err(|error| {
+            format!(
+                "control socket parent {} cannot be opened: {error}",
+                parent.display()
+            )
+        })?;
+        let proc_sock = PathBuf::from(format!("/proc/self/fd/{}", dir_file.as_raw_fd()))
+            .join(file_name);
+        if proc_sock.as_os_str().len() > MAX_SUN_PATH_BYTES {
+            return Err(format!(
+                "control socket filename in {} exceeds the Unix domain socket path limit ({MAX_SUN_PATH_BYTES} bytes); pass `--control-socket <short-0700-dir>/headless.sock`",
+                socket_path.display()
+            ));
+        }
+        return UnixListener::bind(&proc_sock).map_err(|error| {
+            format!(
+                "control socket {} cannot be bound: {error} (pass `--control-socket <short-0700-dir>/headless.sock` or use a shorter `--state-dir`)",
+                socket_path.display()
+            )
+        });
+    }
+
+    UnixListener::bind(socket_path).map_err(|error| {
+        format!(
+            "control socket {} cannot be bound ({error}) — Unix domain socket paths are limited to {MAX_SUN_PATH_BYTES} bytes; pass `--control-socket <short-0700-dir>/headless.sock` or use a shorter `--state-dir`",
+            socket_path.display()
+        )
+    })
+}
+
+fn connect_unix_socket_raw(socket_path: &Path) -> io::Result<UnixStream> {
+    const SAFE_SUN_PATH_BYTES: usize = 100;
+    const MAX_SUN_PATH_BYTES: usize = 107;
+
+    if socket_path.as_os_str().len() <= SAFE_SUN_PATH_BYTES {
+        return UnixStream::connect(socket_path);
+    }
+    if let (Some(parent), Some(file_name)) = (socket_path.parent(), socket_path.file_name())
+        && Path::new("/proc/self/fd").is_dir()
+    {
+        let dir_file = fs::File::open(parent)?;
+        let proc_sock = PathBuf::from(format!("/proc/self/fd/{}", dir_file.as_raw_fd()))
+            .join(file_name);
+        if proc_sock.as_os_str().len() > MAX_SUN_PATH_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control socket filename exceeds Unix SUN_LEN (107 bytes); pass a shorter --control-socket path",
+            ));
+        }
+        return UnixStream::connect(&proc_sock);
+    }
+    UnixStream::connect(socket_path)
+}
+
+/// Tracks agents armed to auto-park (`Command::Stop`) as soon as a session finishes
+/// with `SessionEnd::NoWork` (before `NO_WORK_DELAY` schedules another LLM turn).
+#[derive(Debug, Default)]
+struct StopOnNoWorkTracker {
+    armed_min_runs: HashMap<String, u64>,
+}
+
+impl StopOnNoWorkTracker {
+    /// Arm an already-started agent (at `--headless --stop-on-no-work` startup or via
+    /// daemon-wide `--control --stop-on-no-work`): if its most recent completed round is
+    /// already `NoWork` (waiting in `NO_WORK_DELAY`), park immediately without an extra run.
+    fn arm_existing(&mut self, agent: &crate::engine_api::AgentView) {
+        let min_runs = if matches!(
+            &agent.session,
+            SessionState::Running { .. }
+                | SessionState::Restarting {
+                    last: SessionEnd::NoWork { .. },
+                    ..
+                }
+        ) {
+            agent.runs_total
+        } else {
+            agent.runs_total.saturating_add(1)
+        };
+        self.armed_min_runs.insert(agent.name.clone(), min_runs);
+    }
+
+    /// Arm an agent being explicitly started/woken now (`--control --start-agent` /
+    /// `--start-all`), ensuring at least one fresh run executes unless one is already live.
+    fn arm_for_fresh_wake(&mut self, agent: &crate::engine_api::AgentView) {
+        let min_runs = if matches!(agent.session, SessionState::Running { .. }) {
+            agent.runs_total
+        } else {
+            agent.runs_total.saturating_add(1)
+        };
+        self.armed_min_runs.insert(agent.name.clone(), min_runs);
+    }
+
+    fn disarm(&mut self, name: &str) {
+        self.armed_min_runs.remove(name);
+    }
+
+    fn clear(&mut self) {
+        self.armed_min_runs.clear();
+    }
+
+    fn is_armed(&self, name: &str) -> bool {
+        self.armed_min_runs.contains_key(name)
+    }
+
+    fn reconcile_after_tick(&mut self, engine: &mut Engine) -> Vec<String> {
+        let view = engine.board();
+        let mut to_park = Vec::new();
+        for agent in &view.agents {
+            if agent.desired != Desired::Started {
+                self.armed_min_runs.remove(&agent.name);
+                continue;
+            }
+            let Some(&min_runs) = self.armed_min_runs.get(&agent.name) else {
+                continue;
+            };
+            if agent.runs_total >= min_runs
+                && matches!(
+                    &agent.session,
+                    SessionState::Restarting {
+                        last: SessionEnd::NoWork { .. },
+                        ..
+                    }
+                )
+            {
+                to_park.push((agent.name.clone(), agent.runs_total));
+            }
+        }
+
+        let mut parked = Vec::new();
+        for (name, runs_total) in to_park {
+            self.armed_min_runs.remove(&name);
+            match engine.send(Command::Stop { name: name.clone() }) {
+                Ok(()) => {
+                    log_daemon(&format!(
+                        "agent `{name}` finished with no remaining work; parked to stopped (total runs {runs_total})"
+                    ));
+                    parked.push(name);
+                }
+                Err(error) => {
+                    log_daemon(&format!(
+                        "warning: agent `{name}` could not be parked after no-work: {error}"
+                    ));
+                }
+            }
+        }
+        parked
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlRequest {
+    #[serde(default)]
+    auth_cookie: String,
+    #[serde(default)]
+    start_agents: Vec<String>,
+    #[serde(default)]
+    stop_agents: Vec<String>,
+    #[serde(default)]
+    start_all: bool,
+    #[serde(default)]
+    stop_all: bool,
+    #[serde(default)]
+    stop_on_no_work: bool,
+    #[serde(default)]
+    keep_running: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControlResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub status: Option<StatusReport>,
+}
+
+fn validate_headless_preconditions(
+    layout: &Layout,
+    view: &BoardView,
+    allow_idle: bool,
+) -> Result<(), String> {
     if !view.terms_acknowledged {
         return Err(
             "first-run terms have not been acknowledged; run `gewu-multiverse --configure --accept-terms` (or pass `--accept-terms`) first"
                 .to_owned(),
         );
     }
+
+    let queued: Vec<&str> = view
+        .agents
+        .iter()
+        .filter(|a| engine::removal_requested(layout, &a.name))
+        .map(|a| a.name.as_str())
+        .collect();
+
     let started: Vec<_> = view
         .agents
         .iter()
         .filter(|agent| agent.desired == Desired::Started)
         .collect();
+
     if started.is_empty() {
-        let queued: Vec<&str> = view
-            .agents
-            .iter()
-            .filter(|a| engine::removal_requested(layout, &a.name))
-            .map(|a| a.name.as_str())
-            .collect();
         if let Some(first) = queued.first() {
             return Err(format!(
                 "no agent is set to start (pending removal for `{}`: run `gewu-multiverse --configure --remove-agent {first}` to finish revoking its Forgejo sign-in, and start at least one agent with `--start-agent <name>`)",
                 queued.join(", ")
             ));
         }
-        return Err(
-            "no agent is set to start; configure and start at least one agent with `gewu-multiverse --configure ... --start-agent <name>`"
-                .to_owned(),
-        );
-    }
-    for agent in started {
-        if engine::removal_requested(layout, &agent.name) {
-            return Err(format!(
-                "agent `{}` is queued for removal; finish removing it with `gewu-multiverse --configure --remove-agent {}`",
-                agent.name, agent.name
-            ));
+        if !allow_idle {
+            return Err(
+                "no agent is set to start; configure and start at least one agent with `gewu-multiverse --configure ... --start-agent <name>` (or pass `--allow-idle` to keep bundled Forgejo warm with zero idle model calls)"
+                    .to_owned(),
+            );
         }
-        if let Some(leftover) = &agent.leftover {
+        if view.agents.is_empty() {
+            return Err(
+                "no agents are configured; create at least one agent first with `gewu-multiverse --configure --accept-terms --agents 1 ...`"
+                    .to_owned(),
+            );
+        }
+    }
+
+    if let Some(first) = queued.first() {
+        return Err(format!(
+            "agent `{first}` is queued for removal; finish removing it with `gewu-multiverse --configure --remove-agent {first}`"
+        ));
+    }
+
+    for agent in &view.agents {
+        if (allow_idle || agent.desired == Desired::Started)
+            && let Some(leftover) = &agent.leftover
+        {
             return Err(format!(
                 "agent `{}` has an unfinished earlier process group ({leftover}) — stop the leftover process group or retry cleanup with `gewu-multiverse --configure --start-agent {}`",
                 agent.name, agent.name
             ));
         }
+    }
+
+    for agent in started {
         if let Some(err) = &agent.program_error {
             return Err(format!(
                 "agent `{}` cannot start: {err} — {}",
@@ -772,7 +1455,21 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
             log_daemon(&format!("acknowledged terms (version {TERMS_VERSION})"));
         }
 
-        validate_headless_preconditions(&layout, &view)?;
+        validate_headless_preconditions(&layout, &view, cli.allow_idle)?;
+
+        let control_guard =
+            ControlSocketGuard::bind(&layout, &data_root, cli.control_socket.as_deref(), &view)?;
+        let control_socket_str = control_guard.path().display().to_string();
+
+        let mut daemon_stop_on_no_work = cli.stop_on_no_work;
+        let mut auto_park = StopOnNoWorkTracker::default();
+        if daemon_stop_on_no_work {
+            for agent in &view.agents {
+                if agent.desired == Desired::Started {
+                    auto_park.arm_existing(agent);
+                }
+            }
+        }
 
         let started_names: Vec<String> = view
             .agents
@@ -780,28 +1477,51 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
             .filter(|a| a.desired == Desired::Started)
             .map(|a| a.name.clone())
             .collect();
+        let started_desc = if started_names.is_empty() {
+            "none (idle-warm standby)".to_owned()
+        } else {
+            started_names.join(", ")
+        };
         let confine_label = view
             .confinement
             .clone()
             .unwrap_or_else(|| "none (runs are not confined on this computer)".to_owned());
         log_daemon(&format!(
-            "starting headless daemon (pid {}, confinement: {confine_label}, started agents: {})",
+            "starting headless daemon (pid {}, confinement: {confine_label}, control socket: {}, started agents: {started_desc})",
             std::process::id(),
-            started_names.join(", ")
+            control_guard.path().display(),
         ));
 
         let mut forgejo_ever_ran = matches!(view.forgejo.state, ForgejoState::Running);
         let mut last_forgejo_line = String::new();
-        let mut last_agent_lines: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut last_snapshot_json = String::new();
+        let mut last_agent_lines: HashMap<String, String> = HashMap::new();
+        let mut last_snapshot_sig = String::new();
+        let mut last_snapshot_written_at: Option<Instant> = None;
 
         loop {
             if signals.requested() {
                 log_daemon("termination signal received; shutting down");
                 break;
             }
+            let _ = drain_control_requests(
+                &control_guard,
+                &layout,
+                &data_root,
+                &mut engine,
+                &mut auto_park,
+                &mut daemon_stop_on_no_work,
+                &state_root,
+                &mut last_snapshot_sig,
+                &mut last_snapshot_written_at,
+            );
+
             engine.tick();
+            let parked = auto_park.reconcile_after_tick(&mut engine);
+            if !parked.is_empty() {
+                for name in parked {
+                    last_agent_lines.remove(&name);
+                }
+            }
             let view = engine.board();
 
             let forgejo_line = describe_forgejo_state(&view.forgejo.state, &view.forgejo.url);
@@ -821,6 +1541,7 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
 
             for agent in &view.agents {
                 if agent.desired != Desired::Started {
+                    last_agent_lines.remove(&agent.name);
                     continue;
                 }
                 let line = describe_agent_runtime(agent);
@@ -830,27 +1551,61 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
                 }
             }
 
-            let snap = build_snapshot_from_view(&layout, &data_root, &view, true);
-            if let Ok(json) = serde_json::to_string_pretty(&snap)
-                && json != last_snapshot_json
-            {
-                let _ = write_snapshot_file(&state_root, &json);
-                last_snapshot_json = json;
-            }
+            let snap = build_snapshot_from_view(
+                &layout,
+                &data_root,
+                &view,
+                true,
+                true,
+                daemon_stop_on_no_work,
+                &auto_park,
+                &control_socket_str,
+            );
+            maybe_write_snapshot(
+                &state_root,
+                &snap,
+                &mut last_snapshot_sig,
+                &mut last_snapshot_written_at,
+            );
 
-            for _ in 0..5 {
+            for _ in 0..10 {
                 if signals.requested() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                if drain_control_requests(
+                    &control_guard,
+                    &layout,
+                    &data_root,
+                    &mut engine,
+                    &mut auto_park,
+                    &mut daemon_stop_on_no_work,
+                    &state_root,
+                    &mut last_snapshot_sig,
+                    &mut last_snapshot_written_at,
+                ) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
         }
         Ok(())
     })();
 
     engine.shutdown(stop_grace);
+    let final_socket = resolve_control_socket_path(&layout, cli.control_socket.as_deref())
+        .unwrap_or_else(|_| state_root.join(CONTROL_SOCKET_FILE));
     let final_view = engine.board();
-    let final_snap = build_snapshot_from_view(&layout, &data_root, &final_view, false);
+    let empty_tracker = StopOnNoWorkTracker::default();
+    let final_snap = build_snapshot_from_view(
+        &layout,
+        &data_root,
+        &final_view,
+        false,
+        false,
+        false,
+        &empty_tracker,
+        &final_socket.display().to_string(),
+    );
     if let Ok(json) = serde_json::to_string_pretty(&final_snap) {
         let _ = write_snapshot_file(&state_root, &json);
     }
@@ -858,6 +1613,576 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
         log_daemon("stopped every started agent and Forgejo cleanly");
     }
     outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_control_requests(
+    guard: &ControlSocketGuard,
+    layout: &Layout,
+    data_root: &Path,
+    engine: &mut Engine,
+    auto_park: &mut StopOnNoWorkTracker,
+    daemon_stop_on_no_work: &mut bool,
+    state_root: &Path,
+    last_snapshot_sig: &mut String,
+    last_snapshot_written_at: &mut Option<Instant>,
+) -> bool {
+    let mut handled_any = false;
+    for _ in 0..16 {
+        let stream = match guard.listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => {
+                log_daemon(&format!("warning: control socket accept error: {error}"));
+                break;
+            }
+        };
+        handled_any = true;
+        handle_one_control_stream(
+            stream,
+            guard.path(),
+            guard.cookie(),
+            layout,
+            data_root,
+            engine,
+            auto_park,
+            daemon_stop_on_no_work,
+            state_root,
+            last_snapshot_sig,
+            last_snapshot_written_at,
+        );
+    }
+    handled_any
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_one_control_stream(
+    mut stream: UnixStream,
+    socket_path: &Path,
+    expected_cookie: &str,
+    layout: &Layout,
+    data_root: &Path,
+    engine: &mut Engine,
+    auto_park: &mut StopOnNoWorkTracker,
+    daemon_stop_on_no_work: &mut bool,
+    state_root: &Path,
+    last_snapshot_sig: &mut String,
+    last_snapshot_written_at: &mut Option<Instant>,
+) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(SERVER_SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SERVER_SOCKET_TIMEOUT));
+
+    let my_uid = rustix::process::geteuid();
+    match rustix::net::sockopt::get_socket_peercred(&stream) {
+        Ok(cred) if cred.uid == my_uid => {}
+        Ok(cred) => {
+            let resp = ControlResponse {
+                ok: false,
+                actions: Vec::new(),
+                error: Some(format!(
+                    "control socket rejected peer uid {} (expected {})",
+                    cred.uid.as_raw(),
+                    my_uid.as_raw()
+                )),
+                status: None,
+            };
+            let _ = write_control_response(&mut stream, &resp);
+            return;
+        }
+        Err(error) => {
+            let resp = ControlResponse {
+                ok: false,
+                actions: Vec::new(),
+                error: Some(format!("control socket peer credentials check failed: {error}")),
+                status: None,
+            };
+            let _ = write_control_response(&mut stream, &resp);
+            return;
+        }
+    }
+
+    let mut line = String::new();
+    let read_res = {
+        let limited = (&mut stream).take(MAX_CONTROL_REQUEST_BYTES + 1);
+        let mut reader = BufReader::new(limited);
+        reader.read_line(&mut line)
+    };
+    if let Err(error) = read_res {
+        let resp = ControlResponse {
+            ok: false,
+            actions: Vec::new(),
+            error: Some(format!("failed to read control request: {error}")),
+            status: None,
+        };
+        let _ = write_control_response(&mut stream, &resp);
+        return;
+    }
+    if line.is_empty() {
+        return;
+    }
+    if line.len() as u64 > MAX_CONTROL_REQUEST_BYTES {
+        let resp = ControlResponse {
+            ok: false,
+            actions: Vec::new(),
+            error: Some(format!(
+                "control request exceeds maximum size ({MAX_CONTROL_REQUEST_BYTES} bytes)"
+            )),
+            status: None,
+        };
+        let _ = write_control_response(&mut stream, &resp);
+        return;
+    }
+
+    let req: ControlRequest = match serde_json::from_str(line.trim()) {
+        Ok(req) => req,
+        Err(error) => {
+            let resp = ControlResponse {
+                ok: false,
+                actions: Vec::new(),
+                error: Some(format!("invalid control request JSON: {error}")),
+                status: None,
+            };
+            let _ = write_control_response(&mut stream, &resp);
+            return;
+        }
+    };
+
+    if !constant_time_eq(req.auth_cookie.trim().as_bytes(), expected_cookie.as_bytes()) {
+        let resp = ControlResponse {
+            ok: false,
+            actions: Vec::new(),
+            error: Some(
+                "unauthorized control socket request: missing or invalid daemon control cookie"
+                    .to_owned(),
+            ),
+            status: None,
+        };
+        let _ = write_control_response(&mut stream, &resp);
+        return;
+    }
+
+    let apply_result = apply_control_request(
+        &req,
+        layout,
+        engine,
+        auto_park,
+        daemon_stop_on_no_work,
+    );
+
+    let view = engine.board();
+    let snap = build_snapshot_from_view(
+        layout,
+        data_root,
+        &view,
+        true,
+        true,
+        *daemon_stop_on_no_work,
+        auto_park,
+        &socket_path.display().to_string(),
+    );
+    maybe_write_snapshot(
+        state_root,
+        &snap,
+        last_snapshot_sig,
+        last_snapshot_written_at,
+    );
+
+    let resp = match apply_result {
+        Ok(actions) => ControlResponse {
+            ok: true,
+            actions,
+            error: None,
+            status: Some(snap),
+        },
+        Err(error) => ControlResponse {
+            ok: false,
+            actions: Vec::new(),
+            error: Some(error),
+            status: Some(snap),
+        },
+    };
+    let _ = write_control_response(&mut stream, &resp);
+}
+
+fn maybe_write_snapshot(
+    state_root: &Path,
+    snap: &StatusReport,
+    last_sig: &mut String,
+    last_written_at: &mut Option<Instant>,
+) {
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+    let mut normalized = snap.clone();
+    normalized.updated_unix_ms = 0;
+    let Ok(sig) = serde_json::to_string(&normalized) else {
+        return;
+    };
+    let heartbeat_due = last_written_at.is_none_or(|at| at.elapsed() >= HEARTBEAT_INTERVAL);
+    if sig == *last_sig && !heartbeat_due {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string_pretty(snap)
+        && write_snapshot_file(state_root, &json).is_ok()
+    {
+        *last_sig = sig;
+        *last_written_at = Some(Instant::now());
+    }
+}
+
+fn write_control_response(stream: &mut UnixStream, resp: &ControlResponse) -> Result<(), String> {
+    let mut payload =
+        serde_json::to_string(resp).map_err(|e| format!("response JSON failed: {e}"))?;
+    payload.push('\n');
+    stream
+        .write_all(payload.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("response write failed: {e}"))
+}
+
+fn apply_control_request(
+    req: &ControlRequest,
+    layout: &Layout,
+    engine: &mut Engine,
+    auto_park: &mut StopOnNoWorkTracker,
+    daemon_stop_on_no_work: &mut bool,
+) -> Result<Vec<String>, String> {
+    if req.start_all && req.stop_all {
+        return Err("cannot pass both `--start-all` and `--stop-all`".to_owned());
+    }
+    if req.stop_on_no_work && req.keep_running {
+        return Err("pass either `--stop-on-no-work` or `--keep-running`, not both".to_owned());
+    }
+
+    // Refresh `instruction.md` sizes/contents from disk first so newly written instructions
+    // take effect immediately on the very next started session.
+    engine.refresh_instructions();
+    let view = engine.board();
+    if view.agents.is_empty() {
+        return Err("no agents are configured on the running daemon".to_owned());
+    }
+
+    let mut to_stop = req.stop_agents.clone();
+    if req.stop_all {
+        for agent in &view.agents {
+            if !engine::removal_requested(layout, &agent.name) && !to_stop.contains(&agent.name) {
+                to_stop.push(agent.name.clone());
+            }
+        }
+    }
+
+    let mut to_start = req.start_agents.clone();
+    if req.start_all {
+        for agent in &view.agents {
+            if !to_start.contains(&agent.name) {
+                to_start.push(agent.name.clone());
+            }
+        }
+    }
+
+    for name in &to_start {
+        if to_stop.contains(name) {
+            return Err(format!(
+                "agent `{name}` cannot be both started and stopped in the same `--control` command"
+            ));
+        }
+    }
+
+    // Validate every target name and every start precondition atomically BEFORE mutating
+    // any agent's state on the running daemon.
+    for stop_name in &to_stop {
+        if !view.agents.iter().any(|a| a.name == *stop_name) {
+            return Err(format!("there is no agent named `{stop_name}`"));
+        }
+        if !req.stop_all && engine::removal_requested(layout, stop_name) {
+            return Err(format!(
+                "agent `{stop_name}` is queued for removal; its Forgejo sign-in is already being revoked"
+            ));
+        }
+    }
+    for start_name in &to_start {
+        let Some(agent_view) = view.agents.iter().find(|a| a.name == *start_name) else {
+            return Err(format!("there is no agent named `{start_name}`"));
+        };
+        if engine::removal_requested(layout, start_name) {
+            return Err(format!(
+                "agent `{start_name}` is queued for removal and cannot be started"
+            ));
+        }
+        if let Some(leftover) = &agent_view.leftover {
+            return Err(format!(
+                "agent `{start_name}` has an unfinished earlier process group ({leftover})"
+            ));
+        }
+        if let Some(err) = &agent_view.program_error {
+            return Err(format!(
+                "agent `{start_name}` cannot start: {err} — stop the daemon first, then {}",
+                repair_command_for_agent_block(start_name, &agent_view.program, err)
+            ));
+        }
+        if agent_view.instruction_chars == 0 {
+            let inst_hint = layout
+                .agent(start_name)
+                .map(|p| p.instruction().display().to_string())
+                .unwrap_or_else(|_| format!("<config-dir>/agents/{start_name}/instruction.md"));
+            return Err(format!(
+                "agent `{start_name}` cannot start because its instruction is empty — write `{inst_hint}` first, then re-run `gewu-multiverse --control --start-agent {start_name}`"
+            ));
+        }
+    }
+
+    let mut actions = Vec::new();
+
+    // Execute `to_start` first with full rollback of any newly started targets if a
+    // runtime-only check (such as `codex_sandbox_block`) rejects a later agent in the
+    // same batch, so neither `to_start` nor `to_stop` leaves a partial mutation.
+    if !to_start.is_empty() {
+        let saved_auto_park = auto_park.armed_min_runs.clone();
+        let mut newly_started: Vec<String> = Vec::new();
+        let effective_auto_park = if req.keep_running {
+            false
+        } else if req.stop_on_no_work {
+            true
+        } else {
+            *daemon_stop_on_no_work
+        };
+
+        for start_name in &to_start {
+            let was_stopped = view
+                .agents
+                .iter()
+                .find(|a| a.name == *start_name)
+                .is_some_and(|a| a.desired == Desired::Stopped);
+            if let Some(before) = view.agents.iter().find(|a| a.name == *start_name) {
+                if effective_auto_park {
+                    auto_park.arm_for_fresh_wake(before);
+                } else {
+                    auto_park.disarm(start_name);
+                }
+            }
+            if let Err(error) = engine.send(Command::Start {
+                name: start_name.clone(),
+            }) {
+                auto_park.armed_min_runs = saved_auto_park;
+                for prev in newly_started {
+                    let _ = engine.send(Command::Stop { name: prev });
+                }
+                return Err(error);
+            }
+            let after = engine.board();
+            if let Some(SessionState::Blocked { reason }) = after
+                .agents
+                .iter()
+                .find(|a| a.name == *start_name)
+                .map(|a| &a.session)
+            {
+                let reason = reason.clone();
+                auto_park.armed_min_runs = saved_auto_park;
+                let _ = engine.send(Command::Stop {
+                    name: start_name.clone(),
+                });
+                for prev in newly_started {
+                    let _ = engine.send(Command::Stop { name: prev });
+                }
+                return Err(format!("agent `{start_name}` cannot start: {reason}"));
+            }
+            if was_stopped {
+                newly_started.push(start_name.clone());
+            }
+            let suffix = if effective_auto_park {
+                " (stop-on-no-work)"
+            } else {
+                ""
+            };
+            log_daemon(&format!("control: started agent `{start_name}`{suffix}"));
+            actions.push(format!("started agent `{start_name}`{suffix}"));
+        }
+    }
+
+    for stop_name in &to_stop {
+        auto_park.disarm(stop_name);
+        engine.send(Command::Stop {
+            name: stop_name.clone(),
+        })?;
+        log_daemon(&format!("control: stopped agent `{stop_name}`"));
+        actions.push(format!("stopped agent `{stop_name}`"));
+    }
+
+    // Global daemon auto-park toggle when neither `--start-agent` nor `--start-all` was specified.
+    if to_start.is_empty() {
+        if req.stop_on_no_work {
+            *daemon_stop_on_no_work = true;
+            let current = engine.board();
+            for agent in &current.agents {
+                if agent.desired == Desired::Started {
+                    auto_park.arm_existing(agent);
+                }
+            }
+            let _ = auto_park.reconcile_after_tick(engine);
+            log_daemon("control: enabled --stop-on-no-work for running daemon");
+            actions.push("enabled stop-on-no-work".to_owned());
+        } else if req.keep_running {
+            *daemon_stop_on_no_work = false;
+            auto_park.clear();
+            log_daemon("control: disabled --stop-on-no-work (keep-running)");
+            actions.push("disabled stop-on-no-work (keep-running)".to_owned());
+        }
+    } else {
+        // Advance one engine tick immediately so newly started agents queue their session
+        // before `run_control` returns to the caller.
+        engine.tick();
+        let _ = auto_park.reconcile_after_tick(engine);
+    }
+
+    Ok(actions)
+}
+
+/// Send a live start/stop command to a running `--headless` daemon over its private Unix
+/// socket without acquiring `engine.lock` or restarting bundled Forgejo.
+pub fn run_control(cli: ControlCli) -> Result<String, String> {
+    if cli.start_all && cli.stop_all {
+        return Err("cannot pass both `--start-all` and `--stop-all`".to_owned());
+    }
+    if cli.stop_on_no_work && cli.keep_running {
+        return Err("pass either `--stop-on-no-work` or `--keep-running`, not both".to_owned());
+    }
+    for name in &cli.start_agents {
+        if cli.stop_agents.contains(name) {
+            return Err(format!(
+                "agent `{name}` cannot be both started and stopped in the same `--control` command"
+            ));
+        }
+    }
+
+    let (layout, data_root) = resolve_paths(cli.root, cli.state_root, cli.data_root)?;
+    let socket_path = resolve_control_socket_path(&layout, cli.control_socket.as_deref())?;
+
+    let mut stream = connect_control_socket(&socket_path, &data_root)?;
+    let _ = stream.set_read_timeout(Some(CLIENT_SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CLIENT_SOCKET_TIMEOUT));
+
+    let cookie_path = control_cookie_path(&socket_path)?;
+    let auth_cookie = fs::read_to_string(&cookie_path)
+        .map_err(|error| {
+            format!(
+                "control socket cookie {} cannot be read ({error}) — `--control` must be run by the daemon's host user outside confined agent shells",
+                cookie_path.display()
+            )
+        })?
+        .trim()
+        .to_owned();
+    if auth_cookie.is_empty() {
+        return Err(format!(
+            "control socket cookie {} is empty",
+            cookie_path.display()
+        ));
+    }
+
+    let req = ControlRequest {
+        auth_cookie,
+        start_agents: cli.start_agents,
+        stop_agents: cli.stop_agents,
+        start_all: cli.start_all,
+        stop_all: cli.stop_all,
+        stop_on_no_work: cli.stop_on_no_work,
+        keep_running: cli.keep_running,
+    };
+    let mut payload =
+        serde_json::to_string(&req).map_err(|e| format!("control request JSON failed: {e}"))?;
+    payload.push('\n');
+    stream.write_all(payload.as_bytes()).map_err(|error| {
+        format!(
+            "failed to send command to control socket {}: {error}",
+            socket_path.display()
+        )
+    })?;
+    stream.flush().map_err(|error| {
+        format!(
+            "failed to flush command to control socket {}: {error}",
+            socket_path.display()
+        )
+    })?;
+
+    let mut reply_line = String::new();
+    {
+        let limited = (&mut stream).take(MAX_CONTROL_RESPONSE_BYTES + 1);
+        let mut reader = BufReader::new(limited);
+        reader.read_line(&mut reply_line).map_err(|error| {
+            format!(
+                "failed to read reply from control socket {}: {error}",
+                socket_path.display()
+            )
+        })?;
+    }
+    if reply_line.trim().is_empty() {
+        return Err(format!(
+            "headless daemon closed control socket {} without a response",
+            socket_path.display()
+        ));
+    }
+    if reply_line.len() as u64 > MAX_CONTROL_RESPONSE_BYTES {
+        return Err("control socket response exceeded maximum size".to_owned());
+    }
+
+    let resp: ControlResponse = serde_json::from_str(reply_line.trim()).map_err(|error| {
+        format!(
+            "invalid response from control socket {}: {error}",
+            socket_path.display()
+        )
+    })?;
+
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "control command was rejected by headless daemon".to_owned()));
+    }
+
+    if cli.json {
+        return serde_json::to_string_pretty(&resp)
+            .map_err(|error| format!("control JSON serialization failed: {error}"));
+    }
+
+    if resp.actions.is_empty() {
+        Ok("gewu-multiverse: control command applied".to_owned())
+    } else {
+        Ok(resp
+            .actions
+            .iter()
+            .map(|line| format!("gewu-multiverse: {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+fn connect_control_socket(socket_path: &Path, data_root: &Path) -> Result<UnixStream, String> {
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    loop {
+        match connect_unix_socket_raw(socket_path) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                let lock_held = engine_lock_held(data_root);
+                if lock_held
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    )
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                if lock_held && error.kind() == io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "an active gewu-multiverse instance holds the engine lock, but no headless control socket exists at {} (if the interactive TUI board is open, use the board directly or run `gewu-multiverse --headless`)",
+                        socket_path.display()
+                    ));
+                }
+                return Err(format!(
+                    "no running `--headless` daemon is listening at {} ({error}) — start one with `gewu-multiverse --headless --allow-idle` (or use `gewu-multiverse --configure` while stopped)",
+                    socket_path.display()
+                ));
+            }
+        }
+    }
 }
 
 fn write_snapshot_file(state_root: &Path, json: &str) -> Result<(), String> {
@@ -916,7 +2241,7 @@ fn describe_agent_runtime(agent: &crate::engine_api::AgentView) -> String {
     format!("{prov}, {sess}")
 }
 
-/// Non-secret status report emitted by `--status` and `headless-status.json`.
+/// Non-secret status report emitted by `--status`, `--control --json`, and `headless-status.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReport {
     pub version: String,
@@ -924,7 +2249,15 @@ pub struct StatusReport {
     pub engine_running: bool,
     pub daemon_pid: Option<u32>,
     pub ready_for_headless: bool,
+    #[serde(default)]
+    pub ready_for_idle_headless: bool,
     pub healthy: bool,
+    #[serde(default)]
+    pub idle_standby: bool,
+    #[serde(default)]
+    pub stop_on_no_work: bool,
+    #[serde(default)]
+    pub control_socket: String,
     pub terms_acknowledged: bool,
     pub terms_version: u32,
     pub required_terms_version: u32,
@@ -963,6 +2296,8 @@ pub struct AgentStatusSummary {
     pub name: String,
     pub login: String,
     pub desired: String,
+    #[serde(default)]
+    pub stop_on_no_work: bool,
     pub program: String,
     pub program_installed: bool,
     pub protocol: String,
@@ -978,13 +2313,27 @@ pub struct AgentStatusSummary {
     pub program_error: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_snapshot_from_view(
     layout: &Layout,
     data_root: &Path,
     view: &BoardView,
     running: bool,
+    allow_idle_runtime: bool,
+    daemon_stop_on_no_work: bool,
+    auto_park: &StopOnNoWorkTracker,
+    control_socket: &str,
 ) -> StatusReport {
-    let blocking = collect_view_blocking_reasons(view);
+    let blocking = collect_view_blocking_reasons(layout, view, allow_idle_runtime);
+    let strict_blocking = collect_view_blocking_reasons(layout, view, false);
+    let idle_blocking = collect_view_blocking_reasons(layout, view, true);
+    let started_count = view
+        .agents
+        .iter()
+        .filter(|a| a.desired == Desired::Started)
+        .count();
+    let idle_standby = running && started_count == 0 && !view.agents.is_empty();
+
     let forgejo_state = match &view.forgejo.state {
         ForgejoState::Missing => "missing".to_owned(),
         ForgejoState::Fetching { .. } => "fetching".to_owned(),
@@ -1004,6 +2353,7 @@ fn build_snapshot_from_view(
                 Desired::Started => "started".to_owned(),
                 Desired::Stopped => "stopped".to_owned(),
             },
+            stop_on_no_work: a.desired == Desired::Started && auto_park.is_armed(&a.name),
             program: a.program.clone(),
             program_installed: a.program_installed,
             protocol: a.protocol.clone(),
@@ -1030,16 +2380,24 @@ fn build_snapshot_from_view(
             program_error: a.program_error.clone(),
         })
         .collect();
-    let healthy = running
-        && blocking.is_empty()
-        && matches!(view.forgejo.state, ForgejoState::Running);
+    let forgejo_ready = matches!(view.forgejo.state, ForgejoState::Running)
+        && view.forgejo.repositories >= 1
+        && view.agents.iter().all(|a| {
+            engine::removal_requested(layout, &a.name)
+                || matches!(a.provisioning, Provisioning::Ready)
+        });
+    let healthy = running && blocking.is_empty() && forgejo_ready;
     StatusReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         updated_unix_ms: now_unix_ms(),
         engine_running: running,
         daemon_pid: running.then(std::process::id),
-        ready_for_headless: blocking.is_empty(),
+        ready_for_headless: strict_blocking.is_empty(),
+        ready_for_idle_headless: idle_blocking.is_empty(),
         healthy,
+        idle_standby,
+        stop_on_no_work: daemon_stop_on_no_work,
+        control_socket: control_socket.to_owned(),
         terms_acknowledged: view.terms_acknowledged,
         terms_version: if view.terms_acknowledged {
             TERMS_VERSION
@@ -1056,7 +2414,7 @@ fn build_snapshot_from_view(
         state_dir: layout.state_root().display().to_string(),
         data_dir: data_root.display().to_string(),
         forgejo: ForgejoStatusSummary {
-            binary_installed: bundled_forgejo::is_installed(data_root),
+            binary_installed: is_forgejo_installed_cached(data_root),
             version: view.forgejo.version.clone(),
             state: forgejo_state,
             url: view.forgejo.url.clone(),
@@ -1075,10 +2433,69 @@ fn build_snapshot_from_view(
     }
 }
 
-fn collect_view_blocking_reasons(view: &BoardView) -> Vec<String> {
+fn is_forgejo_installed_cached(data_root: &Path) -> bool {
+    struct CachedDigest {
+        path: PathBuf,
+        dev: u64,
+        ino: u64,
+        len: u64,
+        mtime: i64,
+        mtime_nsec: i64,
+        verified: bool,
+    }
+    static CACHE: std::sync::Mutex<Option<CachedDigest>> = std::sync::Mutex::new(None);
+
+    let bin_path = bundled_forgejo::binary_path(data_root);
+    let Ok(meta) = fs::metadata(&bin_path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    if let Ok(guard) = CACHE.lock()
+        && let Some(c) = guard.as_ref()
+        && c.path == bin_path
+        && c.dev == meta.dev()
+        && c.ino == meta.ino()
+        && c.len == meta.len()
+        && c.mtime == meta.mtime()
+        && c.mtime_nsec == meta.mtime_nsec()
+    {
+        return c.verified;
+    }
+    let verified = bundled_forgejo::is_installed(data_root);
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some(CachedDigest {
+            path: bin_path,
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            verified,
+        });
+    }
+    verified
+}
+
+fn collect_view_blocking_reasons(
+    layout: &Layout,
+    view: &BoardView,
+    allow_idle: bool,
+) -> Vec<String> {
     let mut reasons = Vec::new();
     if !view.terms_acknowledged {
         reasons.push("first-run terms are not acknowledged".to_owned());
+    }
+    for agent in &view.agents {
+        if engine::removal_requested(layout, &agent.name) {
+            reasons.push(format!("agent `{}` is queued for removal", agent.name));
+        }
+        if (allow_idle || agent.desired == Desired::Started)
+            && let Some(leftover) = &agent.leftover
+        {
+            reasons.push(format!("agent `{}` leftover process: {leftover}", agent.name));
+        }
     }
     let started: Vec<_> = view
         .agents
@@ -1086,30 +2503,36 @@ fn collect_view_blocking_reasons(view: &BoardView) -> Vec<String> {
         .filter(|a| a.desired == Desired::Started)
         .collect();
     if started.is_empty() {
-        reasons.push("no agent is marked started".to_owned());
+        if view.agents.is_empty() {
+            reasons.push("no agents are configured".to_owned());
+        } else if !allow_idle {
+            reasons.push("no agent is marked started".to_owned());
+        }
     }
     for agent in started {
-        if let Some(leftover) = &agent.leftover {
-            reasons.push(format!("agent `{}` leftover process: {leftover}", agent.name));
-        }
         if let Some(err) = &agent.program_error {
             reasons.push(format!("agent `{}`: {err}", agent.name));
         }
         if agent.instruction_chars == 0 {
             reasons.push(format!("agent `{}` has an empty instruction", agent.name));
         }
+        if matches!(agent.session, SessionState::Blocked { .. }) {
+            reasons.push(format!("agent `{}` session is blocked", agent.name));
+        }
     }
     reasons
 }
 
-/// Read-only status inspection (`--status [--json]`). Never acquires `engine.lock`
-/// blocks or mutates files on disk.
+/// Read-only status inspection (`--status [--json]`). Never acquires `engine.lock`,
+/// blocks, or mutates files on disk.
 pub fn run_status(cli: StatusCli) -> Result<String, String> {
     let (layout, data_root) = resolve_paths(cli.root, cli.state_root, cli.data_root)?;
+    let control_socket_path =
+        resolve_control_socket_path(&layout, cli.control_socket.as_deref())?;
     let running = engine_lock_held(&data_root);
 
     // When a headless daemon holds `engine.lock` and wrote a fresh snapshot for a live
-    // PID, return its live runtime view directly (refreshing loopback Forgejo liveness).
+    // PID, return its live runtime view directly.
     if running {
         let snap_path = layout.state_root().join(STATUS_SNAPSHOT_FILE);
         if let Ok(text) = fs::read_to_string(&snap_path)
@@ -1117,6 +2540,9 @@ pub fn run_status(cli: StatusCli) -> Result<String, String> {
             && snap.daemon_pid.is_some_and(process_alive)
         {
             snap.engine_running = true;
+            if snap.control_socket.is_empty() {
+                snap.control_socket = control_socket_path.display().to_string();
+            }
             return format_status(&snap, cli.json);
         }
     }
@@ -1150,8 +2576,10 @@ pub fn run_status(cli: StatusCli) -> Result<String, String> {
     };
 
     let mut blocking = Vec::new();
+    let mut idle_blocking = Vec::new();
     if !terms_ok {
         blocking.push("first-run terms are not acknowledged".to_owned());
+        idle_blocking.push("first-run terms are not acknowledged".to_owned());
     }
 
     let mut agents = Vec::new();
@@ -1190,6 +2618,9 @@ pub fn run_status(cli: StatusCli) -> Result<String, String> {
         let removal_queued = engine::removal_requested(&layout, &saved.name);
         if removal_queued {
             prog_err = Some("queued for removal (awaiting Forgejo token revocation)".to_owned());
+            let reason = format!("agent `{}` is queued for removal", saved.name);
+            blocking.push(reason.clone());
+            idle_blocking.push(reason);
         } else if let Some(unknown) = saved.unknown_harness() {
             prog_err = Some(format!("unknown saved program `{unknown}`"));
         } else if !program_installed {
@@ -1210,10 +2641,14 @@ pub fn run_status(cli: StatusCli) -> Result<String, String> {
 
         if desired == Desired::Started {
             if let Some(err) = &prog_err {
-                blocking.push(format!("agent `{}`: {err}", saved.name));
+                let reason = format!("agent `{}`: {err}", saved.name);
+                blocking.push(reason.clone());
+                idle_blocking.push(reason);
             }
             if instruction_chars == 0 {
-                blocking.push(format!("agent `{}` has an empty instruction", saved.name));
+                let reason = format!("agent `{}` has an empty instruction", saved.name);
+                blocking.push(reason.clone());
+                idle_blocking.push(reason);
             }
         }
 
@@ -1228,6 +2663,7 @@ pub fn run_status(cli: StatusCli) -> Result<String, String> {
                     Desired::Stopped => "stopped".to_owned(),
                 }
             },
+            stop_on_no_work: false,
             program: program.id().to_owned(),
             program_installed,
             protocol,
@@ -1252,7 +2688,10 @@ pub fn run_status(cli: StatusCli) -> Result<String, String> {
         });
     }
 
-    if started_count == 0 {
+    if settings.agents.is_empty() {
+        blocking.push("no agents are configured".to_owned());
+        idle_blocking.push("no agents are configured".to_owned());
+    } else if started_count == 0 {
         blocking.push("no agent is marked started".to_owned());
     }
 
@@ -1268,7 +2707,11 @@ pub fn run_status(cli: StatusCli) -> Result<String, String> {
         engine_running: running,
         daemon_pid: None,
         ready_for_headless: blocking.is_empty(),
+        ready_for_idle_headless: idle_blocking.is_empty(),
         healthy: running && blocking.is_empty() && forgejo_reachable,
+        idle_standby: running && started_count == 0 && !settings.agents.is_empty(),
+        stop_on_no_work: false,
+        control_socket: control_socket_path.display().to_string(),
         terms_acknowledged: terms_ok,
         terms_version: settings.terms_version,
         required_terms_version: TERMS_VERSION,
@@ -1338,7 +2781,7 @@ fn format_status(report: &StatusReport, as_json: bool) -> Result<String, String>
     }
     let mut lines = Vec::new();
     lines.push(format!(
-        "gewu-multiverse {} — engine: {} · ready_for_headless: {} · healthy: {}",
+        "gewu-multiverse {} — engine: {} · ready_for_headless: {} · ready_for_idle_headless: {} · healthy: {} · idle_standby: {}",
         report.version,
         if report.engine_running {
             match report.daemon_pid {
@@ -1349,10 +2792,12 @@ fn format_status(report: &StatusReport, as_json: bool) -> Result<String, String>
             "stopped".to_owned()
         },
         report.ready_for_headless,
-        report.healthy
+        report.ready_for_idle_headless,
+        report.healthy,
+        report.idle_standby
     ));
     lines.push(format!(
-        "terms: {} (v{}/{}) · confinement: {}",
+        "terms: {} (v{}/{}) · confinement: {} · control_socket: {}",
         if report.terms_acknowledged {
             "acknowledged"
         } else {
@@ -1360,7 +2805,8 @@ fn format_status(report: &StatusReport, as_json: bool) -> Result<String, String>
         },
         report.terms_version,
         report.required_terms_version,
-        report.confinement
+        report.confinement,
+        report.control_socket
     ));
     lines.push(format!(
         "forgejo {}: binary={} · state={} · url={}",
@@ -1382,9 +2828,14 @@ fn format_status(report: &StatusReport, as_json: bool) -> Result<String, String>
     } else {
         for agent in &report.agents {
             lines.push(format!(
-                "agent {}: desired={} · program={} · session={} · runs={} · instruction={} chars{}",
+                "agent {}: desired={}{} · program={} · session={} · runs={} · instruction={} chars{}",
                 agent.name,
                 agent.desired,
+                if agent.stop_on_no_work {
+                    " (stop-on-no-work)"
+                } else {
+                    ""
+                },
                 agent.program,
                 agent.session,
                 agent.runs_total,

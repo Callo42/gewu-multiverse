@@ -58,6 +58,51 @@ impl Drop for Scratch {
     }
 }
 
+static LIVE_FORGEJO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct DaemonGuard(Option< std::process::Child >);
+
+impl DaemonGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn id(&self) -> u32 {
+        self.0.as_ref().expect("child").id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.as_mut().expect("child").try_wait()
+    }
+
+    fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.0.take().expect("child").wait_with_output()
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 fn base_cmd(scratch: &Scratch) -> Command {
     let mut cmd = Command::new(binary());
     cmd.arg("--config-dir")
@@ -602,6 +647,9 @@ fn configure_bootstraps_without_tty_and_status_never_exposes_secrets_or_blocks_o
 #[test]
 #[ignore = "live Forgejo headless daemon E2E: run with GEWU_FORGEJO_BINARY=/path/to/forgejo-17.0.0-linux-amd64 cargo test --test headless-daemon -- --ignored --nocapture"]
 fn live_headless_daemon_runs_forgejo_and_agent_without_tty_and_stops_cleanly_on_sigterm() {
+    let _serial = LIVE_FORGEJO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let forgejo_bin = PathBuf::from(std::env::var("GEWU_FORGEJO_BINARY").unwrap_or_else(|_| {
         panic!("set GEWU_FORGEJO_BINARY to the pinned forgejo-17.0.0-linux-amd64 binary")
     }));
@@ -657,14 +705,16 @@ fn live_headless_daemon_runs_forgejo_and_agent_without_tty_and_stops_cleanly_on_
 
     // Spawn `--headless` detached from any controlling terminal (`setsid` via process_group + null stdin).
     use std::os::unix::process::CommandExt;
-    let mut daemon = base_cmd(&scratch)
-        .arg("--headless")
-        .env("GEWU_FORGEJO_BINARY", &forgejo_bin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .expect("headless daemon starts");
+    let mut daemon = DaemonGuard::new(
+        base_cmd(&scratch)
+            .arg("--headless")
+            .env("GEWU_FORGEJO_BINARY", &forgejo_bin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("headless daemon starts"),
+    );
     let daemon_pid = daemon.id();
 
     // Poll `--status --json` from outside until `healthy == true` and `runs_total >= 1`.
@@ -809,4 +859,912 @@ fn live_headless_daemon_runs_forgejo_and_agent_without_tty_and_stops_cleanly_on_
             "Forgejo child pid {p} survived --configure --remove-agent shutdown"
         );
     }
+}
+
+#[test]
+fn idle_headless_and_control_validate_preconditions_socket_permissions_and_offline_errors() {
+    let scratch = Scratch::new("idle-control-guards");
+    let secret = "sk-control-never-echo-998877";
+    let key_file = scratch.path().join("model.key");
+    fs::write(&key_file, format!("{secret}\n")).expect("key file");
+    let inst_file = scratch.path().join("agent-1.md");
+    fs::write(&inst_file, "Handle event-driven tasks.\n").expect("inst file");
+
+    // 1. `--headless --allow-idle` with 0 configured agents still fails fast.
+    let zero_agents = base_cmd(&scratch)
+        .args(["--headless", "--accept-terms", "--allow-idle"])
+        .output()
+        .expect("zero agents");
+    assert!(!zero_agents.status.success());
+    let zero_err = String::from_utf8_lossy(&zero_agents.stderr);
+    assert!(
+        zero_err.contains("no agents are configured"),
+        "expected empty-agents error: {zero_err}"
+    );
+
+    // 2. Configure agent-1 started, then `--configure --stop-all` parks it to stopped.
+    let cfg = base_cmd(&scratch)
+        .args([
+            "--configure",
+            "--accept-terms",
+            "--agents",
+            "1",
+            "--agent",
+            "agent-1",
+            "--program",
+            "builtin",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--model",
+            "stub-model",
+            "--api-key-file",
+        ])
+        .arg(&key_file)
+        .arg("--instruction-file")
+        .arg(&inst_file)
+        .args(["--start-agent", "agent-1"])
+        .output()
+        .expect("configure");
+    assert!(
+        cfg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cfg.stderr)
+    );
+
+    let stop_all = base_cmd(&scratch)
+        .args(["--configure", "--stop-all"])
+        .output()
+        .expect("stop-all");
+    assert!(
+        stop_all.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop_all.stderr)
+    );
+
+    let st_out = base_cmd(&scratch)
+        .args(["--status", "--json"])
+        .output()
+        .expect("status");
+    assert!(st_out.status.success());
+    let st: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&st_out.stdout)).expect("json");
+    assert_eq!(st["ready_for_headless"], serde_json::json!(false));
+    assert_eq!(st["ready_for_idle_headless"], serde_json::json!(true));
+    assert_eq!(st["agents"][0]["desired"], serde_json::json!("stopped"));
+
+    // 3. Bare `--headless` (without `--allow-idle`) still fails fast when 0 agents are started.
+    let bare_hl = base_cmd(&scratch)
+        .arg("--headless")
+        .output()
+        .expect("bare headless");
+    assert!(!bare_hl.status.success());
+    let bare_err = String::from_utf8_lossy(&bare_hl.stderr);
+    assert!(
+        bare_err.contains("no agent is set to start") && bare_err.contains("--allow-idle"),
+        "expected fail-fast with --allow-idle hint: {bare_err}"
+    );
+
+    // 4. `--control` when no daemon is running fails immediately without hanging.
+    let started_at = Instant::now();
+    let offline_ctrl = base_cmd(&scratch)
+        .args(["--control", "--start-agent", "agent-1"])
+        .output()
+        .expect("offline --control");
+    assert!(!offline_ctrl.status.success());
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "offline --control hung for {:?}",
+        started_at.elapsed()
+    );
+    let offline_err = String::from_utf8_lossy(&offline_ctrl.stderr);
+    assert!(
+        offline_err.contains("no running `--headless` daemon"),
+        "expected actionable offline message: {offline_err}"
+    );
+
+    // 5. `--control` refuses setup flags, contradictory flags, and plaintext secrets without echo.
+    let eq_secret = format!("--api-key={secret}");
+    for bad_args in [
+        vec!["--control"],
+        vec!["--control", "--accept-terms", "--start-all"],
+        vec!["--control", "--model", "other", "--start-all"],
+        vec!["--control", "--start-all", "--stop-all"],
+        vec!["--control", "--start-agent", "agent-1", "--stop-agent", "agent-1"],
+        vec!["--control", "--start-agent", "agent-1", "--stop-on-no-work", "--keep-running"],
+        vec!["--control", "--api-key", secret],
+        vec!["--control", eq_secret.as_str()],
+    ] {
+        let out = base_cmd(&scratch)
+            .args(&bad_args)
+            .output()
+            .expect("bad --control");
+        assert!(!out.status.success(), "unexpected success for {bad_args:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stdout.contains(secret) && !stderr.contains(secret),
+            "secret echoed for {bad_args:?}:\nstdout={stdout}\nstderr={stderr}"
+        );
+    }
+
+    // 6. `--control-socket` refuses a group/world-accessible parent directory (`0755`).
+    let open_dir = scratch.path().join("open-sock-dir");
+    fs::create_dir_all(&open_dir).expect("open dir");
+    fs::set_permissions(&open_dir, fs::Permissions::from_mode(0o755)).expect("0755");
+    let bad_mode_sock = open_dir.join("headless.sock");
+    let mode_out = base_cmd(&scratch)
+        .args(["--headless", "--allow-idle", "--control-socket"])
+        .arg(&bad_mode_sock)
+        .output()
+        .expect("bad mode sock");
+    assert!(!mode_out.status.success());
+    let mode_err = String::from_utf8_lossy(&mode_out.stderr);
+    assert!(
+        mode_err.contains("0700"),
+        "expected 0700 directory refusal: {mode_err}"
+    );
+
+    // 7. `--control-socket` refuses to overwrite or unlink a pre-existing regular file.
+    let priv_dir = scratch.path().join("priv-sock-dir");
+    fs::create_dir_all(&priv_dir).expect("priv dir");
+    fs::set_permissions(&priv_dir, fs::Permissions::from_mode(0o700)).expect("0700");
+    let regular_file = priv_dir.join("not-a-socket.txt");
+    fs::write(&regular_file, "preserve-this-file\n").expect("write regular file");
+    let reg_out = base_cmd(&scratch)
+        .args(["--headless", "--allow-idle", "--control-socket"])
+        .arg(&regular_file)
+        .output()
+        .expect("regular file sock");
+    assert!(!reg_out.status.success());
+    assert_eq!(
+        fs::read_to_string(&regular_file).expect("regular file intact"),
+        "preserve-this-file\n",
+        "ControlSocketGuard must never overwrite or delete a regular file"
+    );
+
+    // 7b. `--control-socket` refuses to follow a pre-existing symlink at `<socket>.cookie`.
+    let cookie_target = scratch.path().join("do-not-clobber-via-cookie-symlink.txt");
+    fs::write(&cookie_target, "keep-intact\n").expect("write cookie target");
+    let sym_sock = priv_dir.join("sym-test.sock");
+    let sym_cookie = priv_dir.join("sym-test.sock.cookie");
+    std::os::unix::fs::symlink(&cookie_target, &sym_cookie).expect("symlink cookie");
+    let sym_out = base_cmd(&scratch)
+        .args(["--headless", "--allow-idle", "--control-socket"])
+        .arg(&sym_sock)
+        .output()
+        .expect("symlink cookie sock");
+    assert!(!sym_out.status.success());
+    assert_eq!(
+        fs::read_to_string(&cookie_target).expect("cookie symlink target intact"),
+        "keep-intact\n"
+    );
+    let _ = fs::remove_file(&sym_cookie);
+
+    // 8. `--control-socket` refuses a path inside `<config-dir>/agents/`.
+    let inside_agents = scratch.config().join("agents/agent-1/sock-dir");
+    fs::create_dir_all(&inside_agents).expect("inside agents");
+    fs::set_permissions(&inside_agents, fs::Permissions::from_mode(0o700)).expect("0700");
+    let agents_sock = inside_agents.join("headless.sock");
+    let agents_out = base_cmd(&scratch)
+        .args(["--headless", "--allow-idle", "--control-socket"])
+        .arg(&agents_sock)
+        .output()
+        .expect("inside agents sock");
+    assert!(!agents_out.status.success());
+    let agents_err = String::from_utf8_lossy(&agents_out.stderr);
+    assert!(
+        agents_err.contains("agents directory") || agents_err.contains("workspace"),
+        "expected agents-dir overlap refusal: {agents_err}"
+    );
+
+    // 9. F1 regression: when Landlock confinement is active (`"Landlock"`), `--control-socket`
+    //    inside the binary's directory (even when copied under `<config-dir>/bin` so it lies
+    //    inside a protected root!) is refused before bind because Landlock grants read access
+    //    to the running binary's parent directory.
+    if st["confined"] == serde_json::json!(true)
+        && st["confinement"]
+            == serde_json::json!(gewu_multiverse::confinement::Method::Landlock.label())
+    {
+        if let Some(bin_parent) = Path::new(binary()).parent() {
+            let probe_dir =
+                bin_parent.join(format!("gewu-sock-overlap-probe-{}", std::process::id()));
+            if fs::create_dir(&probe_dir).is_ok() {
+                let _ = fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o700));
+                let overlap_sock = probe_dir.join("headless.sock");
+                let overlap_out = base_cmd(&scratch)
+                    .args(["--headless", "--allow-idle", "--control-socket"])
+                    .arg(&overlap_sock)
+                    .output()
+                    .expect("landlock overlap sock");
+                let _ = fs::remove_dir_all(&probe_dir);
+                assert!(!overlap_out.status.success());
+                let overlap_err = String::from_utf8_lossy(&overlap_out.stderr);
+                assert!(
+                    overlap_err.contains("Landlock"),
+                    "expected Landlock overlap refusal: {overlap_err}"
+                );
+            }
+        }
+
+        let copied_bin_dir = scratch.config().join("bin");
+        let copied_sock_dir = copied_bin_dir.join("sock");
+        fs::create_dir_all(&copied_sock_dir).expect("copied bin/sock dir");
+        fs::set_permissions(&copied_bin_dir, fs::Permissions::from_mode(0o700)).expect("0700");
+        fs::set_permissions(&copied_sock_dir, fs::Permissions::from_mode(0o700)).expect("0700");
+        let copied_bin = copied_bin_dir.join("gewu-multiverse");
+        fs::copy(binary(), &copied_bin).expect("copy binary into config/bin");
+        fs::set_permissions(&copied_bin, fs::Permissions::from_mode(0o755)).expect("0755");
+        let copied_sock = copied_sock_dir.join("headless.sock");
+        let copied_out = Command::new(&copied_bin)
+            .arg("--config-dir")
+            .arg(scratch.config())
+            .arg("--state-dir")
+            .arg(scratch.state())
+            .arg("--data-dir")
+            .arg(scratch.data())
+            .args(["--headless", "--allow-idle", "--control-socket"])
+            .arg(&copied_sock)
+            .stdin(Stdio::null())
+            .output()
+            .expect("copied binary landlock overlap");
+        assert!(
+            !copied_out.status.success(),
+            "socket under binary dir inside config-dir must be refused under Landlock"
+        );
+        let copied_err = String::from_utf8_lossy(&copied_out.stderr);
+        assert!(
+            copied_err.contains("Landlock"),
+            "expected Landlock overlap refusal for <config-dir>/bin/sock: {copied_err}"
+        );
+        assert!(!copied_sock.exists(), "refused socket must not be bound");
+        let _ = fs::remove_dir_all(&copied_bin_dir);
+    }
+
+    // 10. F3 regression: a `--state-dir` whose `<state-dir>/headless.sock` exceeds Linux
+    //     `SUN_LEN` (107 bytes) still binds its control socket via `/proc/self/fd/<dir_fd>`
+    //     instead of failing with `SUN_LEN`, while an overlong socket leaf filename (> 90
+    //     bytes) returns an actionable `--control-socket` message.
+    let long_state = scratch
+        .path()
+        .join("deeply-nested-state-path-segment-alpha-0123456789")
+        .join("deeply-nested-state-path-segment-beta-0123456789")
+        .join("deeply-nested-state-path-segment-gamma-0123456789");
+    assert!(
+        long_state.join("headless.sock").as_os_str().len() > 130,
+        "expected >130 byte socket path"
+    );
+    let bad_forgejo = scratch.path().join("bad-forgejo-long");
+    fs::write(&bad_forgejo, b"invalid-forgejo\n").expect("bad forgejo");
+    let long_out = Command::new(binary())
+        .arg("--config-dir")
+        .arg(scratch.config())
+        .arg("--state-dir")
+        .arg(&long_state)
+        .arg("--data-dir")
+        .arg(scratch.data())
+        .args(["--headless", "--allow-idle"])
+        .env("GEWU_FORGEJO_BINARY", &bad_forgejo)
+        .stdin(Stdio::null())
+        .output()
+        .expect("long state-dir headless");
+    assert!(!long_out.status.success());
+    let long_err = String::from_utf8_lossy(&long_out.stderr);
+    assert!(
+        !long_err.contains("SUN_LEN") && long_err.contains("bundled Forgejo failed to start"),
+        "long --state-dir should bind control socket cleanly and reach Forgejo start: {long_err}"
+    );
+
+    let overlong_leaf = priv_dir.join("s".repeat(100));
+    let leaf_out = base_cmd(&scratch)
+        .args(["--headless", "--allow-idle", "--control-socket"])
+        .arg(&overlong_leaf)
+        .output()
+        .expect("overlong socket filename");
+    assert!(!leaf_out.status.success());
+    let leaf_err = String::from_utf8_lossy(&leaf_out.stderr);
+    assert!(
+        leaf_err.contains("--control-socket") && leaf_err.contains("limit"),
+        "expected actionable socket length limit error: {leaf_err}"
+    );
+}
+
+#[test]
+#[ignore = "live Forgejo idle-standby + --control + Landlock + --stop-on-no-work E2E: run with GEWU_FORGEJO_BINARY=/path/to/forgejo-17.0.0-linux-amd64 cargo test --test headless-daemon -- --ignored --nocapture"]
+fn live_idle_warm_standby_runtime_control_landlock_isolation_and_stop_on_no_work() {
+    let _serial = LIVE_FORGEJO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let forgejo_bin = PathBuf::from(std::env::var("GEWU_FORGEJO_BINARY").unwrap_or_else(|_| {
+        panic!("set GEWU_FORGEJO_BINARY to the pinned forgejo-17.0.0-linux-amd64 binary")
+    }));
+    assert!(forgejo_bin.is_file());
+
+    let scratch = Scratch::new("live-idle-control");
+    let secret = "sk-idle-warm-secret-key-4242";
+    let key_file = scratch.path().join("model.key");
+    fs::write(&key_file, format!("{secret}\n")).expect("key");
+    let initial_inst = scratch.path().join("initial.md");
+    fs::write(&initial_inst, "Initial placeholder instruction.\n").expect("initial inst");
+
+    let sock_path = scratch.state().join("headless.sock");
+    let cookie_path = scratch.state().join("headless.sock.cookie");
+    let sock_probe_py = concat!(
+        "import json, socket, subprocess, sys\n",
+        "sock_p, cookie_p, bin_p, cfg_p, state_p, data_p = sys.argv[1:7]\n",
+        "try:\n",
+        "    open(cookie_p, \"rb\").read()\n",
+        "    print(\"COOKIE_READ_ALLOWED\")\n",
+        "except Exception as e:\n",
+        "    print(\"COOKIE_READ_BLOCKED:\" + type(e).__name__)\n",
+        "res = subprocess.run([bin_p, \"--config-dir\", cfg_p, \"--state-dir\", state_p, \"--data-dir\", data_p, \"--control\", \"--stop-all\"], capture_output=True, text=True)\n",
+        "print(\"CLI_CONTROL_ALLOWED\" if res.returncode == 0 else \"CLI_CONTROL_BLOCKED\")\n",
+        "s = socket.socket(socket.AF_UNIX)\n",
+        "try:\n",
+        "    s.connect(sock_p)\n",
+        "    s.sendall(json.dumps({\"stop_all\": True}).encode() + b\"\\n\")\n",
+        "    resp = json.loads(s.makefile(\"r\").readline())\n",
+        "    print(\"CONTROL_BYPASS_ALLOWED\" if resp.get(\"ok\") else \"RAW_CONTROL_REJECTED\")\n",
+        "except Exception as e:\n",
+        "    print(\"RAW_CONNECT_BLOCKED:\" + type(e).__name__)\n",
+    );
+    let sock_probe_cmd = format!(
+        "python3 -c '{}' '{}' '{}' '{}' '{}' '{}' '{}'",
+        sock_probe_py,
+        sock_path.display(),
+        cookie_path.display(),
+        binary(),
+        scratch.config().display(),
+        scratch.state().display(),
+        scratch.data().display(),
+    );
+    let shell_args = serde_json::json!({ "command": sock_probe_cmd }).to_string();
+    let comment_args = serde_json::json!({
+        "repository": "team/workspace",
+        "number": 1,
+        "body": "Processed event #1 in woken session."
+    })
+    .to_string();
+
+    // Scripted replies:
+    // - Session #1 (3 replies):
+    //   1) shell tool probing `<state-dir>/headless.sock` (must be blocked by Landlock!)
+    //   2) forgejo_comment on team/workspace#1 (real remote write -> SessionEnd::Succeeded)
+    //   3) final summary text ("Completed Issue #1.")
+    // - Session #2 (2 replies, started automatically because Session #1 Succeeded):
+    //   4) forgejo_list_assigned_issues (read-only)
+    //   5) final summary text ("No remaining work; nothing to do.") -> SessionEnd::NoWork -> immediate auto-park!
+    // - Agent-2 manual wake/stop check (1 slow reply so we can exercise live `--control --stop-agent agent-2`):
+    let mut slow_agent2_reply = StubReply::json(
+        r#"{"choices":[{"message":{"role":"assistant","content":"No assigned issues found; nothing to do."}}]}"#,
+    );
+    slow_agent2_reply.delay = Duration::from_millis(100);
+
+    let replies = vec![
+        StubReply::json(
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_sock_probe",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": shell_args,
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        ),
+        StubReply::json(
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_comment_1",
+                            "type": "function",
+                            "function": {
+                                "name": "forgejo_comment",
+                                "arguments": comment_args,
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        ),
+        StubReply::json(
+            r#"{"choices":[{"message":{"role":"assistant","content":"Completed Issue #1."}}]}"#,
+        ),
+        StubReply::json(
+            serde_json::json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_list_2",
+                            "type": "function",
+                            "function": {
+                                "name": "forgejo_list_assigned_issues",
+                                "arguments": "{}",
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+        ),
+        StubReply::json(
+            r#"{"choices":[{"message":{"role":"assistant","content":"No assigned issues left; nothing to do."}}]}"#,
+        ),
+        slow_agent2_reply,
+    ];
+    let stub = Stub::start(replies);
+
+    // Configure 2 builtin agents (`agent-1` has an instruction, `agent-2` has an empty instruction),
+    // BOTH left `stopped`.
+    let cfg = base_cmd(&scratch)
+        .args([
+            "--configure",
+            "--accept-terms",
+            "--agents",
+            "2",
+            "--agent",
+            "agent-1",
+            "--program",
+            "builtin",
+            "--base-url",
+            &format!("http://{}/v1", stub.addr()),
+            "--model",
+            "stub-idle-control",
+            "--api-key-file",
+        ])
+        .arg(&key_file)
+        .arg("--instruction-file")
+        .arg(&initial_inst)
+        .args(["--stop-all"])
+        .output()
+        .expect("configure");
+    assert!(
+        cfg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cfg.stderr)
+    );
+    let cfg_agent2 = base_cmd(&scratch)
+        .args(["--configure", "--agent", "agent-2", "--program", "builtin"])
+        .output()
+        .expect("configure agent-2 builtin");
+    assert!(
+        cfg_agent2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cfg_agent2.stderr)
+    );
+
+    // Spawn `gewu-multiverse --headless --allow-idle` detached from any TTY.
+    use std::os::unix::process::CommandExt;
+    let mut daemon = DaemonGuard::new(
+        base_cmd(&scratch)
+            .args(["--headless", "--allow-idle"])
+            .env("GEWU_FORGEJO_BINARY", &forgejo_bin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("idle-warm headless starts"),
+    );
+    let daemon_pid = daemon.id();
+
+    // Wait until `healthy == true`: Forgejo running, `team/workspace` created, and both agent logins provisioned!
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let ready_status = loop {
+        if let Some(status) = daemon.try_wait().expect("try_wait") {
+            let out = daemon.wait_with_output().expect("output");
+            panic!(
+                "idle headless daemon exited early ({status}):\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let st = base_cmd(&scratch)
+            .args(["--status", "--json"])
+            .output()
+            .expect("status --json");
+        if st.status.success()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&st.stdout))
+            && v["healthy"] == serde_json::json!(true)
+        {
+            break v;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for --headless --allow-idle healthy readiness"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+
+    assert_eq!(ready_status["idle_standby"], serde_json::json!(true));
+    assert_eq!(ready_status["ready_for_headless"], serde_json::json!(false));
+    assert_eq!(ready_status["ready_for_idle_headless"], serde_json::json!(true));
+    assert_eq!(ready_status["agents"][0]["provisioning"], serde_json::json!("ready"));
+    assert_eq!(ready_status["agents"][1]["provisioning"], serde_json::json!("ready"));
+    let forgejo_url = ready_status["forgejo"]["url"]
+        .as_str()
+        .expect("forgejo url")
+        .to_owned();
+    let confined = ready_status["confined"].as_bool().unwrap_or(false);
+    let confinement_kind = ready_status["confinement"]
+        .as_str()
+        .unwrap_or("none")
+        .to_owned();
+
+    // Verify 0600 permissions on `headless.sock`, `headless.sock.cookie`, and `headless-status.json`.
+    let sock_meta = fs::symlink_metadata(&sock_path).expect("headless.sock exists");
+    assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600);
+    let cookie_meta = fs::symlink_metadata(&cookie_path).expect("headless.sock.cookie exists");
+    assert_eq!(cookie_meta.permissions().mode() & 0o777, 0o600);
+    assert!(
+        fs::read_to_string(&cookie_path)
+            .expect("cookie text")
+            .trim()
+            .len()
+            >= 64
+    );
+    let snap_meta =
+        fs::symlink_metadata(scratch.state().join("headless-status.json")).expect("snapshot");
+    assert_eq!(snap_meta.permissions().mode() & 0o777, 0o600);
+
+    let pid_path = bundled_forgejo::InstancePaths::under(&scratch.data())
+        .root
+        .join(bundled_forgejo::PID_FILE);
+    let forgejo_pid_before: u32 = fs::read_to_string(&pid_path)
+        .expect("forgejo.pid")
+        .trim()
+        .parse()
+        .expect("u32 pid");
+    assert!(process_alive(forgejo_pid_before));
+
+    // Hold warm standby for 3.5s and create Issue #1 in `team/workspace` in < 1s:
+    // strictly ZERO model requests may fire while all agents are stopped!
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(
+        stub.requests().len(),
+        0,
+        "idle-warm standby made LLM requests while all agents were stopped!"
+    );
+
+    let creds_path = scratch.config().join("credentials.toml");
+    let agent1_token =
+        gewu_multiverse::credentials::forgejo_agent_token_optional(&creds_path, "agent-1")
+            .expect("read creds")
+            .expect("agent-1 forgejo token provisioned");
+    let issue_started = Instant::now();
+    let issue_payload = serde_json::json!({
+        "title": "Event-driven task #1",
+        "body": "Please handle event #1.",
+        "assignees": ["gewu-agent-1"]
+    })
+    .to_string();
+    let create_issue_resp = ureq::post(&format!("{forgejo_url}/api/v1/repos/team/workspace/issues"))
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("token {}", agent1_token.expose()))
+        .send(&issue_payload)
+        .expect("create Forgejo issue #1");
+    assert!(
+        (200..=299).contains(&create_issue_resp.status().as_u16()),
+        "unexpected create issue status: {}",
+        create_issue_resp.status()
+    );
+    assert!(
+        issue_started.elapsed() < Duration::from_secs(1),
+        "warm Forgejo issue creation took {:?} (>= 1s)",
+        issue_started.elapsed()
+    );
+    assert_eq!(stub.requests().len(), 0, "still 0 LLM requests before --control wake");
+
+    // Precondition validation on `--control`: starting `agent-2` (empty instruction) fails
+    // non-zero without starting `agent-2` or disturbing the running daemon.
+    let bad_wake = base_cmd(&scratch)
+        .args(["--control", "--start-agent", "agent-2"])
+        .output()
+        .expect("bad wake agent-2");
+    assert!(!bad_wake.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_wake.stderr).contains("instruction is empty"),
+        "{}",
+        String::from_utf8_lossy(&bad_wake.stderr)
+    );
+
+    // Hot-update `agent-1`'s `instruction.md` on disk WITHOUT restarting the daemon, then wake
+    // `agent-1` with `--control --start-agent agent-1 --stop-on-no-work --json`.
+    let agent1_inst_path = scratch.config().join("agents/agent-1/instruction.md");
+    fs::write(
+        &agent1_inst_path,
+        "HOT-REFRESHED-INSTRUCTION-9001: process Issue #1 in team/workspace.\n",
+    )
+    .expect("hot update instruction.md");
+
+    let wake_started = Instant::now();
+    let wake_out = base_cmd(&scratch)
+        .args([
+            "--control",
+            "--start-agent",
+            "agent-1",
+            "--stop-on-no-work",
+            "--json",
+        ])
+        .output()
+        .expect("wake agent-1");
+    assert!(
+        wake_out.status.success(),
+        "wake failed:\n{}",
+        String::from_utf8_lossy(&wake_out.stderr)
+    );
+    assert!(
+        wake_started.elapsed() < Duration::from_secs(1),
+        "--control wake took {:?}",
+        wake_started.elapsed()
+    );
+    let wake_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&wake_out.stdout)).expect("wake json");
+    assert_eq!(wake_json["ok"], serde_json::json!(true));
+    assert_eq!(
+        wake_json["status"]["idle_standby"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        wake_json["status"]["agents"][0]["desired"],
+        serde_json::json!("started")
+    );
+    assert_eq!(
+        wake_json["status"]["agents"][0]["stop_on_no_work"],
+        serde_json::json!(true)
+    );
+
+    // Wait for `agent-1` to complete Session #1 (`Succeeded` via `forgejo_comment`), automatically
+    // advance into Session #2, finish Session #2 as `NoWork`, and auto-park back to `stopped`!
+    // Must complete well before `NO_WORK_DELAY` (20s) would have scheduled a 3rd run.
+    let park_deadline = Instant::now() + Duration::from_secs(35);
+    let parked_status = loop {
+        if let Some(status) = daemon.try_wait().expect("try_wait") {
+            let out = daemon.wait_with_output().expect("output");
+            panic!(
+                "daemon exited unexpectedly during --stop-on-no-work run ({status}):\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let st = base_cmd(&scratch)
+            .args(["--status", "--json"])
+            .output()
+            .expect("status");
+        if st.status.success()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&st.stdout))
+            && v["agents"][0]["desired"] == serde_json::json!("stopped")
+            && v["agents"][0]["runs_total"].as_u64().unwrap_or(0) >= 2
+        {
+            break v;
+        }
+        assert!(
+            Instant::now() < park_deadline,
+            "timed out waiting for agent-1 multi-run completion + --stop-on-no-work auto-park"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+
+    assert_eq!(parked_status["idle_standby"], serde_json::json!(true));
+    assert_eq!(parked_status["healthy"], serde_json::json!(true));
+    assert_eq!(parked_status["agents"][0]["runs_total"], serde_json::json!(2));
+    assert_eq!(
+        parked_status["agents"][0]["stop_on_no_work"],
+        serde_json::json!(false)
+    );
+
+    // Verify `multiverse.toml` persisted `desired = "stopped"` and zero extra model calls occur.
+    let saved_toml =
+        fs::read_to_string(scratch.config().join("multiverse.toml")).expect("multiverse.toml");
+    assert!(
+        !saved_toml.contains(r#"desired = "started""#),
+        "auto-park must persist desired = stopped in multiverse.toml:\n{saved_toml}"
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let recorded_reqs = stub.requests();
+    assert_eq!(
+        recorded_reqs.len(),
+        5,
+        "expected exactly 5 model turns across 2 sessions (0 idle burn after auto-park), got {}",
+        recorded_reqs.len()
+    );
+
+    // Proof 1: hot-refreshed `instruction.md` was delivered to Session #1 without restarting the daemon!
+    assert!(
+        recorded_reqs[0]
+            .body
+            .contains("HOT-REFRESHED-INSTRUCTION-9001"),
+        "Session #1 did not receive hot-refreshed instruction.md:\n{}",
+        recorded_reqs[0].body
+    );
+
+    // Proof 2: Confined `shell` tool cannot read `headless.sock.cookie`, cannot run
+    // `gewu-multiverse --control`, and raw `AF_UNIX` `connect` without the cookie is rejected!
+    let turn2_json: serde_json::Value =
+        serde_json::from_str(&recorded_reqs[1].body).expect("turn 2 request json");
+    let tool_output = turn2_json["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == serde_json::json!("tool"))
+        .and_then(|m| m["content"].as_str())
+        .expect("tool output message");
+    assert!(
+        !tool_output.contains("COOKIE_READ_ALLOWED")
+            && !tool_output.contains("CLI_CONTROL_ALLOWED")
+            && !tool_output.contains("CONTROL_BYPASS_ALLOWED"),
+        "confined agent shell bypassed control socket isolation! tool output:\n{tool_output}"
+    );
+    if confined
+        && confinement_kind == gewu_multiverse::confinement::Method::Landlock.label()
+    {
+        assert!(
+            tool_output.contains("COOKIE_READ_BLOCKED:PermissionError")
+                && tool_output.contains("CLI_CONTROL_BLOCKED")
+                && (tool_output.contains("RAW_CONTROL_REJECTED")
+                    || tool_output.contains("RAW_CONNECT_BLOCKED:")),
+            "expected Landlock cookie PermissionError + CLI block + raw socket rejection, got:\n{tool_output}"
+        );
+    }
+
+    // Proof 3: `gewu-agent-1`'s comment on `team/workspace#1` was genuinely written to Forgejo!
+    let mut comments_resp = ureq::get(&format!(
+        "{forgejo_url}/api/v1/repos/team/workspace/issues/1/comments"
+    ))
+    .header("Authorization", &format!("token {}", agent1_token.expose()))
+    .call()
+    .expect("read issue #1 comments");
+    let comments_body = comments_resp
+        .body_mut()
+        .read_to_string()
+        .expect("comments body");
+    assert!(
+        comments_body.contains("Processed event #1 in woken session."),
+        "missing agent-1 Forgejo comment: {comments_body}"
+    );
+
+    // Proof 4 (F5 regression): Multi-target `--control --start-all` rolls back `agent-1` if
+    // `agent-2` hits a runtime `Command::Start` block (`removal-pending` marker), leaving zero partial state!
+    let agent2_inst_path = scratch.config().join("agents/agent-2/instruction.md");
+    fs::write(&agent2_inst_path, "Inspect agent-2 queue.\n").expect("agent-2 inst");
+    let removed_marker = scratch.state().join("agent-2/removal-pending");
+    fs::create_dir_all(removed_marker.parent().expect("parent")).expect("agent-2 state dir");
+    fs::write(&removed_marker, b"1\n").expect("write removed marker");
+    let atomic_fail = base_cmd(&scratch)
+        .args(["--control", "--start-all"])
+        .output()
+        .expect("atomic --start-all failure");
+    assert!(!atomic_fail.status.success());
+    fs::remove_file(&removed_marker).expect("remove temporary marker");
+    let post_rollback_st = base_cmd(&scratch)
+        .args(["--status", "--json"])
+        .output()
+        .expect("status after rollback");
+    let post_rollback_val: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&post_rollback_st.stdout)).expect("json");
+    assert_eq!(
+        post_rollback_val["agents"][0]["desired"],
+        serde_json::json!("stopped"),
+        "agent-1 must be rolled back to stopped when a later --start-all target blocks"
+    );
+    assert_eq!(
+        post_rollback_val["idle_standby"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        stub.requests().len(),
+        5,
+        "rolled-back --start-all must not dispatch any LLM request"
+    );
+
+    // Proof 5 (F4 regression + live start/stop): Start `agent-2` WITHOUT `--stop-on-no-work`;
+    // once its single turn finishes as `Restarting (no-work)` inside the 20s `NO_WORK_DELAY`
+    // window, send daemon-wide `--control --stop-on-no-work --json` and verify `agent-2` parks
+    // IMMEDIATELY to `stopped` (`runs_total == 1`, zero extra LLM turn), while Forgejo's PID
+    // remains unchanged!
+    let wake2 = base_cmd(&scratch)
+        .args(["--control", "--start-agent", "agent-2"])
+        .output()
+        .expect("wake agent-2");
+    assert!(
+        wake2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wake2.stderr)
+    );
+    let wait_restarting = Instant::now() + Duration::from_secs(20);
+    loop {
+        let st = base_cmd(&scratch)
+            .args(["--status", "--json"])
+            .output()
+            .expect("status");
+        if st.status.success()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&st.stdout))
+            && v["agents"][1]["session"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("restarting (no-work"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_restarting,
+            "timed out waiting for agent-2 to enter restarting (no-work) window"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let reqs_after_agent2_run1 = stub.requests().len();
+    assert_eq!(reqs_after_agent2_run1, 6);
+
+    let arm_global = base_cmd(&scratch)
+        .args(["--control", "--stop-on-no-work", "--json"])
+        .output()
+        .expect("global --stop-on-no-work");
+    assert!(
+        arm_global.status.success(),
+        "{}",
+        String::from_utf8_lossy(&arm_global.stderr)
+    );
+    let arm_json: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&arm_global.stdout)).expect("arm json");
+    assert_eq!(
+        arm_json["status"]["agents"][1]["desired"],
+        serde_json::json!("stopped"),
+        "F4: global --stop-on-no-work must immediately park an agent already waiting in NoWork"
+    );
+    assert_eq!(
+        arm_json["status"]["idle_standby"],
+        serde_json::json!(true)
+    );
+    assert_eq!(stub.requests().len(), 6, "zero extra LLM requests after immediate park");
+    let forgejo_pid_after: u32 = fs::read_to_string(&pid_path)
+        .expect("forgejo.pid still present")
+        .trim()
+        .parse()
+        .expect("u32 pid");
+    assert_eq!(
+        forgejo_pid_before, forgejo_pid_after,
+        "Forgejo PID changed across live --control start/stop!"
+    );
+    assert!(process_alive(forgejo_pid_after));
+
+    // Send SIGTERM to the daemon and verify exit 0, zero leaked secrets, Forgejo stopped, and
+    // `headless.sock` unlinked!
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(daemon_pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("SIGTERM");
+    let out = daemon.wait_with_output().expect("daemon exits");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "daemon did not exit 0 on SIGTERM ({:?}):\n{stderr}",
+        out.status
+    );
+    assert!(
+        !stderr.contains(secret),
+        "secret leaked in daemon stderr:\n{stderr}"
+    );
+    assert!(!process_alive(forgejo_pid_after));
+    assert!(
+        !sock_path.exists(),
+        "headless.sock was not unlinked on clean shutdown"
+    );
+    assert!(
+        !cookie_path.exists(),
+        "headless.sock.cookie was not unlinked on clean shutdown"
+    );
 }

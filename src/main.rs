@@ -157,6 +157,16 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Invocation::Control(cli) => match gewu_multiverse::headless::run_control(*cli) {
+            Ok(output) => {
+                let _ = writeln!(io::stdout(), "{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("gewu-multiverse: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Invocation::Status(cli) => match gewu_multiverse::headless::run_status(cli) {
             Ok(report) => {
                 let _ = writeln!(io::stdout(), "{report}");

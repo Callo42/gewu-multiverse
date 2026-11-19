@@ -141,7 +141,7 @@ pub fn install(
     {
         return Ok(existing);
     }
-    if let Some(prerequisite) = program.prerequisite_missing() {
+    if let Some(prerequisite) = program.prerequisite_missing_uncached() {
         return Err(prerequisite.to_owned());
     }
     if program == Program::Dsh {

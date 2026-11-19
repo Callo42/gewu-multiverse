@@ -104,7 +104,7 @@ pub const TERMS_VERSION: u32 = 2;
 ///
 /// It stays inside what the product can observe and does not promise perfect shell
 /// interpretation or unconditional containment of detached processes.
-pub const WHATS_NEW: &str = "release archives bundle verified Forgejo 17.0.0 for offline install, and --configure, --headless and --status run without a terminal";
+pub const WHATS_NEW: &str = "headless --allow-idle keeps local Forgejo warm at zero model calls, and --control starts, stops and auto-parks agents on no work";
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.
