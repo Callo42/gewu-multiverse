@@ -1885,6 +1885,34 @@ fn spawn_inaccessible_reader() -> Child {
 }
 
 #[test]
+fn normal_finish_without_supervisor_proof_preserves_uncertain_cleanup() {
+    let _process_test = process_test_lock();
+    let root = scratch("unrelated-service");
+    let layout = Layout::rooted_at(root.clone()).expect("layout");
+    let run_dir = write_run(&layout, "agent-1", "run-1700000000033-0001");
+    let mut service = spawn_inaccessible_reader();
+    let capability = run::prepare_shell_capability(&run_dir).expect("capability");
+    let mut child = Command::new("true").process_group(0).spawn().expect("run child");
+    let pgid = child.id();
+    assert!(child.wait().expect("run ended").success());
+    drop(capability);
+
+    let result = run::request_finish(
+        &run_dir, pgid, run::RunOutcome::NoWork, None,
+        Duration::from_millis(150), None, run::FirstEnding::Terminal,
+    );
+    let service_alive = service.try_wait().expect("service status").is_none();
+    if service_alive {
+        stop_unrelated(service);
+    }
+    assert!(service_alive, "the unrelated service did not survive normal finish");
+    let reason = result.expect_err("this run supplied no proof of an empty tree");
+    assert!(reason.contains("cleanup unverified"), "{reason}");
+    assert!(run_dir.join("shell.capability").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn an_inaccessible_unrelated_process_does_not_hide_a_readable_holder() {
     let _process_test = process_test_lock();
     // Start this process before the capability exists: it cannot inherit it.

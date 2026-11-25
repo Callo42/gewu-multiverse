@@ -315,12 +315,17 @@ impl SessionSpawner for RealSpawner {
         let binary = self.binary.clone();
         let run_dir = run_dir.to_path_buf();
         let workspace = workspace.to_path_buf();
+        let (receipt, supervisor_input) = match crate::run::supervision::channel() {
+            Ok((socket, input)) => (Some(socket), input),
+            Err(_) => (None, Stdio::null()),
+        };
         std::thread::spawn(move || {
             let child = Command::new(&binary)
                 .arg("--run-agent")
                 .arg(&run_dir)
+                .env(crate::run::supervision::CHANNEL_ENV, "1")
                 .current_dir(&workspace)
-                .stdin(Stdio::null())
+                .stdin(supervisor_input)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .process_group(0)
@@ -350,6 +355,17 @@ impl SessionSpawner for RealSpawner {
                         return;
                     }
                     let status = child.wait();
+                    // Retire only this run's capability search obligation. The
+                    // engine still settles its ending and validates the group.
+                    if status.as_ref().is_ok_and(|s| s.code().is_some())
+                        && receipt.as_ref().is_some_and(|socket| {
+                            crate::run::supervision::received_empty_tree(socket, pid)
+                        })
+                        && matches!(crate::run::terminal_recorded(&run_dir), Ok(true))
+                    {
+                        let _ =
+                            std::fs::remove_file(run_dir.join(crate::run::SHELL_CAPABILITY_FILE));
+                    }
                     // The pid/group records are identity handles, not transient
                     // bookkeeping. They stay until the engine has written a durable
                     // ending and verified cleanup (`run::settle_ending`), or until a

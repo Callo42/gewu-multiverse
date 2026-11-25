@@ -104,7 +104,7 @@ pub const TERMS_VERSION: u32 = 2;
 ///
 /// It stays inside what the product can observe and does not promise perfect shell
 /// interpretation or unconditional containment of detached processes.
-pub const WHATS_NEW: &str = "headless --allow-idle keeps local Forgejo warm at zero model calls, and --control starts, stops and auto-parks agents on no work";
+pub const WHATS_NEW: &str = "headless run cleanup isolates normal finishes from unrelated services, and live --control wakes hand over immediately without premature --stop-on-no-work parking";
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.
@@ -646,6 +646,9 @@ struct AgentRuntime {
     starting_run_dir: Option<PathBuf>,
     starting_since: Option<Instant>,
     next_at: Option<Instant>,
+    /// Set when `Command::Start` arrives while a session is already in flight so the
+    /// follow-up run starts immediately on completion instead of waiting a watch/backoff delay.
+    wake_pending: bool,
     last_end: Option<SessionEnd>,
     quick_failures: u32,
     provision_inflight: bool,
@@ -1105,6 +1108,7 @@ impl AgentRuntime {
             starting_run_dir: None,
             starting_since: None,
             next_at: None,
+            wake_pending: false,
             last_end: None,
             quick_failures: 0,
             provision_inflight: false,
@@ -2584,18 +2588,23 @@ fn finish_session(
         }
     }
     agent.last_result = result;
+    let wake_pending = std::mem::take(&mut agent.wake_pending);
     if agent.desired == Desired::Stopped || matches!(end, SessionEnd::Stopped { .. }) {
         agent.session = SessionState::Idle;
         agent.next_at = None;
         return;
     }
-    // A no-work run succeeded at what it was asked to do: it resets the quick-failure
-    // streak and takes the documented 20 s watch interval. A warned run did not
-    // verify its work, so it takes the same watch interval rather than the five-second
-    // success loop that used to replay a deterministic comment every few seconds.
-    // Only an actual quick failure grows the back-off, and a successful work run
-    // keeps the existing good-run interval.
-    let delay = if matches!(end, SessionEnd::NoWork { .. } | SessionEnd::Warned { .. }) {
+    // A fresh Start received while this session was already in flight means new work or a
+    // refreshed instruction may have arrived after this run started; launch the follow-up
+    // run immediately rather than waiting through a watch or backoff delay.
+    // Otherwise, a no-work run takes the documented 20 s watch interval, a warned run takes
+    // the same watch interval rather than the five-second success loop that used to replay a
+    // deterministic comment every few seconds, only an actual quick failure grows the
+    // back-off, and a successful work run keeps the existing good-run interval.
+    let delay = if wake_pending {
+        agent.quick_failures = 0;
+        Duration::ZERO
+    } else if matches!(end, SessionEnd::NoWork { .. } | SessionEnd::Warned { .. }) {
         agent.quick_failures = 0;
         NO_WORK_DELAY
     } else if matches!(end, SessionEnd::Succeeded) || ran >= LONG_SESSION {
@@ -3517,17 +3526,24 @@ impl EngineApi for Engine {
                 inner.agents[index].program_hint = None;
                 inner.set_desired(index, Desired::Started)?;
                 let agent = &mut inner.agents[index];
-                agent.sessions_since_start = 0;
-                agent.session_number = 0;
+                let in_flight = agent.running.is_some() || agent.starting;
+                if !in_flight {
+                    agent.sessions_since_start = 0;
+                    agent.session_number = 0;
+                }
                 agent.quick_failures = 0;
                 agent.next_at = None;
                 let no_instruction = agent.instruction_chars == 0;
                 if no_instruction {
+                    agent.wake_pending = false;
                     agent.session = SessionState::Blocked {
                         reason: "needs an instruction".to_owned(),
                     };
-                } else if agent.running.is_none() && !agent.starting {
+                } else if !in_flight {
+                    agent.wake_pending = false;
                     agent.session = SessionState::Idle;
+                } else {
+                    agent.wake_pending = true;
                 }
                 inner.note(if no_instruction {
                     "not started — write an instruction first".to_owned()
@@ -4186,6 +4202,7 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
         run.stop_deadline = Some(Instant::now() + grace);
     }
     agent.next_at = None;
+    agent.wake_pending = false;
     agent.session = SessionState::Idle;
     Ok(())
 }
@@ -9884,5 +9901,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fresh_start_while_running_launches_next_run_immediately_after_no_work() {
+        let root = scratch_root("engine-wake-handover-immediate");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+
+        // A fresh Start arrives while run #1 is still in flight.
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("fresh start while running");
+
+        let run1_dir = fake.last_run_dir().expect("run #1 directory");
+        write_terminal_record(&run1_dir, run::RunOutcome::NoWork, "no assigned work");
+        fake.finish_current(0);
+
+        // On the very next tick (no NO_WORK_DELAY advancement), run #2 starts immediately.
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 2);
+        let board = engine.board();
+        assert_eq!(board.agents[0].runs_total, 2);
+        assert!(matches!(
+            board.agents[0].session,
+            SessionState::Running { .. }
+        ));
+
+        // Once run #2 also finishes with NoWork (and no further wake arrived), the pending
+        // wake is already consumed so normal NO_WORK_DELAY applies without spin-looping.
+        let run2_dir = fake.last_run_dir().expect("run #2 directory");
+        write_terminal_record(&run2_dir, run::RunOutcome::NoWork, "no assigned work");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let board = engine.board();
+        assert_eq!(board.agents[0].runs_total, 2);
+        assert!(matches!(
+            board.agents[0].session,
+            SessionState::Restarting {
+                last: SessionEnd::NoWork { .. },
+                ..
+            }
+        ));
+        tick(&mut engine, &clock, NO_WORK_DELAY - Duration::from_secs(1));
+        assert_eq!(fake.counts().1, 2, "second NoWork must wait NO_WORK_DELAY");
+        tick(&mut engine, &clock, Duration::from_secs(1));
+        wait_started(&fake, 3);
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+    }
+
+    #[test]
+    fn multiple_starts_while_running_coalesce_to_one_immediate_followup() {
+        let root = scratch_root("engine-wake-handover-coalesce");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+
+        // Two wakes arriving during run #1 coalesce into one immediate post-wake run (#2).
+        for _ in 0..2 {
+            engine
+                .send(Command::Start {
+                    name: "agent-1".to_owned(),
+                })
+                .expect("start while running");
+        }
+        let run1_dir = fake.last_run_dir().expect("run #1 directory");
+        write_terminal_record(&run1_dir, run::RunOutcome::NoWork, "no assigned work");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 2);
+
+        let run2_dir = fake.last_run_dir().expect("run #2 directory");
+        write_terminal_record(&run2_dir, run::RunOutcome::NoWork, "no assigned work");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert_eq!(
+            fake.counts().1,
+            2,
+            "coalesced wakes must trigger only one immediate follow-up run"
+        );
+        assert!(matches!(
+            engine.board().agents[0].session,
+            SessionState::Restarting {
+                last: SessionEnd::NoWork { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stop_clears_pending_wake_from_in_flight_start() {
+        let root = scratch_root("engine-wake-handover-stop");
+        let settings = write_ready(&root, &[("agent-1", Desired::Started)]);
+        let clock = Arc::new(FakeClock::new());
+        let fake = Arc::new(FakeSpawner::new());
+        let mut engine = open_test_engine(&root, settings, Arc::clone(&clock), Arc::clone(&fake));
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 1);
+
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("start while running");
+        engine
+            .send(Command::Stop {
+                name: "agent-1".to_owned(),
+            })
+            .expect("stop clears pending wake");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        let board = engine.board();
+        assert_eq!(board.agents[0].desired, Desired::Stopped);
+        assert_eq!(board.agents[0].session, SessionState::Idle);
+        assert_eq!(fake.counts().1, 1);
+
+        // Restarting later behaves normally (no stale pending wake carried over into run #2).
+        engine
+            .send(Command::Start {
+                name: "agent-1".to_owned(),
+            })
+            .expect("fresh start after stop");
+        tick(&mut engine, &clock, Duration::ZERO);
+        wait_started(&fake, 2);
+        let run2_dir = fake.last_run_dir().expect("run #2 directory");
+        write_terminal_record(&run2_dir, run::RunOutcome::NoWork, "no assigned work");
+        fake.finish_current(0);
+        tick(&mut engine, &clock, Duration::ZERO);
+        assert_eq!(
+            fake.counts().1,
+            2,
+            "no stale wake_pending may skip NO_WORK_DELAY on a later run"
+        );
     }
 }
