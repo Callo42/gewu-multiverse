@@ -1395,18 +1395,12 @@ fn validate_headless_preconditions(
         ));
     }
 
-    for agent in &view.agents {
-        if (allow_idle || agent.desired == Desired::Started)
-            && let Some(leftover) = &agent.leftover
-        {
-            return Err(format!(
-                "agent `{}` has an unfinished earlier process group ({leftover}) — stop the leftover process group or retry cleanup with `gewu-multiverse --configure --start-agent {}`",
-                agent.name, agent.name
-            ));
-        }
-    }
-
     for agent in started {
+        // Recovery blocks this agent in the engine; keep the daemon available
+        // for the other agents and for an explicit retry on this one.
+        if agent.leftover.is_some() {
+            continue;
+        }
         if let Some(err) = &agent.program_error {
             return Err(format!(
                 "agent `{}` cannot start: {err} — {}",
@@ -1908,9 +1902,11 @@ fn apply_control_request(
                 "agent `{start_name}` is queued for removal and cannot be started"
             ));
         }
-        if let Some(leftover) = &agent_view.leftover {
+        if let Some(leftover) = &agent_view.leftover
+            && (to_start.len() != 1 || !to_stop.is_empty())
+        {
             return Err(format!(
-                "agent `{start_name}` has an unfinished earlier process group ({leftover})"
+                "agent `{start_name}` needs a separate --control --start-agent {start_name} to retry cleanup ({leftover})"
             ));
         }
         if let Some(err) = &agent_view.program_error {
@@ -2494,7 +2490,10 @@ fn collect_view_blocking_reasons(
         if (allow_idle || agent.desired == Desired::Started)
             && let Some(leftover) = &agent.leftover
         {
-            reasons.push(format!("agent `{}` leftover process: {leftover}", agent.name));
+            reasons.push(format!(
+                "agent `{name}` leftover process: {leftover}; retry cleanup with --control --start-agent {name}",
+                name = agent.name
+            ));
         }
     }
     let started: Vec<_> = view

@@ -2013,6 +2013,28 @@ mod tests {
     }
 
     #[test]
+    fn only_a_complete_proc_view_can_establish_absence() {
+        assert!(proc_lists_every_pid("proc /proc proc rw,nosuid 0 0"));
+        assert!(proc_lists_every_pid("proc /proc proc rw,hidepid=off 0 0"));
+        assert!(!proc_lists_every_pid("proc /proc proc rw,hidepid=invisible 0 0"));
+        assert!(!proc_lists_every_pid("proc /proc proc rw,hidepid=2 0 0"));
+        assert!(!proc_lists_every_pid("tmpfs /proc tmpfs rw 0 0"));
+        assert!(!proc_lists_every_pid(""));
+    }
+
+    #[test]
+    fn capability_deletion_requires_the_last_reference_to_close() {
+        use nix::poll::PollTimeout;
+        let (file, _) = memfd_capability();
+        let second = file.try_clone().expect("second reference");
+        let watch = CapabilityWatch::on_file(&file).expect("watch anonymous fixture");
+        drop(file);
+        assert!(!watch.deleted(PollTimeout::ZERO));
+        drop(second);
+        assert!(watch.deleted(PollTimeout::from(500u16)));
+    }
+
+    #[test]
     fn a_persistently_inaccessible_capability_holder_stays_uncertain() {
         let root = scratch_root("capability-live-inaccessible");
         let (_capability_file, capability) = memfd_capability();
@@ -2678,6 +2700,7 @@ fn prepare_started_dir(run_dir: &Path) -> Result<(), String> {
 }
 
 pub mod ending;
+pub mod supervision;
 pub use ending::{Owner, PreparedRun, StartedRun};
 
 /// The old PreparedRun block is replaced by `ending::PreparedRun`.
@@ -2994,11 +3017,12 @@ fn settle_run_with_stop(
 }
 
 fn reap(run_dir: &Path, pgid: u32, grace: std::time::Duration) -> Result<bool, String> {
+    let watch = CapabilityWatch::for_group(run_dir, pgid);
     let mut reaped = reap_process_group(pgid, run_dir, grace)?;
     // A native helper may have called setsid and therefore not be in the leader's
     // group. Its inherited capability is the ownership proof; enumerate and close
     // every such group before the identities are removed.
-    reaped |= reap_capability_groups(run_dir, grace)?;
+    reaped |= reap_capability_groups(run_dir, grace, watch)?;
     Ok(reaped)
 }
 
@@ -3262,8 +3286,9 @@ fn read_capability(run_dir: &Path) -> Option<Capability> {
     })
 }
 
-/// Whether one process holds the run's memfd capability. Permission/fd errors
-/// are visible only for a process already known to be in the run's group.
+const DESCRIPTOR_RECHECK: Duration = Duration::from_millis(500);
+
+/// Whether one process holds the run's memfd capability.
 ///
 /// A process that is exiting can transiently refuse its `/proc/<pid>/fd` reads
 /// after it has already been signalled. Re-observe only that concrete descriptor
@@ -3271,9 +3296,15 @@ fn read_capability(run_dir: &Path) -> Option<Capability> {
 /// gone/zombie/exited facts; a live, unreadable or unknown process still returns
 /// uncertainty and keeps its records.
 fn pid_holds_capability(pid: u32, capability: &Capability) -> Result<bool, String> {
-    const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
-    const STEP: std::time::Duration = std::time::Duration::from_millis(10);
-    let deadline = std::time::Instant::now() + RECHECK;
+    pid_holds_capability_until(pid, capability, Instant::now() + DESCRIPTOR_RECHECK)
+}
+
+fn pid_holds_capability_until(
+    pid: u32,
+    capability: &Capability,
+    deadline: Instant,
+) -> Result<bool, String> {
+    const STEP: Duration = Duration::from_millis(10);
     loop {
         match pid_holds_capability_once(pid, capability) {
             Ok(found) => return Ok(found),
@@ -3342,8 +3373,15 @@ fn pid_holds_capability_once(
     pid: u32,
     capability: &Capability,
 ) -> Result<bool, (String, io::Error)> {
+    open_capability_in_pid(pid, capability).map(|file| file.is_some())
+}
+
+fn open_capability_in_pid(
+    pid: u32,
+    capability: &Capability,
+) -> Result<Option<fs::File>, (String, io::Error)> {
     use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let fds = match fs::read_dir(format!("/proc/{pid}/fd")) {
         Ok(fds) => fds,
         Err(error) => {
@@ -3369,7 +3407,11 @@ fn pid_holds_capability_once(
         if target.dev() != capability.device || target.ino() != capability.inode {
             continue;
         }
-        let mut file = match fs::File::open(fd.path()) {
+        let mut file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+            .open(fd.path())
+        {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -3379,12 +3421,63 @@ fn pid_holds_capability_once(
                 ));
             }
         };
+        let opened = file.metadata().map_err(|e| {
+            (format!("process {pid}'s opened capability cannot be inspected: {e}"), e)
+        })?;
+        if opened.dev() != capability.device || opened.ino() != capability.inode {
+            continue;
+        }
         let mut token = [0_u8; 16];
         if file.read_exact(&mut token).is_ok() && hex(&token) == capability.token {
-            return Ok(true);
+            return Ok(Some(file));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// An unlinked memfd is deleted by the kernel when its last reference goes
+/// away. Watch the verified object through our own fd before reaping a group.
+/// This also covers references in processes that cannot be listed in procfs.
+struct CapabilityWatch {
+    notify: nix::sys::inotify::Inotify,
+    watch: nix::sys::inotify::WatchDescriptor,
+}
+
+impl CapabilityWatch {
+    fn for_group(run_dir: &Path, pgid: u32) -> Option<Self> {
+        let capability = read_capability(run_dir)?;
+        let file = group_members(pgid).ok()?.into_iter().find_map(|pid| {
+            open_capability_in_pid(pid, &capability).ok().flatten()
+        })?;
+        Self::on_file(&file)
+    }
+
+    fn on_file(file: &fs::File) -> Option<Self> {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        if file.metadata().ok()?.nlink() != 0 {
+            return None;
+        }
+        let notify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC).ok()?;
+        let pinned = format!("/proc/self/fd/{}", file.as_raw_fd());
+        let watch = notify.add_watch(pinned.as_str(), AddWatchFlags::IN_DELETE_SELF).ok()?;
+        Some(Self { notify, watch })
+    }
+
+    fn deleted(&self, timeout: nix::poll::PollTimeout) -> bool {
+        use nix::poll::{PollFd, PollFlags, poll};
+        use nix::sys::inotify::AddWatchFlags;
+        use std::os::fd::AsFd;
+        let mut fds = [PollFd::new(self.notify.as_fd(), PollFlags::POLLIN)];
+        if !matches!(poll(&mut fds, timeout), Ok(1)) {
+            return false;
+        }
+        self.notify.read_events().is_ok_and(|events| events.iter().any(|event| {
+            event.wd == self.watch && event.mask.contains(AddWatchFlags::IN_DELETE_SELF)
+        }))
+    }
 }
 
 fn capability_holders(pgid: u32, run_dir: &Path) -> Result<Vec<u32>, String> {
@@ -3717,6 +3810,23 @@ fn same_user_could_hold(pid: u32) -> bool {
     matches!((ours, theirs), (Some(ours), Ok(theirs)) if ours == theirs)
 }
 
+/// A filtered procfs may omit a live PID entirely. In that view, an empty
+/// descriptor search cannot establish that an interrupted run is gone.
+fn proc_lists_every_pid(mounts: &str) -> bool {
+    let mut at_proc = mounts.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let _source = fields.next()?;
+        (fields.next()? == "/proc").then_some((fields.next()?, fields.next()?))
+    });
+    let Some(("proc", options)) = at_proc.next() else {
+        return false;
+    };
+    at_proc.next().is_none()
+        && options.split(',').all(|option| {
+            !option.starts_with("hidepid=") || matches!(option, "hidepid=0" | "hidepid=off")
+        })
+}
+
 /// Find a live group that holds the run's capability, or name the uncertainty.
 ///
 /// A readable holder wins. If none is readable and any same-user process could not
@@ -3724,13 +3834,26 @@ fn same_user_could_hold(pid: u32) -> bool {
 /// outcome is not proof that an original-group member is gone.
 fn capability_group(run_dir: &Path) -> Result<Option<u32>, String> {
     let Some(capability) = read_capability(run_dir) else {
-        return Ok(None);
+        return match fs::symlink_metadata(run_dir.join(SHELL_CAPABILITY_FILE)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            _ => Err("cleanup unverified: this run's capability record cannot be read".to_owned()),
+        };
     };
     let entries = fs::read_dir("/proc").map_err(|error| {
         format!("cleanup unverified: the process table cannot be read: {error}")
     })?;
     let mut uncertain: Option<String> = None;
-    for entry in entries.flatten() {
+    // Share the grace period across the table. Every pid still gets inspected,
+    // and a still-live unreadable candidate remains unresolved at the deadline.
+    let deadline = Instant::now() + DESCRIPTOR_RECHECK;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                uncertain = Some(format!("the process table entry cannot be inspected: {error}"));
+                continue;
+            }
+        };
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -3741,7 +3864,7 @@ fn capability_group(run_dir: &Path) -> Result<Option<u32>, String> {
         if pid == std::process::id() {
             continue;
         }
-        match pid_holds_capability(pid, &capability) {
+        match pid_holds_capability_until(pid, &capability, deadline) {
             Ok(true) => {
                 if let Some((_, group, _)) =
                     process_facts(pid).map_err(|error| error.to_string())?
@@ -3764,6 +3887,12 @@ fn capability_group(run_dir: &Path) -> Result<Option<u32>, String> {
         Some(reason) => Err(format!(
             "cleanup unverified: {reason}; a same-user process could still hold the run's capability"
         )),
+        None if !fs::read_to_string("/proc/self/mounts")
+            .is_ok_and(|mounts| proc_lists_every_pid(&mounts))
+            && !run_predates_boot(run_dir) =>
+        {
+            Err("cleanup unverified: the process table can hide a holder of this run's capability; cleanup is uncertain".to_owned())
+        }
         None => Ok(None),
     }
 }
@@ -4001,12 +4130,27 @@ fn categorize_cleanup(reason: String) -> String {
 /// group is accepted only after `capability_group` has verified the descriptor
 /// (dev/ino/token) of a live member; `reap_process_group` then applies the same
 /// pidfd/boot/start ownership checks as the leader path.
-fn reap_capability_groups(run_dir: &Path, grace: std::time::Duration) -> Result<bool, String> {
+fn reap_capability_groups(
+    run_dir: &Path,
+    grace: Duration,
+    mut watch: Option<CapabilityWatch>,
+) -> Result<bool, String> {
+    use nix::poll::PollTimeout;
     let mut seen = Vec::new();
     let mut reaped = false;
     for _ in 0..32 {
-        let Some(group) = capability_group(run_dir)? else {
+        if watch.as_ref().is_some_and(|w| w.deleted(PollTimeout::ZERO)) {
             return Ok(reaped);
+        }
+        let group = match capability_group(run_dir) {
+            Ok(Some(group)) => group,
+            Ok(None) => return Ok(reaped),
+            Err(error) => {
+                if watch.as_ref().is_some_and(|w| w.deleted(PollTimeout::from(500u16))) {
+                    return Ok(reaped);
+                }
+                return Err(error);
+            }
         };
         if seen.contains(&group) {
             return Err(format!(
@@ -4014,6 +4158,9 @@ fn reap_capability_groups(run_dir: &Path, grace: std::time::Duration) -> Result<
             ));
         }
         seen.push(group);
+        if watch.is_none() {
+            watch = CapabilityWatch::for_group(run_dir, group);
+        }
         reaped |= reap_process_group(group, run_dir, grace)?;
     }
     Err("live leftover: too many capability-holding groups survived reaping".to_owned())
@@ -4138,8 +4285,7 @@ fn reap_leftover_run_inner(run_dir: &Path, grace: std::time::Duration) -> Result
         clear_process_records(run_dir);
         return Ok(false);
     };
-    let mut reaped = reap_process_group(pgid, run_dir, grace)?;
-    reaped |= reap_capability_groups(run_dir, grace)?;
+    let reaped = reap(run_dir, pgid, grace)?;
     if !reaped && unverified_group(pgid)? {
         // A live group whose ownership cannot be established is not touched, but
         // it is not hidden either: the open reports it, the card names it and

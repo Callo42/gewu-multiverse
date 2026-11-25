@@ -207,6 +207,23 @@ with `ps`.
 
 ### Left-over processes and the program's own ending
 
+On Linux the engine starts each run with a private socket to its supervisor.
+The supervisor registers as a child subreaper before starting work. At its
+single-threaded exit, the kernel can confirm that all descendants have ended.
+The engine checks the sender PID on that run's socket and the durable ending
+before retiring its capability record. A normal finish can then proceed even
+when an independent service under the same user restricts descriptor access.
+
+Interrupted runs, older records and runs without that confirmation use the
+recovery checks below. Headless keeps serving other agents while one agent is
+blocked. Use `--control --start-agent NAME` on its own to retry cleanup and
+start that agent when recovery succeeds.
+On systems with restricted process visibility, an empty scan alone cannot
+clear the outstanding capability of a run from the current boot.
+When recovery finds a readable holder, it can watch the verified anonymous
+file before reaping the group. The kernel's deletion event for that unlinked
+object confirms that its last reference is gone.
+
 The running server writes its pid into `forgejo/instance/forgejo.pid`; each session
 writes `session.pid` and the process group it leads into `session.pgid` in its run
 directory. The run supervisor also writes the shell's own `shell.pid`, `shell.pgid` and

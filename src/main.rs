@@ -88,7 +88,7 @@ fn main() -> ExitCode {
         Invocation::RunAgent { run_dir } => {
             // One run of one agent, with the plan already written into run_dir. This
             // is the process the engine starts; it needs no terminal and no UI.
-            let end = agent_run::execute(&run_dir);
+            let end = gewu_multiverse::run::supervision::execute(&run_dir);
             ExitCode::from(end.exit_code.clamp(0, 255) as u8)
         }
         Invocation::GitAskpass { prompt } => {
