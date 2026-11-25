@@ -7,12 +7,14 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 
 
 @contextlib.contextmanager
@@ -34,8 +36,17 @@ def main(mode):
     completed = threading.Event()
     slow_seconds = 20
     cleanup_case = mode in ("cleanup", "cleanup-late", "interrupted")
+    handover_case = mode == "handover"
     allow_finish = threading.Event()
     other_agent_called = threading.Event()
+    handover_lock = threading.Lock()
+    handover_state = {
+        "calls": 0,
+        "run2_at": None,
+        "saw_refreshed": False,
+    }
+    handover_run1_started = threading.Event()
+    handover_release_run1 = threading.Event()
 
     class Model(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -47,7 +58,32 @@ def main(mode):
                 other_agent_called.set()
             content = {"role": "assistant", "content": "No assigned work."}
             reason = "stop"
-            if cleanup_case and not received.is_set():
+            if handover_case:
+                with handover_lock:
+                    handover_state["calls"] += 1
+                    call_no = handover_state["calls"]
+                if call_no == 1:
+                    handover_run1_started.set()
+                    handover_release_run1.wait(15)
+                    content = {"role": "assistant", "content": "No assigned issues found; nothing to do."}
+                elif call_no == 2:
+                    with handover_lock:
+                        handover_state["run2_at"] = time.monotonic()
+                        handover_state["saw_refreshed"] = b"HANDOVER-WORK-777" in request
+                    content = {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": "handover_comment", "type": "function", "function": {
+                            "name": "forgejo_comment", "arguments": json.dumps({
+                                "repository": "team/workspace",
+                                "number": 1,
+                                "body": "Processed handover task in post-wake run."
+                            })}}]}
+                    reason = "tool_calls"
+                elif call_no == 3:
+                    content = {"role": "assistant", "content": "Processed handover task."}
+                    reason = "stop"
+                else:
+                    content = {"role": "assistant", "content": "No assigned issues found; nothing to do."}
+            elif cleanup_case and not received.is_set():
                 received.set()
                 content = {"role": "assistant", "content": None, "tool_calls": [{
                     "id": "fixture", "type": "function", "function": {
@@ -127,6 +163,110 @@ def main(mode):
                             assert record["desired"][name] == expected, record
                         print(json.dumps(record), flush=True)
                         return result
+
+                    if handover_case:
+                        # Create a real Forgejo issue #1 so the post-wake run performs real remote work.
+                        ready_status = json.loads(cli("--status", "--json").stdout)
+                        forgejo_url = ready_status["forgejo"]["url"].rstrip("/")
+                        creds_text = (root / "cfg" / "credentials.toml").read_text()
+                        token_section = creds_text.split("[forgejo_agent_tokens]", 1)[1]
+                        token_match = re.search(r'^"?agent-1"?\s*=\s*"([^"]+)"', token_section, re.MULTILINE)
+                        assert token_match, "missing agent-1 Forgejo token in credentials.toml"
+                        agent_token = token_match.group(1)
+
+                        def forgejo_api(method, api_path, body=None):
+                            data = json.dumps(body).encode() if body is not None else None
+                            req = urllib.request.Request(
+                                f"{forgejo_url}{api_path}",
+                                data=data,
+                                method=method,
+                                headers={
+                                    "Authorization": f"token {agent_token}",
+                                    "Content-Type": "application/json",
+                                },
+                            )
+                            with urllib.request.urlopen(req, timeout=15) as resp:
+                                return json.loads(resp.read().decode())
+
+                        # Wake run #1 with --stop-on-no-work and pause it mid-flight.
+                        wake1 = cli("--control", "--start-agent", "agent-1", "--stop-on-no-work", "--json")
+                        assert wake1.returncode == 0, wake1.stderr
+                        assert handover_run1_started.wait(15), "run #1 did not start in handover scenario"
+                        in_flight_status = json.loads(cli("--status", "--json").stdout)
+                        agent1 = next(a for a in in_flight_status["agents"] if a["name"] == "agent-1")
+                        assert agent1["desired"] == "started", agent1
+                        assert agent1["runs_total"] == 1, agent1
+                        assert agent1["session"].startswith("running"), agent1
+                        assert agent1["stop_on_no_work"] is True, agent1
+
+                        # While run #1 is still Running, create the handover issue, refresh the
+                        # instruction, and send a fresh --control --start-agent --stop-on-no-work wake.
+                        forgejo_api("POST", "/api/v1/repos/team/workspace/issues", {
+                            "title": "Handover task #1",
+                            "body": "Assigned while previous session was still running.",
+                        })
+                        (root / "cfg" / "agents" / "agent-1" / "instruction.md").write_text(
+                            "HANDOVER-WORK-777: handle newly assigned work.\n"
+                        )
+                        wake2 = cli("--control", "--start-agent", "agent-1", "--stop-on-no-work", "--json")
+                        assert wake2.returncode == 0, wake2.stderr
+                        wake2_json = json.loads(wake2.stdout)
+                        wake2_agent = next(a for a in wake2_json["status"]["agents"] if a["name"] == "agent-1")
+                        assert wake2_agent["desired"] == "started" and wake2_agent["stop_on_no_work"] is True
+
+                        # Release run #1 so it finishes with NoWork; agent-1 must NOT auto-park
+                        # prematurely and must launch run #2 immediately without waiting NO_WORK_DELAY (20s).
+                        released_at = time.monotonic()
+                        handover_release_run1.set()
+
+                        park_deadline = time.monotonic() + 35
+                        final_status = None
+                        while time.monotonic() < park_deadline:
+                            assert daemon.poll() is None, f"daemon exited {daemon.returncode} during handover"
+                            st = json.loads(cli("--status", "--json").stdout)
+                            a1 = next(a for a in st["agents"] if a["name"] == "agent-1")
+                            if a1["desired"] == "stopped":
+                                if a1["runs_total"] < 2:
+                                    raise AssertionError(
+                                        f"premature auto-park during task handover: {a1}"
+                                    )
+                                final_status = st
+                                break
+                            time.sleep(0.15)
+                        else:
+                            raise TimeoutError("timed out waiting for post-wake handover runs and auto-park")
+
+                        a1_final = next(a for a in final_status["agents"] if a["name"] == "agent-1")
+                        assert a1_final["runs_total"] == 3, a1_final
+                        assert a1_final["session"] == "idle", a1_final
+                        assert a1_final["stop_on_no_work"] is False, a1_final
+                        assert final_status["idle_standby"] is True, final_status
+                        assert final_status["healthy"] is True, final_status
+                        with handover_lock:
+                            run2_at = handover_state["run2_at"]
+                            saw_refreshed = handover_state["saw_refreshed"]
+                            calls_after_park = handover_state["calls"]
+                        assert run2_at is not None, "post-wake run #2 never invoked the model"
+                        handover_latency_s = run2_at - released_at
+                        assert handover_latency_s < 10.0, (
+                            f"post-wake run #2 waited too long ({handover_latency_s:.2f}s >= 10s; "
+                            "expected immediate wake instead of 20s NO_WORK_DELAY)"
+                        )
+                        assert saw_refreshed, "post-wake run #2 did not receive refreshed instruction"
+                        comments = forgejo_api("GET", "/api/v1/repos/team/workspace/issues/1/comments")
+                        assert any("Processed handover task in post-wake run." in c.get("body", "") for c in comments), comments
+                        time.sleep(3)
+                        with handover_lock:
+                            assert handover_state["calls"] == calls_after_park == 4, handover_state
+                        print(json.dumps({
+                            "handover_premature_park": False,
+                            "handover_latency_ms": round(handover_latency_s * 1000, 1),
+                            "handover_saw_refreshed_instruction": saw_refreshed,
+                            "runs_total": a1_final["runs_total"],
+                            "model_calls": calls_after_park,
+                            "parked_idle": True,
+                        }), flush=True)
+                        return
 
                     assert control("--start-agent", "agent-1").returncode == 0
                     assert received.wait(15), "model did not receive the slow request"

@@ -1230,6 +1230,8 @@ impl StopOnNoWorkTracker {
     /// Arm an already-started agent (at `--headless --stop-on-no-work` startup or via
     /// daemon-wide `--control --stop-on-no-work`): if its most recent completed round is
     /// already `NoWork` (waiting in `NO_WORK_DELAY`), park immediately without an extra run.
+    /// Preserves any higher threshold already armed by an explicit fresh wake so a global
+    /// toggle cannot cancel an in-flight task handover.
     fn arm_existing(&mut self, agent: &crate::engine_api::AgentView) {
         let min_runs = if matches!(
             &agent.session,
@@ -1243,18 +1245,22 @@ impl StopOnNoWorkTracker {
         } else {
             agent.runs_total.saturating_add(1)
         };
-        self.armed_min_runs.insert(agent.name.clone(), min_runs);
+        self.armed_min_runs
+            .entry(agent.name.clone())
+            .and_modify(|current| *current = (*current).max(min_runs))
+            .or_insert(min_runs);
     }
 
     /// Arm an agent being explicitly started/woken now (`--control --start-agent` /
-    /// `--start-all`), ensuring at least one fresh run executes unless one is already live.
+    /// `--start-all`), always requiring at least one fresh run started *after* this wake
+    /// (`runs_total + 1`) to finish with `NoWork` before auto-parking—even if an earlier
+    /// session is still `Running` during task handover.
     fn arm_for_fresh_wake(&mut self, agent: &crate::engine_api::AgentView) {
-        let min_runs = if matches!(agent.session, SessionState::Running { .. }) {
-            agent.runs_total
-        } else {
-            agent.runs_total.saturating_add(1)
-        };
-        self.armed_min_runs.insert(agent.name.clone(), min_runs);
+        let min_runs = agent.runs_total.saturating_add(1);
+        self.armed_min_runs
+            .entry(agent.name.clone())
+            .and_modify(|current| *current = (*current).max(min_runs))
+            .or_insert(min_runs);
     }
 
     fn disarm(&mut self, name: &str) {
@@ -1269,6 +1275,23 @@ impl StopOnNoWorkTracker {
         self.armed_min_runs.contains_key(name)
     }
 
+    fn should_park(&self, agent: &crate::engine_api::AgentView) -> bool {
+        if agent.desired != Desired::Started {
+            return false;
+        }
+        let Some(&min_runs) = self.armed_min_runs.get(&agent.name) else {
+            return false;
+        };
+        agent.runs_total >= min_runs
+            && matches!(
+                &agent.session,
+                SessionState::Restarting {
+                    last: SessionEnd::NoWork { .. },
+                    ..
+                }
+            )
+    }
+
     fn reconcile_after_tick(&mut self, engine: &mut Engine) -> Vec<String> {
         let view = engine.board();
         let mut to_park = Vec::new();
@@ -1277,18 +1300,7 @@ impl StopOnNoWorkTracker {
                 self.armed_min_runs.remove(&agent.name);
                 continue;
             }
-            let Some(&min_runs) = self.armed_min_runs.get(&agent.name) else {
-                continue;
-            };
-            if agent.runs_total >= min_runs
-                && matches!(
-                    &agent.session,
-                    SessionState::Restarting {
-                        last: SessionEnd::NoWork { .. },
-                        ..
-                    }
-                )
-            {
+            if self.should_park(agent) {
                 to_park.push((agent.name.clone(), agent.runs_total));
             }
         }
@@ -2851,4 +2863,177 @@ fn format_status(report: &StatusReport, as_json: bool) -> Result<String, String>
         lines.push(format!("blocking: {}", report.blocking_reasons.join("; ")));
     }
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine_api::{AgentView, EndpointTest};
+    use std::time::SystemTime;
+
+    fn agent_view(name: &str, desired: Desired, session: SessionState, runs_total: u64) -> AgentView {
+        AgentView {
+            name: name.to_owned(),
+            login: format!("gewu-{name}"),
+            provisioning: Provisioning::Ready,
+            desired,
+            session,
+            sessions_since_start: 1,
+            runs_total,
+            recent: Vec::new(),
+            instruction_chars: 16,
+            instruction_first_line: Some("do work".to_owned()),
+            instruction: Some("do work\n".to_owned()),
+            instruction_lines: 1,
+            activity: None,
+            activity_at: None,
+            last_error: None,
+            last_result: None,
+            last_failure: None,
+            leftover: None,
+            current_tool: None,
+            current_tool_seconds: 0,
+            retrying: None,
+            last_work: Vec::new(),
+            pull_states: Vec::new(),
+            no_assigned_work: false,
+            last_work_result: None,
+            last_result_is_work: false,
+            program: "builtin".to_owned(),
+            program_label: "Built-in".to_owned(),
+            unknown_program: None,
+            program_installed: true,
+            program_version: None,
+            protocol: "chat-completions".to_owned(),
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            model: "local".to_owned(),
+            key_present: true,
+            model_test: EndpointTest::NotRun,
+            program_error: None,
+            active_program: None,
+            next_program: None,
+            codex_sandbox: None,
+        }
+    }
+
+    #[test]
+    fn arm_for_fresh_wake_while_running_requires_a_post_wake_run() {
+        let mut tracker = StopOnNoWorkTracker::default();
+        let running = agent_view(
+            "agent-1",
+            Desired::Started,
+            SessionState::Running {
+                number: 1,
+                since: SystemTime::now(),
+            },
+            4,
+        );
+        tracker.arm_for_fresh_wake(&running);
+        assert_eq!(tracker.armed_min_runs.get("agent-1"), Some(&5));
+
+        // When the pre-wake in-flight session (#4) finishes with NoWork, it must NOT auto-park.
+        let pre_wake_no_work = agent_view(
+            "agent-1",
+            Desired::Started,
+            SessionState::Restarting {
+                next_at: SystemTime::now(),
+                last: SessionEnd::NoWork {
+                    reason: "no assigned work".to_owned(),
+                },
+            },
+            4,
+        );
+        assert!(!tracker.should_park(&pre_wake_no_work));
+
+        // Once the post-wake session (#5) finishes with Succeeded, it keeps going.
+        let post_wake_worked = agent_view(
+            "agent-1",
+            Desired::Started,
+            SessionState::Restarting {
+                next_at: SystemTime::now(),
+                last: SessionEnd::Succeeded,
+            },
+            5,
+        );
+        assert!(!tracker.should_park(&post_wake_worked));
+
+        // Once a post-wake session (#5 or #6) finishes with NoWork, it auto-parks.
+        let post_wake_no_work = agent_view(
+            "agent-1",
+            Desired::Started,
+            SessionState::Restarting {
+                next_at: SystemTime::now(),
+                last: SessionEnd::NoWork {
+                    reason: "no assigned work".to_owned(),
+                },
+            },
+            5,
+        );
+        assert!(tracker.should_park(&post_wake_no_work));
+    }
+
+    #[test]
+    fn arm_for_fresh_wake_coalesces_duplicate_wakes_and_advances_on_later_runs() {
+        let mut tracker = StopOnNoWorkTracker::default();
+        let running_run4 = agent_view(
+            "agent-1",
+            Desired::Started,
+            SessionState::Running {
+                number: 1,
+                since: SystemTime::now(),
+            },
+            4,
+        );
+        tracker.arm_for_fresh_wake(&running_run4);
+        tracker.arm_for_fresh_wake(&running_run4);
+        assert_eq!(tracker.armed_min_runs.get("agent-1"), Some(&5));
+
+        let running_run5 = agent_view(
+            "agent-1",
+            Desired::Started,
+            SessionState::Running {
+                number: 2,
+                since: SystemTime::now(),
+            },
+            5,
+        );
+        tracker.arm_for_fresh_wake(&running_run5);
+        assert_eq!(tracker.armed_min_runs.get("agent-1"), Some(&6));
+    }
+
+    #[test]
+    fn arm_existing_preserves_fresh_wake_threshold_while_parking_unarmed_no_work() {
+        let mut tracker = StopOnNoWorkTracker::default();
+
+        // An unarmed agent already waiting in NoWork parks immediately under global --stop-on-no-work.
+        let idle_no_work = agent_view(
+            "agent-2",
+            Desired::Started,
+            SessionState::Restarting {
+                next_at: SystemTime::now(),
+                last: SessionEnd::NoWork {
+                    reason: "no assigned work".to_owned(),
+                },
+            },
+            1,
+        );
+        tracker.arm_existing(&idle_no_work);
+        assert_eq!(tracker.armed_min_runs.get("agent-2"), Some(&1));
+        assert!(tracker.should_park(&idle_no_work));
+
+        // A global --stop-on-no-work arriving while agent-1 has an active fresh-wake handover
+        // must not downgrade agent-1's required post-wake threshold back to the pre-wake run.
+        let running_run4 = agent_view(
+            "agent-1",
+            Desired::Started,
+            SessionState::Running {
+                number: 1,
+                since: SystemTime::now(),
+            },
+            4,
+        );
+        tracker.arm_for_fresh_wake(&running_run4);
+        tracker.arm_existing(&running_run4);
+        assert_eq!(tracker.armed_min_runs.get("agent-1"), Some(&5));
+    }
 }

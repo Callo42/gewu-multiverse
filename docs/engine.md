@@ -14,7 +14,9 @@ state root, paired with a `0600` `headless.sock.cookie` file-read capability and
 `SO_PEERCRED` check so confined agent shells cannot control the daemon even though Linux
 Landlock `AccessFs` does not filter `AF_UNIX` `connect(2)`) so
 `--control` can start or stop agents and arm `--stop-on-no-work` live without restarting
-Forgejo; `--configure` applies non-interactive setup while stopped; `--status` reads
+Forgejo (a live `--start-agent`/`--start-all` arriving while a session is already running
+launches a fresh follow-up run immediately once that in-flight session finishes and
+requires a post-wake `NoWork` round before auto-parking); `--configure` applies non-interactive setup while stopped; `--status` reads
 state without taking `engine.lock`; `--install-forgejo` runs the installer and exits;
 `--run-agent` is one agent run without a board.
 
