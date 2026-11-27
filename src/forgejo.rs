@@ -185,6 +185,8 @@ pub struct PullRequest {
     pub html_url: Option<String>,
     /// The head branch.
     pub head: String,
+    /// The head commit SHA, when the instance names it.
+    pub head_sha: Option<String>,
     /// The head repository's full name, when the instance names it.
     pub head_repo: Option<String>,
     /// The base branch.
@@ -225,12 +227,37 @@ pub struct Issue {
     pub updated_at: Option<String>,
     /// The login that opened it, when the instance names one.
     pub author: Option<String>,
+    /// Assigned logins on this issue.
+    pub assignees: Vec<String>,
     /// The number of comments the instance counts.
     pub comments: u64,
     /// `owner/name`, when the reply names the repository.
     pub repository: Option<String>,
     /// The pull-request marker's web address, when this issue is a pull request.
     pub pull_request_url: Option<String>,
+}
+
+/// One formal pull-request review recorded by Forgejo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullReview {
+    pub id: u64,
+    pub state: String,
+    pub body: String,
+    pub author: Option<String>,
+    pub commit_id: Option<String>,
+    pub dismissed: bool,
+    pub stale: bool,
+    pub submitted_at: Option<String>,
+    pub html_url: Option<String>,
+}
+
+/// One organisation webhook configured in Forgejo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgHook {
+    pub id: u64,
+    pub url: String,
+    pub active: bool,
+    pub events: Vec<String>,
 }
 
 impl Issue {
@@ -465,6 +492,433 @@ impl ForgejoClient {
         let body = self.get(&path)?;
         let wire: Vec<WirePull> = parse(&body, &path)?;
         Ok(wire.into_iter().map(PullRequest::from).collect())
+    }
+
+    /// Alias for [`Self::pull_requests`] used by context hydration.
+    pub fn open_pull_requests(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Vec<PullRequest>, ForgejoError> {
+        self.pull_requests(namespace, name)
+    }
+
+    /// List issues of one repository (excluding pull requests), optionally filtered
+    /// by state (`open`/`closed`/`all`) and label names.
+    pub fn repo_issues(
+        &self,
+        namespace: &str,
+        name: &str,
+        state: Option<&str>,
+        labels: &[String],
+    ) -> Result<Vec<Issue>, ForgejoError> {
+        let state = state.unwrap_or("open");
+        let mut path = format!(
+            "/api/v1/repos/{}/{}/issues?state={}&type=issues&limit={MAX_ISSUES}",
+            segment(namespace),
+            segment(name),
+            segment(state),
+        );
+        if !labels.is_empty() {
+            let joined = labels.join(",");
+            path.push_str(&format!("&labels={}", segment(&joined)));
+        }
+        let body = self.get(&path)?;
+        let wire: Vec<WireIssue> = parse(&body, &path)?;
+        let full = format!("{namespace}/{name}");
+        Ok(wire
+            .into_iter()
+            .map(|w| {
+                let mut issue = Issue::from(w);
+                if issue.repository.is_none() {
+                    issue.repository = Some(full.clone());
+                }
+                issue
+            })
+            .collect())
+    }
+
+    /// Create an issue with optional assignees and label names (requires label lookup
+    /// when label names are supplied).
+    pub fn create_issue_full(
+        &self,
+        namespace: &str,
+        name: &str,
+        title: &str,
+        body: &str,
+        assignees: &[String],
+        labels: &[String],
+    ) -> Result<Issue, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues",
+            segment(namespace),
+            segment(name)
+        );
+        let mut payload = serde_json::Map::new();
+        payload.insert("title".to_owned(), serde_json::json!(title));
+        payload.insert("body".to_owned(), serde_json::json!(body));
+        if !assignees.is_empty() {
+            payload.insert("assignees".to_owned(), serde_json::json!(assignees));
+        }
+        if !labels.is_empty() {
+            let ids = self.ensure_repo_label_ids(namespace, name, labels)?;
+            if !ids.is_empty() {
+                payload.insert("labels".to_owned(), serde_json::json!(ids));
+            }
+        }
+        let reply = self.post(&path, &serde_json::Value::Object(payload).to_string())?;
+        let mut issue: Issue = parse::<WireIssue>(&reply, &path)?.into();
+        issue.repository = Some(format!("{namespace}/{name}"));
+        Ok(issue)
+    }
+
+    /// Update an existing issue's title, body, state, assignees and/or labels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_issue(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        state: Option<&str>,
+        assignees: Option<&[String]>,
+        labels: Option<&[String]>,
+    ) -> Result<Issue, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues/{number}",
+            segment(namespace),
+            segment(name)
+        );
+        let mut payload = serde_json::Map::new();
+        if let Some(title) = title {
+            payload.insert("title".to_owned(), serde_json::json!(title));
+        }
+        if let Some(body) = body {
+            payload.insert("body".to_owned(), serde_json::json!(body));
+        }
+        if let Some(state) = state {
+            payload.insert("state".to_owned(), serde_json::json!(state));
+        }
+        if let Some(assignees) = assignees {
+            payload.insert("assignees".to_owned(), serde_json::json!(assignees));
+        }
+        let mut issue: Issue = if payload.is_empty() {
+            self.issue(namespace, name, number)?
+        } else {
+            let reply = self.patch(&path, &serde_json::Value::Object(payload).to_string())?;
+            let mut parsed: Issue = parse::<WireIssue>(&reply, &path)?.into();
+            parsed.repository = Some(format!("{namespace}/{name}"));
+            parsed
+        };
+        if let Some(labels) = labels {
+            let ids = self.ensure_repo_label_ids(namespace, name, labels)?;
+            let label_path = format!(
+                "/api/v1/repos/{}/{}/issues/{number}/labels",
+                segment(namespace),
+                segment(name)
+            );
+            let label_body = serde_json::json!({ "labels": ids }).to_string();
+            let response = self
+                .agent
+                .put(&format!("{}{label_path}", self.base))
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .header("Authorization", self.authorization())
+                .send(&label_body);
+            let _ = self.finish(response, &label_path)?;
+            issue.labels = labels.to_vec();
+        }
+        Ok(issue)
+    }
+
+    fn ensure_repo_label_ids(
+        &self,
+        namespace: &str,
+        name: &str,
+        wanted: &[String],
+    ) -> Result<Vec<u64>, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/labels?limit=100",
+            segment(namespace),
+            segment(name)
+        );
+        let existing: Vec<WireLabelFull> = parse(&self.get(&path)?, &path)?;
+        let mut ids = Vec::new();
+        for label_name in wanted {
+            let trimmed = label_name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(found) = existing
+                .iter()
+                .find(|l| l.name.eq_ignore_ascii_case(trimmed))
+            {
+                ids.push(found.id);
+            } else {
+                let create_path = format!(
+                    "/api/v1/repos/{}/{}/labels",
+                    segment(namespace),
+                    segment(name)
+                );
+                let body = serde_json::json!({
+                    "name": trimmed,
+                    "color": "#5319e7",
+                })
+                .to_string();
+                let reply = self.post(&create_path, &body)?;
+                let created: WireLabelFull = parse(&reply, &create_path)?;
+                ids.push(created.id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Unified diff text of one pull request (stream-bounded to 128 KiB so huge
+    /// PR diffs can never OOM the supervisor or MCP bridge).
+    pub fn pull_diff(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<String, ForgejoError> {
+        const MAX_DIFF_READ_BYTES: usize = 128 * 1024;
+        let path = format!(
+            "/api/v1/repos/{}/{}/pulls/{number}.diff",
+            segment(namespace),
+            segment(name)
+        );
+        let url = format!("{}{path}", self.base);
+        let response = self
+            .agent
+            .get(&url)
+            .header("Accept", "text/plain")
+            .header("Authorization", self.authorization())
+            .call();
+        let response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::Timeout(_)) => {
+                return Err(ForgejoError::Timeout {
+                    secs: self.timeout.as_secs().max(1),
+                });
+            }
+            Err(ureq::Error::BadUri(problem)) => {
+                return Err(ForgejoError::BadUrl {
+                    url: self.base.clone(),
+                    problem,
+                });
+            }
+            Err(other) => {
+                return Err(ForgejoError::Transport {
+                    message: self.token.redact(&other.to_string()),
+                });
+            }
+        };
+        let status = response.status().as_u16();
+        let mut buf = Vec::new();
+        use std::io::Read;
+        response
+            .into_body()
+            .into_reader()
+            .take((MAX_DIFF_READ_BYTES + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|error| ForgejoError::Transport {
+                message: self
+                    .token
+                    .redact(&format!("the diff reply body cannot be read: {error}")),
+            })?;
+        let text = String::from_utf8_lossy(&buf);
+        let body = self.token.redact(&text);
+        self.last_2xx.set((200..=299).contains(&status));
+        match status {
+            401 => Err(ForgejoError::BadToken { status }),
+            403 => match missing_scopes(&body) {
+                Some(rights) => Err(ForgejoError::MissingScope { status, rights }),
+                None => Err(ForgejoError::Forbidden {
+                    status,
+                    message: reply_message(&body, 300),
+                }),
+            },
+            404 => Err(ForgejoError::NotFound {
+                what: path,
+                hint: page_path_hint(&self.base),
+            }),
+            status if !(200..=299).contains(&status) => Err(ForgejoError::Server {
+                status,
+                message: reply_message(&body, 300),
+            }),
+            _ => Ok(body),
+        }
+    }
+
+    /// Formal reviews submitted on one pull request, paginated to exhaustion so a
+    /// `REQUEST_CHANGES` review past page 1 can never be missed.
+    pub fn pull_reviews(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+    ) -> Result<Vec<PullReview>, ForgejoError> {
+        const PAGE_LIMIT: usize = 50;
+        const MAX_PAGES: usize = 20;
+        let mut all = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let path = format!(
+                "/api/v1/repos/{}/{}/pulls/{number}/reviews?limit={PAGE_LIMIT}&page={page}",
+                segment(namespace),
+                segment(name)
+            );
+            let body = self.get(&path)?;
+            let wire: Vec<WireReview> = parse(&body, &path)?;
+            let count = wire.len();
+            all.extend(wire.into_iter().map(PullReview::from));
+            if count < PAGE_LIMIT {
+                return Ok(all);
+            }
+        }
+        Err(ForgejoError::Transport {
+            message: format!(
+                "pull request reviews exceeded the pagination safety bound ({} reviews); refusing incomplete review audit",
+                PAGE_LIMIT * MAX_PAGES
+            ),
+        })
+    }
+
+    /// Submit a formal pull-request review (`COMMENT`, `APPROVED`, or `REQUEST_CHANGES`).
+    pub fn create_pull_review(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+        event: &str,
+        body: &str,
+    ) -> Result<PullReview, ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/pulls/{number}/reviews",
+            segment(namespace),
+            segment(name)
+        );
+        let payload = serde_json::json!({
+            "event": event,
+            "body": body,
+        })
+        .to_string();
+        let reply = self.post(&path, &payload)?;
+        Ok(parse::<WireReview>(&reply, &path)?.into())
+    }
+
+    /// Merge an open pull request (`merge`, `squash`, or `rebase`), optionally
+    /// pinning `head_commit_id` so Forgejo rejects TOCTOU force-pushes.
+    pub fn merge_pull_request(
+        &self,
+        namespace: &str,
+        name: &str,
+        number: u64,
+        method: &str,
+        title: Option<&str>,
+        head_commit_id: Option<&str>,
+    ) -> Result<(), ForgejoError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/pulls/{number}/merge",
+            segment(namespace),
+            segment(name)
+        );
+        let mut payload = serde_json::Map::new();
+        payload.insert("Do".to_owned(), serde_json::json!(method));
+        if let Some(title) = title.filter(|t| !t.trim().is_empty()) {
+            payload.insert("merge_title_field".to_owned(), serde_json::json!(title));
+        }
+        if let Some(sha) = head_commit_id.map(str::trim).filter(|s| !s.is_empty()) {
+            payload.insert("head_commit_id".to_owned(), serde_json::json!(sha));
+        }
+        self.post(&path, &serde_json::Value::Object(payload).to_string())?;
+        Ok(())
+    }
+
+    /// Create a new repository inside an organisation (initialised with `main`).
+    pub fn create_org_repository(
+        &self,
+        organisation: &str,
+        name: &str,
+        description: &str,
+        private: bool,
+    ) -> Result<Repository, ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/repos", segment(organisation));
+        let body = serde_json::json!({
+            "name": name,
+            "description": description,
+            "private": private,
+            "auto_init": true,
+            "default_branch": "main",
+        })
+        .to_string();
+        let reply = self.post(&path, &body)?;
+        Ok(parse::<WireRepo>(&reply, &path)?.into())
+    }
+
+    /// List webhooks registered on an organisation.
+    pub fn list_org_hooks(&self, organisation: &str) -> Result<Vec<OrgHook>, ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/hooks?limit=50", segment(organisation));
+        let body = self.get(&path)?;
+        let wire: Vec<WireHook> = parse(&body, &path)?;
+        Ok(wire.into_iter().map(OrgHook::from).collect())
+    }
+
+    /// Create a Forgejo webhook on an organisation targeting a loopback endpoint.
+    pub fn create_org_hook(
+        &self,
+        organisation: &str,
+        url: &str,
+        secret: &str,
+        events: &[&str],
+    ) -> Result<OrgHook, ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/hooks", segment(organisation));
+        let body = serde_json::json!({
+            "type": "forgejo",
+            "active": true,
+            "events": events,
+            "config": {
+                "url": url,
+                "content_type": "json",
+                "secret": secret,
+            }
+        })
+        .to_string();
+        let reply = self.post(&path, &body)?;
+        Ok(parse::<WireHook>(&reply, &path)?.into())
+    }
+
+    /// Update an existing organisation webhook URL/secret/events.
+    pub fn update_org_hook(
+        &self,
+        organisation: &str,
+        hook_id: u64,
+        url: &str,
+        secret: &str,
+        events: &[&str],
+    ) -> Result<OrgHook, ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/hooks/{hook_id}", segment(organisation));
+        let body = serde_json::json!({
+            "active": true,
+            "events": events,
+            "config": {
+                "url": url,
+                "content_type": "json",
+                "secret": secret,
+            }
+        })
+        .to_string();
+        let reply = self.patch(&path, &body)?;
+        Ok(parse::<WireHook>(&reply, &path)?.into())
+    }
+
+    /// Delete an organisation webhook by id.
+    pub fn delete_org_hook(&self, organisation: &str, hook_id: u64) -> Result<(), ForgejoError> {
+        let path = format!("/api/v1/orgs/{}/hooks/{hook_id}", segment(organisation));
+        match self.delete(&path) {
+            Ok(()) | Err(ForgejoError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// One pull request in any state, when the token may see it.
@@ -1224,6 +1678,79 @@ struct WireLabel {
 }
 
 #[derive(Debug, Deserialize)]
+struct WireLabelFull {
+    id: u64,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireReview {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    user: Option<WireUser>,
+    #[serde(default)]
+    commit_id: Option<String>,
+    #[serde(default)]
+    dismissed: bool,
+    #[serde(default)]
+    stale: bool,
+    #[serde(default)]
+    submitted_at: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
+impl From<WireReview> for PullReview {
+    fn from(wire: WireReview) -> Self {
+        Self {
+            id: wire.id,
+            state: wire.state,
+            body: wire.body,
+            author: wire.user.and_then(|u| u.login),
+            commit_id: wire.commit_id,
+            dismissed: wire.dismissed,
+            stale: wire.stale,
+            submitted_at: wire.submitted_at,
+            html_url: wire.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WireHookConfig {
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireHook {
+    id: u64,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    events: Vec<String>,
+    #[serde(default)]
+    config: Option<WireHookConfig>,
+}
+
+impl From<WireHook> for OrgHook {
+    fn from(wire: WireHook) -> Self {
+        Self {
+            id: wire.id,
+            url: wire.config.map(|c| c.url).unwrap_or_default(),
+            active: wire.active,
+            events: wire.events,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct WirePullMarker {
     #[serde(default)]
     html_url: Option<String>,
@@ -1246,6 +1773,10 @@ struct WireIssue {
     #[serde(default)]
     user: Option<WireUser>,
     #[serde(default)]
+    assignee: Option<WireUser>,
+    #[serde(default)]
+    assignees: Option<Vec<WireUser>>,
+    #[serde(default)]
     comments: u64,
     #[serde(default)]
     repository: Option<WireRepoName>,
@@ -1255,6 +1786,17 @@ struct WireIssue {
 
 impl From<WireIssue> for Issue {
     fn from(wire: WireIssue) -> Self {
+        let mut assignees: Vec<String> = wire
+            .assignees
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|u| u.login)
+            .collect();
+        if let Some(single) = wire.assignee.and_then(|u| u.login)
+            && !assignees.contains(&single)
+        {
+            assignees.push(single);
+        }
         Self {
             number: wire.number,
             title: wire.title,
@@ -1264,6 +1806,7 @@ impl From<WireIssue> for Issue {
             labels: wire.labels.into_iter().map(|label| label.name).collect(),
             updated_at: wire.updated_at,
             author: wire.user.and_then(|user| user.login),
+            assignees,
             comments: wire.comments,
             repository: wire.repository.and_then(|repo| repo.full_name),
             pull_request_url: wire.pull_request.and_then(|marker| marker.html_url),
@@ -1301,6 +1844,8 @@ struct WireRef {
     #[serde(rename = "ref")]
     reference: String,
     #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
     repo: Option<WireRepoName>,
 }
 
@@ -1334,6 +1879,7 @@ impl From<WirePull> for PullRequest {
             },
             html_url: wire.html_url,
             head_repo: wire.head.full_name(),
+            head_sha: wire.head.sha,
             head: wire.head.reference,
             base_repo: wire.base.full_name(),
             base: wire.base.reference,

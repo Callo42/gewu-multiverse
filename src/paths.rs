@@ -168,6 +168,7 @@ pub struct AgentPaths {
     config_dir: PathBuf,
     instruction: PathBuf,
     skills_dir: PathBuf,
+    mcp_config: PathBuf,
     steps_file: PathBuf,
     workspace: PathBuf,
     state_root: PathBuf,
@@ -192,6 +193,7 @@ impl AgentPaths {
             root: layout.root().to_path_buf(),
             instruction: config_dir.join("instruction.md"),
             skills_dir: config_dir.join("skills"),
+            mcp_config: config_dir.join("mcp.json"),
             steps_file: config_dir.join("steps.txt"),
             workspace: config_dir.join("workspace"),
             state_dir: state_root.join(name),
@@ -208,6 +210,11 @@ impl AgentPaths {
     /// The directory holding one directory per skill.
     pub fn skills_dir(&self) -> &Path {
         &self.skills_dir
+    }
+
+    /// The optional per-role external MCP configuration (`agents/<role>/mcp.json`).
+    pub fn mcp_config(&self) -> &Path {
+        &self.mcp_config
     }
 
     /// The declared shell steps a run executes, one per line.

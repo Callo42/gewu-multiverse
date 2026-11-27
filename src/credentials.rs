@@ -120,6 +120,14 @@ pub enum CredentialsError {
         #[source]
         source: io::Error,
     },
+    /// A role external environment secret used a reserved or invalid variable name.
+    #[error("credentials secret key `{key}` is not allowed: {reason}")]
+    InvalidEnvKey {
+        /// The rejected variable name.
+        key: String,
+        /// Why it was refused.
+        reason: String,
+    },
     /// The mode could not be read or set.
     #[error("the mode of {path} cannot be read or set: {source}")]
     Mode {
@@ -341,20 +349,83 @@ impl Secret {
 
     /// Replace every occurrence of every held secret in `text` with `<redacted>`.
     ///
-    /// This is what every string that leaves the process is passed through, so no
-    /// secret the run holds can survive in a transcript, a log or an error even if a
-    /// tool printed the credentials file.
+    /// Sorts secrets longest-first so overlapping secrets do not leave partial
+    /// suffixes behind, and also scrubs JSON-escaped, URL-percent-encoded and
+    /// standard Base64 encodings of secrets (>= 8 bytes).
     pub fn redact(&self, text: &str) -> String {
-        let mut redacted = if self.value.is_empty() {
-            text.to_owned()
-        } else {
-            text.replace(&self.value, REDACTED)
-        };
+        let mut needles: Vec<&str> = Vec::with_capacity(self.also.len() + 1);
+        if !self.value.is_empty() {
+            needles.push(self.value.as_str());
+        }
         for extra in &self.also {
-            redacted = redacted.replace(extra.as_str(), REDACTED);
+            if !extra.is_empty() {
+                needles.push(extra.as_str());
+            }
+        }
+        if needles.is_empty() {
+            return text.to_owned();
+        }
+        needles.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        needles.dedup();
+        let mut redacted = text.to_owned();
+        for secret in needles {
+            if redacted.contains(secret) {
+                redacted = redacted.replace(secret, REDACTED);
+            }
+            if let Ok(quoted) = serde_json::to_string(secret) {
+                let escaped = quoted.trim_matches('"');
+                if escaped != secret && !escaped.is_empty() && redacted.contains(escaped) {
+                    redacted = redacted.replace(escaped, REDACTED);
+                }
+            }
+            if secret.len() >= 8 {
+                let pct = percent_encode_secret(secret);
+                if pct != secret && redacted.contains(&pct) {
+                    redacted = redacted.replace(&pct, REDACTED);
+                }
+                let b64 = base64_secret(secret.as_bytes());
+                if !b64.is_empty() && redacted.contains(&b64) {
+                    redacted = redacted.replace(&b64, REDACTED);
+                }
+            }
         }
         redacted
     }
+}
+
+fn percent_encode_secret(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn base64_secret(input: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (chunk.get(1).copied().unwrap_or(0) as u32) << 8
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 impl fmt::Debug for Secret {
@@ -458,14 +529,99 @@ pub fn forgejo_agent_token_optional(
         .map(|text| Secret::new(text.to_owned())))
 }
 
+/// Read the role-scoped external environment secrets stored under
+/// `[agent_env_secrets.<agent>]` in the 0600 credentials file.
+///
+/// Only the named agent receives these values in its confined workspace runtime;
+/// every value across every agent is also added to [`all_secret_values`] so no
+/// secret can survive into a log, transcript, event stream or `hydrate_cmd` output.
+pub fn agent_env_secrets(
+    path: &Path,
+    agent: &str,
+) -> Result<std::collections::BTreeMap<String, Secret>, CredentialsError> {
+    let value = match read_value(path) {
+        Ok(value) => value,
+        Err(CredentialsError::Absent { .. }) => return Ok(std::collections::BTreeMap::new()),
+        Err(error) => return Err(error),
+    };
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(entries) = value
+        .get("agent_env_secrets")
+        .and_then(|root| root.get(agent))
+        .and_then(toml::Value::as_table)
+    {
+        for (key, val) in entries {
+            if let Err(reason) = crate::engine::settings::validate_external_env_key(key) {
+                return Err(CredentialsError::InvalidEnvKey {
+                    key: key.clone(),
+                    reason,
+                });
+            }
+            if let Some(text) = val.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+                out.insert(key.clone(), Secret::new(text.to_owned()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Write or update one role-scoped external environment secret under
+/// `[agent_env_secrets.<agent>]`.
+pub fn record_agent_env_secret(
+    path: &Path,
+    agent: &str,
+    key: &str,
+    secret_value: &str,
+) -> Result<(), CredentialsError> {
+    if let Err(reason) = crate::engine::settings::validate_external_env_key(key) {
+        return Err(CredentialsError::InvalidEnvKey {
+            key: key.to_owned(),
+            reason,
+        });
+    }
+    let _guard = write_lock();
+    let trimmed = secret_value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let mut root = value_for_write(path)?;
+    let root_table = root
+        .as_table_mut()
+        .ok_or_else(|| CredentialsError::MissingToken {
+            path: path.to_path_buf(),
+            key: "the credentials file".to_owned(),
+        })?;
+    let all_envs = root_table
+        .entry("agent_env_secrets".to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let Some(all_envs_table) = all_envs.as_table_mut() {
+        let agent_envs = all_envs_table
+            .entry(agent.to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let Some(agent_table) = agent_envs.as_table_mut() {
+            agent_table.insert(key.to_owned(), toml::Value::String(trimmed.to_owned()));
+        }
+    }
+    let text = toml::to_string_pretty(&root).map_err(|error| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source: io::Error::other(error),
+    })?;
+    let text = format!("# gewu-multiverse credentials (the tool last wrote this file)\n{text}");
+    crate::mode::write_private(path, text.as_bytes()).map_err(|source| CredentialsError::Rewrite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// Every secret value the credentials file holds, for redacting a run's output.
 ///
 /// A run always redacts its own model key; this returns that key and every other
 /// secret beside it — the `forgejo_token`, the `forgejo_admin_token`, the per-agent
-/// tokens under `[forgejo_agent_tokens]` and every key under `[model_keys]` — so that
-/// a tool which printed the credentials file cannot carry any of them into a log or a
-/// transcript. A file that cannot be read yields nothing: the model key the run
-/// already holds is still redacted.
+/// tokens under `[forgejo_agent_tokens]`, every key under `[model_keys]` and every
+/// role-scoped external secret under `[agent_env_secrets.*]` — so that a tool which
+/// printed the credentials file or its environment cannot carry any of them into a
+/// log or a transcript. A file that cannot be read yields nothing: the model key
+/// the run already holds is still redacted.
 pub fn all_secret_values(path: &Path) -> Vec<Secret> {
     let Ok(value) = read_value(path) else {
         return Vec::new();
@@ -477,6 +633,16 @@ pub fn all_secret_values(path: &Path) -> Vec<Secret> {
     for table in ["forgejo_agent_tokens", "model_keys"] {
         if let Some(entries) = value.get(table).and_then(toml::Value::as_table) {
             for text in entries.values().filter_map(toml::Value::as_str) {
+                push_secret(Some(text), &mut secrets);
+            }
+        }
+    }
+    if let Some(agent_envs) = value
+        .get("agent_env_secrets")
+        .and_then(toml::Value::as_table)
+    {
+        for per_agent in agent_envs.values().filter_map(toml::Value::as_table) {
+            for text in per_agent.values().filter_map(toml::Value::as_str) {
                 push_secret(Some(text), &mut secrets);
             }
         }
@@ -718,6 +884,7 @@ pub fn remove_agent_token(path: &Path, agent: &str) -> Result<Vec<String>, Crede
         for (table, label) in [
             ("forgejo_agent_tokens", "Forgejo token"),
             ("forgejo_token_names", "token name"),
+            ("agent_env_secrets", "role external secrets"),
         ] {
             if let Some(entries) = root.get_mut(table).and_then(toml::Value::as_table_mut) {
                 if entries.remove(agent).is_some() {
@@ -976,6 +1143,7 @@ pub fn remove_agent_secrets(
         for (table, label) in [
             ("model_keys", "model key"),
             ("forgejo_agent_tokens", "Forgejo token"),
+            ("agent_env_secrets", "external environment secrets"),
         ] {
             if let Some(entries) = root.get_mut(table).and_then(toml::Value::as_table_mut) {
                 for agent in agents {
@@ -1653,4 +1821,36 @@ pub fn remove_secret(path: &Path, table: Option<&str>, key: &str) -> Result<(), 
         path: path.to_path_buf(),
         source,
     })
+}
+
+
+#[cfg(test)]
+mod security_hardening_tests {
+    use super::*;
+
+    #[test]
+    fn agent_env_secrets_fails_closed_on_forbidden_env_keys() {
+        let root = crate::test_support::scratch_root("cred-env-key");
+        let path = root.join("credentials.toml");
+        crate::mode::write_private(
+            &path,
+            b"[agent_env_secrets.ops]\nHOME = \"/tmp/hijack\"\n",
+        )
+        .unwrap();
+        assert!(agent_env_secrets(&path, "ops").is_err());
+        assert!(record_agent_env_secret(&path, "ops", "LD_PRELOAD", "/tmp/x.so").is_err());
+        assert!(record_agent_env_secret(&path, "ops", "GEWU_NATIVE_KEY", "x").is_err());
+        assert!(record_agent_env_secret(&path, "ops", "SSH_AUTH_SOCK", "/tmp/s").is_err());
+    }
+
+    #[test]
+    fn secret_redact_handles_overlapping_and_encoded_forms() {
+        let raw = "sk-secret/key+1234";
+        let secret = Secret::new(raw).with_extra_redactions([Secret::new("sk-secret")]);
+        assert_eq!(secret.redact(raw), REDACTED);
+        let b64 = base64_secret(raw.as_bytes());
+        assert!(!secret.redact(&format!("token={b64}")).contains(&b64));
+        let pct = percent_encode_secret(raw);
+        assert!(!secret.redact(&format!("q={pct}")).contains(&pct));
+    }
 }

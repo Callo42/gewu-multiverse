@@ -44,20 +44,20 @@ fn program(
         id: id.to_owned(),
         label: label.to_owned(),
         version: match id {
-            "pi" => "1.4.0",
-            "codex" => "0.164.0",
-            "dsh" => "0.2.1-rc.2",
-            _ => "2.1.4",
+            "pi" => "1.6.1",
+            "codex" => "0.172.0",
+            "dsh" => "0.2.2-rc.5",
+            _ => "2.4.2",
         }
         .to_owned(),
-        installed_version: installed.then(|| "1.4.0".to_owned()),
+        installed_version: installed.then(|| "1.6.1".to_owned()),
         installed,
         license: "MIT".to_owned(),
         download_mb: match id {
-            "pi" => 43,
-            "codex" => 162,
-            "dsh" => 753,
-            _ => 240,
+            "pi" => 57,
+            "codex" => 192,
+            "dsh" => 1231,
+            _ => 125,
         },
         prerequisite: (id == "dsh").then(|| "Node 24.9+ / npm 11.16+".to_owned()),
         prerequisite_met: true,
@@ -99,11 +99,13 @@ fn draw(board: &mut Board, width: u16, height: u16) -> Terminal<TestBackend> {
 #[test]
 fn installer_progress_and_cancel_copy_fit_the_floor_sizes() {
     let mut board = board_with(vec![
+        program("dsh", "DeepSeek Harness", false, None, None, None),
         program("pi", "Pi", false, Some(Some(37)), Some("downloading"), None),
         program("codex", "Codex", true, None, None, None),
-        program("dsh", "DeepSeek Harness", false, None, None, None),
         program("opencode", "OpenCode", false, None, None, None),
     ]);
+    // Built-in -> DeepSeek Harness -> Pi.
+    press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     for (width, height) in [(72, 18), (80, 24)] {
         let terminal = draw(&mut board, width, height);
@@ -138,6 +140,7 @@ fn installer_progress_and_cancel_copy_fit_the_floor_sizes() {
 #[test]
 fn phases_without_a_percentage_are_named_at_the_floor_size() {
     let mut board = board_with(vec![
+        program("dsh", "DeepSeek Harness", false, None, None, None),
         program(
             "pi",
             "Pi",
@@ -147,9 +150,10 @@ fn phases_without_a_percentage_are_named_at_the_floor_size() {
             None,
         ),
         program("codex", "Codex", true, None, None, None),
-        program("dsh", "DeepSeek Harness", false, None, None, None),
         program("opencode", "OpenCode", false, None, None, None),
     ]);
+    // Built-in -> DeepSeek Harness -> Pi.
+    press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     let terminal = draw(&mut board, 72, 18);
     let picture = flat(&terminal);
@@ -160,6 +164,7 @@ fn phases_without_a_percentage_are_named_at_the_floor_size() {
 #[test]
 fn an_error_names_the_old_version_and_a_quit_cancels_the_selected_install() {
     let mut board = board_with(vec![
+        program("dsh", "DeepSeek Harness", false, None, None, None),
         program(
             "pi",
             "Pi",
@@ -169,9 +174,10 @@ fn an_error_names_the_old_version_and_a_quit_cancels_the_selected_install() {
             Some("package checksum mismatch; the old version is still installed"),
         ),
         program("codex", "Codex", true, None, None, None),
-        program("dsh", "DeepSeek Harness", false, None, None, None),
         program("opencode", "OpenCode", false, None, None, None),
     ]);
+    // Built-in -> DeepSeek Harness -> Pi.
+    press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     let terminal = draw(&mut board, 72, 18);
     let picture = flat(&terminal);
@@ -181,9 +187,8 @@ fn an_error_names_the_old_version_and_a_quit_cancels_the_selected_install() {
         "{picture}"
     );
 
-    // Select DeepSeek Harness: its prerequisite must be whole and useful at 72.
-    press(&mut board, KeyCode::Down);
-    press(&mut board, KeyCode::Down);
+    // Select DeepSeek Harness (one row up from Pi): its prerequisite must be whole and useful at 72.
+    press(&mut board, KeyCode::Up);
     let terminal = draw(&mut board, 72, 18);
     let picture = flat(&terminal);
     assert!(picture.contains("Node 24.9+ / npm 11.16+"), "{picture}");
@@ -191,8 +196,7 @@ fn an_error_names_the_old_version_and_a_quit_cancels_the_selected_install() {
 
     // Back to Pi and start its install, then quit once: the warning must say what
     // q again does rather than claim only Forgejo/agents stop.
-    press(&mut board, KeyCode::Up);
-    press(&mut board, KeyCode::Up);
+    press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Char('i'));
     board.tick();
     assert!(board.installing_count() == 1);

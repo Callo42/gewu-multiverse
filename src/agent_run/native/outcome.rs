@@ -928,6 +928,11 @@ fn is_write_tool(tool: &str) -> bool {
     lower.contains("forgejo_comment")
         || lower.contains("forgejo_open_pull_request")
         || lower.contains("forgejo_update_pull_request")
+        || lower.contains("forgejo_create_issue")
+        || lower.contains("forgejo_update_issue")
+        || lower.contains("forgejo_review_pull_request")
+        || lower.contains("forgejo_merge_pull_request")
+        || lower.contains("forgejo_create_repository")
         || matches!(
             lower.as_str(),
             "write" | "edit" | "apply_patch" | "patch" | "file_change"

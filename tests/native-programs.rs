@@ -70,7 +70,7 @@ fn install_pi_fixture(data_root: &Path) {
         std::env::var("GEWU_PI_BINARY").unwrap_or_else(|_| panic!("GEWU_PI_BINARY is not set"));
     let source = PathBuf::from(source);
     assert!(source.is_file(), "{} is not a file", source.display());
-    let root = data_root.join("harnesses/pi/1.4.0");
+    let root = data_root.join("harnesses/pi/1.6.1");
     fs::create_dir_all(root.join("pi")).expect("the fixture directory");
     let target = root.join("pi/pi");
     if !target.exists() {
@@ -81,12 +81,12 @@ fn install_pi_fixture(data_root: &Path) {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("the fixture mode");
     let record = InstallRecord {
         program: "pi".to_owned(),
-        version: "1.4.0".to_owned(),
-        sha256: "f2e4e4329603223d03260cdb8bd5033dbdc1f73ba58ab8939db2e56546e115d2".to_owned(),
+        version: "1.6.1".to_owned(),
+        sha256: "3c7f00715eb512e165c0da8cad314d73c83b54d5bf7748be4adc618fc8357b68".to_owned(),
         license: "MIT".to_owned(),
         entrypoint: "pi/pi".to_owned(),
         resources: None,
-        installed_at: "2026-10-23T00:00:00Z".to_owned(),
+        installed_at: "2026-11-27T00:00:00Z".to_owned(),
     };
     let text = serde_json::to_string_pretty(&record).expect("the record");
     gewu_multiverse::mode::write_private(root.join("install.json"), text.as_bytes())

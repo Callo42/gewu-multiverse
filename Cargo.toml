@@ -1,9 +1,9 @@
 [package]
 name = "gewu-multiverse"
-version = "0.1.43"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "One bundled Forgejo on your machine and the agents you run on it, drawn as a terminal board."
+description = "A private internal GitHub (bundled Forgejo) paired with a customizable team of role-defined AI agents."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/Callo42/gewu-multiverse"

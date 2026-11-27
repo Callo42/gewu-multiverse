@@ -25,7 +25,8 @@ fn an_agent_can_choose_and_install_a_program_from_its_screen() {
     press(&mut board, KeyCode::Enter);
     press(&mut board, KeyCode::Char('p'));
 
-    // Built-in is the first row; moving down reaches Pi.
+    // Built-in is the first row; moving down reaches DeepSeek Harness (fresh default), then Pi.
+    press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Enter);
     assert!(board.sent_commands().iter().any(|command| matches!(
@@ -34,6 +35,7 @@ fn an_agent_can_choose_and_install_a_program_from_its_screen() {
     )));
 
     press(&mut board, KeyCode::Char('p'));
+    press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Char('i'));
     assert!(board.sent_commands().iter().any(|command| matches!(
@@ -59,7 +61,8 @@ fn codex_full_access_needs_a_second_explicit_keypress() {
     let mut board = Board::new(engine);
     press(&mut board, KeyCode::Enter);
     press(&mut board, KeyCode::Char('p'));
-    // Built-in, Pi, Codex.
+    // Built-in, DeepSeek Harness, Pi, Codex.
+    press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Char('f'));

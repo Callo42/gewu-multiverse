@@ -50,7 +50,7 @@ impl Drop for Scratch {
 }
 
 fn install_pi(data_root: &Path, source: &Path) {
-    let root = data_root.join("harnesses/pi/1.4.0");
+    let root = data_root.join("harnesses/pi/1.6.1");
     fs::create_dir_all(root.join("pi")).expect("fixture dir");
     let target = root.join("pi/pi");
     if !target.exists() {
@@ -61,12 +61,12 @@ fn install_pi(data_root: &Path, source: &Path) {
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("fixture mode");
     let record = InstallRecord {
         program: "pi".to_owned(),
-        version: "1.4.0".to_owned(),
+        version: "1.6.1".to_owned(),
         sha256: "fixture".to_owned(),
         license: "MIT".to_owned(),
         entrypoint: "pi/pi".to_owned(),
         resources: None,
-        installed_at: "2026-10-24T00:00:00Z".to_owned(),
+        installed_at: "2026-11-27T00:00:00Z".to_owned(),
     };
     let text = serde_json::to_string_pretty(&record).expect("record");
     gewu_multiverse::mode::write_private(root.join("install.json"), text.as_bytes())
@@ -424,16 +424,16 @@ fn install_source(
 
 fn harness_source(harness: &str) -> (Program, String, String) {
     match harness {
-        "pi" => (Program::Pi, "1.4.0".to_owned(), "pi/pi".to_owned()),
-        "codex" => (Program::Codex, "0.164.0".to_owned(), "bin/codex".to_owned()),
+        "pi" => (Program::Pi, "1.6.1".to_owned(), "pi/pi".to_owned()),
+        "codex" => (Program::Codex, "0.172.0".to_owned(), "bin/codex".to_owned()),
         "dsh" => (
             Program::Dsh,
-            "0.2.1-rc.2".to_owned(),
+            "0.2.2-rc.5".to_owned(),
             "node_modules/.bin/dsh".to_owned(),
         ),
         "opencode" => (
             Program::Opencode,
-            "2.1.4".to_owned(),
+            "2.4.2".to_owned(),
             "package/bin/opencode".to_owned(),
         ),
         other => panic!("unknown harness {other}"),

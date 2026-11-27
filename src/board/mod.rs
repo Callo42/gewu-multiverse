@@ -121,6 +121,9 @@ pub struct Board {
     codex_optin_confirmed: bool,
     confirm_remove: Option<String>,
     confirm_quit: bool,
+    attached: bool,
+    confirm_stop_daemon: bool,
+    daemon_stop_requested: bool,
     notice: Option<String>,
     notice_ticks: u8,
     revealed_password: Option<(String, u8)>,
@@ -139,6 +142,7 @@ impl Board {
     /// Read the first view and open the screen the person belongs on.
     pub fn new(engine: impl EngineApi + 'static) -> Self {
         let mut engine = Box::new(engine);
+        let attached = engine.is_attached();
         let view = engine.board();
         let startup_notice = view.notice.clone();
         let terms_seen = vec![false; view.terms.len()];
@@ -184,6 +188,9 @@ impl Board {
             codex_optin_confirmed: false,
             confirm_remove: None,
             confirm_quit: false,
+            attached,
+            confirm_stop_daemon: false,
+            daemon_stop_requested: false,
             notice: None,
             notice_ticks: 0,
             revealed_password: None,
@@ -727,6 +734,7 @@ impl Board {
                 }
                 Some('e') => self.begin_edit(),
                 Some('q') => self.request_quit(),
+                Some('Q') if self.attached => self.request_stop_daemon(),
                 _ => {}
             },
         }
@@ -852,6 +860,7 @@ impl Board {
                 Some('+') => self.agent_count = (self.agent_count + 1).min(12),
                 Some('-') => self.agent_count = self.agent_count.saturating_sub(1).max(1),
                 Some('q') => self.request_quit(),
+                Some('Q') if self.attached => self.request_stop_daemon(),
                 _ => {}
             },
         }
@@ -883,6 +892,22 @@ impl Board {
                 Some('n') | Some('q') => self.confirm_remove = None,
                 _ if key.code == KeyCode::Esc => self.confirm_remove = None,
                 _ => {}
+            }
+            return;
+        }
+        if self.confirm_stop_daemon {
+            if let Some('Q') = plain(key) {
+                self.confirm_stop_daemon = false;
+                if let Err(err) = self.engine.stop_daemon() {
+                    self.set_notice(err);
+                } else {
+                    self.daemon_stop_requested = true;
+                    self.quitting = true;
+                }
+            } else if matches!(key.code, KeyCode::Esc)
+                || matches!(plain(key), Some('n') | Some('q'))
+            {
+                self.confirm_stop_daemon = false;
             }
             return;
         }
@@ -983,6 +1008,7 @@ impl Board {
                     self.screen = Screen::Help;
                 }
                 Some('q') => self.request_quit(),
+                Some('Q') if self.attached => self.request_stop_daemon(),
                 _ => {}
             },
         }
@@ -1111,6 +1137,7 @@ impl Board {
                     self.screen = Screen::Help;
                 }
                 Some('q') => self.request_quit(),
+                Some('Q') if self.attached => self.request_stop_daemon(),
                 _ => {}
             },
         }
@@ -1301,6 +1328,7 @@ impl Board {
                     self.screen = Screen::Help;
                 }
                 Some('q') => self.request_quit(),
+                Some('Q') if self.attached => self.request_stop_daemon(),
                 _ => {}
             },
         }
@@ -1335,6 +1363,7 @@ impl Board {
                     self.screen = Screen::Help;
                 }
                 Some('q') => self.request_quit(),
+                Some('Q') if self.attached => self.request_stop_daemon(),
                 _ => {}
             },
         }
@@ -1410,6 +1439,11 @@ impl Board {
     }
 
     fn request_quit(&mut self) {
+        if self.attached {
+            // Detaching from a running `--headless` daemon never stops Forgejo or agents.
+            self.quitting = true;
+            return;
+        }
         let live = self.active_started_count();
         let installing = self.installing_count();
         if live == 0 && installing == 0 {
@@ -1434,6 +1468,28 @@ impl Board {
                 ));
             }
         }
+    }
+
+    fn request_stop_daemon(&mut self) {
+        if !self.attached {
+            return;
+        }
+        self.screen = Screen::Home;
+        self.confirm_stop_daemon = true;
+        self.confirm_remove = None;
+        self.set_notice(
+            "Q again stops the headless daemon, all agents, and Forgejo (Esc cancels)",
+        );
+    }
+
+    /// Whether this board is attached remotely to a running `--headless` daemon.
+    pub fn is_attached(&self) -> bool {
+        self.attached
+    }
+
+    /// Whether the user explicitly requested stopping the attached daemon (`Q`).
+    pub fn daemon_stop_requested(&self) -> bool {
+        self.daemon_stop_requested
     }
 
     /// How many program installs are still running, for the quit warning.

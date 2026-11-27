@@ -577,6 +577,9 @@ pub const PINNED_APP_INI: &[(&str, &str, &str)] = &[
     // person's page. They are pinned off on every start, including on an instance
     // an earlier version made (U10).
     ("other", "SHOW_FOOTER_TEMPLATE_LOAD_TIME", "false"),
+    // Allow bundled Forgejo to deliver local-only wake webhooks to the engine's
+    // loopback receiver (never external hosts).
+    ("webhook", "ALLOWED_HOST_LIST", "loopback"),
 ];
 
 /// The lower-case section name of an INI header line.
@@ -801,6 +804,9 @@ pub fn app_ini_text(
          \n\
          [cron]\n\
          ENABLED = false\n\
+         \n\
+         [webhook]\n\
+         ALLOWED_HOST_LIST = loopback\n\
          \n\
          [log]\n\
          MODE = file\n\

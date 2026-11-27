@@ -282,3 +282,258 @@ fn a_host_without_landlock_is_unconfined_and_refuses_the_shell() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_symlinked_home_or_tmpdir_cannot_escape_landlock_program_or_shell() {
+    let root = scratch("n1-symlink-escape");
+    let workspace = root.join("workspace");
+    let victim = root.join("victim");
+    let rt_root = root.join("rt");
+    for dir in [&workspace, &victim, &rt_root] {
+        fs::create_dir_all(dir).expect("a directory");
+    }
+    let victim_secret = victim.join("secret.txt");
+    write_private(&victim_secret, "HOST-SECRET-DO-NOT-READ");
+    let real_home = rt_root.join("real-home");
+    let real_tmp = rt_root.join("real-tmp");
+    fs::create_dir_all(&real_home).expect("real home");
+    fs::create_dir_all(&real_tmp).expect("real tmp");
+    let symlink_home = rt_root.join("home-link");
+    let symlink_tmp = rt_root.join("tmp-link");
+    std::os::unix::fs::symlink(&victim, &symlink_home).expect("symlink home");
+    std::os::unix::fs::symlink(&victim, &symlink_tmp).expect("symlink tmp");
+
+    let spec_path = root.join("program-spec.json");
+    let spec = serde_json::json!({
+        "workspace": workspace.display().to_string(),
+        "program": "/bin/cat",
+        "args": [victim_secret.display().to_string()],
+        "read": [],
+        "write": [real_home.display().to_string(), real_tmp.display().to_string()],
+    });
+    fs::write(&spec_path, spec.to_string()).expect("spec");
+
+    // 1. --confined-program with symlinked HOME MUST fail closed and never leak victim.
+    let out_home = Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--confined-program")
+        .arg(&spec_path)
+        .env("HOME", &symlink_home)
+        .env("TMPDIR", &real_tmp)
+        .output()
+        .expect("run confined program with symlinked HOME");
+    let stdout_home = String::from_utf8_lossy(&out_home.stdout);
+    let stderr_home = String::from_utf8_lossy(&out_home.stderr);
+    if !stderr_home.contains("Landlock is not available") {
+        assert!(
+            !out_home.status.success(),
+            "symlinked HOME was allowed: {stdout_home}\n{stderr_home}"
+        );
+        assert!(
+            !stdout_home.contains("HOST-SECRET-DO-NOT-READ"),
+            "symlinked HOME leaked victim secret: {stdout_home}"
+        );
+    }
+
+    // 2. --confined-program with symlinked TMPDIR MUST fail closed and never leak victim.
+    let out_tmp = Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--confined-program")
+        .arg(&spec_path)
+        .env("HOME", &real_home)
+        .env("TMPDIR", &symlink_tmp)
+        .output()
+        .expect("run confined program with symlinked TMPDIR");
+    let stdout_tmp = String::from_utf8_lossy(&out_tmp.stdout);
+    let stderr_tmp = String::from_utf8_lossy(&out_tmp.stderr);
+    if !stderr_tmp.contains("Landlock is not available") {
+        assert!(
+            !out_tmp.status.success(),
+            "symlinked TMPDIR was allowed: {stdout_tmp}\n{stderr_tmp}"
+        );
+        assert!(
+            !stdout_tmp.contains("HOST-SECRET-DO-NOT-READ"),
+            "symlinked TMPDIR leaked victim secret: {stdout_tmp}"
+        );
+    }
+
+    // 3. --confined-shell with symlinked HOME MUST fail closed too.
+    let out_shell = Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--confined-shell")
+        .env("GEWU_CONFINE_METHOD", "landlock")
+        .env(
+            "GEWU_CONFINE_COMMAND",
+            format!("cat {}", victim_secret.display()),
+        )
+        .env("GEWU_CONFINE_WORKSPACE", &workspace)
+        .env("HOME", &symlink_home)
+        .env("TMPDIR", &real_tmp)
+        .output()
+        .expect("run confined shell with symlinked HOME");
+    let stdout_shell = String::from_utf8_lossy(&out_shell.stdout);
+    let stderr_shell = String::from_utf8_lossy(&out_shell.stderr);
+    if !stderr_shell.contains("runs are not confined on this computer") {
+        assert!(
+            !out_shell.status.success(),
+            "confined shell allowed symlinked HOME: {stdout_shell}\n{stderr_shell}"
+        );
+        assert!(
+            !stdout_shell.contains("HOST-SECRET-DO-NOT-READ"),
+            "confined shell leaked victim secret via symlinked HOME: {stdout_shell}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn leaf_only_landlock_writes_prevent_replacing_home_or_driver_dir_with_symlinks() {
+    let root = scratch("n1-n2-leaf-writes");
+    let workspace = root.join("workspace");
+    let rt_root = root.join("rt");
+    let home = rt_root.join("home");
+    let tmp = rt_root.join("tmp");
+    let codex = rt_root.join("codex");
+    for dir in [&workspace, &home, &tmp, &codex] {
+        fs::create_dir_all(dir).expect("a directory");
+    }
+    let victim = root.join("victim");
+    fs::create_dir_all(&victim).expect("victim");
+
+    // Exact resident-runtime write shape: leaf dirs only, NEVER `rt_root`.
+    let spec_path = root.join("leaf-spec.json");
+    let script = format!(
+        "rmdir '{}' 2>&1; echo home_rm=$?; rmdir '{}' 2>&1; echo codex_rm=$?; ln -s '{}' '{}' 2>&1; echo link=$?",
+        home.display(),
+        codex.display(),
+        victim.display(),
+        rt_root.join("evil").display(),
+    );
+    let spec = serde_json::json!({
+        "workspace": workspace.display().to_string(),
+        "program": "/bin/sh",
+        "args": ["-c", script],
+        "read": [],
+        "write": [
+            home.display().to_string(),
+            tmp.display().to_string(),
+            codex.display().to_string(),
+        ],
+    });
+    fs::write(&spec_path, spec.to_string()).expect("spec");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--confined-program")
+        .arg(&spec_path)
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp)
+        .output()
+        .expect("run leaf-only confined program");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("Landlock is not available") {
+        return;
+    }
+    assert!(
+        stdout.contains("home_rm=1") && stdout.contains("codex_rm=1") && stdout.contains("link=1"),
+        "confined program modified non-writable rt_root parent: {stdout}\n{stderr}"
+    );
+    assert!(home.is_dir() && !fs::symlink_metadata(&home).unwrap().file_type().is_symlink());
+    assert!(codex.is_dir() && !fs::symlink_metadata(&codex).unwrap().file_type().is_symlink());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn mcp_bridge_rejects_unauthenticated_and_wrong_cookie_peers() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    // Use a guaranteed-short `/tmp` scratch root so `UnixStream::connect` never exceeds
+    // Linux's 108-byte `SUN_LEN` limit even when the caller sets a long `TMPDIR`.
+    let root = PathBuf::from(format!(
+        "/tmp/gw-b2-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            % 1_000_000_000
+    ));
+    fs::create_dir_all(&root).expect("short scratch root");
+    let state_dir = root.join("mcp-state");
+    let run_dir = root.join("run");
+    let ws = root.join("ws");
+    for d in [&state_dir, &run_dir, &ws] {
+        fs::create_dir_all(d).expect("dir");
+    }
+    let creds = root.join("credentials.toml");
+    write_private(&creds, "[forgejo_agent_tokens]\ncoder = \"tok-test-b2\"\n");
+    gewu_multiverse::run::write_forgejo_context(
+        &run_dir,
+        &gewu_multiverse::run::RunForgejo {
+            url: "http://127.0.0.1:1".to_owned(),
+            login: "gewu-coder".to_owned(),
+            repositories: Vec::new(),
+        },
+    )
+    .expect("forgejo context");
+    let cookie = "b2testcookie0123456789abcdef0123456789abcdef0123456789abcdef0123";
+    let cookie_file = state_dir.join(gewu_multiverse::mcp_forgejo::MCP_COOKIE_FILE);
+    write_private(&cookie_file, cookie);
+    let sock = state_dir.join("mcp.sock");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gewu-multiverse"))
+        .arg("--mcp-forgejo-serve")
+        .arg(&sock)
+        .arg(&state_dir)
+        .arg(&run_dir)
+        .arg(&creds)
+        .arg("coder")
+        .arg(&ws)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn mcp server");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !sock.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(sock.exists(), "mcp socket did not bind");
+
+    // 1. Unauthenticated JSON-RPC without cookie handshake -> server closes stream (EOF).
+    {
+        let mut s = UnixStream::connect(&sock).expect("connect unauth");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        writeln!(s, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}}").unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        let n = r.read_line(&mut line).unwrap_or(0);
+        assert_eq!(n, 0, "unauthenticated MCP peer received a reply: {line}");
+    }
+    // 2. Wrong cookie -> server closes stream (EOF).
+    {
+        let mut s = UnixStream::connect(&sock).expect("connect wrong cookie");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        writeln!(s, "{{\"gewu_mcp_auth\":\"wrong-cookie\"}}").unwrap();
+        writeln!(s, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}}").unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        let n = r.read_line(&mut line).unwrap_or(0);
+        assert_eq!(n, 0, "wrong-cookie MCP peer received a reply: {line}");
+    }
+    // 3. Valid cookie -> server answers tools/list with the 6 default tools.
+    {
+        let mut s = UnixStream::connect(&sock).expect("connect valid cookie");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        writeln!(s, "{{\"gewu_mcp_auth\":\"{cookie}\"}}").unwrap();
+        writeln!(s, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\"}}").unwrap();
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        let n = r.read_line(&mut line).expect("valid cookie read");
+        assert!(n > 0 && line.contains("forgejo_comment"), "valid cookie reply: {line}");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&root);
+}

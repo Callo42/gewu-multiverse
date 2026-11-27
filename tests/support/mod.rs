@@ -169,11 +169,11 @@ pub fn pi_old_install(root: &Path, record_version: &str) {
 /// A DeepSeek Harness-shaped install with the required native helpers.
 pub fn dsh_old_install(root: &Path, record_version: &str, spawn_helper_mode: u32) {
     let executable = root.join("node_modules/.bin/dsh");
-    write_executable(&executable, "#!/bin/sh\necho 0.2.1-rc.2\n");
+    write_executable(&executable, "#!/bin/sh\necho 0.2.2-rc.5\n");
     let platform = node_platform();
     write_private(
         &root.join("node_modules/@deepseek-ai/dsh/package.json"),
-        br#"{"name":"@deepseek-ai/dsh","version":"0.2.1-rc.2"}"#,
+        br#"{"name":"@deepseek-ai/dsh","version":"0.2.2-rc.5"}"#,
     );
     write_private(
         &root.join("node_modules/koffi/package.json"),

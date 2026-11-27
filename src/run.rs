@@ -92,6 +92,70 @@ pub struct RunPlan {
     pub hide: Vec<PathBuf>,
 }
 
+/// Sidecar file recording non-secret per-role execution configuration for one run.
+pub const ROLE_PLAN_FILE: &str = "role.json";
+
+/// Role-scoped execution metadata written beside `plan.json` before a run starts.
+///
+/// Kept as an optional sidecar (like `forgejo.json` and `native.json`) so older
+/// run records and existing `RunPlan` fixtures continue working unchanged. Holds
+/// zero secrets; role external API secrets live in 0600 `credentials.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRunPlan {
+    /// Why this wakeup started (`scheduled`, `manual`, or `event: ...`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wake_reason: String,
+    /// Role-scoped mechanical context reconstruction configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<crate::engine::settings::RoleContextConfig>,
+    /// Role-scoped tiered internal GitHub permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<crate::engine::settings::RolePermissions>,
+    /// Non-secret role-scoped external environment variables.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Optional path to `agents/<role>/mcp.json` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config: Option<PathBuf>,
+    /// Optional per-role resident `HarnessRuntime` Unix socket path when active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_socket: Option<PathBuf>,
+    /// Optional 256-bit per-role authentication cookie for `runtime_socket`
+    /// (stored only in mode-0600 `role.json` under the protected state root,
+    /// never accessible to Landlock-confined agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_cookie: Option<String>,
+}
+
+impl RoleRunPlan {
+    /// Write the role plan at 0600.
+    pub fn write(&self, run_dir: &Path) -> io::Result<()> {
+        let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+        crate::mode::write_private_nofollow(run_dir.join(ROLE_PLAN_FILE), text.as_bytes())
+    }
+
+    /// Read the role plan, defaulting cleanly when absent (legacy runs).
+    pub fn read(run_dir: &Path) -> io::Result<Self> {
+        match fs::read_to_string(run_dir.join(ROLE_PLAN_FILE)) {
+            Ok(text) => serde_json::from_str(&text).map_err(io::Error::other),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether this role plan carries any non-default fields worth writing.
+    pub fn is_empty(&self) -> bool {
+        self.wake_reason.is_empty()
+            && self.context.is_none()
+            && self.permissions.is_none()
+            && self.env.is_empty()
+            && self.mcp_config.is_none()
+            && self.runtime_socket.is_none()
+            && self.runtime_cookie.is_none()
+    }
+}
+
 /// The non-secret context that lets a run declare the Forgejo tools.
 ///
 /// It is written beside the plan, before the process starts, and holds no token: the
@@ -818,6 +882,16 @@ pub fn facts_from_records(run_dir: &Path) -> RunFacts {
                             facts.remote = true;
                             facts.wrote = true;
                         }
+                    }
+                    Some(
+                        "created_issue"
+                        | "updated_issue"
+                        | "reviewed"
+                        | "merged"
+                        | "created_repository",
+                    ) => {
+                        facts.remote = true;
+                        facts.wrote = true;
                     }
                     Some("already_open") => {
                         if let Some(number) = number {
@@ -2813,12 +2887,25 @@ fn wait_session_status(handle: &mut RunHandle, limit: Duration) -> bool {
 /// The owner's raw process-group signal. Every run/child group signal uses this
 /// function; adapters outside `run.rs` call it instead of `killpg`.
 pub(crate) fn adapter_signal_run_group(pid: u32, force: bool) {
+    if pid <= 1 {
+        return;
+    }
     let signal = if force {
         nix::sys::signal::Signal::SIGKILL
     } else {
         nix::sys::signal::Signal::SIGTERM
     };
     let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid as i32), signal);
+}
+
+/// Force-terminate an orphaned resident role-runtime process and its process group.
+pub(crate) fn adapter_kill_orphan_runtime(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
+    let raw = nix::unistd::Pid::from_raw(pid as i32);
+    let _ = nix::sys::signal::killpg(raw, nix::sys::signal::Signal::SIGKILL);
+    let _ = nix::sys::signal::kill(raw, nix::sys::signal::Signal::SIGKILL);
 }
 
 /// Request a signal to a starting child's group by the pid the job reported. The

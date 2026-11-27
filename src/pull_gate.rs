@@ -45,13 +45,15 @@ pub enum PullRequestAuthorship {
 impl PullRequestAuthorship {
     /// Classify one request's author against the agent's recorded login.
     ///
-    /// A missing author is always [`Self::UnnamedAuthor`], whether or not a login was
-    /// recorded. A named author with no login is [`Self::Uncompared`], never
-    /// [`Self::AnotherAccount`]: the product cannot prove "another account" from a
-    /// value it never read.
+    /// Both values are trimmed and compared ASCII case-insensitively. Empty or
+    /// missing authors are [`Self::UnnamedAuthor`]; empty or missing logins are
+    /// [`Self::Uncompared`] — never [`Self::AnotherAccount`], so self-review and
+    /// self-merge guards fail closed.
     pub fn of(author: Option<&str>, login: Option<&str>) -> Self {
-        match (author, login) {
-            (Some(author), Some(login)) if author == login => Self::Own,
+        let norm_author = author.map(str::trim).filter(|s| !s.is_empty());
+        let norm_login = login.map(str::trim).filter(|s| !s.is_empty());
+        match (norm_author, norm_login) {
+            (Some(author), Some(login)) if author.eq_ignore_ascii_case(login) => Self::Own,
             (Some(_), Some(_)) => Self::AnotherAccount,
             (Some(_), None) => Self::Uncompared,
             (None, _) => Self::UnnamedAuthor,
@@ -61,6 +63,12 @@ impl PullRequestAuthorship {
     /// Whether this request is the agent's own, and so what the update may touch.
     pub fn is_own(self) -> bool {
         self == Self::Own
+    }
+
+    /// Whether authorship is positively proven to belong to a different account
+    /// (fails closed on [`Self::Own`], [`Self::UnnamedAuthor`], and [`Self::Uncompared`]).
+    pub fn is_verified_other(self) -> bool {
+        self == Self::AnotherAccount
     }
 
     /// What the request is, in the words every surface uses.
@@ -150,6 +158,7 @@ mod tests {
             state: "open".to_owned(),
             html_url: None,
             head: "topic".to_owned(),
+            head_sha: None,
             head_repo: head_repo.map(str::to_owned),
             base: "main".to_owned(),
             base_repo: Some("lab/demo".to_owned()),

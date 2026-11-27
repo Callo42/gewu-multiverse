@@ -62,8 +62,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use landlock::{
-    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 /// The environment variable that names the chosen mechanism to `--confined-shell`.
@@ -106,13 +106,37 @@ pub(crate) fn shell_program() -> &'static str {
 const PROBE_SECRET: &[u8] = b"TOPSECRET";
 
 /// The trees Landlock may read, on top of the run's own workspace, `TMPDIR` and
-/// `HOME`. The names are the same ones [`exec_landlock`] grants.
+/// `HOME`. Broad `/run` is intentionally excluded so per-user runtime sockets
+/// under `/run/user/<uid>` (SSH/GPG agents, D-Bus, keyrings) are never exposed;
+/// only `/run/systemd/resolve` and `/run/udev` are granted read-only.
 const LANDLOCK_READ_TREES: &[&str] = &[
-    "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/opt", "/proc", "/sys", "/run",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/etc",
+    "/opt",
+    "/proc",
+    "/sys",
+    "/run/systemd/resolve",
+    "/run/udev",
 ];
 
-/// The subtrees Landlock may read and write on top of the run's own directories.
-const LANDLOCK_WRITE_TREES: &[&str] = &["/dev"];
+/// The exact device nodes and PTY subtree Landlock may read and write on top of
+/// the run's own directories. Broad `/dev` (including `/dev/shm` and host devices)
+/// is intentionally excluded.
+const LANDLOCK_WRITE_TREES: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+    "/dev/ptmx",
+    "/dev/pts",
+];
 
 /// How long a capability probe may take. A host that hangs on `unshare` is not a
 /// host that can confine a run; the board must still open.
@@ -499,6 +523,23 @@ fn command_finishes_within(mut command: Command, timeout: Duration) -> bool {
 /// version that asks for a right the kernel lacks is an error and the next lower one
 /// is tried, so an older Landlock kernel gets its own rights rather than a partially
 /// enforced set.
+/// Build a HardRequirement Landlock ruleset for `abi` and `all`, also enabling
+/// `Scope::Signal | Scope::AbstractUnixSocket` whenever the kernel ABI supports
+/// Landlock v6+.
+fn create_landlock_ruleset(
+    abi: ABI,
+    all: BitFlags<AccessFs>,
+) -> Result<landlock::RulesetCreated, landlock::RulesetError> {
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(all)?;
+    let scopes = Scope::from_all(abi);
+    if !scopes.is_empty() {
+        ruleset = ruleset.scope(scopes)?;
+    }
+    ruleset.create()
+}
+
 fn landlock_accesses() -> Option<(ABI, BitFlags<AccessFs>)> {
     for abi in [
         ABI::V9,
@@ -512,10 +553,7 @@ fn landlock_accesses() -> Option<(ABI, BitFlags<AccessFs>)> {
         ABI::V1,
     ] {
         let access = AccessFs::from_all(abi);
-        let built = Ruleset::default()
-            .set_compatibility(CompatLevel::HardRequirement)
-            .handle_access(access);
-        if built.is_ok_and(|ruleset| ruleset.create().is_ok()) {
+        if create_landlock_ruleset(abi, access).is_ok() {
             return Some((abi, access));
         }
     }
@@ -921,9 +959,187 @@ pub fn run_confined_program(spec_path: &Path) -> i32 {
     }
 }
 
+/// Open a directory component-by-component from `/` using `O_PATH | O_DIRECTORY | O_NOFOLLOW`.
+///
+/// Any symlink at ANY component (leaf or ancestor) fails closed with `ELOOP`, and the
+/// returned `OwnedFd` is handed directly to `landlock::PathBeneath::new` so there is
+/// zero TOCTOU window between symlink validation and Landlock rule attachment.
+/// When `allow_missing` is true, a genuinely absent path (`ENOENT`) returns `Ok(None)`;
+/// symlinks (including dangling symlinks) always return `Err`.
+fn open_landlock_dir_nofollow(
+    path: &Path,
+    label: &str,
+    allow_missing: bool,
+) -> io::Result<Option<std::os::fd::OwnedFd>> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} `{}` must be an absolute path", path.display()),
+        ));
+    }
+    let mut cur = open(
+        "/",
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| io::Error::other(format!("cannot open `/` for {label}: {e}")))?;
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(seg) => {
+                match openat(
+                    &cur,
+                    seg,
+                    OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(next) => cur = next,
+                    Err(Errno::ENOENT) if allow_missing => return Ok(None),
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "{label} `{}` refused (symlink or non-directory component `{}`): {e}",
+                                path.display(),
+                                seg.to_string_lossy()
+                            ),
+                        ));
+                    }
+                }
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{label} `{}` contains disallowed traversal component", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(Some(cur))
+}
+
+/// Open a read-only spec path (directory or regular file) component-by-component with
+/// `O_NOFOLLOW`, returning `(fd, is_dir)`. Any symlink component fails closed.
+fn open_landlock_read_nofollow(
+    path: &Path,
+    label: &str,
+) -> io::Result<Option<(std::os::fd::OwnedFd, bool)>> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} `{}` must be an absolute path", path.display()),
+        ));
+    }
+    let parts: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::RootDir | Component::CurDir => None,
+            Component::Normal(seg) => Some(Ok(seg)),
+            Component::ParentDir | Component::Prefix(_) => Some(Err(())),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|()| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} `{}` contains disallowed traversal component", path.display()),
+            )
+        })?;
+    if parts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} cannot grant `/`"),
+        ));
+    }
+    let mut cur = open(
+        "/",
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| io::Error::other(format!("cannot open `/` for {label}: {e}")))?;
+    for seg in &parts[..parts.len() - 1] {
+        match openat(
+            &cur,
+            *seg,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(next) => cur = next,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{label} `{}` refused (symlink or non-directory ancestor `{}`): {e}",
+                        path.display(),
+                        seg.to_string_lossy()
+                    ),
+                ));
+            }
+        }
+    }
+    let last = parts[parts.len() - 1];
+    match openat(
+        &cur,
+        last,
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(dir_fd) => Ok(Some((dir_fd, true))),
+        Err(Errno::ENOTDIR) => {
+            // Regular file (e.g. product binary path): open strictly without following symlinks.
+            match openat(
+                &cur,
+                last,
+                OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(file_fd) => Ok(Some((file_fd, false))),
+                Err(Errno::ENOENT) => Ok(None),
+                Err(e) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{label} `{}` refused (symlink leaf `{}`): {e}",
+                        path.display(),
+                        last.to_string_lossy()
+                    ),
+                )),
+            }
+        }
+        Err(Errno::ENOENT) => Ok(None),
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{label} `{}` refused (symlink leaf `{}`): {e}",
+                path.display(),
+                last.to_string_lossy()
+            ),
+        )),
+    }
+}
+
 /// Landlock for an arbitrary native program: the same HardRequirement ruleset as
 /// the shell, plus the program's own read-only install directory and any private
 /// config roots the supervisor named.
+///
+/// Every user/supervisor writable path (`workspace`, `TMPDIR`, `HOME`, `spec.write`)
+/// and every `spec.read` path is opened component-by-component with `O_NOFOLLOW` so
+/// no symlink inside an agent-writable tree can ever redirect a Landlock grant.
 fn exec_landlock_program(
     workspace: &Path,
     spec: &ConfinedProgramSpec,
@@ -932,41 +1148,76 @@ fn exec_landlock_program(
         io::Error::other("runs are not confined on this computer — Landlock is not available")
     })?;
     let read = AccessFs::from_read(abi);
-    let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(all)
-        .and_then(|ruleset| ruleset.create())
-        .map_err(|error| {
-            io::Error::other(format!("the Landlock ruleset cannot be made: {error}"))
-        })?;
-    let mut rules = Vec::new();
+    let read_file_only = read & (AccessFs::ReadFile | AccessFs::Execute);
+    let mut ruleset = create_landlock_ruleset(abi, all).map_err(|error| {
+        io::Error::other(format!("the Landlock ruleset cannot be made: {error}"))
+    })?;
+    let mut sys_rules = Vec::new();
     for path in landlock_read_trees() {
         if path.exists() {
-            rules.extend(landlock::path_beneath_rules([path], read));
+            sys_rules.extend(landlock::path_beneath_rules([path], read));
         }
     }
+    for path in LANDLOCK_WRITE_TREES {
+        let p = Path::new(path);
+        if p.exists() {
+            sys_rules.extend(landlock::path_beneath_rules([p], all));
+        }
+    }
+    ruleset = ruleset
+        .add_rules(sys_rules)
+        .map_err(|error| io::Error::other(format!("system Landlock rules failed: {error}")))?;
+
     for path in &spec.read {
-        if path.exists() {
-            rules.extend(landlock::path_beneath_rules([path], read));
+        if let Some((fd, is_dir)) = open_landlock_read_nofollow(path, "spec.read")? {
+            let access = if is_dir { read } else { read_file_only };
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, access))
+                .map_err(|error| {
+                    io::Error::other(format!("read Landlock rule failed: {error}"))
+                })?;
         }
     }
-    let mut writable = vec![workspace.to_path_buf(), PathBuf::from("/dev")];
-    writable.extend(LANDLOCK_WRITE_TREES.iter().skip(1).map(PathBuf::from));
+
+    let ws_fd = open_landlock_dir_nofollow(workspace, "workspace", false)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "workspace directory is missing")
+    })?;
+    ruleset = ruleset
+        .add_rule(PathBeneath::new(ws_fd, all))
+        .map_err(|error| io::Error::other(format!("workspace Landlock rule failed: {error}")))?;
+
     if let Some(temp) = std::env::var_os("TMPDIR") {
-        writable.push(PathBuf::from(temp));
+        let temp_path = PathBuf::from(temp);
+        if let Some(fd) = open_landlock_dir_nofollow(&temp_path, "TMPDIR", true)? {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, all))
+                .map_err(|error| {
+                    io::Error::other(format!("TMPDIR Landlock rule failed: {error}"))
+                })?;
+        }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        writable.push(PathBuf::from(home));
-    }
-    writable.extend(spec.write.iter().cloned());
-    for path in writable {
-        if path.exists() {
-            rules.extend(landlock::path_beneath_rules([path], all));
+        let home_path = PathBuf::from(home);
+        if let Some(fd) = open_landlock_dir_nofollow(&home_path, "HOME", true)? {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, all))
+                .map_err(|error| {
+                    io::Error::other(format!("HOME Landlock rule failed: {error}"))
+                })?;
         }
     }
+    for path in &spec.write {
+        if let Some(fd) = open_landlock_dir_nofollow(path, "spec.write", true)? {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, all))
+                .map_err(|error| {
+                    io::Error::other(format!("write Landlock rule failed: {error}"))
+                })?;
+        }
+    }
+
     let status = ruleset
-        .add_rules(rules)
-        .and_then(|ruleset| ruleset.restrict_self())
+        .restrict_self()
         .map_err(|error| {
             io::Error::other(format!("the Landlock rules cannot be applied: {error}"))
         })?;
@@ -1115,35 +1366,55 @@ fn exec_landlock(workspace: &Path, command: &str) -> io::Result<std::convert::In
         io::Error::other("runs are not confined on this computer — Landlock is not available")
     })?;
     let read = AccessFs::from_read(abi);
-    let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(all)
-        .and_then(|ruleset| ruleset.create())
-        .map_err(|error| {
-            io::Error::other(format!("the Landlock ruleset cannot be made: {error}"))
-        })?;
-    let mut rules = Vec::new();
+    let mut ruleset = create_landlock_ruleset(abi, all).map_err(|error| {
+        io::Error::other(format!("the Landlock ruleset cannot be made: {error}"))
+    })?;
+    let mut sys_rules = Vec::new();
     for path in landlock_read_trees() {
         if path.exists() {
-            rules.extend(landlock::path_beneath_rules([path], read));
+            sys_rules.extend(landlock::path_beneath_rules([path], read));
         }
     }
-    let mut writable = vec![workspace.to_path_buf(), PathBuf::from("/dev")];
-    writable.extend(LANDLOCK_WRITE_TREES.iter().skip(1).map(PathBuf::from));
+    for path in LANDLOCK_WRITE_TREES {
+        let p = Path::new(path);
+        if p.exists() {
+            sys_rules.extend(landlock::path_beneath_rules([p], all));
+        }
+    }
+    ruleset = ruleset
+        .add_rules(sys_rules)
+        .map_err(|error| io::Error::other(format!("system Landlock rules failed: {error}")))?;
+
+    let ws_fd = open_landlock_dir_nofollow(workspace, "workspace", false)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "workspace directory is missing")
+    })?;
+    ruleset = ruleset
+        .add_rule(PathBeneath::new(ws_fd, all))
+        .map_err(|error| io::Error::other(format!("workspace Landlock rule failed: {error}")))?;
+
     if let Some(temp) = std::env::var_os("TMPDIR") {
-        writable.push(PathBuf::from(temp));
+        let temp_path = PathBuf::from(temp);
+        if let Some(fd) = open_landlock_dir_nofollow(&temp_path, "TMPDIR", true)? {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, all))
+                .map_err(|error| {
+                    io::Error::other(format!("TMPDIR Landlock rule failed: {error}"))
+                })?;
+        }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        writable.push(PathBuf::from(home));
-    }
-    for path in writable {
-        if path.exists() {
-            rules.extend(landlock::path_beneath_rules([path], all));
+        let home_path = PathBuf::from(home);
+        if let Some(fd) = open_landlock_dir_nofollow(&home_path, "HOME", true)? {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, all))
+                .map_err(|error| {
+                    io::Error::other(format!("HOME Landlock rule failed: {error}"))
+                })?;
         }
     }
+
     let status = ruleset
-        .add_rules(rules)
-        .and_then(|ruleset| ruleset.restrict_self())
+        .restrict_self()
         .map_err(|error| {
             io::Error::other(format!("the Landlock rules cannot be applied: {error}"))
         })?;
@@ -1437,11 +1708,10 @@ mod tests {
     #[test]
     fn a_landlock_hidden_root_is_detected_under_each_allowed_tree() {
         for root in [
-            "/run/user/1000/gewu",
             "/etc/gewu",
             "/opt/gewu",
             "/usr/local/gewu",
-            "/dev/shm/gewu",
+            "/dev/pts/gewu",
             "/proc/self/gewu",
             "/sys/gewu",
         ] {
@@ -1451,10 +1721,15 @@ mod tests {
                 "Landlock would expose {root}"
             );
         }
-        assert!(
-            landlock_overlap(&[PathBuf::from("/var/lib/gewu")], &[]).is_none(),
-            "an ordinary path outside the allow-list is not an overlap"
-        );
+        // Broad `/run` (including `/run/user/<uid>`) and `/dev/shm` are intentionally
+        // excluded from Landlock grants so user agent sockets and shared memory stay hidden.
+        for excluded in ["/run/user/1000/gewu", "/dev/shm/gewu", "/var/lib/gewu"] {
+            let hidden = PathBuf::from(excluded);
+            assert!(
+                landlock_overlap(std::slice::from_ref(&hidden), &[]).is_none(),
+                "{excluded} must stay outside Landlock's allow-list"
+            );
+        }
         // A hidden root inside a workspace is the B9 case the reviewer names.
         let workspace = PathBuf::from("/tmp/me/agents/agent-1/workspace");
         let hidden = workspace.join("state");

@@ -73,6 +73,8 @@ pub struct SessionRequest {
     pub hide: Vec<PathBuf>,
     /// The native program this run launches, when it is not the built-in loop.
     pub native: Option<NativeRequest>,
+    /// Optional per-role wake/context/permission/env/runtime sidecar plan.
+    pub role: crate::run::RoleRunPlan,
 }
 
 /// The immutable native program facts carried from the agent's settings into a run.
@@ -282,6 +284,11 @@ impl SessionSpawner for RealSpawner {
             };
             plan.write(&request.run_dir).map_err(|error| {
                 format!("the session's native program plan cannot be written: {error}")
+            })?;
+        }
+        if !request.role.is_empty() {
+            request.role.write(&request.run_dir).map_err(|error| {
+                format!("the session's role plan cannot be written: {error}")
             })?;
         }
         Ok(PreparedSession {

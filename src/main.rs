@@ -103,12 +103,20 @@ fn main() -> ExitCode {
         Invocation::ConfinedProgram { spec } => {
             ExitCode::from(confinement::run_confined_program(&spec).clamp(0, 255) as u8)
         }
+        Invocation::RoleRuntime { spec } => {
+            ExitCode::from(
+                gewu_multiverse::harness_runtime::serve_role_runtime(&spec).clamp(0, 255) as u8,
+            )
+        }
         Invocation::McpForgejo { context } => {
             ExitCode::from(mcp_forgejo::serve(&context).clamp(0, 255) as u8)
         }
-        Invocation::McpForgejoConnect { socket } => {
-            ExitCode::from(mcp_forgejo::connect(&socket).clamp(0, 255) as u8)
-        }
+        Invocation::McpForgejoConnect {
+            socket,
+            cookie_file,
+        } => ExitCode::from(
+            mcp_forgejo::connect(&socket, cookie_file.as_deref()).clamp(0, 255) as u8,
+        ),
         Invocation::McpForgejoServe {
             socket,
             state,
@@ -378,6 +386,28 @@ fn run_engine(cli: Cli) -> Result<Option<String>, StartupError> {
         cli.data_root,
     )
     .map_err(StartupError::Engine)?;
+    // If a `--headless` daemon is already running for these directories, attach to it
+    // over `headless.sock` instead of failing on `engine.lock`. Pressing `q` detaches
+    // without disturbing Forgejo or running agents; pressing `Q` stops the daemon.
+    if let Some(remote) = gewu_multiverse::headless::try_attach_daemon(&layout, &data_root) {
+        let mut screen = Screen::enter()?;
+        let mut board = Board::new(remote);
+        let drawn = event_loop(&mut screen, &mut board, Some(&termination));
+        board.shutdown();
+        let lost = matches!(drawn, Ok(LoopEnd::Lost));
+        if lost {
+            screen.abandon();
+        }
+        let left = if lost { Ok(()) } else { screen.leave() };
+        drawn.and(left)?;
+        let line = if board.daemon_stop_requested() {
+            "gewu-multiverse: stopped the running headless daemon and Forgejo".to_owned()
+        } else {
+            "gewu-multiverse: detached from running daemon — Forgejo and agents continue running"
+                .to_owned()
+        };
+        return Ok(Some(line));
+    }
     let options = EngineOptions::new(layout, data_root).map_err(StartupError::Engine)?;
     // Open the terminal before the slow recovery, so a killed run's cleanup is
     // visible as a sentence instead of a blank alternate screen. Only a live earlier

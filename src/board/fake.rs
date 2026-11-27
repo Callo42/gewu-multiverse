@@ -670,6 +670,26 @@ impl EngineApi for FakeEngine {
                 self.notice = Some(format!("agent-{number} added"));
                 self.agents.push(agent);
             }
+            Command::AddNamedAgent { name } => {
+                if self.agents.len() >= MAX_AGENTS {
+                    return Err(format!("{MAX_AGENTS} agents is the most"));
+                }
+                if self.agents.iter().any(|agent| agent.name == name) {
+                    return Err(format!("agent `{name}` already exists"));
+                }
+                let number = self.next_number();
+                let mut agent = self.new_agent(number);
+                agent.name = name.clone();
+                agent.login = format!("gewu-{name}");
+                self.notice = Some(format!("{name} added"));
+                self.agents.push(agent);
+            }
+            Command::SetAgentRoleConfig { name, .. } => {
+                self.notice = Some(format!("{name} role configuration saved"));
+            }
+            Command::SetGlobalRoleDefaults { .. } => {
+                self.notice = Some("global role defaults saved".to_owned());
+            }
             Command::RemoveAgent { name } => {
                 let Some(index) = self.agents.iter().position(|agent| agent.name == name) else {
                     return Err(format!("no agent named {name}"));

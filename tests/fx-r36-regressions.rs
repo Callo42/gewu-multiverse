@@ -443,7 +443,7 @@ fn the_upgrade_line_does_not_claim_perfect_marks_or_unconditional_containment() 
     let line = gewu_multiverse::engine::WHATS_NEW;
     assert!(!line.contains("never outlive"), "{line}");
     assert!(!line.contains("exactly what happened"), "{line}");
-    assert!(line.contains("headless run cleanup"), "{line}");
-    assert!(line.contains("--control wakes"), "{line}");
-    assert!(line.contains("--stop-on-no-work"), "{line}");
+    assert!(line.contains("role-defined teams"), "{line}");
+    assert!(line.contains("HarnessRuntime"), "{line}");
+    assert!(line.contains("existing v0.1.x configs"), "{line}");
 }

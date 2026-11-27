@@ -1046,7 +1046,14 @@ fn the_shell_environment_holds_no_agent_token() {
     plan.write(&run_dir).expect("the plan with a step");
     assert!(run_binary(&run_dir).success());
     let log = log_text(&run_dir);
-    assert!(log.contains("GEWU_GIT_CREDENTIALS"), "{log}");
+    assert!(
+        !log.contains("GEWU_GIT_CREDENTIALS"),
+        "shell environment must not expose GEWU_GIT_CREDENTIALS or raw Forgejo token path: {log}"
+    );
+    assert!(
+        log.contains("GIT_CONFIG_GLOBAL"),
+        "shell should authenticate git via supervisor-owned GitProxy: {log}"
+    );
     assert!(
         !log.contains(AGENT_TOKEN),
         "the shell environment holds the token"

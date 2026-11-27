@@ -498,7 +498,14 @@ fn install_dsh(
     check_cancel(cancel)?;
     let mut command = Command::new("npm");
     command
-        .args(["ci", "--no-audit", "--no-fund", "--no-progress", "--prefix"])
+        .args([
+            "ci",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--no-progress",
+            "--prefix",
+        ])
         .arg(stage)
         .env("HOME", &home)
         .env("npm_config_cache", &cache)
@@ -516,6 +523,39 @@ fn install_dsh(
         format!("npm could not install DeepSeek Harness from its locked packages ({error})")
     })?;
     if !status.success() {
+        return Err(npm_failure(&log_path));
+    }
+    check_cancel(cancel)?;
+    // Explicitly rebuild ONLY the three reviewed native-helper packages after
+    // `npm ci --ignore-scripts`, so unapproved packages (e.g. `protobufjs`) never
+    // execute lifecycle scripts even when npm's `allowScripts` is advisory.
+    let mut rebuild = Command::new("npm");
+    rebuild
+        .args([
+            "rebuild",
+            "--no-audit",
+            "--no-fund",
+            "--no-progress",
+            "--prefix",
+        ])
+        .arg(stage)
+        .args(["@deepseek-ai/dsh-subprocess-local", "koffi", "node-pty"])
+        .env("HOME", &home)
+        .env("npm_config_cache", &cache)
+        .env("npm_config_registry", "https://registry.npmjs.org/")
+        .env("npm_config_update_notifier", "false")
+        .env("npm_config_audit", "false")
+        .env("npm_config_fund", "false")
+        .env("npm_config_progress", "false")
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_PATH");
+    let rebuild_status = run_child(rebuild, cancel, &log_path).map_err(|error| {
+        if error == INSTALL_CANCELED {
+            return error;
+        }
+        format!("npm could not rebuild the three reviewed DeepSeek Harness helpers ({error})")
+    })?;
+    if !rebuild_status.success() {
         return Err(npm_failure(&log_path));
     }
     check_cancel(cancel)?;
@@ -553,7 +593,7 @@ fn install_dsh(
     let koffi_version = json_field(&stage.join("node_modules/koffi/package.json"), "version")
         .unwrap_or_else(|| "unknown".to_owned());
     let resources = format!(
-        "npm lock sha256 {lock_sha}; @deepseek-ai/dsh tarball sha256 {} (verified; lock integrity sha512 verified); entrypoint {entrypoint}; node-pty pty.node sha256 {pty_sha}; koffi {koffi_version}; npm >=11.16 policy enforced; install scripts reviewed: node-pty, koffi and dsh-subprocess-local; no-op scripts denied: @google/genai and protobufjs; dangerously-allow-all-scripts refused; no recursive tree digest is claimed",
+        "npm lock sha256 {lock_sha}; @deepseek-ai/dsh tarball sha256 {} (verified; lock integrity sha512 verified); entrypoint {entrypoint}; node-pty pty.node sha256 {pty_sha}; koffi {koffi_version}; installed with npm ci --ignore-scripts + explicit npm rebuild of reviewed helpers (@deepseek-ai/dsh-subprocess-local, koffi, node-pty); protobufjs script never executed; dangerously-allow-all-scripts refused; no recursive tree digest is claimed",
         harness::artefact_sha256(Program::Dsh)
     );
     // The npm home and cache are installer state, not part of the program.
@@ -719,11 +759,10 @@ fn check_npm_scripts_enabled(stage: &Path, home: &Path, cache: &Path) -> Result<
 /// changed lock is not silently run: it fails before npm starts until the new
 /// scripts are reviewed.
 fn verify_dsh_script_policy() -> Result<(), String> {
-    const REVIEWED: [(&str, &str, bool); 5] = [
-        ("@deepseek-ai/dsh-subprocess-local", "0.2.1-rc.2", true),
+    const REVIEWED: [(&str, &str, bool); 4] = [
+        ("@deepseek-ai/dsh-subprocess-local", "0.2.2-rc.5", true),
         ("koffi", "3.1.1", true),
         ("node-pty", "1.2.0-beta.15", true),
-        ("@google/genai", "2.21.0", false),
         ("protobufjs", "7.6.6", false),
     ];
     let package: serde_json::Value =
@@ -868,7 +907,7 @@ fn verify_dsh_package_artifact(stage: &Path, cancel: &CancelToken) -> Result<(),
 }
 
 fn dsh_lock_integrity() -> &'static str {
-    "sha512-tvY+yhfKRifthbqPe/OK0AYxM5ZkvqfYq/jMYgJcEUxiRRL1Vwra3Ti5TB6AXgSWQdiPHYh/Vp6SJa9yHwMNuw=="
+    "sha512-cNbp12tLYLUTXaVli7zwwMjzmmEVCD1PRldg4oKtXM4+lFYckcaliMS2PU/FoThB4iAN/fKOSID0nrtRZU4Gjw=="
 }
 
 fn node_platform() -> String {

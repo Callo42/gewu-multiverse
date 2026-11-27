@@ -6,7 +6,7 @@
 //! durable transcript ending as the built-in loop. The native program owns its model
 //! turns, tools, retries and session; this module never reimplements them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
@@ -32,6 +32,9 @@ use outcome::{Disposition, NativeEvent, NativeOutcome, SupervisorEnd};
 /// The run's private native directory under the confined run temp.
 struct NativeFiles {
     root: PathBuf,
+    /// Read-only supervisor directory (Landlock read-only, never writable by the harness)
+    /// holding `model.key`, `mcp.cookie`, `.gitconfig`, and `--confined-program` specs.
+    ro_dir: PathBuf,
     home: PathBuf,
     tmp: PathBuf,
     config: PathBuf,
@@ -42,16 +45,22 @@ struct NativeFiles {
     skills: Vec<PathBuf>,
     mcp_state: Option<PathBuf>,
     mcp_socket: Option<PathBuf>,
+    mcp_cookie: Option<PathBuf>,
     /// The run-private Responses bridge Codex should use, when one is running.
     model_url: Option<String>,
     /// The one-model catalog that keeps Codex on direct, plain-function tools.
     model_catalog: Option<PathBuf>,
+    /// Validated per-role external MCP servers from `agents/<role>/mcp.json`.
+    role_mcp_servers: Vec<crate::role_mcp::ExternalMcpServer>,
+    /// Role-scoped tiered Forgejo permissions.
+    permissions: crate::engine::settings::RolePermissions,
 }
 
 /// A supervisor-owned MCP server outside the native Landlock writable roots.
 struct McpServer {
     child: Child,
     socket: PathBuf,
+    cookie: PathBuf,
     state: PathBuf,
 }
 
@@ -60,7 +69,7 @@ impl McpServer {
         plan: &crate::run::RunPlan,
         shell: &Shell,
         temp: &Path,
-        _native_root: &Path,
+        ro_dir: &Path,
         exe: &Path,
     ) -> Result<Option<Self>, String> {
         if crate::run::read_forgejo_context(&shell.run_dir).is_none()
@@ -72,6 +81,16 @@ impl McpServer {
         std::fs::create_dir_all(&state)
             .map_err(|error| format!("the MCP state directory cannot be created: {error}"))?;
         let _ = crate::mode::set_mode(&state, crate::mode::PRIVATE_DIR_MODE);
+        let cookie_val = crate::mode::random_hex_256()
+            .map_err(|error| format!("the MCP auth cookie cannot be generated: {error}"))?;
+        crate::mode::write_private_nofollow(
+            state.join(crate::mcp_forgejo::MCP_COOKIE_FILE),
+            cookie_val.as_bytes(),
+        )
+        .map_err(|error| format!("the MCP auth cookie cannot be written: {error}"))?;
+        let ro_cookie = ro_dir.join(crate::mcp_forgejo::MCP_COOKIE_FILE);
+        crate::mode::write_private_nofollow(&ro_cookie, cookie_val.as_bytes())
+            .map_err(|error| format!("the role MCP auth cookie cannot be written: {error}"))?;
         let socket = state.join("mcp.sock");
         let _ = std::fs::remove_file(&socket);
         let child = Command::new(exe)
@@ -93,6 +112,7 @@ impl McpServer {
                 return Ok(Some(Self {
                     child,
                     socket,
+                    cookie: ro_cookie,
                     state,
                 }));
             }
@@ -169,8 +189,10 @@ fn base64(input: &[u8]) -> String {
 fn start_opencode_server(
     files: &NativeFiles,
     plan: &crate::run::RunPlan,
+    role_plan: &crate::run::RoleRunPlan,
+    external_secrets: &BTreeMap<String, Secret>,
     exe: &Path,
-    shell: &Shell,
+    _shell: &Shell,
 ) -> Result<Option<(HelperProcess, String, String)>, String> {
     let Some(socket_parent) = files.mcp_state.as_ref() else {
         return Ok(None);
@@ -183,16 +205,29 @@ fn start_opencode_server(
         .port();
     drop(listener);
     let url = format!("http://127.0.0.1:{port}");
-    let password = format!("gewu-{}-{}", plan.run_id, std::process::id());
-    let spec = files.root.join("opencode-server.json");
+    let password = crate::mode::random_hex_256()
+        .map_err(|error| format!("OpenCode's server password cannot be generated: {error}"))?;
+    let spec = files.ro_dir.join("opencode-server.json");
+    let mut read_paths = vec![
+        files.install_root.display().to_string(),
+        files.ro_dir.display().to_string(),
+        exe.display().to_string(),
+    ];
+    if let Some(mcp_dir) = files.mcp_socket.as_ref().and_then(|p| p.parent()) {
+        read_paths.push(mcp_dir.display().to_string());
+    }
     write_json(
         &spec,
         &json!({
             "workspace": plan.workspace.display().to_string(),
             "program": files.program.display().to_string(),
             "args": ["serve", "--hostname", "127.0.0.1", "--port", port.to_string()],
-            "read": [files.install_root.display().to_string(), exe.display().to_string(), files.mcp_socket.as_ref().and_then(|p| p.parent()).map(|p| p.display().to_string()).unwrap_or_default(), shell.askpass.as_ref().map(|p| p.display().to_string()).unwrap_or_default()],
-            "write": [files.root.display().to_string()],
+            "read": read_paths,
+            "write": [
+                files.home.display().to_string(),
+                files.tmp.display().to_string(),
+                files.config.display().to_string(),
+            ],
         }),
     )?;
     let mut command = Command::new(exe);
@@ -210,19 +245,22 @@ fn start_opencode_server(
     command
         .env("HOME", &files.home)
         .env("TMPDIR", &files.tmp)
-        .env("XDG_CONFIG_HOME", files.root.join("opencode"))
+        .env("XDG_CONFIG_HOME", files.ro_dir.join("opencode-cfg"))
+        .env("XDG_DATA_HOME", files.config.join("data"))
         .env("XDG_STATE_HOME", files.config.join("state"))
         .env("XDG_CACHE_HOME", files.config.join("cache"))
         .env("XDG_RUNTIME_DIR", files.config.join("run"))
+        .env("GIT_CONFIG_GLOBAL", files.ro_dir.join(".gitconfig"))
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("OPENCODE_PASSWORD", &password);
-    if let Some(askpass) = shell.askpass.as_ref() {
-        command
-            .env("GIT_ASKPASS", exe)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env(crate::workspace::ASKPASS_CREDENTIALS, askpass)
-            .env(crate::workspace::ASKPASS_AGENT, &plan.agent);
-        if let Some(login) = shell.login.as_ref() {
-            command.env(crate::workspace::ASKPASS_LOGIN, login);
+    for (key, value) in &role_plan.env {
+        if crate::engine::settings::validate_external_env_key(key).is_ok() {
+            command.env(key, value);
+        }
+    }
+    for (key, secret_val) in external_secrets {
+        if crate::engine::settings::validate_external_env_key(key).is_ok() {
+            command.env(key, secret_val.expose());
         }
     }
     let mut child = command
@@ -288,9 +326,17 @@ fn start_opencode_server(
     let socket = files.mcp_socket.as_ref().ok_or_else(|| {
         "OpenCode's MCP socket is missing from the private launch files".to_owned()
     })?;
+    let mut mcp_cmd = vec![
+        files.key_helper.display().to_string(),
+        "--mcp-forgejo-connect".to_owned(),
+        socket.display().to_string(),
+    ];
+    if let Some(cookie) = files.mcp_cookie.as_ref() {
+        mcp_cmd.push(cookie.display().to_string());
+    }
     let body = json!({"config": {
         "type": "local",
-        "command": [files.key_helper.display().to_string(), "--mcp-forgejo-connect".to_owned(), socket.display().to_string()],
+        "command": mcp_cmd,
         "codemode": true,
         "timeout": {"startup": 20000, "catalog": 20000, "execution": 120000}
     }});
@@ -414,6 +460,7 @@ struct NativeState {
     pr_ok: bool,
     pr_updated: bool,
     comment_ok: bool,
+    forgejo_write_ok: bool,
     forgejo_read_ok: bool,
     pushed: bool,
     uncertain_write: bool,
@@ -441,6 +488,7 @@ impl NativeState {
             pr_ok: false,
             pr_updated: false,
             comment_ok: false,
+            forgejo_write_ok: false,
             forgejo_read_ok: false,
             pushed: false,
             uncertain_write: false,
@@ -450,9 +498,14 @@ impl NativeState {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn codex_tool_approvals() -> String {
+    codex_tool_approvals_for(&crate::engine::settings::RolePermissions::default())
+}
+
+fn codex_tool_approvals_for(permissions: &crate::engine::settings::RolePermissions) -> String {
     let mut text = String::new();
-    for tool in crate::forgejo_tools::TOOL_NAMES {
+    for tool in crate::forgejo_tools::allowed_tool_names(permissions) {
         text.push_str(&format!(
             "\n[mcp_servers.gewu_forgejo.tools.{tool}]\napproval_mode = \"approve\"\n"
         ));
@@ -460,7 +513,7 @@ fn codex_tool_approvals() -> String {
     text
 }
 
-fn non_success_reason(state: &NativeState, requested: RequestedWork) -> String {
+fn non_success_reason(state: &NativeState) -> String {
     if let Some(terminal) = state.outcome.terminal_failure_reason() {
         return terminal;
     }
@@ -487,31 +540,18 @@ fn non_success_reason(state: &NativeState, requested: RequestedWork) -> String {
         return "the requested remote work was not verified; the local change is recorded"
             .to_owned();
     }
-    if !state.outcome.saw_tool() && requires_confirmed_tool(requested) {
+    if !state.outcome.saw_tool() {
         // Codex's in-run workspace sandbox can refuse a command without emitting a
         // JSON event at all; the refusal reaches only the model, not this stream.
         // With no supported event surface the product cannot name the denial, but
         // it must not claim success for work whose tool calls left no confirmed
-        // result. Say exactly what is known.
+        // result. Say exactly what is known — independent of prompt language.
         return match state.outcome.program() {
             Some(Program::Codex) => "the native program ended successfully but no tool call or workspace change was observed; Codex's own workspace sandbox can refuse a command without emitting an event, so the requested work is unconfirmed and this run is not a success".to_owned(),
             _ => "the native program ended successfully but no tool call or workspace change was observed, so the requested work is unconfirmed and this run is not a success".to_owned(),
         };
     }
     "the native program finished without verified success; no matching tool or work fact was recorded".to_owned()
-}
-
-fn requires_confirmed_tool(requested: RequestedWork) -> bool {
-    matches!(
-        requested,
-        RequestedWork::ReadOnly
-            | RequestedWork::GenericWrite
-            | RequestedWork::PullRequest
-            | RequestedWork::PullRequestUpdate
-            | RequestedWork::Comment
-            | RequestedWork::Push
-            | RequestedWork::ForgejoRead
-    )
 }
 
 /// The local work's own sentence, including the boolean-only fallback older tests
@@ -534,12 +574,7 @@ fn has_failure_cause(state: &NativeState) -> bool {
         || state.uncertain_write
 }
 
-fn run_reason(
-    ending: RunEnding,
-    summary: &str,
-    state: &NativeState,
-    requested: RequestedWork,
-) -> Option<String> {
+fn run_reason(ending: RunEnding, summary: &str, state: &NativeState) -> Option<String> {
     match ending {
         RunEnding::Succeeded => (!summary.trim().is_empty()).then(|| summary.to_owned()),
         RunEnding::NoWork => Some(if summary.trim().is_empty() {
@@ -551,13 +586,13 @@ fn run_reason(
             let local = local_reason(state);
             match local {
                 Some(local) if has_failure_cause(state) => {
-                    Some(format!("{local}; {}", non_success_reason(state, requested)))
+                    Some(format!("{local}; {}", non_success_reason(state)))
                 }
                 Some(local) => Some(local),
-                None => Some(non_success_reason(state, requested)),
+                None => Some(non_success_reason(state)),
             }
         }
-        RunEnding::Refused => Some(non_success_reason(state, requested)),
+        RunEnding::Refused => Some(non_success_reason(state)),
     }
 }
 
@@ -567,6 +602,8 @@ fn run_reason(
 pub(super) fn run(
     plan: &crate::run::RunPlan,
     native: &NativePlan,
+    role_plan: &crate::run::RoleRunPlan,
+    external_secrets: &BTreeMap<String, Secret>,
     instruction: &[u8],
     secret: &Secret,
     mut tool_index: u32,
@@ -602,7 +639,46 @@ pub(super) fn run(
         );
     };
 
-    let mut files = match prepare_files(plan, native, program, protocol, shell, temp) {
+    // Prefer the role's warm resident HarnessRuntime when available (strictly
+    // ephemeral per-wake session, authenticated with its 256-bit role cookie,
+    // same Landlock boundary and objective ledger).
+    if let (Some(socket), Some(cookie)) = (
+        role_plan.runtime_socket.as_deref(),
+        role_plan.runtime_cookie.as_deref(),
+    ) && crate::harness_runtime::ping_socket(socket, cookie)
+    {
+        match run_via_resident_runtime(
+            socket,
+            cookie,
+            plan,
+            native,
+            program,
+            instruction,
+            secret,
+            tool_index,
+            shell,
+            transcript,
+            log,
+        ) {
+            Ok(end) => return end,
+            Err(reason) => {
+                log.line(&format!(
+                    "role runtime unavailable ({reason}); falling back to direct isolated launch"
+                ));
+            }
+        }
+    }
+
+    let mut files = match prepare_files(
+        plan,
+        native,
+        role_plan,
+        external_secrets,
+        program,
+        protocol,
+        shell,
+        temp,
+    ) {
         Ok(files) => files,
         Err(reason) => return RunEnd::failed(reason),
     };
@@ -612,13 +688,14 @@ pub(super) fn run(
         native.version,
         files.program.display()
     ));
-    let mcp_server = match McpServer::start(plan, shell, temp, &files.root, &files.key_helper) {
+    let mcp_server = match McpServer::start(plan, shell, temp, &files.ro_dir, &files.key_helper) {
         Ok(server) => server,
         Err(reason) => return RunEnd::failed(reason),
     };
     if let Some(server) = mcp_server.as_ref() {
         files.mcp_state = Some(server.state().to_path_buf());
         files.mcp_socket = Some(server.socket.clone());
+        files.mcp_cookie = Some(server.cookie.clone());
         log.line(&format!("mcp bridge: {}", server.socket.display()));
     } else {
         log.line("mcp bridge: off — no Forgejo context or own token");
@@ -635,15 +712,9 @@ pub(super) fn run(
         "native Git: no supervisor transport"
     });
     if let Some(proxy) = git_proxy.as_ref() {
-        let path = files.home.join(".gitconfig");
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str("[http]\n\tproxy = ");
-        text.push_str(&proxy.url());
-        text.push('\n');
-        if let Err(error) = crate::mode::write_private(&path, text.as_bytes()) {
+        let path = files.ro_dir.join(".gitconfig");
+        let text = format!("[http]\n\tproxy = {}\n", proxy.url());
+        if let Err(error) = crate::mode::write_private_nofollow(&path, text.as_bytes()) {
             return RunEnd::failed(format!(
                 "the native Git transport config cannot be written: {error}"
             ));
@@ -701,7 +772,7 @@ pub(super) fn run(
         Err(error) => return RunEnd::failed(format!("this program cannot be found: {error}")),
     };
     if program == Program::Opencode {
-        match start_opencode_server(&files, plan, &exe, shell) {
+        match start_opencode_server(&files, plan, role_plan, external_secrets, &exe, shell) {
             Ok(Some((server, url, password))) => {
                 let mut adjusted = vec![
                     argv[0].clone(),
@@ -726,26 +797,55 @@ pub(super) fn run(
     }
     let _opencode_server = opencode_server;
 
-    let spec = files.root.join("confined-program.json");
+    let spec = files.ro_dir.join("confined-program.json");
+    let mut read_paths = vec![
+        files.install_root.display().to_string(),
+        files.ro_dir.display().to_string(),
+    ];
+    if let Some(exe_parent) = files.key_helper.parent() {
+        read_paths.push(exe_parent.display().to_string());
+    }
+    if let Some(mcp_dir) = files.mcp_socket.as_ref().and_then(|path| path.parent()) {
+        read_paths.push(mcp_dir.display().to_string());
+    }
+    let mut write_paths = vec![
+        files.home.display().to_string(),
+        files.tmp.display().to_string(),
+        files.config.display().to_string(),
+    ];
+    match program {
+        Program::Pi => write_paths.push(files.root.join("pi").display().to_string()),
+        Program::Codex => write_paths.push(files.root.join("codex").display().to_string()),
+        Program::Dsh => write_paths.push(files.root.join("dsh").display().to_string()),
+        Program::Opencode | Program::Builtin => {}
+    }
     if let Err(error) = write_json(
         &spec,
         &json!({
             "workspace": plan.workspace.display().to_string(),
             "program": argv.first().cloned().unwrap_or_default(),
             "args": argv.iter().skip(1).cloned().collect::<Vec<_>>(),
-            "read": [
-                files.install_root.display().to_string(),
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| exe.parent().map(|parent| parent.display().to_string()))
-                    .unwrap_or_default(),
-                files.mcp_socket.as_ref().and_then(|path| path.parent()).map(|path| path.display().to_string()).unwrap_or_default(),
-            ],
-            "write": [files.root.display().to_string()],
+            "read": read_paths,
+            "write": write_paths,
         }),
     ) {
         return RunEnd::failed(format!("the native launch plan cannot be written: {error}"));
     }
+
+    // Open the event log strictly outside harness-writable `files.root` and BEFORE
+    // spawning the child, using O_NOFOLLOW so a symlink cannot hijack the append.
+    let mut event_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(crate::mode::SECRET_FILE_MODE)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(shell.run_dir.join("native-events.jsonl"))
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return RunEnd::failed(format!("the native event record cannot be opened: {error}"));
+        }
+    };
 
     let mut command = Command::new(&exe);
     command
@@ -766,10 +866,22 @@ pub(super) fn run(
         .env("XDG_STATE_HOME", files.config.join("state"))
         .env("XDG_CACHE_HOME", files.config.join("cache"))
         .env("XDG_RUNTIME_DIR", files.config.join("run"))
-        .env("GIT_CONFIG_GLOBAL", files.home.join(".gitconfig"))
+        .env("GIT_CONFIG_GLOBAL", files.ro_dir.join(".gitconfig"))
         .env("GEWU_AGENT", &plan.agent)
         .env("GEWU_RUN_ID", &plan.run_id)
         .env("GEWU_WORKSPACE", &plan.workspace);
+    for (key, value) in &role_plan.env {
+        if let Err(reason) = crate::engine::settings::validate_external_env_key(key) {
+            return RunEnd::failed(reason);
+        }
+        command.env(key, value);
+    }
+    for (key, secret_val) in external_secrets {
+        if let Err(reason) = crate::engine::settings::validate_external_env_key(key) {
+            return RunEnd::failed(reason);
+        }
+        command.env(key, secret_val.expose());
+    }
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -810,19 +922,6 @@ pub(super) fn run(
     let mut state = NativeState::new(program);
     let mut stderr_lines: Vec<String> = Vec::new();
     let mut progress_written = String::new();
-    let mut event_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(crate::mode::SECRET_FILE_MODE)
-        .open(files.root.join("events.jsonl"))
-    {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return RunEnd::failed(format!("the native event record cannot be opened: {error}"));
-        }
-    };
 
     let (tx, rx) = mpsc::channel::<(bool, String)>();
     if let Some(stdout) = child.stdout.take() {
@@ -1030,22 +1129,21 @@ pub(super) fn run(
         refused_write: state.refused_write.clone(),
         wrote: state.wrote,
         checked_empty: state.checked_empty,
-        remote: state.pr_ok || state.pushed || state.comment_ok,
+        remote: state.pr_ok || state.pushed || state.comment_ok || state.forgejo_write_ok,
         read: (state.tool_ok || state.forgejo_read_ok) && state.local_work.is_empty(),
         ..RunEvidence::default()
     };
     let instruction = String::from_utf8_lossy(instruction);
-    let requested = requested_work(&instruction, &plan.steps);
     // The transcript-derived facts in `execute` decide the final mark and work
-    // line. This is the summary/failure base only: a declared step, a native tool
-    // event and an early failure are all recorded in the transcript and are read by
-    // the one facts function from there.
+    // line purely from objective tool/MCP/Git/workspace ledgers — no English prose
+    // verb classifier is consulted, so Chinese and English role prompts behave
+    // identically.
     let ending = if state.uncertain_write {
         RunEnding::Warned
     } else {
         crate::agent_run::ending_for_instruction(&instruction, &summary, &evidence)
     };
-    let reason = run_reason(ending, &summary, &state, requested);
+    let reason = run_reason(ending, &summary, &state);
     RunEnd {
         exit_code: 0,
         reason,
@@ -1053,199 +1151,235 @@ pub(super) fn run(
     }
 }
 
-/// Whether the instruction asks for a change, not only a report. This is a
-/// bounded prose check: the tool/work witness below still decides whether the
-/// change happened, and a read-only request may complete from a successful tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestedWork {
-    ReadOnly,
-    GenericWrite,
-    PullRequest,
-    PullRequestUpdate,
-    Comment,
-    UnsupportedForgejoWrite,
-    Push,
-    ForgejoRead,
-    Ambiguous,
-}
+/// Execute one stateless wakeup on this role's resident `HarnessRuntime` host.
+///
+/// The resident host keeps the harness runtime warm inside Landlock and opens a
+/// strictly ephemeral session per wakeup (`sessionId = run_id` / `new_session` /
+/// `thread/start { ephemeral: true }` / `--archived` run). All transcripts, push
+/// witnesses, local diffs, MCP ledgers and outcome resolution stay owned here.
+#[allow(clippy::too_many_arguments)]
+fn run_via_resident_runtime(
+    socket: &Path,
+    cookie: &str,
+    plan: &crate::run::RunPlan,
+    native: &NativePlan,
+    program: Program,
+    instruction: &[u8],
+    secret: &Secret,
+    mut tool_index: u32,
+    shell: &Shell,
+    transcript: &mut Transcript,
+    log: &mut RunLog,
+) -> Result<RunEnd, String> {
+    // Keep per-run MCP ledger/counter strictly beneath `shell.run_dir` (inside
+    // state_root, completely inaccessible to Landlock-confined harnesses).
+    let mcp_state = shell.run_dir.join("mcp-state");
+    std::fs::create_dir_all(&mcp_state)
+        .map_err(|e| format!("runtime mcp-state dir cannot be created: {e}"))?;
+    let _ = crate::mode::set_mode(&mcp_state, crate::mode::PRIVATE_DIR_MODE);
+    let ledger_path = mcp_state.join("calls.jsonl");
+    let counter_path = mcp_state.join("writes");
 
-/// A bounded request classification for the native boundary. This is not a general
-/// intent classifier: explicit read phrasing wins; explicit PR/comment/push asks
-/// need the matching supervisor fact; only an ordinary change word may use a
-/// workspace witness; everything else stays ambiguous and therefore warned.
-fn requested_work(instruction: &str, steps: &[String]) -> RequestedWork {
-    let lower = instruction.trim().to_ascii_lowercase();
-    let tokens: Vec<&str> = lower
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect();
-    let changes = tokens.iter().any(|word| {
-        matches!(
-            *word,
-            "change"
-                | "refactor"
-                | "rename"
-                | "rewrite"
-                | "implement"
-                | "modify"
-                | "update"
-                | "fix"
-                | "create"
-                | "delete"
-                | "remove"
-                | "add"
-                | "write"
-                | "edit"
-                | "apply"
-                | "close"
-                | "reopen"
-        )
+    let mut event_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(crate::mode::SECRET_FILE_MODE)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(shell.run_dir.join("native-events.jsonl"))
+        .map_err(|e| format!("the native event record cannot be opened: {e}"))?;
+
+    log.line(&format!(
+        "native program: {} {} via per-role resident runtime {}",
+        program.label(),
+        native.version,
+        socket.display()
+    ));
+
+    let workspace_before = crate::workspace::snapshot_workspace(&plan.workspace);
+    let push_watch = crate::workspace::watch_push(&plan.workspace);
+    let mut state = NativeState::new(program);
+    let mut stderr_lines: Vec<String> = Vec::new();
+    let mut progress_written = String::new();
+    let mut stdout_carry = String::new();
+    let mut stderr_carry = String::new();
+
+    let prompt_text = String::from_utf8_lossy(instruction).into_owned();
+    let exit_code = crate::harness_runtime::execute_on_runtime(
+        socket,
+        cookie,
+        &plan.run_id,
+        &shell.run_dir,
+        &prompt_text,
+        plan.timeout_secs.max(1),
+        &ledger_path,
+        &counter_path,
+        |output| match output {
+            crate::harness_runtime::RuntimeOutput::Event(line) => {
+                let cleaned = redact_native_line(secret, line, &mut stdout_carry);
+                let _ = writeln!(event_file, "{cleaned}");
+                handle_event(
+                    &cleaned,
+                    program,
+                    &mut state,
+                    &mut tool_index,
+                    plan,
+                    transcript,
+                    log,
+                );
+                write_progress(shell, &state, &mut progress_written, log);
+            }
+            crate::harness_runtime::RuntimeOutput::Stderr(err_line) => {
+                let cleaned = redact_native_line(secret, err_line, &mut stderr_carry);
+                if !cleaned.trim().is_empty() {
+                    if stderr_lines.len() < 64 {
+                        stderr_lines.push(cleaned.clone());
+                    }
+                    log.block(&cleaned);
+                    if state.outcome.observe_retry_text(&cleaned) {
+                        write_progress(shell, &state, &mut progress_written, log);
+                    }
+                }
+            }
+        },
+    )?;
+
+    if let Some(pushed) = crate::workspace::pushed_during(&push_watch) {
+        let repository = crate::workspace::remote_full_name(&pushed.repository);
+        let base = crate::workspace::default_branch_of(&pushed.repository);
+        let _ = crate::run::write_push_witness_at(
+            &shell.run_dir,
+            &pushed.branch,
+            &pushed.remote_ref,
+            repository.as_deref(),
+            base.as_deref(),
+        );
+        state.wrote = true;
+        state.pushed = true;
+    }
+    apply_ledger_dir(&mcp_state, transcript, &mut state);
+    let local = crate::workspace::changes_since(&workspace_before, &plan.workspace);
+    if !local.is_empty() {
+        let _ = crate::run::write_local_work(&shell.run_dir, &local);
+        state.wrote = true;
+        state.workspace_wrote = true;
+        state.local_work = local;
+    }
+    if let Some(call) = state.open.values().next().cloned() {
+        finish_call(
+            &call,
+            Some(1),
+            None,
+            "the resident runtime ended the turn before this tool finished".to_owned(),
+            transcript,
+            log,
+            &mut state,
+        );
+    }
+
+    let resolution = state.outcome.finish(Some(exit_code), SupervisorEnd::Natural);
+    match resolution.disposition {
+        Disposition::Failed => {
+            if let Some(reason) = resolution.reason.as_deref() {
+                let _ = crate::run::write_native_progress(
+                    &shell.run_dir,
+                    "failed",
+                    reason,
+                    true,
+                    state.outcome.tool_warning().map(String::as_str),
+                );
+            }
+        }
+        Disposition::Succeeded => {
+            let _ = crate::run::write_native_progress(
+                &shell.run_dir,
+                "succeeded",
+                "",
+                true,
+                state.outcome.tool_warning().map(String::as_str),
+            );
+        }
+        Disposition::Stopped | Disposition::TimedOut => {}
+    }
+    for text in state.outcome.committed_texts() {
+        let _ = transcript.append(&Record::native_text(text.clone()));
+    }
+    let stderr_reason = stderr_cause(&stderr_lines);
+    let generic_exit = resolution.reason.as_deref().is_none_or(|reason| {
+        reason.starts_with("the native program exited with code")
+            || reason == "the native program was ended by a signal"
     });
-    let imperative_comment = tokens.first() == Some(&"comment")
-        || lower.contains("leave a comment")
-        || lower.contains("post a comment")
-        || lower.contains("write a comment")
-        || lower.contains("add a comment");
-    let read_prefix = [
-        "read ",
-        "summarize",
-        "summarise",
-        "inspect ",
-        "list ",
-        "review ",
-    ]
-    .iter()
-    .any(|word| lower.starts_with(word));
-    let forgejo = ["issue", "pull request", "forgejo"]
-        .iter()
-        .any(|word| lower.contains(word));
-    let update_pr = lower.contains("update the pull request")
-        || lower.contains("update pull request")
-        || lower.contains("update the pr")
-        || lower.contains("update pr");
-    let open_pr = lower.contains("open a pull request")
-        || lower.starts_with("open a pr")
-        || lower.contains("create a pull request")
-        || lower.contains("open the pull request");
-    if lower.contains("close the issue")
-        || lower.contains("close issue")
-        || lower.contains("reopen the issue")
-        || lower.contains("reopen issue")
-    {
-        // The six supplied tools cannot close or reopen an issue. A read, a shell
-        // success or a generic tool acknowledgement cannot satisfy this ask.
-        return RequestedWork::UnsupportedForgejoWrite;
+    let reason = if generic_exit {
+        stderr_reason
+            .clone()
+            .or_else(|| resolution.reason.clone())
+            .unwrap_or_else(|| format!("the resident program exited with code {exit_code}"))
+    } else {
+        resolution
+            .reason
+            .clone()
+            .or(stderr_reason)
+            .unwrap_or_else(|| format!("the resident program exited with code {exit_code}"))
+    };
+    if exit_code != 0 || resolution.disposition == Disposition::Failed {
+        return Ok(RunEnd::failed(reason));
     }
-    if imperative_comment {
-        return RequestedWork::Comment;
+    if resolution.disposition != Disposition::Succeeded {
+        return Ok(RunEnd::failed(
+            "the native program ended without a completion event; the run is not a success"
+                .to_owned(),
+        ));
     }
-    let compound_action = read_prefix
-        && tokens.iter().enumerate().any(|(index, word)| {
-            if !matches!(*word, "and" | "then") {
-                return false;
-            }
-            let mut next = index + 1;
-            if tokens.get(next) == Some(&"then") {
-                next += 1;
-            }
-            tokens.get(next).is_some_and(|word| {
-                matches!(
-                    *word,
-                    "change"
-                        | "refactor"
-                        | "rename"
-                        | "rewrite"
-                        | "implement"
-                        | "modify"
-                        | "update"
-                        | "fix"
-                        | "create"
-                        | "delete"
-                        | "remove"
-                        | "add"
-                        | "write"
-                        | "edit"
-                        | "apply"
-                        | "close"
-                        | "reopen"
-                        | "comment"
-                        | "push"
-                )
-            })
-        });
-    if read_prefix && !compound_action && !update_pr && !open_pr {
-        let path_like = lower.split_whitespace().any(|word| {
-            word.contains('/')
-                || [
-                    ".rs", ".md", ".py", ".js", ".ts", ".go", ".java", ".c", ".h", ".toml",
-                    ".json", ".yaml", ".yml", ".sh",
-                ]
-                .iter()
-                .any(|suffix| word.ends_with(suffix))
-        });
-        let comment_local = tokens.contains(&"code")
-            || tokens.contains(&"file")
-            || tokens.contains(&"source")
-            || path_like;
-        let pr_explicit = tokens.contains(&"pr") || lower.contains("pull request");
-        let comment_explicit = tokens.contains(&"comment") && !comment_local;
-        let forgejo_noun = forgejo || pr_explicit || comment_explicit;
-        return if forgejo_noun {
-            RequestedWork::ForgejoRead
-        } else {
-            RequestedWork::ReadOnly
-        };
-    }
-    if update_pr {
-        return RequestedWork::PullRequestUpdate;
-    }
-    if open_pr {
-        return RequestedWork::PullRequest;
-    }
-    if tokens.first() == Some(&"push") {
-        return RequestedWork::Push;
-    }
-    if changes || !steps.is_empty() {
-        return RequestedWork::GenericWrite;
-    }
-    if forgejo {
-        return RequestedWork::ForgejoRead;
-    }
-    if tokens
-        .iter()
-        .any(|word| matches!(*word, "read" | "inspect"))
-    {
-        return RequestedWork::ReadOnly;
-    }
-    RequestedWork::Ambiguous
+
+    let summary = resolution
+        .text
+        .as_deref()
+        .map(|text| model::whole_message(text, 4000))
+        .unwrap_or_default();
+    let evidence = RunEvidence {
+        failed_call: state.failed_call.clone(),
+        refused_write: state.refused_write.clone(),
+        wrote: state.wrote,
+        checked_empty: state.checked_empty,
+        remote: state.pr_ok || state.pushed || state.comment_ok || state.forgejo_write_ok,
+        read: (state.tool_ok || state.forgejo_read_ok) && state.local_work.is_empty(),
+        ..RunEvidence::default()
+    };
+    let ending = if state.uncertain_write {
+        RunEnding::Warned
+    } else {
+        crate::agent_run::ending_for_instruction(&prompt_text, &summary, &evidence)
+    };
+    let reason = run_reason(ending, &summary, &state);
+    Ok(RunEnd {
+        exit_code: 0,
+        reason,
+        ending,
+    })
 }
 
 /// A successful piece of work the product itself observed: an accepted Forgejo
 /// write (the MCP ledger's `ok` result), a Git push proved by the remote-tracking
-/// reflog, or a real workspace change. It outranks the instruction classifier:
-/// whatever the words asked for, real work is not a warning. This is what makes a
-/// successful `forgejo_comment` or a verified push count for every native program,
-/// including an instruction that also asked for something the tools cannot do
-/// (`close the issue`) or that used a nominal change word (`do not change any files`).
+/// reflog, or a real workspace change.
 fn observed_work(state: &NativeState) -> bool {
-    state.wrote || state.comment_ok || state.pr_ok || state.pushed || state.workspace_wrote
+    state.wrote
+        || state.comment_ok
+        || state.pr_ok
+        || state.forgejo_write_ok
+        || state.pushed
+        || state.workspace_wrote
 }
 
 /// The decision helper for the unit tests: the production path derives its facts
 /// from the transcript in `execute`.
 #[cfg(test)]
-fn decide_native_ending(
-    base: RunEnding,
-    _requested: RequestedWork,
-    state: &NativeState,
-) -> RunEnding {
+fn decide_native_ending(base: RunEnding, state: &NativeState) -> RunEnding {
     let mut local = state.local_work.clone();
     if state.workspace_wrote && local.is_empty() {
         // Older tests set only the boolean. A changed workspace is still local.
         local.committed = true;
     }
     let facts = crate::run::RunFacts {
-        remote: state.pr_ok || state.pushed || state.comment_ok,
+        remote: state.pr_ok || state.pushed || state.comment_ok || state.forgejo_write_ok,
         read: state.tool_ok || state.forgejo_read_ok,
         wrote: state.wrote,
         saw_tool: state.outcome.saw_tool(),
@@ -1256,34 +1390,42 @@ fn decide_native_ending(
 }
 
 /// Prepare all private native files for one harness.
+#[allow(clippy::too_many_arguments)]
 fn prepare_files(
     plan: &crate::run::RunPlan,
     native: &NativePlan,
+    role_plan: &crate::run::RoleRunPlan,
+    external_secrets: &BTreeMap<String, Secret>,
     _program: Program,
     _protocol: Protocol,
     shell: &Shell,
     temp: &Path,
 ) -> Result<NativeFiles, String> {
-    let root = temp.join("native");
-    let home = root.join("home");
-    let tmp = root.join("tmp");
-    let config = root.join("config");
-    for dir in [&root, &home, &tmp, &config] {
-        std::fs::create_dir_all(dir)
+    let temp_canon = std::fs::canonicalize(temp).unwrap_or_else(|_| temp.to_path_buf());
+    let root = temp_canon.join("native");
+    let ro_dir = temp_canon.join("ro");
+    let home = temp_canon.join("home");
+    let tmp = temp_canon.join("tmp");
+    let config = temp_canon.join("xdg");
+    for dir in [&root, &ro_dir, &home, &tmp, &config] {
+        crate::mode::ensure_dir_nofollow_under(&temp_canon, dir)
             .map_err(|error| format!("{} cannot be created: {error}", dir.display()))?;
-        let _ = crate::mode::set_mode(dir, crate::mode::PRIVATE_DIR_MODE);
     }
-    for name in ["config", "state", "cache", "run"] {
+    for name in ["config", "state", "cache", "run", "data"] {
         let dir = config.join(name);
-        std::fs::create_dir_all(&dir)
+        crate::mode::ensure_dir_nofollow_under(&temp_canon, &dir)
             .map_err(|error| format!("{} cannot be created: {error}", dir.display()))?;
-        let _ = crate::mode::set_mode(&dir, crate::mode::PRIVATE_DIR_MODE);
     }
-    let key = root.join("model.key");
-    crate::mode::write_private(&key, plan_key(plan)?.as_bytes())
+    // Keep model.key and .gitconfig in Landlock read-only `ro_dir` (never in writable `root`).
+    let key = ro_dir.join("model.key");
+    crate::mode::write_private_nofollow_under(&temp_canon, &key, plan_key(plan)?.as_bytes())
         .map_err(|error| format!("the run's key file cannot be written: {error}"))?;
+    let _ = crate::mode::write_private_nofollow_under(&temp_canon, ro_dir.join(".gitconfig"), b"");
     let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
         .map_err(|error| format!("this program cannot be found: {error}"))?;
+    let install_root =
+        std::fs::canonicalize(&native.install_root).unwrap_or_else(|_| native.install_root.clone());
     let mut skills = Vec::new();
     let installed_skills = shell.run_dir.join("skills");
     if let Ok(entries) = std::fs::read_dir(&installed_skills) {
@@ -1294,20 +1436,29 @@ fn prepare_files(
         }
     }
     skills.sort();
+    let role_mcp_servers = match role_plan.mcp_config.as_deref() {
+        Some(path) => crate::role_mcp::load_role_mcp_servers(path, &role_plan.env, external_secrets)?,
+        None => Vec::new(),
+    };
+    let permissions = role_plan.permissions.clone().unwrap_or_default();
     Ok(NativeFiles {
         root,
+        ro_dir,
         home,
         tmp,
         config,
         key,
         key_helper: exe,
         program: native.program.clone(),
-        install_root: native.install_root.clone(),
+        install_root,
         skills,
         mcp_state: None,
         mcp_socket: None,
+        mcp_cookie: None,
         model_url: None,
         model_catalog: None,
+        role_mcp_servers,
+        permissions,
     })
 }
 
@@ -1452,10 +1603,10 @@ fn write_codex_catalog(files: &NativeFiles, model: &str) -> Result<Option<PathBu
     ] {
         object.insert(key.to_owned(), value);
     }
-    let path = home.join("model-catalog.json");
+    let path = files.ro_dir.join("model-catalog.json");
     let text = serde_json::to_vec(&json!({"models": [entry]}))
         .map_err(|error| format!("the Codex catalog cannot be written: {error}"))?;
-    crate::mode::write_private(&path, &text)
+    crate::mode::write_private_nofollow(&path, &text)
         .map_err(|error| format!("the Codex catalog cannot be written: {error}"))?;
     Ok(Some(path))
 }
@@ -1471,22 +1622,22 @@ fn build_launch(
     let mut envs: Vec<(String, String)> = Vec::new();
     let mcp = files.mcp_socket.as_ref().map(|socket| {
         let exe = files.key_helper.display().to_string();
-        (
-            exe,
-            vec![
-                "--mcp-forgejo-connect".to_owned(),
-                socket.display().to_string(),
-            ],
-        )
+        let mut mcp_args = vec![
+            "--mcp-forgejo-connect".to_owned(),
+            socket.display().to_string(),
+        ];
+        if let Some(cookie) = files.mcp_cookie.as_ref() {
+            mcp_args.push(cookie.display().to_string());
+        }
+        (exe, mcp_args)
     });
     let model = native.model.clone();
     let budget = launch_budget(plan.timeout_secs);
     match program {
         Program::Pi => {
             let dir = files.root.join("pi");
-            std::fs::create_dir_all(&dir)
+            crate::mode::ensure_dir_nofollow_under(&files.root, &dir)
                 .map_err(|error| format!("{} cannot be created: {error}", dir.display()))?;
-            let _ = crate::mode::set_mode(&dir, crate::mode::PRIVATE_DIR_MODE);
             let api = match protocol {
                 Protocol::ChatCompletions => "openai-completions",
                 Protocol::Responses => "openai-responses",
@@ -1502,8 +1653,9 @@ fn build_launch(
                     }
                 }
             });
-            write_json(&dir.join("models.json"), &models)?;
-            write_json(
+            write_json_under(&files.root, &dir.join("models.json"), &models)?;
+            write_json_under(
+                &files.root,
                 &dir.join("settings.json"),
                 &json!({
                     "httpIdleTimeoutMs": budget.request_ms,
@@ -1513,13 +1665,24 @@ fn build_launch(
                     }
                 }),
             )?;
+            let mut servers = serde_json::Map::new();
             if let Some((exe, mcp_args)) = mcp.as_ref() {
-                write_json(
-                    &dir.join("mcp.json"),
-                    &json!({"mcpServers": {"gewu_forgejo": {
-                        "command": exe, "args": mcp_args, "exposure": "direct",
+                servers.insert(
+                    "gewu_forgejo".to_owned(),
+                    json!({
+                        "command": exe,
+                        "args": mcp_args,
+                        "exposure": "direct",
                         "description": "gewu-multiverse Forgejo tools for this agent"
-                    }}}),
+                    }),
+                );
+            }
+            crate::role_mcp::insert_pi_servers(&mut servers, &files.role_mcp_servers);
+            if !servers.is_empty() {
+                write_json_under(
+                    &files.root,
+                    &dir.join("mcp.json"),
+                    &json!({"mcpServers": servers}),
                 )?;
             }
             envs.push(("PI_CODING_AGENT_DIR".to_owned(), dir.display().to_string()));
@@ -1533,12 +1696,12 @@ fn build_launch(
                 "--model".to_owned(),
                 model,
             ]);
-            let skills_dir = dir.join("skills");
+            let skills_dir = files.ro_dir.join("pi-skills");
             for skill in &files.skills {
                 let Some(name) = skill.file_name() else {
                     continue;
                 };
-                copy_tree(skill, &skills_dir.join(name))?;
+                copy_tree(&files.ro_dir, skill, &skills_dir.join(name))?;
                 args.push("--skill".to_owned());
                 args.push(skills_dir.join(name).display().to_string());
             }
@@ -1588,15 +1751,24 @@ fn build_launch(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
-                config.push_str(&codex_tool_approvals());
+                config.push_str(&codex_tool_approvals_for(&files.permissions));
             }
-            crate::mode::write_private(dir.join("config.toml"), config.as_bytes())
+            if !files.role_mcp_servers.is_empty() {
+                config.push_str(&crate::role_mcp::render_codex_toml_servers(
+                    &files.role_mcp_servers,
+                ));
+            }
+            crate::mode::write_private_nofollow_under(
+                &files.root,
+                dir.join("config.toml"),
+                config.as_bytes(),
+            )
                 .map_err(|error| format!("the Codex configuration cannot be written: {error}"))?;
             for skill in &files.skills {
                 let Some(name) = skill.file_name() else {
                     continue;
                 };
-                copy_tree(skill, &dir.join("skills").join(name))?;
+                copy_tree(&files.root, skill, &dir.join("skills").join(name))?;
             }
             envs.push(("CODEX_HOME".to_owned(), dir.display().to_string()));
             // The warning is the only place Codex names a recovered 503; without it
@@ -1644,20 +1816,31 @@ fn build_launch(
                     mcp_args.iter().map(|arg| yaml(arg)).collect::<Vec<_>>().join(", ")
                 ));
             }
-            crate::mode::write_private(dir.join("overlay.yml"), overlay.as_bytes()).map_err(
+            if !files.role_mcp_servers.is_empty() {
+                overlay.push_str(&crate::role_mcp::render_dsh_overlay_servers(
+                    &files.role_mcp_servers,
+                ));
+            }
+            let overlay_path = files.ro_dir.join("dsh-overlay.yml");
+            crate::mode::write_private_nofollow(&overlay_path, overlay.as_bytes()).map_err(
                 |error| format!("the DeepSeek Harness configuration cannot be written: {error}"),
             )?;
-            let key = std::fs::read_to_string(&files.key)
+            let key = crate::mode::read_private_regular(&files.key)
                 .map_err(|error| format!("the captured run key cannot be read: {error}"))?;
             let dotenv = format!("GEWU_NATIVE_KEY={}\n", key.trim_end());
-            crate::mode::write_private(dir.join(".env"), dotenv.as_bytes()).map_err(|error| {
+            crate::mode::write_private_nofollow_under(
+                &files.root,
+                dir.join(".env"),
+                dotenv.as_bytes(),
+            )
+            .map_err(|error| {
                 format!("the DeepSeek Harness key file cannot be written: {error}")
             })?;
             for skill in &files.skills {
                 let Some(name) = skill.file_name() else {
                     continue;
                 };
-                copy_tree(skill, &dir.join("skills").join(name))?;
+                copy_tree(&files.root, skill, &dir.join("skills").join(name))?;
             }
             envs.push(("DSH_HOME".to_owned(), dir.display().to_string()));
             envs.push((
@@ -1668,16 +1851,15 @@ fn build_launch(
                 "--profile".to_owned(),
                 "headless".to_owned(),
                 "--patch".to_owned(),
-                dir.join("overlay.yml").display().to_string(),
+                overlay_path.display().to_string(),
                 "--json".to_owned(),
             ]);
         }
         Program::Opencode => {
-            let dir = files.root.join("opencode");
+            let dir = files.ro_dir.join("opencode-cfg");
             let cfg = dir.join("opencode");
-            std::fs::create_dir_all(&cfg)
-                .map_err(|error| format!("{} cannot be created: {error}", error))?;
-            let _ = crate::mode::set_mode(&dir, crate::mode::PRIVATE_DIR_MODE);
+            crate::mode::ensure_dir_nofollow_under(&files.ro_dir, &cfg)
+                .map_err(|error| format!("{} cannot be created: {error}", cfg.display()))?;
             let npm = match protocol {
                 Protocol::ChatCompletions => "@ai-sdk/openai-compatible",
                 Protocol::Responses => "@ai-sdk/openai",
@@ -1702,17 +1884,27 @@ fn build_launch(
                 },
                 "model": format!("gewu/{model}")
             });
+            let mut oc_mcp = serde_json::Map::new();
             if let Some((exe, mcp_args)) = mcp.as_ref() {
-                config["mcp"] = json!({"gewu_forgejo": {
-                    "type": "local", "command": std::iter::once(exe.clone()).chain(mcp_args.iter().cloned()).collect::<Vec<_>>(), "enabled": true
-                }});
+                oc_mcp.insert(
+                    "gewu_forgejo".to_owned(),
+                    json!({
+                        "type": "local",
+                        "command": std::iter::once(exe.clone()).chain(mcp_args.iter().cloned()).collect::<Vec<_>>(),
+                        "enabled": true
+                    }),
+                );
+            }
+            crate::role_mcp::insert_opencode_servers(&mut oc_mcp, &files.role_mcp_servers);
+            if !oc_mcp.is_empty() {
+                config["mcp"] = Value::Object(oc_mcp);
             }
             write_json(&cfg.join("opencode.json"), &config)?;
             for skill in &files.skills {
                 let Some(name) = skill.file_name() else {
                     continue;
                 };
-                copy_tree(skill, &cfg.join("skills").join(name))?;
+                copy_tree(&files.ro_dir, skill, &cfg.join("skills").join(name))?;
             }
             envs.push(("XDG_CONFIG_HOME".to_owned(), dir.display().to_string()));
             args.extend([
@@ -1901,6 +2093,11 @@ fn is_write_tool(tool: &str) -> bool {
     lower.contains("forgejo_comment")
         || lower.contains("forgejo_open_pull_request")
         || lower.contains("forgejo_update_pull_request")
+        || lower.contains("forgejo_create_issue")
+        || lower.contains("forgejo_update_issue")
+        || lower.contains("forgejo_review_pull_request")
+        || lower.contains("forgejo_merge_pull_request")
+        || lower.contains("forgejo_create_repository")
         || matches!(
             lower.as_str(),
             "write" | "edit" | "apply_patch" | "patch" | "file_change"
@@ -1912,6 +2109,10 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
     let Some(dir) = files.mcp_state.as_ref() else {
         return;
     };
+    apply_ledger_dir(dir, transcript, state);
+}
+
+fn apply_ledger_dir(dir: &Path, transcript: &mut Transcript, state: &mut NativeState) {
     let Ok(text) = std::fs::read_to_string(dir.join("calls.jsonl")) else {
         return;
     };
@@ -1966,11 +2167,15 @@ fn apply_ledger(files: &NativeFiles, transcript: &mut Transcript, state: &mut Na
                 state.wrote = true;
                 if tool.ends_with(crate::forgejo_tools::COMMENT) {
                     state.comment_ok = true;
-                } else {
+                } else if tool.ends_with(crate::forgejo_tools::OPEN_PULL_REQUEST)
+                    || tool.ends_with(crate::forgejo_tools::UPDATE_PULL_REQUEST)
+                {
                     state.pr_ok = true;
                     if tool.ends_with(crate::forgejo_tools::UPDATE_PULL_REQUEST) {
                         state.pr_updated = true;
                     }
+                } else {
+                    state.forgejo_write_ok = true;
                 }
             } else if record
                 .get("accepted")
@@ -2060,26 +2265,37 @@ fn write_progress(shell: &Shell, state: &NativeState, last: &mut String, log: &m
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|error| format!("{} cannot be written: {error}", path.display()))?;
-    crate::mode::write_private(path, text.as_bytes())
+    crate::mode::write_private_nofollow(path, text.as_bytes())
         .map_err(|error| format!("{} cannot be written: {error}", path.display()))
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst)
+fn write_json_under(root: &Path, path: &Path, value: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("{} cannot be written: {error}", path.display()))?;
+    crate::mode::write_private_nofollow_under(root, path, text.as_bytes())
+        .map_err(|error| format!("{} cannot be written: {error}", path.display()))
+}
+
+fn copy_tree(root: &Path, src: &Path, dst: &Path) -> Result<(), String> {
+    crate::mode::ensure_dir_nofollow_under(root, dst)
         .map_err(|error| format!("{} cannot be created: {error}", dst.display()))?;
-    let _ = crate::mode::set_mode(dst, crate::mode::PRIVATE_DIR_MODE);
     for entry in std::fs::read_dir(src)
         .map_err(|error| format!("{} cannot be read: {error}", src.display()))?
         .flatten()
     {
         let path = entry.path();
         let target = dst.join(entry.file_name());
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && meta.file_type().is_symlink()
+        {
+            continue;
+        }
         if path.is_dir() {
-            copy_tree(&path, &target)?;
+            copy_tree(root, &path, &target)?;
         } else if path.is_file() {
             let bytes = std::fs::read(&path)
                 .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-            crate::mode::write_private(&target, &bytes)
+            crate::mode::write_private_nofollow_under(root, &target, &bytes)
                 .map_err(|error| format!("{} cannot be written: {error}", target.display()))?;
         }
     }
@@ -2158,12 +2374,9 @@ mod native_proof_tests {
 
     #[test]
     fn r1_a_read_only_cycle_that_writes_nothing_is_no_work() {
-        // Wave 37 C1: `nothing new to add` is the neutral outcome the README
-        // promises for a check that read its issue and wrote nothing. A missing
-        // empty-list ledger is not evidence that the model's own sentence is false.
         let state = NativeState::default();
         assert_eq!(
-            decide_native_ending(RunEnding::NoWork, RequestedWork::ReadOnly, &state),
+            decide_native_ending(RunEnding::NoWork, &state),
             RunEnding::NoWork
         );
         let checked = NativeState {
@@ -2171,26 +2384,17 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::NoWork, RequestedWork::ReadOnly, &checked),
+            decide_native_ending(RunEnding::NoWork, &checked),
             RunEnding::NoWork
         );
         assert_eq!(
-            run_reason(
-                RunEnding::NoWork,
-                "nothing new to add",
-                &state,
-                RequestedWork::ReadOnly
-            )
-            .as_deref(),
+            run_reason(RunEnding::NoWork, "nothing new to add", &state).as_deref(),
             Some("nothing new to add")
         );
     }
 
     #[test]
     fn c1_observed_work_outranks_a_failed_test_and_a_negative_summary() {
-        // The work is the product's own fact. A failing test before the fix and a
-        // final sentence that claims failure cannot turn a pushed branch or an
-        // opened pull request into a warning.
         let work = NativeState {
             pushed: true,
             workspace_wrote: true,
@@ -2199,7 +2403,7 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Warned, RequestedWork::PullRequest, &work),
+            decide_native_ending(RunEnding::Warned, &work),
             RunEnding::Succeeded
         );
         let comment = NativeState {
@@ -2208,11 +2412,9 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Refused, RequestedWork::Comment, &comment),
+            decide_native_ending(RunEnding::Refused, &comment),
             RunEnding::Succeeded
         );
-        // The rejected checkout of a branch an interrupted run left behind is a
-        // failed command, not a failed run, once the retry pushed and opened work.
         let existing_branch = NativeState {
             pushed: true,
             workspace_wrote: true,
@@ -2222,16 +2424,9 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(
-                RunEnding::Warned,
-                RequestedWork::PullRequest,
-                &existing_branch
-            ),
+            decide_native_ending(RunEnding::Warned, &existing_branch),
             RunEnding::Succeeded
         );
-        // F1: a local edit/commit with a failed push is not verified remote work.
-        // The failed command and the negative summary stay visible in the warning;
-        // the reason names the local work rather than pretending it succeeded.
         let local_only = NativeState {
             workspace_wrote: true,
             failed_call: Some(
@@ -2239,14 +2434,12 @@ mod native_proof_tests {
             ),
             ..NativeState::default()
         };
-        let ending =
-            decide_native_ending(RunEnding::Warned, RequestedWork::PullRequest, &local_only);
+        let ending = decide_native_ending(RunEnding::Warned, &local_only);
         assert_eq!(ending, RunEnding::Warned);
         let reason = run_reason(
             ending,
             "I could not finish the task. The work is still pending.",
             &local_only,
-            RequestedWork::PullRequest,
         )
         .expect("reason");
         assert!(reason.contains("workspace changed"), "{reason}");
@@ -2256,28 +2449,16 @@ mod native_proof_tests {
             "{reason}"
         );
 
-        // A blocked write is not hidden; the reason names the observed work first.
         let blocked = NativeState {
             comment_ok: true,
             wrote: true,
             refused_write: Some("forgejo_update_pull_request: no open pull request".to_owned()),
             ..NativeState::default()
         };
-        // The comment is real remote work, so the failed update cannot make the run
-        // a refusal; the mark is a tick and the work block names the comment.
-        let ending = decide_native_ending(
-            RunEnding::Refused,
-            RequestedWork::PullRequestUpdate,
-            &blocked,
-        );
+        let ending = decide_native_ending(RunEnding::Refused, &blocked);
         assert_eq!(ending, RunEnding::Succeeded);
-        let reason = run_reason(
-            ending,
-            "I could not update the pull request",
-            &blocked,
-            RequestedWork::PullRequestUpdate,
-        )
-        .expect("reason");
+        let reason = run_reason(ending, "I could not update the pull request", &blocked)
+            .expect("reason");
         assert_eq!(reason, "I could not update the pull request");
     }
 
@@ -2288,36 +2469,18 @@ mod native_proof_tests {
             wrote: true,
             ..NativeState::default()
         };
-        let local_ending =
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &local);
+        let local_ending = decide_native_ending(RunEnding::Succeeded, &local);
         assert_eq!(
             local_ending,
             RunEnding::Warned,
             "a local-only write is not verified remote work"
         );
-        let local_reason = run_reason(
-            local_ending,
-            "I could not push the branch.",
-            &local,
-            RequestedWork::PullRequest,
-        )
-        .expect("reason");
+        let local_reason =
+            run_reason(local_ending, "I could not push the branch.", &local).expect("reason");
         assert!(local_reason.contains("workspace changed"), "{local_reason}");
         assert!(
             !local_reason.contains("no tool call or workspace change"),
             "{local_reason}"
-        );
-        assert!(
-            !local_reason.contains("no matching tool or work fact"),
-            "{local_reason}"
-        );
-        assert_eq!(
-            requested_work("Open a pull request and comment on the issue.", &[]),
-            RequestedWork::PullRequest
-        );
-        assert_eq!(
-            requested_work("Read the comment on the issue and summarize it.", &[]),
-            RequestedWork::ForgejoRead
         );
         let comment = NativeState {
             comment_ok: true,
@@ -2325,54 +2488,51 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::Comment, &comment),
+            decide_native_ending(RunEnding::Succeeded, &comment),
             RunEnding::Succeeded
         );
     }
 
     #[test]
-    fn c2_imperative_comment_change_and_push_use_their_own_facts() {
-        assert_eq!(
-            requested_work("Comment on the issue.", &[]),
-            RequestedWork::Comment
-        );
-        assert_eq!(
-            requested_work("Review and change the form.", &[]),
-            RequestedWork::GenericWrite
-        );
-        assert_eq!(requested_work("Push the branch.", &[]), RequestedWork::Push);
+    fn c2_chinese_and_english_prompts_use_identical_objective_ledger() {
         let pushed = NativeState {
             pushed: true,
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::Push, &pushed),
+            decide_native_ending(RunEnding::Succeeded, &pushed),
             RunEnding::Succeeded
         );
+        let reviewed = NativeState {
+            forgejo_write_ok: true,
+            wrote: true,
+            ..NativeState::default()
+        };
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &pushed),
+            decide_native_ending(RunEnding::Succeeded, &reviewed),
             RunEnding::Succeeded
         );
+        // Chinese no-work summary with read-only tool facts resolves to NoWork cleanly.
+        let cn_base = crate::agent_run::ending_for_instruction(
+            "检查分配给你的 issue，如果没有任务就退出。",
+            "已检查，暂无任务需要处理。",
+            &RunEvidence {
+                read: true,
+                ..RunEvidence::default()
+            },
+        );
+        assert_eq!(cn_base, RunEnding::NoWork);
     }
 
-    /// Regression for wave 36 C1: the instruction's prose classifier is not the
-    /// work witness. A successful MCP comment and a verified push are work even when
-    /// the instruction also says `close the issue` (which the tools cannot do) or
-    /// uses a nominal change word like `do not change any files`.
     #[test]
     fn c1_a_successful_comment_or_push_is_work_whatever_the_prose_asked() {
-        let close = requested_work(
-            "Look at the issue assigned to you. Comment on it with a plan, add a file, commit and push it, and close the issue.",
-            &[],
-        );
-        assert_eq!(close, RequestedWork::UnsupportedForgejoWrite);
         let comment = NativeState {
             comment_ok: true,
             wrote: true,
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, close, &comment),
+            decide_native_ending(RunEnding::Succeeded, &comment),
             RunEnding::Succeeded,
             "a comment the product observed was reported as no work"
         );
@@ -2382,23 +2542,13 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, close, &push),
+            decide_native_ending(RunEnding::Succeeded, &push),
             RunEnding::Succeeded,
             "a verified push was reported as no work"
         );
-        let do_not_change = requested_work(
-            "Answer every new issue assigned to you. Leave one short, helpful comment. Do not change any files.",
-            &[],
-        );
-        assert_eq!(do_not_change, RequestedWork::GenericWrite);
-        assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, do_not_change, &comment),
-            RunEnding::Succeeded,
-            "the nominal `change` word hid the observed comment"
-        );
         let no_work = NativeState::default();
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, close, &no_work),
+            decide_native_ending(RunEnding::Succeeded, &no_work),
             RunEnding::Warned,
             "with no recorded fact the requested work is unconfirmed"
         );
@@ -2411,11 +2561,7 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(
-                RunEnding::Succeeded,
-                RequestedWork::ForgejoRead,
-                &native_only
-            ),
+            decide_native_ending(RunEnding::Succeeded, &native_only),
             RunEnding::NoWork,
             "a successful read with no write is no work"
         );
@@ -2424,7 +2570,7 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::ForgejoRead, &ledger),
+            decide_native_ending(RunEnding::Succeeded, &ledger),
             RunEnding::NoWork,
             "a successful Forgejo read with no write is no work"
         );
@@ -2455,6 +2601,7 @@ mod native_proof_tests {
         std::fs::write(state.join("calls.jsonl"), format!("{line}\n")).expect("the ledger");
         let files = NativeFiles {
             root: root.clone(),
+            ro_dir: root.clone(),
             home: root.join("home"),
             tmp: root.join("tmp"),
             config: root.join("config"),
@@ -2465,8 +2612,11 @@ mod native_proof_tests {
             skills: Vec::new(),
             mcp_state: Some(state),
             mcp_socket: None,
+            mcp_cookie: None,
             model_url: None,
             model_catalog: None,
+            role_mcp_servers: Vec::new(),
+            permissions: crate::engine::settings::RolePermissions::default(),
         };
         let mut transcript = Transcript::open(&run_dir).expect("the transcript");
         let mut state = NativeState::default();
@@ -2521,26 +2671,15 @@ mod native_proof_tests {
                 ..RunEvidence::default()
             },
         );
+        assert_eq!(decide_native_ending(base, &state), RunEnding::NoWork);
         assert_eq!(
-            decide_native_ending(base, RequestedWork::GenericWrite, &state),
-            RunEnding::NoWork
-        );
-        assert_eq!(
-            run_reason(
-                RunEnding::NoWork,
-                summary,
-                &state,
-                RequestedWork::GenericWrite
-            )
-            .as_deref(),
+            run_reason(RunEnding::NoWork, summary, &state).as_deref(),
             Some(summary)
         );
     }
 
     #[test]
     fn r8_a_local_only_change_is_warned_and_names_the_file() {
-        // Walk B F1: the workspace comparison found README.md changed, so the run
-        // is a warning even when the instruction's prose asks for a change.
         let state = NativeState {
             workspace_wrote: true,
             local_work: crate::workspace::WorkspaceChanges {
@@ -2550,16 +2689,9 @@ mod native_proof_tests {
             },
             ..NativeState::default()
         };
-        let ending =
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &state);
+        let ending = decide_native_ending(RunEnding::Succeeded, &state);
         assert_eq!(ending, RunEnding::Warned);
-        let reason = run_reason(
-            ending,
-            "I edited README.md locally.",
-            &state,
-            RequestedWork::GenericWrite,
-        )
-        .expect("reason");
+        let reason = run_reason(ending, "I edited README.md locally.", &state).expect("reason");
         assert!(reason.contains("README.md"), "{reason}");
         assert!(reason.contains("workspace changed"), "{reason}");
     }
@@ -2589,6 +2721,7 @@ mod native_proof_tests {
         std::fs::write(state.join("calls.jsonl"), format!("{line}\n")).expect("the ledger");
         let files = NativeFiles {
             root: root.clone(),
+            ro_dir: root.clone(),
             home: root.join("home"),
             tmp: root.join("tmp"),
             config: root.join("config"),
@@ -2599,8 +2732,11 @@ mod native_proof_tests {
             skills: Vec::new(),
             mcp_state: Some(state),
             mcp_socket: None,
+            mcp_cookie: None,
             model_url: None,
             model_catalog: None,
+            role_mcp_servers: Vec::new(),
+            permissions: crate::engine::settings::RolePermissions::default(),
         };
         let mut transcript = Transcript::open(&run_dir).expect("the transcript");
         let mut state = NativeState::default();
@@ -2630,73 +2766,16 @@ mod native_proof_tests {
     }
 
     #[test]
-    fn r2_read_only_comment_succeeds_from_a_read_fact_and_generic_write_needs_a_witness() {
-        assert_eq!(
-            requested_work("Read the comment on the issue and summarize it.", &[]),
-            RequestedWork::ForgejoRead
-        );
-        let read = NativeState {
-            tool_ok: true,
-            ..NativeState::default()
-        };
-        assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::ReadOnly, &read),
-            RunEnding::NoWork,
-            "a read-only run is no work even when the instruction asked for a change"
-        );
-        assert_eq!(
-            requested_work("Rename the parser module.", &[]),
-            RequestedWork::GenericWrite
-        );
-        assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::GenericWrite, &read),
-            RunEnding::NoWork,
-            "a successful read is not a workspace write"
-        );
-    }
-    #[test]
-    fn c2_issue_update_prefix_and_local_repository_are_not_implicit_writes() {
-        assert_eq!(
-            requested_work("Read the updated issue and summarize it.", &[]),
-            RequestedWork::ForgejoRead
-        );
-        assert_eq!(
-            requested_work("Read the prefix of the issue and report it.", &[]),
-            RequestedWork::ForgejoRead
-        );
-        assert_eq!(
-            requested_work("Read the issue and fix the parser.", &[]),
-            RequestedWork::GenericWrite
-        );
-        assert_eq!(
-            requested_work("Read the local repository README and summarize it.", &[]),
-            RequestedWork::ReadOnly
-        );
-    }
-
-    #[test]
-    fn c2_supported_and_unsupported_actions_need_matching_facts() {
+    fn r2_read_only_and_supported_actions_use_objective_facts() {
         let read = NativeState {
             tool_ok: true,
             forgejo_read_ok: true,
             ..NativeState::default()
         };
         assert_eq!(
-            requested_work("Close the issue after checking it.", &[]),
-            RequestedWork::UnsupportedForgejoWrite
-        );
-        assert_eq!(
-            decide_native_ending(
-                RunEnding::Succeeded,
-                RequestedWork::UnsupportedForgejoWrite,
-                &read
-            ),
+            decide_native_ending(RunEnding::Succeeded, &read),
             RunEnding::NoWork,
-            "a run that only read did no work"
-        );
-        assert_eq!(
-            requested_work("Update the pull request description.", &[]),
-            RequestedWork::PullRequestUpdate
+            "a read-only run is no work"
         );
         let updated = NativeState {
             pr_ok: true,
@@ -2704,17 +2783,8 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(
-                RunEnding::Succeeded,
-                RequestedWork::PullRequestUpdate,
-                &updated
-            ),
+            decide_native_ending(RunEnding::Succeeded, &updated),
             RunEnding::Succeeded
-        );
-        assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &updated),
-            RunEnding::Succeeded,
-            "an accepted pull-request write is work"
         );
         let opened = NativeState {
             pr_ok: true,
@@ -2722,7 +2792,7 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            decide_native_ending(RunEnding::Succeeded, RequestedWork::PullRequest, &opened),
+            decide_native_ending(RunEnding::Succeeded, &opened),
             RunEnding::Succeeded
         );
     }
@@ -2737,76 +2807,7 @@ mod native_proof_tests {
         let combined = format!("{first}{second}");
         assert!(!combined.contains(secret.expose()));
     }
-    #[test]
-    fn c2_nominal_update_and_close_words_are_reads_not_writes() {
-        assert_eq!(
-            requested_work("Read the update.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the close event.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the PR.", &[]),
-            RequestedWork::ForgejoRead
-        );
-        assert_eq!(
-            requested_work("Read the comment.", &[]),
-            RequestedWork::ForgejoRead
-        );
-        assert_eq!(
-            requested_work("Read the code comment in src/main.rs.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the comment in src/main.rs.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the local repository README.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the issue and fix the parser.", &[]),
-            RequestedWork::GenericWrite
-        );
-        assert_eq!(
-            requested_work("Review and change the form.", &[]),
-            RequestedWork::GenericWrite
-        );
-    }
-    #[test]
-    fn c2_action_must_follow_the_connector_and_pr_object_keeps_its_fact() {
-        assert_eq!(
-            requested_work("Read the update and the logs.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the logs and update the file.", &[]),
-            RequestedWork::GenericWrite
-        );
-        assert_eq!(
-            requested_work("Read the PR in the repository.", &[]),
-            RequestedWork::ForgejoRead
-        );
-        assert_eq!(
-            requested_work("Read the code comment in src/main.rs.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the local repository README.", &[]),
-            RequestedWork::ReadOnly
-        );
-        assert_eq!(
-            requested_work("Read the issue and fix the parser.", &[]),
-            RequestedWork::GenericWrite
-        );
-        assert_eq!(
-            requested_work("Review and change the form.", &[]),
-            RequestedWork::GenericWrite
-        );
-    }
+
     #[test]
     fn a1_codex_config_approves_exactly_the_six_product_tools() {
         let text = codex_tool_approvals();
@@ -2838,13 +2839,7 @@ mod native_proof_tests {
             ..NativeState::default()
         };
         assert_eq!(
-            run_reason(
-                RunEnding::Refused,
-                prose,
-                &refused,
-                RequestedWork::Ambiguous
-            )
-            .as_deref(),
+            run_reason(RunEnding::Refused, prose, &refused).as_deref(),
             Some("MCP tool call requires approval, but approval policy is never")
         );
         let first = NativeState {
@@ -2852,8 +2847,7 @@ mod native_proof_tests {
             refused_write: Some("forgejo_update_pull_request: no open pull request".to_owned()),
             ..NativeState::default()
         };
-        let first_reason = run_reason(RunEnding::Refused, prose, &first, RequestedWork::Ambiguous)
-            .expect("reason");
+        let first_reason = run_reason(RunEnding::Refused, prose, &first).expect("reason");
         assert!(first_reason.contains("bubblewrap"), "{first_reason}");
         assert!(
             !first_reason.contains("no open pull request"),
@@ -2863,47 +2857,21 @@ mod native_proof_tests {
             uncertain_write: true,
             ..NativeState::default()
         };
-        let reason = run_reason(
-            RunEnding::Warned,
-            prose,
-            &uncertain,
-            RequestedWork::Ambiguous,
-        )
-        .expect("reason");
+        let reason = run_reason(RunEnding::Warned, prose, &uncertain).expect("reason");
         assert!(!reason.contains("I read the issue"));
         assert!(reason.contains("uncertain"));
         assert_eq!(
-            run_reason(
-                RunEnding::Succeeded,
-                prose,
-                &refused,
-                RequestedWork::Ambiguous
-            )
-            .as_deref(),
+            run_reason(RunEnding::Succeeded, prose, &refused).as_deref(),
             Some(prose)
         );
-        // No work is the run's own neutral sentence, not a generic failure. It is
-        // the reason the card shows after `∅`, so it must be kept.
         assert_eq!(
-            run_reason(
-                RunEnding::NoWork,
-                "nothing new to add",
-                &NativeState::default(),
-                RequestedWork::Ambiguous
-            )
-            .as_deref(),
+            run_reason(RunEnding::NoWork, "nothing new to add", &NativeState::default()).as_deref(),
             Some("nothing new to add")
         );
-        // A warning that is not a refusal never repeats the success prose.
         assert!(
-            !run_reason(
-                RunEnding::Warned,
-                prose,
-                &NativeState::default(),
-                RequestedWork::Ambiguous
-            )
-            .expect("reason")
-            .contains("I read the issue")
+            !run_reason(RunEnding::Warned, prose, &NativeState::default())
+                .expect("reason")
+                .contains("I read the issue")
         );
     }
 }
@@ -3045,12 +3013,10 @@ mod unconfirmed_work_tests {
     #[test]
     fn work_that_needs_a_tool_is_never_success_without_a_confirmed_tool_result() {
         let state = NativeState::new(Program::Codex);
-        let reason = non_success_reason(&state, RequestedWork::GenericWrite);
+        let reason = non_success_reason(&state);
         assert!(reason.contains("no tool call"), "{reason}");
         assert!(reason.contains("sandbox can refuse"), "{reason}");
         assert!(reason.contains("unconfirmed"), "{reason}");
-        assert!(!requires_confirmed_tool(RequestedWork::Ambiguous));
-        assert!(requires_confirmed_tool(RequestedWork::ReadOnly));
     }
 
     #[test]
@@ -3257,6 +3223,7 @@ mod attempt_replay_tests {
         };
         let files = NativeFiles {
             root: root.clone(),
+            ro_dir: root.clone(),
             home: root.join("home"),
             tmp: root.join("tmp"),
             config: root.join("config"),
@@ -3267,8 +3234,11 @@ mod attempt_replay_tests {
             skills: Vec::new(),
             mcp_state: None,
             mcp_socket: None,
+            mcp_cookie: None,
             model_url: Some("http://127.0.0.1:9".to_owned()),
             model_catalog: Some(root.join("catalog.json")),
+            role_mcp_servers: Vec::new(),
+            permissions: crate::engine::settings::RolePermissions::default(),
         };
         let (argv, _, _) =
             build_launch(&plan, &native, Program::Codex, Protocol::Responses, &files)
@@ -3308,6 +3278,7 @@ mod attempt_replay_tests {
             .expect("program mode");
         let files = NativeFiles {
             root: root.clone(),
+            ro_dir: root.clone(),
             home,
             tmp: root.join("tmp"),
             config: root.join("config"),
@@ -3318,8 +3289,11 @@ mod attempt_replay_tests {
             skills: Vec::new(),
             mcp_state: None,
             mcp_socket: None,
+            mcp_cookie: None,
             model_url: None,
             model_catalog: None,
+            role_mcp_servers: Vec::new(),
+            permissions: crate::engine::settings::RolePermissions::default(),
         };
         let path = write_codex_catalog(&files, "gpt-5.6-sol")
             .expect("catalog")

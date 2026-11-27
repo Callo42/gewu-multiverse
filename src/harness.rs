@@ -25,23 +25,23 @@ pub enum Program {
     Opencode,
 }
 
-/// The native programs, in display order. Pi is the fresh-install default.
+/// The native programs, in display order. DeepSeek Harness (`dsh`) is the fresh-install default.
 pub const NATIVE_PROGRAMS: [Program; 4] =
-    [Program::Pi, Program::Codex, Program::Dsh, Program::Opencode];
+    [Program::Dsh, Program::Pi, Program::Codex, Program::Opencode];
 
 /// The official artefact URL for one pinned program.
 pub(crate) fn artefact_url(program: Program) -> Option<&'static str> {
     match program {
         Program::Pi => Some(
-            "https://github.com/earendil-works/pi/releases/download/v1.4.0/pi-linux-x64.tar.gz",
+            "https://github.com/earendil-works/pi/releases/download/v1.6.1/pi-linux-x64.tar.gz",
         ),
         Program::Codex => Some(
-            "https://github.com/openai/codex/releases/download/rust-v0.164.0/codex-package-x86_64-unknown-linux-musl.tar.gz",
+            "https://github.com/openai/codex/releases/download/rust-v0.172.0/codex-package-x86_64-unknown-linux-musl.tar.gz",
         ),
         Program::Opencode => {
-            Some("https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.1.4.tgz")
+            Some("https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-2.4.2.tgz")
         }
-        Program::Dsh => Some("https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.2.1-rc.2.tgz"),
+        Program::Dsh => Some("https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.2.2-rc.5.tgz"),
         Program::Builtin => None,
     }
 }
@@ -49,10 +49,10 @@ pub(crate) fn artefact_url(program: Program) -> Option<&'static str> {
 /// The official artefact SHA-256 for the single-file tarballs.
 pub(crate) fn artefact_sha256(program: Program) -> &'static str {
     match program {
-        Program::Pi => "f2e4e4329603223d03260cdb8bd5033dbdc1f73ba58ab8939db2e56546e115d2",
-        Program::Codex => "3ec55053109608d5038f7e50750f7d25f768dfd740fef071aa710e2559b63aac",
-        Program::Opencode => "ce05abe2dce1041391c8ec8cdb8da066f640fd471e72ac846dcb089c441e11e1",
-        Program::Dsh => "40e3d025c0240c4316ff42dee9bedc7709c0fb38aea10543b47076ed2af52e1d",
+        Program::Pi => "3c7f00715eb512e165c0da8cad314d73c83b54d5bf7748be4adc618fc8357b68",
+        Program::Codex => "63e3b00065ed7f62166d0522e17f663cb866a31d80d03e63365482ed34a1d991",
+        Program::Opencode => "99d288cb5c68411622cbd5a5629afb8f07110cd0a748d7cdd7eb34b08cf56f5a",
+        Program::Dsh => "67da5a3c458f46cd278e0eec6ad0e3a44e99fd13087c6f11a1b362268900a52c",
         Program::Builtin => "",
     }
 }
@@ -178,10 +178,10 @@ impl Program {
     pub fn pinned_version(self) -> &'static str {
         match self {
             Self::Builtin => "",
-            Self::Pi => "1.4.0",
-            Self::Codex => "0.164.0",
-            Self::Dsh => "0.2.1-rc.2",
-            Self::Opencode => "2.1.4",
+            Self::Pi => "1.6.1",
+            Self::Codex => "0.172.0",
+            Self::Dsh => "0.2.2-rc.5",
+            Self::Opencode => "2.4.2",
         }
     }
 
@@ -198,10 +198,10 @@ impl Program {
     pub fn download_mb(self) -> u32 {
         match self {
             Self::Builtin => 0,
-            Self::Pi => 43,
-            Self::Codex => 162,
-            Self::Dsh => 753,
-            Self::Opencode => 240,
+            Self::Pi => 57,
+            Self::Codex => 192,
+            Self::Dsh => 1231,
+            Self::Opencode => 125,
         }
     }
 
@@ -460,7 +460,9 @@ fn dsh_helpers_ready(root: &Path) -> bool {
     else {
         return false;
     };
-    if value.get("version").and_then(serde_json::Value::as_str) != Some("0.2.1-rc.2") {
+    if value.get("version").and_then(serde_json::Value::as_str)
+        != Some(Program::Dsh.pinned_version())
+    {
         return false;
     }
     let platform = node_platform();
@@ -676,11 +678,11 @@ mod tests {
         assert_eq!(lock["lockfileVersion"], 3);
         assert_eq!(
             lock["packages"][""]["dependencies"]["@deepseek-ai/dsh"],
-            "^0.2.1-rc.2"
+            Program::Dsh.pinned_version()
         );
         assert_eq!(
             lock["packages"]["node_modules/@deepseek-ai/dsh"]["version"],
-            "0.2.1-rc.2"
+            Program::Dsh.pinned_version()
         );
         assert!(
             lock["packages"]

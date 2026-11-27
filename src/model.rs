@@ -165,8 +165,8 @@ fn shell_description(method: crate::confinement::Method) -> &'static str {
         Method::Landlock => {
             "Run one shell command with the agent's workspace as its working directory. \
              The run is confined with Landlock: it can read its workspace, this run's \
-             private temporary directory, the system tools, /etc, /proc, /sys and /run, \
-             but not the product's saved keys, your home or another run's files. It is \
+             private temporary directory, the system tools, /etc, /proc and /sys, \
+             but not the product's saved keys, your home, /run/user, /dev/shm or another run's files. It is \
              not a container."
         }
         Method::Bwrap => {
@@ -195,6 +195,19 @@ fn shell_description(method: crate::confinement::Method) -> &'static str {
 /// The declared tools of a run: `shell`, plus the Forgejo tools when the run's
 /// context says the agent can use them.
 pub fn tools_with(forgejo: bool, method: crate::confinement::Method) -> Vec<ToolSpec> {
+    tools_with_permissions(
+        forgejo,
+        &crate::engine::settings::RolePermissions::default(),
+        method,
+    )
+}
+
+/// The declared tools of a run with explicit role Forgejo permissions.
+pub fn tools_with_permissions(
+    forgejo: bool,
+    permissions: &crate::engine::settings::RolePermissions,
+    method: crate::confinement::Method,
+) -> Vec<ToolSpec> {
     let mut declared = vec![ToolSpec {
         kind: "function",
         function: FunctionSpec {
@@ -214,7 +227,7 @@ pub fn tools_with(forgejo: bool, method: crate::confinement::Method) -> Vec<Tool
         },
     }];
     if forgejo {
-        declared.extend(forgejo_tools());
+        declared.extend(forgejo_tools_for_permissions(permissions));
     }
     declared
 }
@@ -373,6 +386,214 @@ pub(crate) fn forgejo_tools() -> Vec<ToolSpec> {
             },
         },
     ]
+}
+
+/// Tiered Forgejo tools enabled for one role's [`RolePermissions`].
+pub(crate) fn forgejo_tools_for_permissions(
+    permissions: &crate::engine::settings::RolePermissions,
+) -> Vec<ToolSpec> {
+    let mut tools = forgejo_tools();
+    let repository = || {
+        serde_json::json!({
+            "type": "string",
+            "description": "The repository as `owner/name`, cloned into your workspace."
+        })
+    };
+    let number = || {
+        serde_json::json!({
+            "type": "integer",
+            "minimum": 1,
+            "description": "The issue or pull-request number in that repository."
+        })
+    };
+    let string_array = |desc: &str| {
+        serde_json::json!({
+            "type": "array",
+            "items": { "type": "string" },
+            "description": desc
+        })
+    };
+    if permissions.triage {
+        tools.extend([
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::LIST_ISSUES,
+                    description: "List issues in a repository cloned into your workspace, optionally filtered by state (`open`, `closed`, `all`) and label names. Read only.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "repository": repository(),
+                            "state": {
+                                "type": "string",
+                                "enum": ["open", "closed", "all"],
+                                "description": "Issue state filter (default `open`)."
+                            },
+                            "labels": string_array("Optional label names to filter by.")
+                        },
+                        "required": ["repository"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::CREATE_ISSUE,
+                    description: "Create a new issue in a cloned repository, optionally setting assignees and labels. Counts against the per-run write bound.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "repository": repository(),
+                            "title": { "type": "string", "description": "Non-empty issue title." },
+                            "body": { "type": "string", "description": "Issue description (at most 8192 bytes)." },
+                            "assignees": string_array("Optional Forgejo login names to assign (e.g. `gewu-coder`)."),
+                            "labels": string_array("Optional label names to attach (missing labels are created automatically).")
+                        },
+                        "required": ["repository", "title"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::UPDATE_ISSUE,
+                    description: "Update an existing issue's title, body, state (`open`/`closed`), assignees, and/or labels. Counts against the per-run write bound.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "repository": repository(),
+                            "number": number(),
+                            "title": { "type": "string", "description": "Updated title." },
+                            "body": { "type": "string", "description": "Updated body." },
+                            "state": { "type": "string", "enum": ["open", "closed"], "description": "Updated state." },
+                            "assignees": string_array("Replace assignees with these Forgejo logins."),
+                            "labels": string_array("Replace labels with these label names.")
+                        },
+                        "required": ["repository", "number"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+        ]);
+    }
+    if permissions.review {
+        tools.extend([
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::LIST_PULL_REQUESTS,
+                    description: "List all open pull requests in a cloned repository (author, title, head -> base, URL). Read only.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "repository": repository()
+                        },
+                        "required": ["repository"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::READ_PULL_DIFF,
+                    description: "Read the unified diff of a pull request in a cloned repository (bounded). Read only.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "repository": repository(),
+                            "number": number()
+                        },
+                        "required": ["repository", "number"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::REVIEW_PULL_REQUEST,
+                    description: "Submit a formal review (`COMMENT`, `APPROVE`, or `REQUEST_CHANGES`) on another role's open pull request. Self-review of your own pull request is refused. Counts against the per-run write bound.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "repository": repository(),
+                            "number": number(),
+                            "event": {
+                                "type": "string",
+                                "enum": ["COMMENT", "APPROVE", "REQUEST_CHANGES"],
+                                "description": "Review verdict."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Review summary (required for COMMENT and REQUEST_CHANGES)."
+                            }
+                        },
+                        "required": ["repository", "number", "event"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+        ]);
+    }
+    if permissions.maintain {
+        tools.extend([
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::MERGE_PULL_REQUEST,
+                    description: "Merge another role's open pull request that has at least one active non-author APPROVE review and no unresolved REQUEST_CHANGES. Self-merge is refused. Counts against the per-run write bound.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "repository": repository(),
+                            "number": number(),
+                            "method": {
+                                "type": "string",
+                                "enum": ["merge", "squash", "rebase"],
+                                "description": "Merge strategy (default `merge`)."
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Optional merge commit title."
+                            }
+                        },
+                        "required": ["repository", "number"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+            ToolSpec {
+                kind: "function",
+                function: FunctionSpec {
+                    name: crate::forgejo_tools::CREATE_REPOSITORY,
+                    description: "Create a new repository under the `team` organisation (initialised with `main`). Never deletes repositories. Counts against the per-run write bound.",
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Repository name (1-64 ASCII letters, digits, `-`, `_`, `.`)."
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Short repository description."
+                            },
+                            "private": {
+                                "type": "boolean",
+                                "description": "Whether the repository is private (default true)."
+                            }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }),
+                },
+            },
+        ]);
+    }
+    tools
 }
 
 /// What one exchange needs: where, which model, which key, how long to wait.

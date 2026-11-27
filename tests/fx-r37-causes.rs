@@ -374,11 +374,11 @@ fn c4_next_follows_the_highlight_and_the_new_programs_own_connection() {
     assert!(frame.contains("next run: Codex"), "{frame}");
     assert!(frame.contains("connection: OpenAI Responses"), "{frame}");
 
-    // Codex -> DeepSeek Harness: its own default is Chat Completions, not the
+    // Codex -> OpenCode: its own default is Chat Completions, not the
     // previous program's Responses.
     press(&mut board, KeyCode::Down);
     let frame = frame_text(&mut board, 120, 24);
-    assert!(frame.contains("next run: DeepSeek Harness"), "{frame}");
+    assert!(frame.contains("next run: OpenCode"), "{frame}");
     assert!(frame.contains("connection: Chat Completions"), "{frame}");
     assert!(
         !sent
@@ -398,11 +398,13 @@ fn c4_next_follows_the_highlight_and_the_new_programs_own_connection() {
 #[test]
 fn c4_choosing_an_uninstalled_program_offers_the_install_first() {
     let mut programs = installed_programs();
-    programs[0].installed = false;
-    programs[0].installed_version = None;
+    if let Some(dsh) = programs.iter_mut().find(|p| p.id == "dsh") {
+        dsh.installed = false;
+        dsh.installed_version = None;
+    }
     let (mut board, sent) = board(view(vec![agent("agent-1", "builtin")], programs));
     open_program(&mut board);
-    // Built-in, then Pi (not installed).
+    // Built-in, then DeepSeek Harness (not installed).
     press(&mut board, KeyCode::Down);
     press(&mut board, KeyCode::Enter);
     assert_eq!(board.screen(), Screen::Program);
