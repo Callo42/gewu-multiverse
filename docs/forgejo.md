@@ -186,15 +186,21 @@ The repository is `owner/name` and must be one of the agent's clones; anything e
 refused with one sentence naming the ones it may use. Opening refuses when the branch
 is the base, has no commits the base lacks, is not on the remote, or already has an open
 request for the pair. Updating changes only the agent's own open request for that
-branch and repository, as the recorded login. The tools never merge, close, reopen,
-delete, label, assign, approve a review, or change a repository or a user.
+branch and repository, as the recorded login. By default, roles receive only these six
+tools; roles may explicitly opt into `triage` (list/create/update issues), `review`
+(list PRs, bounded diff, formal reviews with supervisor self-review block), and
+`maintain` (merge approved non-own PRs with supervisor self-merge & commit-SHA approval
+blocks, and create private `team/*` repositories). Destructive repository deletion and
+organisation administration are never exposed to agents.
 
-A comment, an opened request and an update are writes and each counts against a
-**per-run bound of eight writes**; after that the write tools refuse with one sentence,
-while reads continue. Every call is made with the agent's own key, read at the call. The
-key is not in a model message, a tool result, the transcript, the log, `shell`'s
-environment or the workspace. Every failure reaches the model as one bounded sentence
-naming the class and status, never a raw reply body and never a key.
+All write tools count against a **per-run bound of eight writes** (configurable per role,
+1–64); after that the write tools refuse with one sentence, while reads continue. Every
+call is made with the agent's own key, read at the call; git operations inside agent
+runs authenticate through a supervisor-owned capability-authenticated loopback `GitProxy`
+so the raw Forgejo token is never exposed to the shell. The key is not in a model message,
+a tool result, the transcript, the log, `shell`'s environment or the workspace. Every
+failure reaches the model as one bounded sentence naming the class and status, never a
+raw reply body and never a key.
 
 Each call is recorded in the run's transcript with its tool, repository, number and
 outcome; each successful write is also a run action with its web URL. The board reads

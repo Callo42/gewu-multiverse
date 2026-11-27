@@ -128,10 +128,18 @@ use. Their authority is deliberately narrow:
   for that branch.
 
 The list is assigned-only; a read or a comment in a cloned team repository is not
-gated by the assignment. A comment, an opened request and an update are writes and each
-counts against a **per-run bound of eight writes**. After eight, the write tools refuse with one
-sentence naming the bound, while reads continue. The tools never merge, close, reopen,
-delete, label, assign, approve a review, or change a repository or a user.
+gated by the assignment. Write calls count against a **per-run bound of eight writes**
+(persisted under an exclusive lock before the request runs, and refunded only on a
+pre-2xx refusal). After eight, the write tools refuse with one sentence naming the bound,
+while reads continue.
+
+By default, every role receives only the six least-privilege tools above. Roles may
+explicitly opt into additional Forgejo tiers in `multiverse.toml` (`[agents.permissions]`):
+`triage` (list/create/update issues, labels, assignees), `review` (read bounded PR diffs
+and submit formal reviews, with supervisor-enforced self-review prevention), and
+`maintain` (merge non-author PRs that have a current, non-stale, non-dismissed approval
+matching the PR head SHA, and create private `team/*` repositories). Repository deletion
+and organization administration remain reserved to the human `owner` account.
 
 The Forgejo tools use the agent's **own** key, never the administrator's. The product
 reads it from the credentials file at the call and puts it only in the request's

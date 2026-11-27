@@ -10,8 +10,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 /// Where the bundled Forgejo is in its life.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForgejoState {
     /// The pinned Forgejo binary is not on this machine yet.
     Missing,
@@ -30,7 +32,7 @@ pub enum ForgejoState {
 }
 
 /// The one Forgejo every agent is connected to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgejoView {
     pub state: ForgejoState,
     /// The address the person opens in a browser, e.g. `http://127.0.0.1:3000`.
@@ -53,7 +55,7 @@ pub struct ForgejoView {
 }
 
 /// Whether an agent's Forgejo account is ready.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Provisioning {
     /// Waiting for Forgejo, or its account is being created.
     Pending,
@@ -64,14 +66,14 @@ pub enum Provisioning {
 }
 
 /// What the person asked an agent to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Desired {
     Started,
     Stopped,
 }
 
 /// How one session ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionEnd {
     Succeeded,
     /// The run exited cleanly, but its own final summary says it could not do the
@@ -104,7 +106,7 @@ pub enum SessionEnd {
 }
 
 /// What an agent is doing now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     /// Stopped: no session runs and none will start.
     Idle,
@@ -121,7 +123,7 @@ pub enum SessionState {
 }
 
 /// One native program the product can install, as the Program screen shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramView {
     /// Stable id (`pi`, `codex`, `dsh`, `opencode`).
     pub id: String,
@@ -151,7 +153,7 @@ pub struct ProgramView {
 }
 
 /// The immutable program facts of one run, for active-versus-next display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunProgramView {
     /// Program id.
     pub program: String,
@@ -174,7 +176,7 @@ pub struct RunProgramView {
 /// A run records the request it opened, not what later happened to it. The engine
 /// refreshes these states while the board is open, so the screen can say `merged`
 /// or `closed` instead of repeating the run's `open` forever.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullStateView {
     /// `owner/name` of the repository the request belongs to.
     pub repository: String,
@@ -185,7 +187,7 @@ pub struct PullStateView {
 }
 
 /// One agent, as its card shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentView {
     /// Its name, e.g. `agent-1`.
     pub name: String,
@@ -285,7 +287,7 @@ pub struct AgentView {
 }
 
 /// One agent's kept program and model, named on the upgrade screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeAgent {
     /// The agent's name.
     pub name: String,
@@ -298,7 +300,7 @@ pub struct UpgradeAgent {
 }
 
 /// What an older installation looked like when this version first opened it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpgradeView {
     /// The version recorded by the earlier build, e.g. `0.1.29`.
     pub from_version: String,
@@ -329,7 +331,7 @@ pub struct UpgradeView {
 }
 
 /// How an endpoint test went.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EndpointTest {
     NotRun,
     Running,
@@ -338,7 +340,7 @@ pub enum EndpointTest {
 }
 
 /// The one model endpoint every agent uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointView {
     pub configured: bool,
     /// The completions URL as written (legacy).
@@ -353,7 +355,7 @@ pub struct EndpointView {
 }
 
 /// Everything the board shows, read once per frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardView {
     /// The first-run terms were acknowledged (agents cannot start before).
     pub terms_acknowledged: bool,
@@ -384,7 +386,7 @@ pub struct BoardView {
 }
 
 /// What the board can ask for. Every command returns at once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Record the first-run terms.
     AcknowledgeTerms,
@@ -444,6 +446,26 @@ pub enum Command {
     },
     /// Add one more agent (the next free `agent-N`).
     AddAgent,
+    /// Add one named role (semantic name such as `pm`, `coder`, `reviewer`, or `agent-N`).
+    AddNamedAgent {
+        name: String,
+    },
+    /// Update one role's wake mode, context configuration, permissions, or non-secret env.
+    SetAgentRoleConfig {
+        name: String,
+        wake_mode: Option<Option<String>>,
+        wake_interval_secs: Option<Option<u64>>,
+        context: Option<crate::engine::settings::RoleContextConfig>,
+        permissions: Option<crate::engine::settings::RolePermissions>,
+        env_updates: Vec<(String, String)>,
+        env_removals: Vec<String>,
+    },
+    /// Update installation-wide defaults (`wake_mode`, `default_context`, `runtime_idle_secs`).
+    SetGlobalRoleDefaults {
+        wake_mode: Option<String>,
+        default_context: Option<String>,
+        runtime_idle_secs: Option<u64>,
+    },
     /// Stop it, revoke its token, remove it from the organisation; its Forgejo account
     /// and its history stay.
     RemoveAgent {
@@ -479,6 +501,14 @@ pub trait EngineApi {
     fn readable_transcript(&self, agent: &str) -> Option<PathBuf> {
         let _ = agent;
         None
+    }
+    /// Whether this engine handle is attached remotely to a live `--headless` daemon.
+    fn is_attached(&self) -> bool {
+        false
+    }
+    /// Explicitly request a live remote daemon to shut down (only used when attached).
+    fn stop_daemon(&mut self) -> Result<(), String> {
+        Ok(())
     }
     /// Stop every session and the Forgejo; wait at most `grace` before forcing.
     fn shutdown(&mut self, grace: Duration);

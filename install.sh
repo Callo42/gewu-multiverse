@@ -6,15 +6,15 @@
 #
 #   sh install.sh v0.1.0            # a specific release tag instead of the latest
 #   sh install.sh --tarball ./gewu-multiverse-*-x86_64-linux.tar.gz [--checksum ./file.sha256]
-#   sh install.sh --harness pi,codex
+#   sh install.sh --harness dsh,pi,codex
 #   GEWU_HARNESSES=pi,opencode sh install.sh
 #   INSTALL_DIR=$HOME/bin sh install.sh
 #
 # Release archives include the verified Forgejo 17.0.0 binary under forgejo/, so
 # installing from a release archive (online or via --tarball) prepares Forgejo
 # without a second download.
-# The default program is Pi. --harness none installs no agent program.
-# A new agent still starts as Pi (not installed) until the built-in engine is chosen.
+# The default program is DeepSeek Harness (`dsh`). --harness none installs no agent program.
+# A new agent still starts as DeepSeek Harness (dsh, not installed) until another program is chosen.
 # Ctrl-C during a download, unpack or program install cancels it; the binary that
 # was already installed stays in place.
 #
@@ -27,7 +27,7 @@ repo=Callo42/gewu-multiverse
 tag=
 local_tarball=
 local_checksum=
-harnesses=${GEWU_HARNESSES:-pi}
+harnesses=${GEWU_HARNESSES:-dsh}
 dir=${INSTALL_DIR:-$HOME/.local/bin}
 floor=2.39
 tmp=

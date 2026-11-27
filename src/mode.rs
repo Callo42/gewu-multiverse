@@ -6,9 +6,36 @@
 
 use std::fs;
 use std::io;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Constant-time byte-slice equality check for authentication cookies and tokens.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Generate a 256-bit cryptographically random lowercase hex string from `/dev/urandom`.
+pub fn random_hex_256() -> io::Result<String> {
+    let mut bytes = [0u8; 32];
+    let mut f = fs::File::open("/dev/urandom")?;
+    f.read_exact(&mut bytes)?;
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
+}
 
 /// The only mode the credentials file may have: its user alone may read and write it.
 pub const SECRET_FILE_MODE: u32 = 0o600;
@@ -102,7 +129,9 @@ pub fn render(mode: u32) -> String {
 /// Write a whole file with mode 0600, replacing whatever was there.
 ///
 /// The mode is set at creation and checked afterwards, so a file that already
-/// existed with a wider mode does not keep it.
+/// existed with a wider mode does not keep it. The staging file is created with
+/// `O_CREAT | O_EXCL | O_NOFOLLOW` and a unique suffix so a symlink planted beside
+/// the target can never hijack the write.
 pub fn write_private(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
     let path = path.as_ref();
     // A configuration file may be a symlink the person made on purpose. Write the
@@ -111,32 +140,287 @@ pub fn write_private(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
         Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
         _ => path.to_path_buf(),
     };
+    write_private_atomic(&path, bytes)
+}
+
+/// Write a whole file with mode 0600, **strictly refusing symlinks** at the target
+/// path or staging file.
+///
+/// Used for supervisor-owned runtime files, keys, cookies, pointers and harness
+/// configs so an agent cannot plant a symlink to clobber arbitrary host files.
+pub fn write_private_nofollow(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is a symlink and cannot be written", path.display()),
+            ));
+        }
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+    }
+    write_private_atomic(path, bytes)
+}
+
+/// Read a private regular file with `O_NOFOLLOW`, verifying it is a regular file
+/// owned by the current effective UID (never a symlink or FIFO).
+pub fn read_private_regular(path: impl AsRef<Path>) -> io::Result<String> {
+    let path = path.as_ref();
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let my_uid = rustix::process::geteuid().as_raw();
+    if meta.uid() != my_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not owned by the current user", path.display()),
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Open (creating missing directories with mode `0700`) `target` strictly beneath
+/// `root` using fd-relative `mkdirat` + `openat(..., O_DIRECTORY | O_NOFOLLOW)`.
+///
+/// Every step from `root` down is pinned by directory file descriptor, so even a
+/// concurrent `renameat2(RENAME_EXCHANGE)` swapping an intermediate directory with
+/// a symlink cannot redirect traversal outside `root` (zero TOCTOU).
+fn open_dir_nofollow_under(root: &Path, target: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::{Mode, fstat, mkdirat};
+    use std::path::Component;
+
+    let my_uid = rustix::process::geteuid().as_raw();
+    let mut cur = open(
+        root,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} must be a regular directory (not a symlink): {e}",
+                root.display()
+            ),
+        )
+    })?;
+    let root_stat = fstat(&cur).map_err(|e| io::Error::other(e.to_string()))?;
+    if root_stat.st_uid != my_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not owned by the current user", root.display()),
+        ));
+    }
+    let rel = target.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is outside protected root {}",
+                target.display(),
+                root.display()
+            ),
+        )
+    })?;
+    let dir_mode = Mode::from_bits_truncate(PRIVATE_DIR_MODE);
+    for comp in rel.components() {
+        match comp {
+            Component::CurDir => continue,
+            Component::Normal(seg) => {
+                match mkdirat(&cur, seg, dir_mode) {
+                    Ok(()) | Err(Errno::EEXIST) => {}
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "cannot create directory `{}` under {}: {e}",
+                                seg.to_string_lossy(),
+                                root.display()
+                            ),
+                        ));
+                    }
+                }
+                let next = openat(
+                    &cur,
+                    seg,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "component `{}` under {} is a symlink or non-directory and cannot be traversed: {e}",
+                            seg.to_string_lossy(),
+                            root.display()
+                        ),
+                    )
+                })?;
+                let st = fstat(&next).map_err(|e| io::Error::other(e.to_string()))?;
+                if st.st_uid != my_uid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "component `{}` under {} is not owned by the current user",
+                            seg.to_string_lossy(),
+                            root.display()
+                        ),
+                    ));
+                }
+                cur = next;
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} contains disallowed path traversal", target.display()),
+                ));
+            }
+        }
+    }
+    Ok(cur)
+}
+
+/// Create `target` strictly beneath `root` without following any symlink component.
+pub fn ensure_dir_nofollow_under(root: &Path, target: &Path) -> io::Result<()> {
+    let _fd = open_dir_nofollow_under(root, target)?;
+    Ok(())
+}
+
+/// Write a mode-0600 file strictly beneath `root`, performing the entire directory
+/// walk, staging file creation (`O_CREAT | O_EXCL | O_NOFOLLOW`), `fchmod`, and
+/// `renameat` relative to the pinned parent directory file descriptor so concurrent
+/// `renameat2(RENAME_EXCHANGE)` symlink swaps can never redirect the write outside `root`.
+pub fn write_private_nofollow_under(
+    root: &Path,
+    path: impl AsRef<Path>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{AtFlags, OFlag, openat, renameat};
+    use nix::sys::stat::{Mode, SFlag, fstatat};
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+
+    let path = path.as_ref();
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no file name", path.display()),
+        )
+    })?;
+    let dir_fd = open_dir_nofollow_under(root, parent)?;
+
+    match fstatat(&dir_fd, file_name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(st) => {
+            let kind = st.st_mode & SFlag::S_IFMT.bits();
+            if kind == SFlag::S_IFLNK.bits() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is a symlink and cannot be written", path.display()),
+                ));
+            }
+            if kind != SFlag::S_IFREG.bits() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a regular file", path.display()),
+                ));
+            }
+            if (st.st_mode & 0o222) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} is read-only", path.display()),
+                ));
+            }
+        }
+        Err(Errno::ENOENT) => {}
+        Err(e) => return Err(io::Error::other(e.to_string())),
+    }
+
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let rand_tag = random_hex_256()
+        .map(|h| h[..16].to_owned())
+        .unwrap_or_else(|_| format!("{seq}"));
+    let name_str = file_name.to_str().unwrap_or("file");
+    let stage_name = format!(".{name_str}.part-{}-{seq}-{rand_tag}", std::process::id());
+    let stage_fd = openat(
+        &dir_fd,
+        stage_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(SECRET_FILE_MODE),
+    )
+    .map_err(|e| io::Error::other(format!("staging file under {} failed: {e}", parent.display())))?;
+
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::File::from(stage_fd);
+        file.write_all(bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))?;
+        file.sync_all()?;
+        drop(file);
+        renameat(&dir_fd, stage_name.as_str(), &dir_fd, file_name)
+            .map_err(|e| io::Error::other(format!("atomic rename into {} failed: {e}", path.display())))
+    })();
+    if result.is_err() {
+        let _ = unlinkat(&dir_fd, stage_name.as_str(), UnlinkatFlags::NoRemoveDir);
+    }
+    result
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // A rename into a writable directory can replace a read-only file, which the old
     // truncate-and-write could not do. Keep the refusal a read-only target earned:
     // the caller's one sentence says the file cannot be written.
-    if let Ok(metadata) = fs::metadata(&path) {
-        if metadata.permissions().readonly() {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_symlink() && metadata.permissions().readonly() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("{} is read-only", path.display()),
             ));
         }
     }
-    // Write a temporary file beside the target and rename it into place, so another
-    // process reading a secret while it is rewritten sees either the old file or the
-    // new one, never a half-written line.
-    let stage = path.with_extension(format!("part-{}", std::process::id()));
+    // Write a unique temporary file beside the target using O_CREAT | O_EXCL | O_NOFOLLOW,
+    // set mode 0600 on the open file descriptor (`fchmod`, never path-based `chmod`),
+    // and atomically rename it into place.
+    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let rand_tag = random_hex_256()
+        .map(|h| h[..16].to_owned())
+        .unwrap_or_else(|_| format!("{seq}"));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    let stage = path.with_file_name(format!(".{name}.part-{}-{seq}-{rand_tag}", std::process::id()));
     let result = (|| -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(SECRET_FILE_MODE)
+            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
             .open(&stage)?;
         file.write_all(bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))?;
         file.sync_all()?;
-        set_mode(&stage, SECRET_FILE_MODE)?;
-        fs::rename(&stage, &path)
+        fs::rename(&stage, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&stage);
@@ -207,5 +491,98 @@ mod tests {
         write_private(&path, b"second").expect("written again");
         assert_eq!(mode_of(&path).expect("mode readable"), 0o600);
         assert_eq!(fs::read_to_string(&path).expect("readable"), "second");
+    }
+
+    #[test]
+    fn write_private_nofollow_refuses_symlinks_and_preserves_target() {
+        let root = crate::test_support::scratch_root("mode-nofollow");
+        let target = root.join("victim.txt");
+        fs::write(&target, "untouched").expect("victim");
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(write_private_nofollow(&link, b"clobbered").is_err());
+        assert_eq!(fs::read_to_string(&target).expect("read"), "untouched");
+        assert!(read_private_regular(&link).is_err());
+    }
+
+    #[test]
+    fn write_private_nofollow_under_rejects_symlinked_ancestor_directory() {
+        let root = crate::test_support::scratch_root("mode-ancestor-nofollow");
+        let rt_root = root.join("rt");
+        let victim = root.join("victim");
+        fs::create_dir_all(&rt_root).expect("rt");
+        fs::create_dir_all(&victim).expect("victim");
+        fs::write(victim.join("config.toml"), "original").expect("victim config");
+        std::os::unix::fs::symlink(&victim, rt_root.join("codex")).expect("symlink ancestor");
+
+        let err = ensure_dir_nofollow_under(&rt_root, &rt_root.join("codex/sub"))
+            .expect_err("symlinked ancestor dir must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let err = write_private_nofollow_under(
+            &rt_root,
+            rt_root.join("codex/config.toml"),
+            b"attacker",
+        )
+        .expect_err("write through symlinked ancestor must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(
+            fs::read_to_string(victim.join("config.toml")).expect("read victim"),
+            "original"
+        );
+    }
+
+    #[test]
+    fn write_private_nofollow_under_is_immune_to_concurrent_rename_exchange_race() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = crate::test_support::scratch_root("mode-n6-race");
+        let rt_root = root.join("rt");
+        let codex = rt_root.join("codex");
+        let real_skills = codex.join("skills");
+        let symlink_alt = codex.join("skills-link");
+        let victim = root.join("victim");
+        fs::create_dir_all(&real_skills).expect("skills");
+        fs::create_dir_all(&victim).expect("victim");
+        std::os::unix::fs::symlink(&victim, &symlink_alt).expect("symlink alt");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let codex_bg = codex.clone();
+        let racer = std::thread::spawn(move || {
+            use nix::fcntl::{OFlag, RenameFlags, open, renameat2};
+            use nix::sys::stat::Mode;
+            let dir_fd = open(
+                &codex_bg,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("open codex");
+            while !stop_bg.load(Ordering::Relaxed) {
+                let _ = renameat2(
+                    &dir_fd,
+                    "skills",
+                    &dir_fd,
+                    "skills-link",
+                    RenameFlags::RENAME_EXCHANGE,
+                );
+            }
+        });
+
+        for i in 0..300 {
+            let target = rt_root.join(format!("codex/skills/pwn-{i}.txt"));
+            let _ = write_private_nofollow_under(&rt_root, &target, b"RACE-DATA");
+            assert!(
+                !victim.join(format!("pwn-{i}.txt")).exists(),
+                "TOCTOU race escaped root on iteration {i}"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = racer.join();
+        assert_eq!(
+            fs::read_dir(&victim).expect("read victim").count(),
+            0,
+            "victim directory must remain completely empty"
+        );
     }
 }

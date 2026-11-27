@@ -133,7 +133,9 @@ sys.stdin.read()
 root = os.environ["PI_CODING_AGENT_DIR"]
 with open(os.path.join(root, "mcp.json")) as handle:
     config = json.load(handle)
-socket_path = config["mcpServers"]["gewu_forgejo"]["args"][1]
+args = config["mcpServers"]["gewu_forgejo"]["args"]
+socket_path = args[1]
+cookie = open(args[2]).read().strip() if len(args) > 2 else None
 stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 for _ in range(200):
     try:
@@ -141,6 +143,8 @@ for _ in range(200):
         break
     except OSError:
         time.sleep(0.02)
+if cookie:
+    stream.sendall((json.dumps({"gewu_mcp_auth": cookie}) + "\n").encode())
 reader = stream.makefile("rb")
 
 def call(number, name, arguments):
@@ -183,7 +187,9 @@ sys.stdin.read()
 root = os.environ["PI_CODING_AGENT_DIR"]
 with open(os.path.join(root, "mcp.json")) as handle:
     config = json.load(handle)
-socket_path = config["mcpServers"]["gewu_forgejo"]["args"][1]
+args = config["mcpServers"]["gewu_forgejo"]["args"]
+socket_path = args[1]
+cookie = open(args[2]).read().strip() if len(args) > 2 else None
 stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 for _ in range(200):
     try:
@@ -191,6 +197,8 @@ for _ in range(200):
         break
     except OSError:
         time.sleep(0.02)
+if cookie:
+    stream.sendall((json.dumps({"gewu_mcp_auth": cookie}) + "\n").encode())
 reader = stream.makefile("rb")
 
 def send(request):
@@ -233,7 +241,9 @@ subprocess.run(["git", "push", "-q", "origin", "feature"], cwd=clone, check=True
 root = os.environ["PI_CODING_AGENT_DIR"]
 with open(os.path.join(root, "mcp.json")) as handle:
     config = json.load(handle)
-socket_path = config["mcpServers"]["gewu_forgejo"]["args"][1]
+args = config["mcpServers"]["gewu_forgejo"]["args"]
+socket_path = args[1]
+cookie = open(args[2]).read().strip() if len(args) > 2 else None
 stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 for _ in range(200):
     try:
@@ -241,6 +251,8 @@ for _ in range(200):
         break
     except OSError:
         time.sleep(0.02)
+if cookie:
+    stream.sendall((json.dumps({"gewu_mcp_auth": cookie}) + "\n").encode())
 reader = stream.makefile("rb")
 
 def send(request):
@@ -836,7 +848,9 @@ with open("README.md", "a") as handle:
 root = os.environ["PI_CODING_AGENT_DIR"]
 with open(os.path.join(root, "mcp.json")) as handle:
     config = json.load(handle)
-socket_path = config["mcpServers"]["gewu_forgejo"]["args"][1]
+args = config["mcpServers"]["gewu_forgejo"]["args"]
+socket_path = args[1]
+cookie = open(args[2]).read().strip() if len(args) > 2 else None
 stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 for _ in range(200):
     try:
@@ -844,6 +858,8 @@ for _ in range(200):
         break
     except OSError:
         time.sleep(0.02)
+if cookie:
+    stream.sendall((json.dumps({"gewu_mcp_auth": cookie}) + "\n").encode())
 reader = stream.makefile("rb")
 
 def send(request):

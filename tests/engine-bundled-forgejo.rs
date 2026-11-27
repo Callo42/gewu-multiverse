@@ -597,6 +597,22 @@ fn the_bundled_engine_runs_a_started_agent_until_stopped() {
         },
     );
     choose_builtin(&mut engine, &["agent-1", "agent-2"]);
+    // Exercise the v0.1.30 periodic wake schedule during this two-minute load test so
+    // brief `NoWork` turns resume after 20 s rather than waiting for the v0.2.0 hybrid
+    // 300 s fallback timer.
+    for name in ["agent-1", "agent-2"] {
+        engine
+            .send(Command::SetAgentRoleConfig {
+                name: name.to_owned(),
+                wake_mode: Some(Some("periodic".to_owned())),
+                wake_interval_secs: Some(Some(20)),
+                context: None,
+                permissions: None,
+                env_updates: Vec::new(),
+                env_removals: Vec::new(),
+            })
+            .expect("periodic schedule is selectable");
+    }
     let board = engine.board();
     assert_eq!(board.agents[0].login, "gewu-agent-1");
     assert_eq!(board.agents[1].login, "gewu-agent-2");
@@ -1099,6 +1115,7 @@ fn a_relative_configuration_root_writes_the_first_runs_plan_and_log() {
         email: "gewu-agent-1@agents.invalid".to_owned(),
         forgejo_url: "http://127.0.0.1:1".to_owned(),
         native: None,
+        role: Default::default(),
         repositories: Vec::new(),
         confinement: gewu_multiverse::confinement::Method::None,
         hide: Vec::new(),
@@ -2208,6 +2225,22 @@ fn two_agents_load_a_v0130_shaped_data_directory_for_two_minutes() {
         },
     );
     choose_builtin(&mut engine, &["agent-1", "agent-2"]);
+    // Exercise the v0.1.30 periodic wake schedule during this two-minute load test so
+    // brief `NoWork` turns resume after 20 s rather than waiting for the v0.2.0 hybrid
+    // 300 s fallback timer.
+    for name in ["agent-1", "agent-2"] {
+        engine
+            .send(Command::SetAgentRoleConfig {
+                name: name.to_owned(),
+                wake_mode: Some(Some("periodic".to_owned())),
+                wake_interval_secs: Some(Some(20)),
+                context: None,
+                permissions: None,
+                env_updates: Vec::new(),
+                env_removals: Vec::new(),
+            })
+            .expect("periodic schedule is selectable");
+    }
     for name in ["agent-1", "agent-2"] {
         fs::write(
             engine.instruction_path(name).expect("the instruction path"),

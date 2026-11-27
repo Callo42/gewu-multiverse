@@ -46,10 +46,10 @@ pub const STATUS_SNAPSHOT_FILE: &str = "headless-status.json";
 pub const CONTROL_SOCKET_FILE: &str = "headless.sock";
 
 /// Upper bound on a single `--control` request payload.
-const MAX_CONTROL_REQUEST_BYTES: u64 = 16 * 1024;
+const MAX_CONTROL_REQUEST_BYTES: u64 = 128 * 1024;
 
-/// Upper bound on a single `--control` response payload.
-const MAX_CONTROL_RESPONSE_BYTES: u64 = 512 * 1024;
+/// Upper bound on a single `--control` response payload (covers 20-agent `BoardView` snapshots).
+const MAX_CONTROL_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Server-side socket read/write bound so a stalled client cannot block `run_headless`.
 const SERVER_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
@@ -252,6 +252,12 @@ fn apply_configure(
             summary.push(format!("added agent `{}`", last.name));
         }
     }
+    if let Some(role_name) = &cli.add_role {
+        engine.send(Command::AddNamedAgent {
+            name: role_name.clone(),
+        })?;
+        summary.push(format!("added role `{role_name}`"));
+    }
     if let Some(remove) = &cli.remove_agent {
         if !engine.board().agents.iter().any(|a| &a.name == remove) {
             return Err(format!("there is no agent named `{remove}`"));
@@ -283,9 +289,46 @@ fn apply_configure(
         }
     }
 
+    let explicit_agent = cli.agent.as_ref().or(cli.add_role.as_ref());
+    let has_per_role_only_flags = cli.wake_interval.is_some()
+        || !cli.context_views.is_empty()
+        || !cli.context_repos.is_empty()
+        || !cli.context_labels.is_empty()
+        || cli.hydrate_cmd.is_some()
+        || cli.allow_triage
+        || cli.allow_review
+        || cli.allow_maintain
+        || cli.write_bound.is_some()
+        || !cli.env_vars.is_empty()
+        || !cli.secret_env_files.is_empty();
+    let role_scoped_wake_or_ctx =
+        (explicit_agent.is_some() || has_per_role_only_flags)
+            && (cli.wake_mode.is_some() || cli.context_mode.is_some());
+
+    if cli.runtime_idle_secs.is_some()
+        || (!role_scoped_wake_or_ctx && (cli.wake_mode.is_some() || cli.context_mode.is_some()))
+    {
+        engine.send(Command::SetGlobalRoleDefaults {
+            wake_mode: if !role_scoped_wake_or_ctx {
+                cli.wake_mode.clone()
+            } else {
+                None
+            },
+            default_context: if !role_scoped_wake_or_ctx {
+                cli.context_mode.clone()
+            } else {
+                None
+            },
+            runtime_idle_secs: cli.runtime_idle_secs,
+        })?;
+        summary.push("updated global role defaults".to_owned());
+    }
+
     let need_agent_targets = requested_program.is_some()
         || requested_codex_sandbox.is_some()
         || cli.instruction_file.is_some()
+        || has_per_role_only_flags
+        || role_scoped_wake_or_ctx
         || (has_conn_inputs && defer_conn_to_agents);
 
     let target_agents: Vec<String> = if need_agent_targets {
@@ -295,14 +338,14 @@ fn apply_configure(
             .into_iter()
             .map(|agent| agent.name)
             .collect();
-        if let Some(explicit) = &cli.agent {
+        if let Some(explicit) = explicit_agent {
             if !existing.iter().any(|name| name == explicit) {
                 return Err(format!("there is no agent named `{explicit}`"));
             }
             vec![explicit.clone()]
         } else if existing.is_empty() {
             return Err(
-                "no agents exist yet; pass `--agents <count>` (or `--add-agent`) before configuring an agent"
+                "no agents exist yet; pass `--agents <count>` (or `--add-agent` / `--add-role <name>`) before configuring an agent"
                     .to_owned(),
             );
         } else if existing.len() == 1 {
@@ -444,6 +487,149 @@ fn apply_configure(
             summary.push(format!(
                 "wrote instruction for `{name}` ({} chars)",
                 text.chars().count()
+            ));
+        }
+
+        let has_role_settings_change = role_scoped_wake_or_ctx
+            || cli.wake_interval.is_some()
+            || !cli.context_views.is_empty()
+            || !cli.context_repos.is_empty()
+            || !cli.context_labels.is_empty()
+            || cli.hydrate_cmd.is_some()
+            || cli.allow_triage
+            || cli.allow_review
+            || cli.allow_maintain
+            || cli.write_bound.is_some()
+            || !cli.env_vars.is_empty();
+        if has_role_settings_change {
+            let current_settings = Settings::load(&settings::path_in(layout.root()))?;
+            let global_ctx = current_settings.effective_default_context();
+            let saved_agent = current_settings.agent(name);
+
+            let next_context = if (role_scoped_wake_or_ctx && cli.context_mode.is_some())
+                || !cli.context_views.is_empty()
+                || !cli.context_repos.is_empty()
+                || !cli.context_labels.is_empty()
+                || cli.hydrate_cmd.is_some()
+            {
+                let mut ctx = saved_agent
+                    .map(|a| a.effective_context(global_ctx))
+                    .unwrap_or_default();
+                if let Some(mode_raw) = cli.context_mode.as_deref() {
+                    ctx.mode = settings::ContextMode::parse(mode_raw).ok_or_else(|| {
+                        format!("unknown context mode `{mode_raw}` (choose none or self)")
+                    })?;
+                }
+                for view_name in &cli.context_views {
+                    let v = view_name.trim();
+                    if v != "open_pulls" && v != "unassigned_issues" {
+                        return Err(format!(
+                            "unknown --context-view `{v}` (choose open_pulls or unassigned_issues)"
+                        ));
+                    }
+                    if !ctx.views.iter().any(|existing| existing == v) {
+                        ctx.views.push(v.to_owned());
+                    }
+                    if ctx.mode == settings::ContextMode::None {
+                        ctx.mode = settings::ContextMode::SelfOnly;
+                    }
+                }
+                for repo in &cli.context_repos {
+                    let r = repo.trim();
+                    if !r.is_empty() && !ctx.repos.iter().any(|existing| existing == r) {
+                        ctx.repos.push(r.to_owned());
+                    }
+                }
+                for label in &cli.context_labels {
+                    let l = label.trim();
+                    if !l.is_empty() && !ctx.labels.iter().any(|existing| existing == l) {
+                        ctx.labels.push(l.to_owned());
+                    }
+                }
+                if let Some(cmd) = &cli.hydrate_cmd {
+                    let trimmed = cmd.trim();
+                    ctx.hydrate_cmd = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+                    if ctx.hydrate_cmd.is_some() && ctx.mode == settings::ContextMode::None {
+                        ctx.mode = settings::ContextMode::SelfOnly;
+                    }
+                }
+                Some(ctx)
+            } else {
+                None
+            };
+
+            let next_permissions = if cli.allow_triage
+                || cli.allow_review
+                || cli.allow_maintain
+                || cli.write_bound.is_some()
+            {
+                let mut perms = saved_agent
+                    .map(settings::AgentSettings::effective_permissions)
+                    .unwrap_or_default();
+                if cli.allow_triage {
+                    perms.triage = true;
+                }
+                if cli.allow_review {
+                    perms.review = true;
+                }
+                if cli.allow_maintain {
+                    perms.maintain = true;
+                }
+                if let Some(bound) = cli.write_bound {
+                    if !(1..=32).contains(&bound) {
+                        return Err(format!(
+                            "--write-bound must be between 1 and 32 (got {bound})"
+                        ));
+                    }
+                    perms.write_bound = Some(bound);
+                }
+                Some(perms)
+            } else {
+                None
+            };
+
+            engine.send(Command::SetAgentRoleConfig {
+                name: name.clone(),
+                wake_mode: if role_scoped_wake_or_ctx && cli.wake_mode.is_some() {
+                    Some(cli.wake_mode.clone())
+                } else {
+                    None
+                },
+                wake_interval_secs: cli.wake_interval.map(Some),
+                context: next_context,
+                permissions: next_permissions,
+                env_updates: cli.env_vars.clone(),
+                env_removals: Vec::new(),
+            })?;
+            summary.push(format!("configured role settings for `{name}`"));
+        }
+
+        for (secret_key, secret_path) in &cli.secret_env_files {
+            settings::validate_external_env_key(secret_key)?;
+            let raw = fs::read_to_string(secret_path).map_err(|error| {
+                format!(
+                    "secret env file {} for `{secret_key}` cannot be read: {error}",
+                    secret_path.display()
+                )
+            })?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "secret env file {} for `{secret_key}` is empty",
+                    secret_path.display()
+                ));
+            }
+            credentials::record_agent_env_secret(
+                &layout.credentials_file(),
+                name,
+                secret_key,
+                trimmed,
+            )
+            .map_err(|error| {
+                format!("secret env `{secret_key}` for `{name}` cannot be stored: {error}")
+            })?;
+            summary.push(format!(
+                "stored 0600 secret env `{secret_key}` for `{name}`"
             ));
         }
     }
@@ -1326,10 +1512,18 @@ impl StopOnNoWorkTracker {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ControlRequest {
     #[serde(default)]
     auth_cookie: String,
+    /// Optional extended action (`"control"` / absent = legacy `--control`; `"board_snapshot"`,
+    /// `"engine_command"`, `"session_files"`, `"shutdown_daemon"` for attached TUI consoles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<Command>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
     #[serde(default)]
     start_agents: Vec<String>,
     #[serde(default)]
@@ -1344,7 +1538,7 @@ struct ControlRequest {
     keep_running: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ControlResponse {
     pub ok: bool,
     #[serde(default)]
@@ -1353,6 +1547,12 @@ pub struct ControlResponse {
     pub error: Option<String>,
     #[serde(default)]
     pub status: Option<StatusReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_files: Option<(PathBuf, PathBuf)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readable_transcript: Option<PathBuf>,
 }
 
 fn validate_headless_preconditions(
@@ -1503,10 +1703,15 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
         let mut last_agent_lines: HashMap<String, String> = HashMap::new();
         let mut last_snapshot_sig = String::new();
         let mut last_snapshot_written_at: Option<Instant> = None;
+        let mut shutdown_requested = false;
 
         loop {
-            if signals.requested() {
-                log_daemon("termination signal received; shutting down");
+            if signals.requested() || shutdown_requested {
+                log_daemon(if shutdown_requested {
+                    "shutdown requested by attached console; shutting down"
+                } else {
+                    "termination signal received; shutting down"
+                });
                 break;
             }
             let _ = drain_control_requests(
@@ -1516,10 +1721,15 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
                 &mut engine,
                 &mut auto_park,
                 &mut daemon_stop_on_no_work,
+                &mut shutdown_requested,
                 &state_root,
                 &mut last_snapshot_sig,
                 &mut last_snapshot_written_at,
             );
+            if shutdown_requested {
+                log_daemon("shutdown requested by attached console; shutting down");
+                break;
+            }
 
             engine.tick();
             let parked = auto_park.reconcile_after_tick(&mut engine);
@@ -1575,7 +1785,7 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
             );
 
             for _ in 0..10 {
-                if signals.requested() {
+                if signals.requested() || shutdown_requested {
                     break;
                 }
                 if drain_control_requests(
@@ -1585,6 +1795,7 @@ pub fn run_headless(cli: HeadlessCli) -> Result<(), String> {
                     &mut engine,
                     &mut auto_park,
                     &mut daemon_stop_on_no_work,
+                    &mut shutdown_requested,
                     &state_root,
                     &mut last_snapshot_sig,
                     &mut last_snapshot_written_at,
@@ -1629,6 +1840,7 @@ fn drain_control_requests(
     engine: &mut Engine,
     auto_park: &mut StopOnNoWorkTracker,
     daemon_stop_on_no_work: &mut bool,
+    shutdown_requested: &mut bool,
     state_root: &Path,
     last_snapshot_sig: &mut String,
     last_snapshot_written_at: &mut Option<Instant>,
@@ -1653,6 +1865,7 @@ fn drain_control_requests(
             engine,
             auto_park,
             daemon_stop_on_no_work,
+            shutdown_requested,
             state_root,
             last_snapshot_sig,
             last_snapshot_written_at,
@@ -1671,6 +1884,7 @@ fn handle_one_control_stream(
     engine: &mut Engine,
     auto_park: &mut StopOnNoWorkTracker,
     daemon_stop_on_no_work: &mut bool,
+    shutdown_requested: &mut bool,
     state_root: &Path,
     last_snapshot_sig: &mut String,
     last_snapshot_written_at: &mut Option<Instant>,
@@ -1679,30 +1893,28 @@ fn handle_one_control_stream(
     let _ = stream.set_read_timeout(Some(SERVER_SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SERVER_SOCKET_TIMEOUT));
 
+    let err_resp = |msg: String| ControlResponse {
+        ok: false,
+        error: Some(msg),
+        ..ControlResponse::default()
+    };
+
     let my_uid = rustix::process::geteuid();
     match rustix::net::sockopt::get_socket_peercred(&stream) {
         Ok(cred) if cred.uid == my_uid => {}
         Ok(cred) => {
-            let resp = ControlResponse {
-                ok: false,
-                actions: Vec::new(),
-                error: Some(format!(
-                    "control socket rejected peer uid {} (expected {})",
-                    cred.uid.as_raw(),
-                    my_uid.as_raw()
-                )),
-                status: None,
-            };
+            let resp = err_resp(format!(
+                "control socket rejected peer uid {} (expected {})",
+                cred.uid.as_raw(),
+                my_uid.as_raw()
+            ));
             let _ = write_control_response(&mut stream, &resp);
             return;
         }
         Err(error) => {
-            let resp = ControlResponse {
-                ok: false,
-                actions: Vec::new(),
-                error: Some(format!("control socket peer credentials check failed: {error}")),
-                status: None,
-            };
+            let resp = err_resp(format!(
+                "control socket peer credentials check failed: {error}"
+            ));
             let _ = write_control_response(&mut stream, &resp);
             return;
         }
@@ -1715,57 +1927,123 @@ fn handle_one_control_stream(
         reader.read_line(&mut line)
     };
     if let Err(error) = read_res {
-        let resp = ControlResponse {
-            ok: false,
-            actions: Vec::new(),
-            error: Some(format!("failed to read control request: {error}")),
-            status: None,
-        };
-        let _ = write_control_response(&mut stream, &resp);
+        let _ = write_control_response(
+            &mut stream,
+            &err_resp(format!("failed to read control request: {error}")),
+        );
         return;
     }
     if line.is_empty() {
         return;
     }
     if line.len() as u64 > MAX_CONTROL_REQUEST_BYTES {
-        let resp = ControlResponse {
-            ok: false,
-            actions: Vec::new(),
-            error: Some(format!(
+        let _ = write_control_response(
+            &mut stream,
+            &err_resp(format!(
                 "control request exceeds maximum size ({MAX_CONTROL_REQUEST_BYTES} bytes)"
             )),
-            status: None,
-        };
-        let _ = write_control_response(&mut stream, &resp);
+        );
         return;
     }
 
     let req: ControlRequest = match serde_json::from_str(line.trim()) {
         Ok(req) => req,
         Err(error) => {
-            let resp = ControlResponse {
-                ok: false,
-                actions: Vec::new(),
-                error: Some(format!("invalid control request JSON: {error}")),
-                status: None,
-            };
-            let _ = write_control_response(&mut stream, &resp);
+            let _ = write_control_response(
+                &mut stream,
+                &err_resp(format!("invalid control request JSON: {error}")),
+            );
             return;
         }
     };
 
     if !constant_time_eq(req.auth_cookie.trim().as_bytes(), expected_cookie.as_bytes()) {
-        let resp = ControlResponse {
-            ok: false,
-            actions: Vec::new(),
-            error: Some(
+        let _ = write_control_response(
+            &mut stream,
+            &err_resp(
                 "unauthorized control socket request: missing or invalid daemon control cookie"
                     .to_owned(),
             ),
-            status: None,
-        };
-        let _ = write_control_response(&mut stream, &resp);
+        );
         return;
+    }
+
+    match req.action.as_deref() {
+        Some("board_snapshot") => {
+            engine.refresh_instructions();
+            let view = engine.board();
+            let resp = ControlResponse {
+                ok: true,
+                board: Some(view),
+                ..ControlResponse::default()
+            };
+            let _ = write_control_response(&mut stream, &resp);
+            return;
+        }
+        Some("engine_command") => {
+            let Some(cmd) = req.command else {
+                let _ = write_control_response(
+                    &mut stream,
+                    &err_resp("engine_command request missing `command`".to_owned()),
+                );
+                return;
+            };
+            let cmd_res = engine.send(cmd);
+            engine.tick();
+            let view = engine.board();
+            let resp = match cmd_res {
+                Ok(()) => ControlResponse {
+                    ok: true,
+                    board: Some(view),
+                    ..ControlResponse::default()
+                },
+                Err(error) => ControlResponse {
+                    ok: false,
+                    error: Some(error),
+                    board: Some(view),
+                    ..ControlResponse::default()
+                },
+            };
+            let _ = write_control_response(&mut stream, &resp);
+            return;
+        }
+        Some("session_files") => {
+            let Some(agent) = req.agent.as_deref() else {
+                let _ = write_control_response(
+                    &mut stream,
+                    &err_resp("session_files request missing `agent`".to_owned()),
+                );
+                return;
+            };
+            let files = engine.session_files(agent);
+            let readable = engine.readable_transcript(agent);
+            let resp = ControlResponse {
+                ok: true,
+                session_files: files,
+                readable_transcript: readable,
+                ..ControlResponse::default()
+            };
+            let _ = write_control_response(&mut stream, &resp);
+            return;
+        }
+        Some("shutdown_daemon") => {
+            *shutdown_requested = true;
+            let resp = ControlResponse {
+                ok: true,
+                actions: vec!["daemon shutdown requested".to_owned()],
+                ..ControlResponse::default()
+            };
+            let _ = write_control_response(&mut stream, &resp);
+            return;
+        }
+        None | Some("control") => {}
+        Some(other) => {
+            let _ = write_control_response(
+                &mut stream,
+                &err_resp(format!("unknown control socket action `{other}`")),
+            );
+            return;
+        }
     }
 
     let apply_result = apply_control_request(
@@ -1800,12 +2078,14 @@ fn handle_one_control_stream(
             actions,
             error: None,
             status: Some(snap),
+            ..ControlResponse::default()
         },
         Err(error) => ControlResponse {
             ok: false,
             actions: Vec::new(),
             error: Some(error),
             status: Some(snap),
+            ..ControlResponse::default()
         },
     };
     let _ = write_control_response(&mut stream, &resp);
@@ -2093,6 +2373,7 @@ pub fn run_control(cli: ControlCli) -> Result<String, String> {
         stop_all: cli.stop_all,
         stop_on_no_work: cli.stop_on_no_work,
         keep_running: cli.keep_running,
+        ..ControlRequest::default()
     };
     let mut payload =
         serde_json::to_string(&req).map_err(|e| format!("control request JSON failed: {e}"))?;
@@ -2865,6 +3146,210 @@ fn format_status(report: &StatusReport, as_json: bool) -> Result<String, String>
     Ok(lines.join("\n"))
 }
 
+// ---------------------------------------------------------------------------
+// Remote TUI attachment to a live `--headless` daemon (`headless.sock`)
+// ---------------------------------------------------------------------------
+
+/// `EngineApi` adapter that attaches an interactive TUI board to an already-running
+/// `--headless` daemon over its private `0600` Unix control socket + capability cookie.
+///
+/// Closing/detaching (`shutdown`) is intentionally a no-op so pressing `q` detaches
+/// cleanly without stopping Forgejo or running roles. Pressing `Q` explicitly calls
+/// `stop_daemon()`.
+pub struct RemoteDaemonEngine {
+    layout: Layout,
+    socket_path: PathBuf,
+    auth_cookie: String,
+    cached_view: BoardView,
+    pending_notice: Option<String>,
+    disconnected: bool,
+}
+
+/// Attempt to attach to a live `--headless` daemon serving `layout` / `data_root`.
+///
+/// Returns `Some(RemoteDaemonEngine)` only when `engine.lock` is held AND the
+/// default `headless.sock` + `headless.sock.cookie` answers a `"board_snapshot"` probe.
+pub fn try_attach_daemon(layout: &Layout, data_root: &Path) -> Option<RemoteDaemonEngine> {
+    if !engine_lock_held(data_root) {
+        return None;
+    }
+    let socket_path = resolve_control_socket_path(layout, None).ok()?;
+    let cookie_path = control_cookie_path(&socket_path).ok()?;
+    let auth_cookie = fs::read_to_string(&cookie_path).ok()?.trim().to_owned();
+    if auth_cookie.is_empty() {
+        return None;
+    }
+    let req = ControlRequest {
+        auth_cookie: auth_cookie.clone(),
+        action: Some("board_snapshot".to_owned()),
+        ..ControlRequest::default()
+    };
+    let resp = send_daemon_rpc(&socket_path, &req, Duration::from_secs(2)).ok()?;
+    if !resp.ok {
+        return None;
+    }
+    let view = resp.board?;
+    Some(RemoteDaemonEngine {
+        layout: layout.clone(),
+        socket_path,
+        auth_cookie,
+        cached_view: view,
+        pending_notice: Some("attached to running daemon — q detaches, Q stops daemon".to_owned()),
+        disconnected: false,
+    })
+}
+
+fn send_daemon_rpc(
+    socket_path: &Path,
+    req: &ControlRequest,
+    timeout: Duration,
+) -> Result<ControlResponse, String> {
+    let mut stream = connect_unix_socket_raw(socket_path)
+        .map_err(|error| format!("daemon socket {} cannot be reached: {error}", socket_path.display()))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let mut payload =
+        serde_json::to_string(req).map_err(|error| format!("daemon request JSON failed: {error}"))?;
+    payload.push('\n');
+    stream
+        .write_all(payload.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("daemon socket write failed: {error}"))?;
+
+    let mut reply_line = String::new();
+    {
+        let limited = (&mut stream).take(MAX_CONTROL_RESPONSE_BYTES + 1);
+        let mut reader = BufReader::new(limited);
+        reader
+            .read_line(&mut reply_line)
+            .map_err(|error| format!("daemon socket read failed: {error}"))?;
+    }
+    if reply_line.trim().is_empty() {
+        return Err("headless daemon closed socket without a reply".to_owned());
+    }
+    if reply_line.len() as u64 > MAX_CONTROL_RESPONSE_BYTES {
+        return Err("daemon socket response exceeded maximum size".to_owned());
+    }
+    serde_json::from_str(reply_line.trim())
+        .map_err(|error| format!("invalid daemon response JSON: {error}"))
+}
+
+impl RemoteDaemonEngine {
+    fn rpc(&self, req: &ControlRequest, timeout: Duration) -> Result<ControlResponse, String> {
+        send_daemon_rpc(&self.socket_path, req, timeout)
+    }
+}
+
+impl EngineApi for RemoteDaemonEngine {
+    fn is_attached(&self) -> bool {
+        true
+    }
+
+    fn stop_daemon(&mut self) -> Result<(), String> {
+        let req = ControlRequest {
+            auth_cookie: self.auth_cookie.clone(),
+            action: Some("shutdown_daemon".to_owned()),
+            ..ControlRequest::default()
+        };
+        let resp = self.rpc(&req, CLIENT_SOCKET_TIMEOUT)?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp
+                .error
+                .unwrap_or_else(|| "daemon refused shutdown request".to_owned()))
+        }
+    }
+
+    fn board(&mut self) -> BoardView {
+        let mut view = self.cached_view.clone();
+        if let Some(note) = self.pending_notice.take() {
+            view.notice = Some(note);
+        }
+        view
+    }
+
+    fn send(&mut self, command: Command) -> Result<(), String> {
+        let req = ControlRequest {
+            auth_cookie: self.auth_cookie.clone(),
+            action: Some("engine_command".to_owned()),
+            command: Some(command),
+            ..ControlRequest::default()
+        };
+        let resp = self.rpc(&req, CLIENT_SOCKET_TIMEOUT)?;
+        if let Some(view) = resp.board {
+            self.cached_view = view;
+        }
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(resp
+                .error
+                .unwrap_or_else(|| "daemon rejected command".to_owned()))
+        }
+    }
+
+    fn tick(&mut self) {
+        let req = ControlRequest {
+            auth_cookie: self.auth_cookie.clone(),
+            action: Some("board_snapshot".to_owned()),
+            ..ControlRequest::default()
+        };
+        match self.rpc(&req, Duration::from_secs(2)) {
+            Ok(resp) if resp.ok => {
+                if let Some(view) = resp.board {
+                    self.cached_view = view;
+                    self.disconnected = false;
+                }
+            }
+            _ => {
+                if !self.disconnected {
+                    self.disconnected = true;
+                    self.pending_notice =
+                        Some("headless daemon disconnected — press q to close".to_owned());
+                }
+            }
+        }
+    }
+
+    fn instruction_path(&self, agent: &str) -> Option<PathBuf> {
+        self.layout
+            .agent(agent)
+            .ok()
+            .map(|paths| paths.instruction().to_path_buf())
+    }
+
+    fn session_files(&self, agent: &str) -> Option<(PathBuf, PathBuf)> {
+        let req = ControlRequest {
+            auth_cookie: self.auth_cookie.clone(),
+            action: Some("session_files".to_owned()),
+            agent: Some(agent.to_owned()),
+            ..ControlRequest::default()
+        };
+        self.rpc(&req, Duration::from_secs(2))
+            .ok()
+            .filter(|resp| resp.ok)
+            .and_then(|resp| resp.session_files)
+    }
+
+    fn readable_transcript(&self, agent: &str) -> Option<PathBuf> {
+        let req = ControlRequest {
+            auth_cookie: self.auth_cookie.clone(),
+            action: Some("session_files".to_owned()),
+            agent: Some(agent.to_owned()),
+            ..ControlRequest::default()
+        };
+        self.rpc(&req, Duration::from_secs(2))
+            .ok()
+            .filter(|resp| resp.ok)
+            .and_then(|resp| resp.readable_transcript)
+    }
+
+    fn shutdown(&mut self, _grace: Duration) {
+        // Detaching never stops the background `--headless` daemon.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3035,5 +3520,48 @@ mod tests {
         tracker.arm_for_fresh_wake(&running_run4);
         tracker.arm_existing(&running_run4);
         assert_eq!(tracker.armed_min_runs.get("agent-1"), Some(&5));
+    }
+
+    #[test]
+    fn board_view_and_command_round_trip_through_control_rpc_json() {
+        let mut fake = crate::board::FakeEngine::new();
+        fake.send(Command::AcknowledgeTerms).expect("terms");
+        let view = fake.board();
+        let resp = ControlResponse {
+            ok: true,
+            board: Some(view.clone()),
+            ..ControlResponse::default()
+        };
+        let wire = serde_json::to_string(&resp).expect("serialize board response");
+        let decoded: ControlResponse = serde_json::from_str(&wire).expect("deserialize");
+        assert!(decoded.ok);
+        assert_eq!(decoded.board, Some(view));
+
+        let cmd = Command::SetAgentRoleConfig {
+            name: "reviewer".to_owned(),
+            wake_mode: Some(Some("event".to_owned())),
+            wake_interval_secs: None,
+            context: Some(settings::RoleContextConfig {
+                mode: settings::ContextMode::SelfOnly,
+                views: vec!["open_pulls".to_owned()],
+                ..Default::default()
+            }),
+            permissions: Some(settings::RolePermissions {
+                review: true,
+                maintain: true,
+                ..Default::default()
+            }),
+            env_updates: vec![("SERVICE_ENV".to_owned(), "staging".to_owned())],
+            env_removals: Vec::new(),
+        };
+        let req = ControlRequest {
+            auth_cookie: "abc".to_owned(),
+            action: Some("engine_command".to_owned()),
+            command: Some(cmd.clone()),
+            ..ControlRequest::default()
+        };
+        let req_wire = serde_json::to_string(&req).expect("serialize cmd request");
+        let req_decoded: ControlRequest = serde_json::from_str(&req_wire).expect("deserialize");
+        assert_eq!(req_decoded.command, Some(cmd));
     }
 }

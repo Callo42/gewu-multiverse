@@ -1121,19 +1121,131 @@ pub fn git_env(credential: &GitCredential<'_>) -> Vec<(String, String)> {
     ]
 }
 
+/// Build a hardened `git` command against a possibly untrusted agent workspace.
+///
+/// Explicitly neutralises executable repository-local git config directives
+/// (`core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, `diff.external`,
+/// `core.pager`, `core.editor`, `protocol.ext.allow`, `gc.auto`,
+/// `credential.helper`, plus any `filter.<name>.*` or `diff.<name>.textconv`
+/// declared in `.git/config`) and strips global/system git config so host-side
+/// supervision calls can never execute attacker-controlled hooks or filters.
+pub(crate) fn hardened_git_command(cwd: &Path, read_only: bool) -> Command {
+    let mut command = Command::new("git");
+    if read_only {
+        command.arg("--no-optional-locks");
+    }
+    command
+        .args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.sshCommand=/bin/false",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "core.editor=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "gc.auto=0",
+        ]);
+    // Neutralise any repo-local filter.<name>.{clean,smudge,process} or
+    // diff.<name>.textconv drivers found in `.git/config`.
+    for (section, name) in repo_executable_git_sections(cwd) {
+        if section == "filter" {
+            command
+                .args(["-c", &format!("filter.{name}.clean=")])
+                .args(["-c", &format!("filter.{name}.smudge=")])
+                .args(["-c", &format!("filter.{name}.process=")]);
+        } else if section == "diff" {
+            command
+                .args(["-c", &format!("diff.{name}.textconv=")])
+                .args(["-c", &format!("diff.{name}.command=")]);
+        }
+    }
+    command
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_EXTERNAL_DIFF", "")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_EDITOR", "false")
+        .env("GIT_SSH_COMMAND", "/bin/false")
+        .env("GIT_TEMPLATE_DIR", "");
+    command
+}
+
+/// Inspect `<cwd>/.git/config` (non-recursively, bounded) for `[filter "..."]`
+/// and `[diff "..."]` section names so command-line `-c` overrides disable them.
+fn repo_executable_git_sections(cwd: &Path) -> Vec<(&'static str, String)> {
+    let cfg_path = cwd.join(".git/config");
+    let Ok(meta) = std::fs::symlink_metadata(&cfg_path) else {
+        return Vec::new();
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() > 256 * 1024 {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(&cfg_path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+            continue;
+        };
+        let inner = inner.trim();
+        let Some((sect, rest)) = inner.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let kind = if sect.eq_ignore_ascii_case("filter") {
+            "filter"
+        } else if sect.eq_ignore_ascii_case("diff") {
+            "diff"
+        } else {
+            continue;
+        };
+        let rest = rest.trim();
+        if let Some(quoted) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+            && !quoted.is_empty()
+            && !quoted.contains('=')
+            && !quoted.contains('\n')
+        {
+            out.push((kind, quoted.to_owned()));
+        }
+    }
+    out
+}
+
 /// Run one git command, without a secret anywhere in it.
 fn run_git(
     args: &[&str],
     cwd: &Path,
     credential: Option<&GitCredential<'_>>,
 ) -> Result<String, WorkspaceError> {
-    let mut command = Command::new("git");
-    // No credential helper: the token travels through the askpass pipe and is never
-    // written into a git credential store.
-    command.arg("-c").arg("credential.helper=");
+    let read_only = matches!(
+        args.first().copied(),
+        Some(
+            "status"
+                | "rev-parse"
+                | "for-each-ref"
+                | "rev-list"
+                | "show-ref"
+                | "symbolic-ref"
+                | "diff"
+                | "log"
+        )
+    );
+    let mut command = hardened_git_command(cwd, read_only);
     command.args(args);
-    command.current_dir(cwd);
-    command.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(credential) = credential {
         for (key, value) in git_env(credential) {
             command.env(key, value);
@@ -1545,5 +1657,35 @@ mod change_tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn snapshot_workspace_never_executes_repo_local_fsmonitor_or_clean_filters() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch_root("workspace-fsmonitor-blocked");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        git(&repo, &["init", "-q"]);
+        let marker = root.join("pwned.marker");
+        let evil = root.join("evil.sh");
+        fs::write(&evil, format!("#!/bin/sh\ntouch {}\n", marker.display())).expect("evil script");
+        fs::set_permissions(&evil, fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Plant both core.fsmonitor and a clean filter via .git/config + .gitattributes.
+        let mut cfg = fs::read_to_string(repo.join(".git/config")).expect("git config");
+        cfg.push_str(&format!(
+            "\n[core]\n\tfsmonitor = {}\n[filter \"evil\"]\n\tclean = {}\n",
+            evil.display(),
+            evil.display()
+        ));
+        fs::write(repo.join(".git/config"), cfg).expect("write config");
+        fs::write(repo.join(".gitattributes"), "* filter=evil\n").expect("gitattributes");
+        fs::write(repo.join("hello.txt"), "hi\n").expect("hello");
+
+        let _snap = snapshot_workspace(&root);
+        assert!(
+            !marker.exists(),
+            "hardened git status executed repo-local fsmonitor or clean filter!"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -13,14 +13,14 @@ rewrite the native prompt, or write into a native session store.
 
 ## Pinned programs
 
-| id | version | official package | licence | protocols |
-| --- | --- | --- | --- | --- |
-| `pi` | 1.4.0 | `github.com/earendil-works/pi` release tarball | MIT | Chat Completions, Responses, Anthropic Messages |
-| `codex` | 0.164.0 | `github.com/openai/codex` release package | Apache-2.0 | Responses |
-| `dsh` | 0.2.1-rc.2 | `@deepseek-ai/dsh` npm package, locked closure | MIT | Chat Completions, Responses, Anthropic Messages |
-| `opencode` | 2.1.4 | `@opencode/cli` npm package | MIT | Chat Completions, Responses, Anthropic Messages |
+| id | version | official package | licence | protocols | resident runtime mode |
+| --- | --- | --- | --- | --- | --- |
+| `dsh` *(fresh default)* | 0.2.2-rc.5 | `@deepseek-ai/dsh` npm package, locked closure | MIT | Chat Completions, Responses, Anthropic Messages | `dsh --profile sdk` (ephemeral `sessionId` per wake) |
+| `pi` | 1.6.1 | `github.com/earendil-works/pi` release tarball | MIT | Chat Completions, Responses, Anthropic Messages | `pi --mode rpc --no-session` (`new_session` per wake) |
+| `codex` | 0.172.0 | `github.com/openai/codex` release package | Apache-2.0 | Responses | `codex app-server --listen stdio://` (`ephemeral: true` thread per wake) |
+| `opencode` | 2.4.2 | `@opencode/cli` npm package | MIT | Chat Completions, Responses, Anthropic Messages | `opencode serve` (archived session deleted after each wake) |
 
-Codex is Responses-only. Codex 0.164.0 declares MCP tools inside the Responses
+Codex is Responses-only. Codex 0.172.0 declares MCP tools inside the Responses
 `namespace` extension, which a connection that speaks only plain function calling
 cannot see. For a Codex run the supervisor opens a second loopback transport in front
 of the configured model address: each nested tool is sent as a plain function named
@@ -85,30 +85,23 @@ foreign lock or a cancelled program install leaves the installed binary in place
 
 ### DeepSeek Harness: locked graph and helpers
 
-DeepSeek Harness 0.2.1-rc.2 is installed from its vendored lockfile with `npm ci`,
-an isolated `HOME`/cache inside the stage, the official npm registry, and no global
-Node/npm, shared cache or user npm setting changed. Node.js 24.9 or newer and npm
-11.16.0 or newer are required and are checked before a stage is made. npm before
-11.16.0 ignores the project `allowScripts` map, so the installer refuses it rather than
-running a denied lifecycle script; the check happens before any stage or download.
+DeepSeek Harness 0.2.2-rc.5 is installed from its vendored lockfile with
+`npm ci --ignore-scripts`, followed by an explicit `npm rebuild` restricted solely to
+the three reviewed native helper packages (`@deepseek-ai/dsh-subprocess-local`, `koffi`,
+`node-pty`), using an isolated `HOME`/cache inside the stage, the official npm registry,
+and no global Node/npm, shared cache or user npm setting changed. Node.js 24.9 or newer
+and npm 11.16.0 or newer are required and checked before staging.
 
-The lockfile has five packages with install scripts. This product reviews that exact
-set: `node-pty@1.2.0-beta.15`, `koffi@3.1.1` and
-`@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2` are allowed because their native
-helpers are needed; `@google/genai@2.21.0` and `protobufjs@7.6.6` are recorded as
-denied no-ops. Any changed lock with a different script set fails before `npm`
-starts. `allowScripts` is not a blanket switch, and this installer never passes
-`--dangerously-allow-all-scripts`. A configured
-`dangerously-allow-all-scripts=true` is refused before npm runs, because it bypasses
-the two explicit denials. The preflight asks npm for the install's effective
-empty-project context, so a caller project's `.npmrc` cannot mask user/global/
-environment settings; npm's boolean spellings (`true`, `1`, `yes`, `on` and their
-false forms) are handled, and an unrecognized value is refused rather than guessed.
-If npm is configured to skip install scripts, the install
-fails with that reason instead of pretending the program is ready. After
-`npm ci`, the installer loads `node-pty`'s native module and executes `koffi`'s libc
-`getpid` binding; a `spawn-helper`, where the platform ships one, must be executable.
-A missing or non-executable helper fails truthfully and the old version is kept.
+The lockfile has four packages with install scripts. This product statically reviews that
+exact set before npm starts (`node-pty@1.2.0-beta.15`, `koffi@3.1.1`, and
+`@deepseek-ai/dsh-subprocess-local@0.2.2-rc.5` are rebuilt explicitly; `protobufjs@7.6.6`
+is recorded as denied and never executed because `npm ci` runs with `--ignore-scripts` and
+`npm rebuild` omits it). Any changed lock with a different script set fails before `npm`
+starts, and this installer never passes `--dangerously-allow-all-scripts` (refusing any
+user/global config that enables it). After the selective rebuild, the installer loads
+`node-pty`'s native module and executes `koffi`'s libc `getpid` binding; a `spawn-helper`,
+where the platform ships one, must be executable. A missing or non-executable helper
+fails truthfully and the old version is kept.
 
 The published top-level `@deepseek-ai/dsh` tarball is downloaded again and checked
 against its official SHA-256 and the lockfile's SHA-512. `install.json` records that
@@ -116,11 +109,15 @@ tarball hash, the exact lock SHA-256, the `node-pty` helper hash and the `koffi`
 version. It does **not** claim a recursive tree digest: no such official digest is
 published, so the record labels the lock and archive provenance instead.
 
-A fresh installation defaults new agents to Pi 1.4.0. Existing `multiverse.toml`
+A fresh installation defaults new agents to DeepSeek Harness 0.2.2-rc.5. Existing `multiverse.toml`
 files without `default_harness` keep the built-in engine, so an upgrade is not a
 silent migration. An agent's instruction, workspace, accounts, declared steps,
 skills and run records are product-owned files and are not moved when its program
 changes.
+
+## Per-role resident `HarnessRuntime`
+
+On Landlock-confined hosts, the engine may maintain **one resident `HarnessRuntime` host per role** (`--role-runtime <spec>`), confined inside that exact role's Landlock boundary and never shared across roles. Each wakeup dispatches a fresh ephemeral session on the role's warm runtime—avoiding repeated cold start and MCP registration—while guaranteeing zero cross-round chat history carryover. Idle runtimes park automatically after `runtime_idle_secs` (default `300s`) and shut down whenever the role stops or its configuration changes. If a resident runtime is unavailable, the supervisor falls back transparently to a clean confined one-shot run.
 
 ## Connection and key
 
@@ -138,14 +135,18 @@ The key file is mode 0600 under the run's private tree and is removed with that 
 ## Forgejo tools
 
 When the agent has its own Forgejo token and at least one clone, the supervisor owns a
-minimal per-run MCP server. Its state and counter live outside every native-writable
-root; the native program receives a thin relay over a run-private socket. It exposes
-exactly the six existing product tools: list assigned issues, read an issue/PR,
-comment, list own PRs, open a PR, update own PR. It reads only that run's token and
-workspace. The write reservation is persisted before a request can take effect, so a
-restart, malformed reply or persistence failure cannot reset or undercount the
-eight-write bound. The supervisor ledger is the record of what was read or written;
-native outcomes require the matching terminal and work facts, not prose alone.
+per-role MCP server. Its state, counter, and mandatory 256-bit authentication cookie live
+outside every native-writable root; the native program receives a thin relay over a
+private Unix socket verified by both `SO_PEERCRED` and the `0600` cookie. By default it
+exposes only the six least-privilege product tools (`list_assigned_issues`,
+`read_issue_or_pull`, `comment`, `list_my_pull_requests`, `open_pull_request`,
+`update_pull_request`); roles may additionally opt into `triage`, `review` (self-review
+blocked), or `maintain` (self-merge and unapproved/stale merges blocked) permissions in
+`multiverse.toml`. It reads only that role's token and workspace. The write reservation
+is persisted under an exclusive lock before a request can take effect, so a restart,
+malformed reply or persistence failure cannot reset or undercount the eight-write bound.
+The supervisor ledger is the record of what was read or written; native outcomes require
+the matching terminal and work facts, not prose alone.
 
 ## Confinement
 

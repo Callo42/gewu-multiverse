@@ -33,7 +33,7 @@ fn run(
 #[test]
 fn a_checksum_and_an_invalid_archive_keep_the_old_install() {
     let sandbox = Sandbox::new("checksum");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
 
@@ -67,7 +67,7 @@ fn a_checksum_and_an_invalid_archive_keep_the_old_install() {
 #[test]
 fn a_missing_node_or_npm_is_refused_before_a_stage_is_built() {
     let sandbox = Sandbox::new("missing-node");
-    let root = sandbox.install_root("dsh", "0.2.1-rc.2");
+    let root = sandbox.install_root("dsh", "0.2.2-rc.5");
     dsh_old_install(&root, "0.2.0", 0);
     let old = fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint");
     let mut command = sandbox.product();
@@ -88,7 +88,7 @@ fn a_missing_node_or_npm_is_refused_before_a_stage_is_built() {
 #[test]
 fn cancelling_a_slow_download_keeps_the_old_install_and_removes_the_stage() {
     let sandbox = Sandbox::new("cancel");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let body = vec![7u8; 2 * 1024 * 1024];
@@ -123,7 +123,7 @@ fn cancelling_a_slow_download_keeps_the_old_install_and_removes_the_stage() {
 #[test]
 fn cancelling_during_extraction_kills_the_unpacker_and_removes_the_stage() {
     let sandbox = Sandbox::new("cancel-tar");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let archive = pi_archive(&sandbox.root);
@@ -156,7 +156,7 @@ fn cancelling_during_extraction_kills_the_unpacker_and_removes_the_stage() {
 #[test]
 fn cancelling_during_the_locked_package_build_kills_npm_and_removes_the_stage() {
     let sandbox = Sandbox::new("cancel-npm");
-    let root = sandbox.install_root("dsh", "0.2.1-rc.2");
+    let root = sandbox.install_root("dsh", "0.2.2-rc.5");
     dsh_old_install(&root, "0.2.0", 0);
     let old = fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint");
     write_executable(
@@ -194,7 +194,7 @@ exec sleep 30
 fn a_hard_kill_before_the_rename_leaves_only_an_owned_stage_and_a_foreign_stage_survives_the_next_install()
  {
     let sandbox = Sandbox::new("kill-before");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let body = vec![9u8; 2 * 1024 * 1024];
@@ -232,10 +232,10 @@ fn a_hard_kill_before_the_rename_leaves_only_an_owned_stage_and_a_foreign_stage_
     fs::write(foreign_old.join("keep"), b"backup data").expect("the foreign backup file");
     // A prefixed legacy stage with only the package files the old installer wrote is
     // recognised; a foreign directory with the same name shape is kept.
-    let legacy = harness.join("1.4.part-999");
+    let legacy = harness.join("1.6.part-999");
     fs::create_dir_all(&legacy).expect("the legacy stage");
     fs::write(legacy.join("pi.tar.part"), b"partial").expect("the legacy part");
-    let legacy_foreign = harness.join("1.4.part-998");
+    let legacy_foreign = harness.join("1.6.part-998");
     fs::create_dir_all(&legacy_foreign).expect("the foreign legacy-shaped stage");
     fs::write(legacy_foreign.join("keep"), b"user data").expect("the foreign legacy file");
 
@@ -278,7 +278,7 @@ fn a_hard_kill_before_the_rename_leaves_only_an_owned_stage_and_a_foreign_stage_
 #[test]
 fn a_hard_kill_after_the_old_root_rename_is_recovered_before_use() {
     let sandbox = Sandbox::new("kill-after");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let archive = pi_archive(&sandbox.root);
@@ -336,7 +336,7 @@ fn a_hard_kill_after_the_old_root_rename_is_recovered_before_use() {
 #[test]
 fn a_staged_not_ready_old_restores_and_settles_by_identity() {
     let sandbox = Sandbox::new("staged-old-not-ready");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     fs::set_permissions(
         root.join("pi/pi"),
@@ -379,7 +379,7 @@ fn a_staged_not_ready_old_restores_and_settles_by_identity() {
 #[test]
 fn a_staged_foreign_root_keeps_the_journal_and_old_backup() {
     let sandbox = Sandbox::new("staged-foreign");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let archive = pi_archive(&sandbox.root);
@@ -446,7 +446,7 @@ fn a_staged_foreign_root_keeps_the_journal_and_old_backup() {
 #[test]
 fn an_old_not_ready_restored_root_settles_and_a_retry_succeeds() {
     let sandbox = Sandbox::new("old-not-ready");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     fs::set_permissions(
         root.join("pi/pi"),
@@ -505,7 +505,7 @@ fn an_old_not_ready_restored_root_settles_and_a_retry_succeeds() {
 #[test]
 fn a_fresh_old_moved_kill_is_recoverable_and_a_retry_succeeds() {
     let sandbox = Sandbox::new("fresh-old-moved");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     assert!(!root.exists());
     let archive = pi_archive(&sandbox.root);
     let digest = sha256_hex(&archive);
@@ -552,7 +552,7 @@ fn a_fresh_old_moved_kill_is_recoverable_and_a_retry_succeeds() {
 #[test]
 fn an_old_moved_foreign_root_without_a_backup_keeps_the_journal() {
     let sandbox = Sandbox::new("old-moved-foreign");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let archive = pi_archive(&sandbox.root);
     let digest = sha256_hex(&archive);
@@ -610,7 +610,7 @@ fn an_old_moved_foreign_root_without_a_backup_keeps_the_journal() {
 #[test]
 fn a_published_foreign_root_without_a_backup_keeps_the_journal() {
     let sandbox = Sandbox::new("published-foreign");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let archive = pi_archive(&sandbox.root);
     let digest = sha256_hex(&archive);
@@ -669,7 +669,7 @@ fn a_published_foreign_root_without_a_backup_keeps_the_journal() {
 #[test]
 fn a_published_old_not_ready_root_settles_without_calling_it_ready() {
     let sandbox = Sandbox::new("published-old-not-ready");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     fs::set_permissions(
         root.join("pi/pi"),
@@ -734,7 +734,7 @@ fn a_published_old_not_ready_root_settles_without_calling_it_ready() {
 #[test]
 fn cancelling_after_a_not_ready_old_rename_restores_it() {
     let sandbox = Sandbox::new("cancel-old-not-ready");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     fs::set_permissions(
         root.join("pi/pi"),
@@ -780,7 +780,7 @@ fn cancelling_after_a_not_ready_old_rename_restores_it() {
 #[test]
 fn cancelling_after_the_old_rename_restores_it_and_removes_the_journal() {
     let sandbox = Sandbox::new("cancel-after-old");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let archive = pi_archive(&sandbox.root);
@@ -826,7 +826,7 @@ fn cancelling_after_the_old_rename_restores_it_and_removes_the_journal() {
 #[test]
 fn a_failed_restore_keeps_foreign_data_the_old_backup_and_the_journal() {
     let sandbox = Sandbox::new("failed-restore");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let archive = pi_archive(&sandbox.root);
@@ -902,7 +902,7 @@ fn a_failed_restore_keeps_foreign_data_the_old_backup_and_the_journal() {
 #[test]
 fn a_kill_between_the_old_rename_and_its_journal_write_is_recovered() {
     let sandbox = Sandbox::new("kill-unjournaled");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let old_binary = fs::read(root.join("pi/pi")).expect("the old binary");
     let archive = pi_archive(&sandbox.root);
@@ -955,9 +955,9 @@ fn a_kill_between_the_old_rename_and_its_journal_write_is_recovered() {
 fn a_legacy_old_root_is_restored_when_the_version_root_is_missing() {
     let sandbox = Sandbox::new("legacy-old");
     let harness = sandbox.harness_dir("pi");
-    let root = sandbox.install_root("pi", "1.4.0");
-    let old = harness.join("1.4.old-4242");
-    pi_old_install(&old, "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
+    let old = harness.join("1.6.old-4242");
+    pi_old_install(&old, "1.6.1");
     assert!(!root.exists());
     let notes = harness::recover_pending(&sandbox.data_root());
     assert!(notes.is_empty(), "{notes:?}");
@@ -969,7 +969,7 @@ fn a_legacy_old_root_is_restored_when_the_version_root_is_missing() {
 #[test]
 fn a_hard_kill_after_the_new_root_is_published_keeps_the_verified_new_tree() {
     let sandbox = Sandbox::new("kill-published");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let archive = pi_archive(&sandbox.root);
     let digest = sha256_hex(&archive);
@@ -1023,7 +1023,7 @@ fn a_hard_kill_after_the_new_root_is_published_keeps_the_verified_new_tree() {
 #[test]
 fn a_second_install_is_refused_and_a_repeat_after_success_is_ready_without_a_download() {
     let sandbox = Sandbox::new("parallel");
-    let root = sandbox.install_root("pi", "1.4.0");
+    let root = sandbox.install_root("pi", "1.6.1");
     pi_old_install(&root, "1.3.9");
     let body = pi_archive(&sandbox.root);
     let digest = sha256_hex(&body);
@@ -1088,12 +1088,12 @@ fn a_foreign_lock_is_not_removed() {
 #[test]
 fn blocked_dsh_scripts_are_diagnosed_and_the_old_install_is_kept() {
     let sandbox = Sandbox::new("dsh-blocked");
-    let root = sandbox.install_root("dsh", "0.2.1-rc.2");
+    let root = sandbox.install_root("dsh", "0.2.2-rc.5");
     dsh_old_install(&root, "0.2.0", 0o600);
     let old = fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint");
 
     let tree = sandbox.root.join("fake-tree");
-    dsh_old_install(&tree, "0.2.1-rc.2", 0o600);
+    dsh_old_install(&tree, "0.2.2-rc.5", 0o600);
     // The fixture tree must carry only the package contents; its install.json is not
     // copied by npm.
     fs::remove_file(tree.join("install.json")).expect("the fixture record");
@@ -1154,7 +1154,7 @@ exit 0
 #[test]
 fn unsupported_npm_and_dangerous_script_config_are_refused_before_effects() {
     let sandbox = Sandbox::new("dsh-npm-policy");
-    let root = sandbox.install_root("dsh", "0.2.1-rc.2");
+    let root = sandbox.install_root("dsh", "0.2.2-rc.5");
     dsh_old_install(&root, "0.2.0", 0);
     let old = fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint");
     let marker = sandbox.root.join("npm-ci-ran");
@@ -1257,7 +1257,7 @@ fn the_npm_policy_preflight_uses_the_install_context_and_npm_boolean_forms() {
         return;
     };
     let sandbox = Sandbox::new("dsh-npm-context");
-    let root = sandbox.install_root("dsh", "0.2.1-rc.2");
+    let root = sandbox.install_root("dsh", "0.2.2-rc.5");
     dsh_old_install(&root, "0.2.0", 0);
     let old = fs::read(root.join("node_modules/.bin/dsh")).expect("the old entrypoint");
     let marker = sandbox.root.join("npm-ci-ran");
@@ -1348,8 +1348,8 @@ exit 1
 #[test]
 fn a_record_without_its_executable_or_helper_is_not_ready() {
     let sandbox = Sandbox::new("not-ready");
-    let pi = sandbox.install_root("pi", "1.4.0");
-    pi_old_install(&pi, "1.4.0");
+    let pi = sandbox.install_root("pi", "1.6.1");
+    pi_old_install(&pi, "1.6.1");
     assert!(harness::installed(&sandbox.data_root(), Program::Pi).is_some());
     fs::set_permissions(
         pi.join("pi/pi"),
@@ -1358,8 +1358,8 @@ fn a_record_without_its_executable_or_helper_is_not_ready() {
     .expect("the binary mode");
     assert!(harness::installed(&sandbox.data_root(), Program::Pi).is_none());
 
-    let dsh = sandbox.install_root("dsh", "0.2.1-rc.2");
-    dsh_old_install(&dsh, "0.2.1-rc.2", 0);
+    let dsh = sandbox.install_root("dsh", "0.2.2-rc.5");
+    dsh_old_install(&dsh, "0.2.2-rc.5", 0);
     assert!(harness::installed(&sandbox.data_root(), Program::Dsh).is_some());
     fs::remove_file(dsh.join(format!(
         "node_modules/node-pty/prebuilds/{}/pty.node",

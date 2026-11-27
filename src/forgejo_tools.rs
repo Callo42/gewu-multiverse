@@ -8,12 +8,14 @@
 //! or `shell`'s environment.
 //!
 //! The rules the person's `P` and `U` keys use are the rules here: the open gate and
-//! the authorship rule live in [`crate::pull_gate`] and are shared, not copied. The
-//! authority is deliberately narrow — read assigned issues, read one issue or pull
-//! request with its comments, comment, list the agent's own open pull requests, open a
-//! pull request from the clone's pushed branch, and update the agent's own open
-//! request. There is no merge, close, reopen, delete, label, assignment, review or
-//! repository setting.
+//! the authorship rule live in [`crate::pull_gate`] and are shared, not copied. By
+//! default a role receives six least-privilege tools (list assigned issues, read one
+//! issue/PR with comments, comment, list own open PRs, open a PR from a pushed branch,
+//! and update its own open PR). Roles may opt into `triage` (list/create/update issues),
+//! `review` (list PRs, read diffs, formal reviews with supervisor self-review block),
+//! and `maintain` (merge approved non-own PRs with supervisor self-merge/approval-SHA
+//! blocks, and create `team/*` repos). Destructive repo deletion and organisation
+//! administration are never exposed.
 //!
 //! Every refusal is one bounded sentence the model can act on, and every Forgejo
 //! failure names its class and status, never a raw reply body.
@@ -60,7 +62,25 @@ pub const OPEN_PULL_REQUEST: &str = "forgejo_open_pull_request";
 /// The name of the update tool.
 pub const UPDATE_PULL_REQUEST: &str = "forgejo_update_pull_request";
 
-/// Every Forgejo tool, in the order they are declared.
+// Tiered opt-in tools (triage / review / maintain).
+/// Triage: list all issues in a cloned repository (with state/label filter).
+pub const LIST_ISSUES: &str = "forgejo_list_issues";
+/// Triage: create a new issue (with optional assignees and labels).
+pub const CREATE_ISSUE: &str = "forgejo_create_issue";
+/// Triage: update an existing issue (title, body, state, assignees, labels).
+pub const UPDATE_ISSUE: &str = "forgejo_update_issue";
+/// Review: list open pull requests in a cloned repository.
+pub const LIST_PULL_REQUESTS: &str = "forgejo_list_pull_requests";
+/// Review: read the unified diff of one pull request (bounded).
+pub const READ_PULL_DIFF: &str = "forgejo_read_pull_diff";
+/// Review: submit a formal review (`COMMENT`, `APPROVE`, `REQUEST_CHANGES`); self-review hard-blocked.
+pub const REVIEW_PULL_REQUEST: &str = "forgejo_review_pull_request";
+/// Maintain: merge an approved non-own pull request; self-merge & unapproved merge hard-blocked.
+pub const MERGE_PULL_REQUEST: &str = "forgejo_merge_pull_request";
+/// Maintain: create a new repository under the `team` organisation (never deletes).
+pub const CREATE_REPOSITORY: &str = "forgejo_create_repository";
+
+/// Default least-privilege Forgejo tools, in the order they are declared.
 pub const TOOL_NAMES: [&str; 6] = [
     LIST_ASSIGNED_ISSUES,
     READ_ISSUE_OR_PULL,
@@ -70,9 +90,54 @@ pub const TOOL_NAMES: [&str; 6] = [
     UPDATE_PULL_REQUEST,
 ];
 
-/// Whether a tool writes, and so counts against [`WRITE_BOUND`].
+/// Every Forgejo tool across default and opt-in permission tiers.
+pub const ALL_TOOL_NAMES: [&str; 14] = [
+    LIST_ASSIGNED_ISSUES,
+    READ_ISSUE_OR_PULL,
+    COMMENT,
+    LIST_MY_PULL_REQUESTS,
+    OPEN_PULL_REQUEST,
+    UPDATE_PULL_REQUEST,
+    LIST_ISSUES,
+    CREATE_ISSUE,
+    UPDATE_ISSUE,
+    LIST_PULL_REQUESTS,
+    READ_PULL_DIFF,
+    REVIEW_PULL_REQUEST,
+    MERGE_PULL_REQUEST,
+    CREATE_REPOSITORY,
+];
+
+/// Tools allowed for one role's permission configuration.
+pub fn allowed_tool_names(
+    permissions: &crate::engine::settings::RolePermissions,
+) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = TOOL_NAMES.to_vec();
+    if permissions.triage {
+        names.extend([LIST_ISSUES, CREATE_ISSUE, UPDATE_ISSUE]);
+    }
+    if permissions.review {
+        names.extend([LIST_PULL_REQUESTS, READ_PULL_DIFF, REVIEW_PULL_REQUEST]);
+    }
+    if permissions.maintain {
+        names.extend([MERGE_PULL_REQUEST, CREATE_REPOSITORY]);
+    }
+    names
+}
+
+/// Whether a tool writes, and so counts against the role's write bound.
 pub fn is_write_tool(name: &str) -> bool {
-    matches!(name, COMMENT | OPEN_PULL_REQUEST | UPDATE_PULL_REQUEST)
+    matches!(
+        name,
+        COMMENT
+            | OPEN_PULL_REQUEST
+            | UPDATE_PULL_REQUEST
+            | CREATE_ISSUE
+            | UPDATE_ISSUE
+            | REVIEW_PULL_REQUEST
+            | MERGE_PULL_REQUEST
+            | CREATE_REPOSITORY
+    )
 }
 
 /// What one tool call did, for the run to record and to feed the model.
@@ -112,8 +177,15 @@ pub struct ForgejoTools {
     workspace: PathBuf,
     agent: String,
     token: Secret,
+    permissions: crate::engine::settings::RolePermissions,
+    /// Supervisor-held token used exclusively for `forgejo_create_repository` under
+    /// the `team` organisation when `permissions.maintain == true` and the agent's
+    /// own token is restricted from org repo creation. Never exposed to the agent
+    /// and never used for destructive operations.
+    org_creator_token: Option<Secret>,
     writes: Cell<u32>,
     accepted: Cell<bool>,
+    viewer_verified: Cell<bool>,
 }
 
 impl std::fmt::Debug for ForgejoTools {
@@ -123,6 +195,7 @@ impl std::fmt::Debug for ForgejoTools {
             .field("login", &self.config.login)
             .field("repositories", &self.config.repositories)
             .field("agent", &self.agent)
+            .field("permissions", &self.permissions)
             .field("writes", &self.writes.get())
             .finish_non_exhaustive()
     }
@@ -140,7 +213,7 @@ impl ForgejoTools {
     }
 
     /// Build the tools with the writes already made by an earlier MCP server of the
-    /// same run, so restarting the bridge cannot reset the eight-write bound.
+    /// same run, so restarting the bridge cannot reset the write bound.
     pub fn new_with_writes(
         config: RunForgejo,
         workspace: impl Into<PathBuf>,
@@ -153,9 +226,38 @@ impl ForgejoTools {
             workspace: workspace.into(),
             agent: agent.into(),
             token,
+            permissions: crate::engine::settings::RolePermissions::default(),
+            org_creator_token: None,
             writes: Cell::new(writes),
             accepted: Cell::new(false),
+            viewer_verified: Cell::new(false),
         }
+    }
+
+    /// Attach role-scoped Forgejo permissions to these tools.
+    pub fn with_permissions(
+        mut self,
+        permissions: crate::engine::settings::RolePermissions,
+    ) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    /// Attach optional supervisor org-repo creation token (only used when
+    /// `permissions.maintain == true` for `team/<repo>` creation).
+    pub fn with_org_creator_token(mut self, token: Option<Secret>) -> Self {
+        self.org_creator_token = token;
+        self
+    }
+
+    /// Effective per-run write bound for this role.
+    pub fn write_bound(&self) -> u32 {
+        self.permissions.effective_write_bound()
+    }
+
+    /// Role permissions currently active on these tools.
+    pub fn permissions(&self) -> &crate::engine::settings::RolePermissions {
+        &self.permissions
     }
 
     /// How many writes this run has made.
@@ -206,18 +308,85 @@ impl ForgejoTools {
         .map_err(|error| self.error_sentence(error))
     }
 
-    /// Check that a name is one of this agent's cloned repositories.
+    /// Verify once that the Forgejo token actually authenticates as `self.config.login`
+    /// (case-insensitively, refusing empty logins). Used before review/merge hard blocks
+    /// so a forged or stale `forgejo.json` login can never bypass self-review/self-merge.
+    fn verify_token_identity(&self, client: &ForgejoClient) -> Result<(), String> {
+        let expected = self.config.login.trim();
+        if expected.is_empty() {
+            return Err(sentence(
+                "refused: the role's Forgejo login is empty; cannot verify authorship".to_owned(),
+            ));
+        }
+        if self.viewer_verified.get() {
+            return Ok(());
+        }
+        let actual = client
+            .viewer()
+            .map_err(|error| self.error_sentence(error))?;
+        let actual = actual.login.trim();
+        if actual.is_empty() || !actual.eq_ignore_ascii_case(expected) {
+            return Err(sentence(format!(
+                "refused: Forgejo token authenticates as `{actual}`, which does not match role login `{expected}`"
+            )));
+        }
+        self.viewer_verified.set(true);
+        Ok(())
+    }
+
+    /// Check that a name is one of this agent's cloned repositories, strictly inside
+    /// `self.workspace` without following any symlink outside the workspace.
     fn repository(&self, full_name: &str) -> Result<(&RunForgejoRepository, PathBuf), String> {
         let Some(repository) = self.config.repository(full_name) else {
             return Err(self.unknown_repository(full_name));
         };
-        let destination = self.workspace.join(&repository.directory);
-        if !destination.join(".git").is_dir() {
+        let dir_name = repository.directory.as_str();
+        if dir_name.is_empty()
+            || dir_name == "."
+            || dir_name == ".."
+            || dir_name.contains('/')
+            || dir_name.contains('\\')
+            || dir_name.contains('\0')
+        {
+            return Err(sentence(format!(
+                "`{full_name}` has an invalid clone directory `{dir_name}`"
+            )));
+        }
+        let destination = self.workspace.join(dir_name);
+        let Ok(dest_meta) = std::fs::symlink_metadata(&destination) else {
+            return Err(sentence(format!(
+                "`{full_name}` is no longer a clone in this agent's workspace; a repository is named `owner/name` and must be cloned there first"
+            )));
+        };
+        if dest_meta.file_type().is_symlink() || !dest_meta.file_type().is_dir() {
+            return Err(sentence(format!(
+                "`{full_name}` clone directory `{dir_name}` must be a real directory inside the workspace, not a symlink"
+            )));
+        }
+        let canon_ws = std::fs::canonicalize(&self.workspace).map_err(|_| {
+            sentence("this agent's workspace directory cannot be resolved".to_owned())
+        })?;
+        let canon_dest = std::fs::canonicalize(&destination).map_err(|_| {
+            sentence(format!("`{full_name}` clone directory cannot be resolved"))
+        })?;
+        if !canon_dest.starts_with(&canon_ws) {
+            return Err(sentence(format!(
+                "`{full_name}` resolves outside this agent's workspace and is refused"
+            )));
+        }
+        let git_dir = canon_dest.join(".git");
+        let git_ok = std::fs::symlink_metadata(&git_dir)
+            .map(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+            .unwrap_or(false)
+            && std::fs::canonicalize(&git_dir)
+                .map(|g| g.starts_with(&canon_dest))
+                .unwrap_or(false);
+        if !git_ok {
             return Err(sentence(format!(
                 "`{full_name}` is no longer a clone in this agent's workspace; a repository is named `owner/name` and must be cloned there first"
             )));
         }
-        Ok((repository, destination))
+        Ok((repository, canon_dest))
     }
 
     fn unknown_repository(&self, full_name: &str) -> String {
@@ -348,9 +517,17 @@ impl ForgejoTools {
             )));
         }
         self.accepted.set(false);
-        if is_write_tool(name) && self.writes.get() >= WRITE_BOUND {
+        let allowed = allowed_tool_names(&self.permissions);
+        if !allowed.contains(&name) {
             return Err(sentence(format!(
-                "the per-run Forgejo write bound of {WRITE_BOUND} is reached; this run can still read Forgejo, but no further comment or pull request will be written"
+                "tool `{name}` is not enabled for this role; allowed Forgejo tools are {}",
+                allowed.join(", ")
+            )));
+        }
+        let bound = self.write_bound();
+        if is_write_tool(name) && self.writes.get() >= bound {
+            return Err(sentence(format!(
+                "the per-run Forgejo write bound of {bound} is reached; this run can still read Forgejo, but no further write will be accepted"
             )));
         }
         match name {
@@ -360,9 +537,17 @@ impl ForgejoTools {
             LIST_MY_PULL_REQUESTS => self.list_my_pull_requests(),
             OPEN_PULL_REQUEST => self.open_pull_request(&args),
             UPDATE_PULL_REQUEST => self.update_pull_request(&args),
+            LIST_ISSUES => self.list_issues(&args),
+            CREATE_ISSUE => self.create_issue(&args),
+            UPDATE_ISSUE => self.update_issue(&args),
+            LIST_PULL_REQUESTS => self.list_pull_requests(&args),
+            READ_PULL_DIFF => self.read_pull_diff(&args),
+            REVIEW_PULL_REQUEST => self.review_pull_request(&args),
+            MERGE_PULL_REQUEST => self.merge_pull_request(&args),
+            CREATE_REPOSITORY => self.create_repository(&args),
             other => Err(sentence(format!(
                 "no Forgejo tool named `{other}` is declared; the Forgejo tools are {}",
-                TOOL_NAMES.join(", ")
+                allowed.join(", ")
             ))),
         }
     }
@@ -564,7 +749,12 @@ impl ForgejoTools {
                 .pull_requests(&owner, &name)
                 .map_err(|error| self.error_sentence(error))?;
             for pull in pulls {
-                if pull.author.as_deref() != Some(self.config.login.as_str()) {
+                if !crate::pull_gate::PullRequestAuthorship::of(
+                    pull.author.as_deref(),
+                    Some(self.config.login.as_str()),
+                )
+                .is_own()
+                {
                     continue;
                 }
                 lines.push(format!(
@@ -845,6 +1035,475 @@ impl ForgejoTools {
         }
     }
 
+    /// Triage: list issues in a cloned repository (with optional `state` and `labels`).
+    fn list_issues(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let repository = self.repository_arg(args)?;
+        let (owner, name) = self.split_repository(&repository)?;
+        self.repository(&repository)?;
+        let state = args
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| matches!(*s, "open" | "closed" | "all"))
+            .unwrap_or("open");
+        let labels = bounded_string_array_arg(args, "labels", 10, 64)?;
+        let client = self.client()?;
+        let issues = client
+            .repo_issues(&owner, &name, Some(state), &labels)
+            .map_err(|error| self.error_sentence(error))?;
+        let mut lines = Vec::new();
+        for issue in issues.iter().filter(|i| i.pull_request_url.is_none()) {
+            let assignees = if issue.assignees.is_empty() {
+                "unassigned".to_owned()
+            } else {
+                format!("assigned: {}", issue.assignees.join(", "))
+            };
+            let lbl = if issue.labels.is_empty() {
+                "no labels".to_owned()
+            } else {
+                issue.labels.join(", ")
+            };
+            lines.push(format!(
+                "{repository}#{} [{}] — {} [{lbl}] ({assignees})",
+                issue.number, issue.state, issue.title
+            ));
+        }
+        if lines.is_empty() {
+            return Ok(ToolReply {
+                text: format!("no {state} issues found in `{repository}`"),
+                repository: Some(repository),
+                number: None,
+                action: None,
+                url: None,
+                branch: None,
+            });
+        }
+        let (mut text, cut) = bounded(&lines.join("\n"), MAX_TOOL_OUTPUT);
+        if cut {
+            text.push_str("\n[truncated — more issues were not shown]");
+        }
+        Ok(ToolReply {
+            text,
+            repository: Some(repository),
+            number: None,
+            action: None,
+            url: None,
+            branch: None,
+        })
+    }
+
+    /// Triage: create an issue in a cloned repository (with optional assignees and labels).
+    fn create_issue(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let repository = self.repository_arg(args)?;
+        let title = self.title_arg(args)?;
+        let body = self.body_arg(args).unwrap_or_default();
+        if body.len() > WRITE_COMMENT_BYTES {
+            return Err(sentence(format!(
+                "the issue body is {} bytes; the bound is {WRITE_COMMENT_BYTES} bytes — shorten it",
+                body.len()
+            )));
+        }
+        let assignees = bounded_string_array_arg(args, "assignees", 10, 64)?;
+        let labels = bounded_string_array_arg(args, "labels", 10, 64)?;
+        let (owner, name) = self.split_repository(&repository)?;
+        self.repository(&repository)?;
+        let client = self.client()?;
+        client.begin_write();
+        let created = client.create_issue_full(&owner, &name, &title, &body, &assignees, &labels);
+        self.note_accepted(&client);
+        let issue = created.map_err(|error| self.error_sentence(error))?;
+        let url = issue
+            .html_url
+            .clone()
+            .unwrap_or_else(|| self.web_url(&repository, issue.number, None));
+        Ok(ToolReply {
+            text: format!("created issue {repository}#{} — {url}", issue.number),
+            repository: Some(repository),
+            number: Some(issue.number),
+            action: Some("created_issue"),
+            url: Some(url),
+            branch: None,
+        })
+    }
+
+    /// Triage: update an issue's title, body, state (`open`/`closed`), assignees or labels.
+    fn update_issue(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let repository = self.repository_arg(args)?;
+        let number = self.number(args)?;
+        let title = args
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let body = args.get("body").and_then(serde_json::Value::as_str);
+        if let Some(b) = body
+            && b.len() > WRITE_COMMENT_BYTES
+        {
+            return Err(sentence(format!(
+                "the issue body is {} bytes; the bound is {WRITE_COMMENT_BYTES} bytes",
+                b.len()
+            )));
+        }
+        let state = match args.get("state").and_then(serde_json::Value::as_str) {
+            Some("open") => Some("open"),
+            Some("closed") => Some("closed"),
+            Some(other) => {
+                return Err(sentence(format!(
+                    "`state` must be `open` or `closed` (got `{other}`)"
+                )));
+            }
+            None => None,
+        };
+        let assignees = match args.get("assignees") {
+            Some(_) => Some(bounded_string_array_arg(args, "assignees", 10, 64)?),
+            None => None,
+        };
+        let labels = match args.get("labels") {
+            Some(_) => Some(bounded_string_array_arg(args, "labels", 10, 64)?),
+            None => None,
+        };
+        if title.is_none()
+            && body.is_none()
+            && state.is_none()
+            && assignees.is_none()
+            && labels.is_none()
+        {
+            return Err(sentence(
+                "provide at least one of `title`, `body`, `state`, `assignees`, or `labels`"
+                    .to_owned(),
+            ));
+        }
+        let (owner, name) = self.split_repository(&repository)?;
+        self.repository(&repository)?;
+        let client = self.client()?;
+        client.begin_write();
+        let updated = client.update_issue(
+            &owner,
+            &name,
+            number,
+            title,
+            body,
+            state,
+            assignees.as_deref(),
+            labels.as_deref(),
+        );
+        self.note_accepted(&client);
+        let issue = updated.map_err(|error| self.error_sentence(error))?;
+        let url = issue
+            .html_url
+            .clone()
+            .unwrap_or_else(|| self.web_url(&repository, issue.number, None));
+        Ok(ToolReply {
+            text: format!(
+                "updated issue {repository}#{} [{}] — {url}",
+                issue.number, issue.state
+            ),
+            repository: Some(repository),
+            number: Some(issue.number),
+            action: Some("updated_issue"),
+            url: Some(url),
+            branch: None,
+        })
+    }
+
+    /// Review: list all open pull requests in a cloned repository.
+    fn list_pull_requests(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let repository = self.repository_arg(args)?;
+        let (owner, name) = self.split_repository(&repository)?;
+        self.repository(&repository)?;
+        let client = self.client()?;
+        let pulls = client
+            .pull_requests(&owner, &name)
+            .map_err(|error| self.error_sentence(error))?;
+        let mut lines = Vec::new();
+        for pull in &pulls {
+            let author = pull.author.as_deref().unwrap_or("unknown");
+            lines.push(format!(
+                "{repository}#{} by `{author}` — {} ({} -> {}) {}",
+                pull.number,
+                pull.title,
+                pull.head,
+                pull.base,
+                pull.html_url.as_deref().unwrap_or("no web URL")
+            ));
+        }
+        if lines.is_empty() {
+            return Ok(ToolReply {
+                text: format!("no open pull requests in `{repository}`"),
+                repository: Some(repository),
+                number: None,
+                action: None,
+                url: None,
+                branch: None,
+            });
+        }
+        let (mut text, cut) = bounded(&lines.join("\n"), MAX_TOOL_OUTPUT);
+        if cut {
+            text.push_str("\n[truncated — more pull requests were not shown]");
+        }
+        Ok(ToolReply {
+            text,
+            repository: Some(repository),
+            number: None,
+            action: None,
+            url: None,
+            branch: None,
+        })
+    }
+
+    /// Review: read the unified diff of one pull request (bounded).
+    fn read_pull_diff(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let repository = self.repository_arg(args)?;
+        let number = self.number(args)?;
+        let (owner, name) = self.split_repository(&repository)?;
+        self.repository(&repository)?;
+        let client = self.client()?;
+        let diff = client
+            .pull_diff(&owner, &name, number)
+            .map_err(|error| self.error_sentence(error))?;
+        let (mut text, cut) = bounded(&diff, MAX_TOOL_OUTPUT);
+        if cut {
+            text.push_str("\n[diff truncated at the tool's output bound]");
+        }
+        Ok(ToolReply {
+            text,
+            repository: Some(repository),
+            number: Some(number),
+            action: None,
+            url: None,
+            branch: None,
+        })
+    }
+
+    /// Review: submit a formal review (`COMMENT`, `APPROVE`, `REQUEST_CHANGES`).
+    /// Supervisor hard-blocks self-review on the role's own pull request.
+    fn review_pull_request(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let repository = self.repository_arg(args)?;
+        let number = self.number(args)?;
+        let raw_event = args
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_ascii_uppercase())
+            .ok_or_else(|| {
+                sentence("`event` must be `COMMENT`, `APPROVE`, or `REQUEST_CHANGES`".to_owned())
+            })?;
+        let api_event = match raw_event.as_str() {
+            "COMMENT" => "COMMENT",
+            "APPROVE" | "APPROVED" => "APPROVED",
+            "REQUEST_CHANGES" => "REQUEST_CHANGES",
+            other => {
+                return Err(sentence(format!(
+                    "`event` must be `COMMENT`, `APPROVE`, or `REQUEST_CHANGES` (got `{other}`)"
+                )));
+            }
+        };
+        let body = self.body_arg(args).unwrap_or_default();
+        if body.len() > WRITE_COMMENT_BYTES {
+            return Err(sentence(format!(
+                "the review body is {} bytes; the bound is {WRITE_COMMENT_BYTES} bytes",
+                body.len()
+            )));
+        }
+        if api_event != "APPROVED" && body.trim().is_empty() {
+            return Err(sentence(
+                "reviews with `COMMENT` or `REQUEST_CHANGES` require a non-empty `body`".to_owned(),
+            ));
+        }
+        let (owner, name) = self.split_repository(&repository)?;
+        self.repository(&repository)?;
+        let client = self.client()?;
+        self.verify_token_identity(&client)?;
+        let Some(pull) = client
+            .pull_request(&owner, &name, number)
+            .map_err(|error| self.error_sentence(error))?
+        else {
+            return Err(sentence(format!(
+                "pull request {repository}#{number} was not found"
+            )));
+        };
+        if pull.state != "open" {
+            return Err(sentence(format!(
+                "pull request {repository}#{number} is `{}` and cannot be reviewed",
+                pull.state
+            )));
+        }
+        // HARD INVARIANT: fail closed unless PR author is positively proven to be another account.
+        let authorship =
+            PullRequestAuthorship::of(pull.author.as_deref(), Some(self.config.login.as_str()));
+        if !authorship.is_verified_other() {
+            return Err(sentence(format!(
+                "self-review is refused: {repository}#{number} ({}); another role must review it",
+                authorship.fact()
+            )));
+        }
+        client.begin_write();
+        let review = client.create_pull_review(&owner, &name, number, api_event, &body);
+        self.note_accepted(&client);
+        let review = review.map_err(|error| self.error_sentence(error))?;
+        let url = review
+            .html_url
+            .clone()
+            .or(pull.html_url.clone())
+            .unwrap_or_else(|| self.web_url(&repository, number, None));
+        Ok(ToolReply {
+            text: format!("reviewed {repository}#{number} ({api_event}) — {url}"),
+            repository: Some(repository),
+            number: Some(number),
+            action: Some("reviewed"),
+            url: Some(url),
+            branch: Some(pull.head),
+        })
+    }
+
+    /// Maintain: merge an approved non-own pull request.
+    /// Supervisor hard-blocks self-merge and merges without an active non-self `APPROVED` review.
+    fn merge_pull_request(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let repository = self.repository_arg(args)?;
+        let number = self.number(args)?;
+        let method = match args
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("merge") => "merge",
+            Some("squash") => "squash",
+            Some("rebase") => "rebase",
+            Some(other) => {
+                return Err(sentence(format!(
+                    "`method` must be `merge`, `squash`, or `rebase` (got `{other}`)"
+                )));
+            }
+        };
+        let title = args.get("title").and_then(serde_json::Value::as_str);
+        let (owner, name) = self.split_repository(&repository)?;
+        self.repository(&repository)?;
+        let client = self.client()?;
+        self.verify_token_identity(&client)?;
+        let Some(pull) = client
+            .pull_request(&owner, &name, number)
+            .map_err(|error| self.error_sentence(error))?
+        else {
+            return Err(sentence(format!(
+                "pull request {repository}#{number} was not found"
+            )));
+        };
+        if pull.state != "open" {
+            return Err(sentence(format!(
+                "pull request {repository}#{number} is `{}` and cannot be merged",
+                pull.state
+            )));
+        }
+        // HARD INVARIANT 1: fail closed unless PR author is positively proven to be another account.
+        let authorship =
+            PullRequestAuthorship::of(pull.author.as_deref(), Some(self.config.login.as_str()));
+        if !authorship.is_verified_other() {
+            return Err(sentence(format!(
+                "self-merge is refused: {repository}#{number} ({}); another role with maintain permission must merge it",
+                authorship.fact()
+            )));
+        }
+        // HARD INVARIANT 2: require at least one active, non-dismissed, non-stale
+        // non-author APPROVED review matching the current PR head SHA, and zero
+        // unresolved REQUEST_CHANGES reviews across all review pages.
+        let reviews = client
+            .pull_reviews(&owner, &name, number)
+            .map_err(|error| self.error_sentence(error))?;
+        if let Err(reason) =
+            verify_merge_approval(pull.author.as_deref(), pull.head_sha.as_deref(), &reviews)
+        {
+            return Err(sentence(format!(
+                "merge refused for {repository}#{number}: {reason}"
+            )));
+        }
+        client.begin_write();
+        let merged = client.merge_pull_request(
+            &owner,
+            &name,
+            number,
+            method,
+            title,
+            pull.head_sha.as_deref(),
+        );
+        self.note_accepted(&client);
+        merged.map_err(|error| self.error_sentence(error))?;
+        let url = pull
+            .html_url
+            .clone()
+            .unwrap_or_else(|| self.web_url(&repository, number, None));
+        Ok(ToolReply {
+            text: format!("merged {repository}#{number} via {method} — {url}"),
+            repository: Some(repository),
+            number: Some(number),
+            action: Some("merged"),
+            url: Some(url),
+            branch: Some(pull.head),
+        })
+    }
+
+    /// Maintain: create a new repository under the `team` organisation (never deletes).
+    fn create_repository(&self, args: &serde_json::Value) -> Result<ToolReply, String> {
+        let raw_name = args
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| sentence("the arguments need a non-empty repository `name`".to_owned()))?;
+        if raw_name.len() > 64
+            || raw_name.contains('/')
+            || raw_name.contains("..")
+            || !raw_name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            || !raw_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(sentence(format!(
+                "repository name `{raw_name}` must be 1–64 ASCII letters, digits, `-`, `_`, or `.` starting with a letter or digit"
+            )));
+        }
+        let description = args
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let private = match args.get("private") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(sentence(
+                    "`private` must be a boolean (`true` or `false`)".to_owned(),
+                ));
+            }
+        };
+        let org = crate::bundled_forgejo::ORGANISATION;
+        let client = match self.org_creator_token.as_ref() {
+            Some(token) => {
+                ForgejoClient::new(&self.config.url, token.clone(), forgejo::DEFAULT_TIMEOUT)
+                    .map_err(|error| self.error_sentence(error))?
+            }
+            None => self.client()?,
+        };
+        client.begin_write();
+        let created = client.create_org_repository(org, raw_name, description, private);
+        self.note_accepted(&client);
+        let repo = created.map_err(|error| self.error_sentence(error))?;
+        let url = repo
+            .html_url
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", self.config.url.trim_end_matches('/'), repo.full_name));
+        Ok(ToolReply {
+            text: format!("created repository {} — {url}", repo.full_name),
+            repository: Some(repo.full_name),
+            number: None,
+            action: Some("created_repository"),
+            url: Some(url),
+            branch: repo.default_branch,
+        })
+    }
+
     /// A web URL built from the configured instance, for a reply that names none.
     fn web_url(&self, repository: &str, number: u64, comment: Option<u64>) -> String {
         let base = self.config.url.trim_end_matches('/');
@@ -910,9 +1569,129 @@ fn bounded_text(text: &str, limit: usize) -> String {
     text
 }
 
+/// Extract a bounded, deduplicated list of non-empty strings from a JSON array field.
+fn bounded_string_array_arg(
+    args: &serde_json::Value,
+    key: &str,
+    max_items: usize,
+    max_len: usize,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let Some(raw) = args.get(key) else {
+        return Ok(out);
+    };
+    let Some(arr) = raw.as_array() else {
+        return Err(sentence(format!("`{key}` must be an array of strings")));
+    };
+    if arr.len() > max_items {
+        return Err(sentence(format!(
+            "`{key}` accepts at most {max_items} items per call (got {})",
+            arr.len()
+        )));
+    }
+    for item in arr {
+        let Some(s) = item.as_str() else {
+            return Err(sentence(format!("`{key}` must contain only strings")));
+        };
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.len() > max_len {
+            return Err(sentence(format!(
+                "each item in `{key}` must be at most {max_len} bytes"
+            )));
+        }
+        if !out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(trimmed)) {
+            out.push(trimmed.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Evaluate whether a pull request has an active, non-dismissed, non-stale
+/// non-author `APPROVED` review matching the current PR head SHA and zero
+/// unresolved non-author `REQUEST_CHANGES` reviews.
+pub(crate) fn verify_merge_approval(
+    pr_author: Option<&str>,
+    pr_head_sha: Option<&str>,
+    reviews: &[crate::forgejo::PullReview],
+) -> Result<(), &'static str> {
+    let Some(pr_author) = pr_author.map(str::trim).filter(|a| !a.is_empty()) else {
+        return Err("pull request author is missing; refusing merge");
+    };
+    let Some(expected_head) = pr_head_sha.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err("pull request head commit SHA is missing; refusing unpinned merge");
+    };
+
+    // Sort deterministically by (submitted_at, id) so response ordering cannot
+    // hide a newer REQUEST_CHANGES or inflate an older APPROVED review.
+    let mut ordered: Vec<&crate::forgejo::PullReview> = reviews.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.submitted_at
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.submitted_at.as_deref().unwrap_or(""))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut latest_by_reviewer: std::collections::BTreeMap<String, &'static str> =
+        std::collections::BTreeMap::new();
+    for review in ordered {
+        let Some(reviewer) = review
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        else {
+            continue;
+        };
+        if pr_author.eq_ignore_ascii_case(reviewer) {
+            continue;
+        }
+        let key = reviewer.to_ascii_lowercase();
+        let state = review.state.trim().to_ascii_uppercase();
+        if review.dismissed || state == "DISMISSED" {
+            latest_by_reviewer.insert(key, "DISMISSED");
+            continue;
+        }
+        match state.as_str() {
+            "REQUEST_CHANGES" => {
+                latest_by_reviewer.insert(key, "REQUEST_CHANGES");
+            }
+            "APPROVED" => {
+                let sha_matches = review
+                    .commit_id
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|cid| cid.eq_ignore_ascii_case(expected_head));
+                if !review.stale && sha_matches {
+                    latest_by_reviewer.insert(key, "APPROVED");
+                } else {
+                    // A stale or older-commit approval does not satisfy current head
+                    // approval; preserve an earlier REQUEST_CHANGES if still unresolved.
+                    if latest_by_reviewer.get(&key).copied() != Some("REQUEST_CHANGES") {
+                        latest_by_reviewer.insert(key, "STALE_APPROVAL");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if latest_by_reviewer.values().any(|s| *s == "REQUEST_CHANGES") {
+        return Err("a reviewer has an unresolved REQUEST_CHANGES review");
+    }
+    if !latest_by_reviewer.values().any(|s| *s == "APPROVED") {
+        return Err(
+            "at least one current, non-dismissed, non-author APPROVED review matching the PR head commit is required before merging",
+        );
+    }
+    Ok(())
+}
+
 /// Whether a name is a declared Forgejo tool.
 pub fn is_forgejo_tool(name: &str) -> bool {
-    TOOL_NAMES.contains(&name)
+    ALL_TOOL_NAMES.contains(&name)
 }
 
 /// The sentence for a tool that is not declared, used by the run loop.
@@ -966,12 +1745,128 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_writes_count() {
-        assert!(is_write_tool(COMMENT));
-        assert!(is_write_tool(OPEN_PULL_REQUEST));
-        assert!(is_write_tool(UPDATE_PULL_REQUEST));
-        assert!(!is_write_tool(LIST_ASSIGNED_ISSUES));
-        assert!(!is_write_tool(READ_ISSUE_OR_PULL));
-        assert!(!is_write_tool(LIST_MY_PULL_REQUESTS));
+    fn write_and_read_tool_classification_matches_all_tiers() {
+        for write_tool in [
+            COMMENT,
+            OPEN_PULL_REQUEST,
+            UPDATE_PULL_REQUEST,
+            CREATE_ISSUE,
+            UPDATE_ISSUE,
+            REVIEW_PULL_REQUEST,
+            MERGE_PULL_REQUEST,
+            CREATE_REPOSITORY,
+        ] {
+            assert!(is_write_tool(write_tool), "{write_tool} must be a write tool");
+        }
+        for read_tool in [
+            LIST_ASSIGNED_ISSUES,
+            READ_ISSUE_OR_PULL,
+            LIST_MY_PULL_REQUESTS,
+            LIST_ISSUES,
+            LIST_PULL_REQUESTS,
+            READ_PULL_DIFF,
+        ] {
+            assert!(!is_write_tool(read_tool), "{read_tool} must be a read tool");
+        }
+    }
+
+    #[test]
+    fn merge_approval_rejects_stale_dismissed_wrong_sha_missing_author_and_reversed_order() {
+        use crate::forgejo::PullReview;
+        let rev = |id, author: Option<&str>, state: &str, commit: Option<&str>, dismissed, stale, ts: &str| {
+            PullReview {
+                id,
+                state: state.to_owned(),
+                body: String::new(),
+                author: author.map(str::to_owned),
+                commit_id: commit.map(str::to_owned),
+                dismissed,
+                stale,
+                submitted_at: Some(ts.to_owned()),
+                html_url: None,
+            }
+        };
+        // Missing PR author fails closed.
+        assert!(
+            verify_merge_approval(
+                None,
+                Some("sha-head"),
+                &[rev(1, Some("gewu-rev"), "APPROVED", Some("sha-head"), false, false, "2026-11-27T01:00:00Z")]
+            )
+            .is_err()
+        );
+        // Missing PR head SHA fails closed (refuses unpinned merge).
+        assert!(
+            verify_merge_approval(
+                Some("gewu-coder"),
+                None,
+                &[rev(1, Some("gewu-rev"), "APPROVED", Some("sha-head"), false, false, "2026-11-27T01:00:00Z")]
+            )
+            .is_err()
+        );
+        // Stale / older-commit approval after force-push is rejected.
+        assert!(
+            verify_merge_approval(
+                Some("gewu-coder"),
+                Some("sha-v2"),
+                &[rev(1, Some("gewu-rev"), "APPROVED", Some("sha-v1"), false, false, "2026-11-27T01:00:00Z")]
+            )
+            .is_err()
+        );
+        // Dismissed approval is rejected.
+        assert!(
+            verify_merge_approval(
+                Some("gewu-coder"),
+                Some("sha-v1"),
+                &[rev(1, Some("gewu-rev"), "APPROVED", Some("sha-v1"), true, false, "2026-11-27T01:00:00Z")]
+            )
+            .is_err()
+        );
+        // Reversed response order: newer REQUEST_CHANGES beats older APPROVED.
+        assert!(
+            verify_merge_approval(
+                Some("gewu-coder"),
+                Some("sha-v1"),
+                &[
+                    rev(2, Some("gewu-rev"), "REQUEST_CHANGES", Some("sha-v1"), false, false, "2026-11-27T02:00:00Z"),
+                    rev(1, Some("gewu-rev"), "APPROVED", Some("sha-v1"), false, false, "2026-11-27T01:00:00Z"),
+                ]
+            )
+            .is_err()
+        );
+        // Current non-dismissed, non-stale non-author approval on current head SHA passes.
+        assert!(
+            verify_merge_approval(
+                Some("gewu-coder"),
+                Some("sha-v2"),
+                &[rev(3, Some("gewu-rev"), "APPROVED", Some("sha-v2"), false, false, "2026-11-27T03:00:00Z")]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn symlinked_clone_directory_outside_workspace_is_refused() {
+        let root = crate::test_support::scratch_root("tools-symlink-clone");
+        let ws = root.join("ws");
+        let sibling = root.join("sibling-repo");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(sibling.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&sibling, ws.join("workspace")).unwrap();
+        let tools = ForgejoTools::new(
+            crate::run::RunForgejo {
+                url: "http://127.0.0.1:1".to_owned(),
+                login: "gewu-coder".to_owned(),
+                repositories: vec![crate::run::RunForgejoRepository {
+                    full_name: "team/workspace".to_owned(),
+                    directory: "workspace".to_owned(),
+                }],
+            },
+            &ws,
+            "coder",
+            Secret::new("dummy"),
+        );
+        let err = tools.repository("team/workspace").expect_err("symlink refused");
+        assert!(err.contains("symlink"), "{err}");
     }
 }

@@ -2087,6 +2087,8 @@ fn draw_dense_list_line(
 fn draw_home(board: &mut Board, buf: &mut Buffer, area: Rect, build: bool) {
     let title = if build {
         "Setting up…"
+    } else if board.is_attached() {
+        "gewu-multiverse · attached"
     } else {
         "gewu-multiverse"
     };
@@ -2419,7 +2421,11 @@ fn draw_home_footer(board: &mut Board, buf: &mut Buffer, inner: Rect) {
         "←→ pick   ⏎ open   s start/stop   + add   − remove",
         theme::fg(theme::MUTED),
     );
-    let second = "f Forgejo   m model   ? help   q quit";
+    let second = if board.is_attached() {
+        "f Forgejo   m model   ? help   q detach   Q stop daemon"
+    } else {
+        "f Forgejo   m model   ? help   q quit"
+    };
     text_util::put(
         buf,
         inner,
@@ -4542,9 +4548,10 @@ mod program_view_tests {
             let mut board = Board::new(engine);
             board.screen = Screen::Program;
             board.agent_name = "agent-1".to_owned();
-            // The Program screen preselects the agent's saved program (Codex here);
+            // The Program screen preselects the agent's saved program (Codex here,
+            // index 3 after [built-in, DSH, Pi, Codex, OpenCode]);
             // the preview must follow that highlight.
-            board.program_index = 2;
+            board.program_index = 3;
             board.program_protocol = crate::harness::Protocol::Responses;
             board.view.agents[0].active_program = Some(RunProgramView {
                 program: "codex".to_owned(),

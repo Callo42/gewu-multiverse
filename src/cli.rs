@@ -55,6 +55,11 @@ pub enum Invocation {
         /// The private launch plan.
         spec: PathBuf,
     },
+    /// Run a per-role resident harness server/RPC host. Started by the engine, never by a person.
+    RoleRuntime {
+        /// The private runtime specification file.
+        spec: PathBuf,
+    },
     /// Print one run's model key for a native program's command-backed credential
     /// helper. Started by the native program, never by a person.
     PrintNativeKey {
@@ -86,6 +91,8 @@ pub enum Invocation {
     McpForgejoConnect {
         /// The run-private socket.
         socket: PathBuf,
+        /// Optional path to the role's read-only 0600 MCP authentication cookie.
+        cookie_file: Option<PathBuf>,
     },
     /// Install one official native program into the product's data directory.
     InstallHarness {
@@ -196,6 +203,8 @@ pub struct ConfigureCli {
     pub agents: Option<usize>,
     /// Add one new agent (`agent-N`).
     pub add_agent: bool,
+    /// Add one semantic role (e.g. `pm`, `coder`, `reviewer`, `ops`).
+    pub add_role: Option<String>,
     /// Remove one named agent.
     pub remove_agent: Option<String>,
     /// Target agent name for per-agent program/model/instruction changes.
@@ -206,6 +215,34 @@ pub struct ConfigureCli {
     pub codex_sandbox: Option<String>,
     /// Path to markdown file to write as the target agent's `instruction.md`.
     pub instruction_file: Option<PathBuf>,
+    /// Wake mode (`periodic`, `event`, or `hybrid`). Applies to `--agent` or global default.
+    pub wake_mode: Option<String>,
+    /// Per-role wake interval in seconds (`periodic` or `hybrid` fallback).
+    pub wake_interval: Option<u64>,
+    /// Mechanical context snapshot mode (`none` or `self`). Applies to `--agent` or global default.
+    pub context_mode: Option<String>,
+    /// Optional team views for the role (`open_pulls`, `unassigned_issues`).
+    pub context_views: Vec<String>,
+    /// Optional repository filter for the role (`team/repo` or `repo`).
+    pub context_repos: Vec<String>,
+    /// Optional issue label filter for the role.
+    pub context_labels: Vec<String>,
+    /// Optional sandboxed pre-wake command (`hydrate_cmd`).
+    pub hydrate_cmd: Option<String>,
+    /// Grant `triage` Forgejo permissions to the target role.
+    pub allow_triage: bool,
+    /// Grant `review` Forgejo permissions to the target role.
+    pub allow_review: bool,
+    /// Grant `maintain` Forgejo permissions to the target role.
+    pub allow_maintain: bool,
+    /// Override per-run Forgejo write bound for the target role (1..=32).
+    pub write_bound: Option<u32>,
+    /// Global idle timeout (seconds) before per-role resident runtimes park.
+    pub runtime_idle_secs: Option<u64>,
+    /// Non-secret external environment variables (`KEY=VALUE`) for the target role.
+    pub env_vars: Vec<(String, String)>,
+    /// External secret environment variables (`KEY=PATH`) stored in 0600 `credentials.toml`.
+    pub secret_env_files: Vec<(String, PathBuf)>,
     /// Agents to mark `started` (verifying preconditions).
     pub start_agents: Vec<String>,
     /// Agents to mark `stopped`.
@@ -229,10 +266,25 @@ impl ConfigureCli {
             || self.api_key_stdin
             || self.agents.is_some()
             || self.add_agent
+            || self.add_role.is_some()
             || self.remove_agent.is_some()
             || self.program.is_some()
             || self.codex_sandbox.is_some()
             || self.instruction_file.is_some()
+            || self.wake_mode.is_some()
+            || self.wake_interval.is_some()
+            || self.context_mode.is_some()
+            || !self.context_views.is_empty()
+            || !self.context_repos.is_empty()
+            || !self.context_labels.is_empty()
+            || self.hydrate_cmd.is_some()
+            || self.allow_triage
+            || self.allow_review
+            || self.allow_maintain
+            || self.write_bound.is_some()
+            || self.runtime_idle_secs.is_some()
+            || !self.env_vars.is_empty()
+            || !self.secret_env_files.is_empty()
             || !self.start_agents.is_empty()
             || !self.stop_agents.is_empty()
             || self.start_all
@@ -250,11 +302,26 @@ impl ConfigureCli {
             || self.api_key_stdin
             || self.agents.is_some()
             || self.add_agent
+            || self.add_role.is_some()
             || self.remove_agent.is_some()
             || self.agent.is_some()
             || self.program.is_some()
             || self.codex_sandbox.is_some()
             || self.instruction_file.is_some()
+            || self.wake_mode.is_some()
+            || self.wake_interval.is_some()
+            || self.context_mode.is_some()
+            || !self.context_views.is_empty()
+            || !self.context_repos.is_empty()
+            || !self.context_labels.is_empty()
+            || self.hydrate_cmd.is_some()
+            || self.allow_triage
+            || self.allow_review
+            || self.allow_maintain
+            || self.write_bound.is_some()
+            || self.runtime_idle_secs.is_some()
+            || !self.env_vars.is_empty()
+            || !self.secret_env_files.is_empty()
             || self.test_model
     }
 }
@@ -298,9 +365,14 @@ Options:
                     --accept-terms
                     --base-url <url> --model <id> [--protocol <chat-completions|responses|anthropic-messages>]
                     --api-key-file <file> | --api-key-stdin
-                    --agents <count> | --add-agent | --remove-agent <name>
+                    --agents <count> | --add-agent | --add-role <name> | --remove-agent <name>
                     [--agent <name>] [--program <builtin|pi|codex|dsh|opencode>]
                     [--codex-sandbox <native|full-access>] [--instruction-file <file>]
+                    [--wake-mode <periodic|event|hybrid>] [--wake-interval <secs>]
+                    [--context-mode <none|self>] [--context-view <open_pulls|unassigned_issues>]
+                    [--context-repo <repo>] [--context-label <label>] [--hydrate-cmd <cmd>]
+                    [--allow-triage] [--allow-review] [--allow-maintain] [--write-bound <n>]
+                    [--runtime-idle-secs <secs>] [--env KEY=VALUE] [--secret-env-file KEY=FILE]
                     [--start-agent <name>] [--stop-agent <name>] [--start-all] [--stop-all]
                     [--test-model]
     --control     Start or stop agents on a running --headless daemon without
@@ -332,6 +404,10 @@ fn is_forbidden_secret_flag(argument: &str) -> bool {
         || argument.starts_with("--api_key=")
         || argument == "--model_key"
         || argument.starts_with("--model_key=")
+        || argument == "--secret-env"
+        || argument.starts_with("--secret-env=")
+        || argument == "--secret_env"
+        || argument.starts_with("--secret_env=")
 }
 
 /// Read the arguments, without the program name.
@@ -388,6 +464,9 @@ where
             "--accept-terms" => cfg.accept_terms = true,
             "--api-key-stdin" => cfg.api_key_stdin = true,
             "--add-agent" => cfg.add_agent = true,
+            "--allow-triage" => cfg.allow_triage = true,
+            "--allow-review" => cfg.allow_review = true,
+            "--allow-maintain" => cfg.allow_maintain = true,
             "--start-all" => cfg.start_all = true,
             "--stop-all" => cfg.stop_all = true,
             "--test-model" => cfg.test_model = true,
@@ -405,6 +484,11 @@ where
                     spec: value_after(&mut args, "--confined-program")?,
                 });
             }
+            "--role-runtime" => {
+                return Ok(Invocation::RoleRuntime {
+                    spec: value_after(&mut args, "--role-runtime")?,
+                });
+            }
             "--print-native-key" => {
                 return Ok(Invocation::PrintNativeKey {
                     key: value_after(&mut args, "--print-native-key")?,
@@ -416,8 +500,11 @@ where
                 });
             }
             "--mcp-forgejo-connect" => {
+                let socket = value_after(&mut args, "--mcp-forgejo-connect")?;
+                let cookie_file = args.next().map(PathBuf::from);
                 return Ok(Invocation::McpForgejoConnect {
-                    socket: value_after(&mut args, "--mcp-forgejo-connect")?,
+                    socket,
+                    cookie_file,
                 });
             }
             "--mcp-forgejo-serve" => {
@@ -543,6 +630,90 @@ where
                     return Err("--instruction-file was given twice".to_owned());
                 }
                 cfg.instruction_file = Some(file_after(&mut args, "--instruction-file")?);
+            }
+            "--add-role" => {
+                if cfg.add_role.is_some() {
+                    return Err("--add-role was given twice".to_owned());
+                }
+                cfg.add_role = Some(string_after(&mut args, "--add-role")?);
+            }
+            "--wake-mode" => {
+                if cfg.wake_mode.is_some() {
+                    return Err("--wake-mode was given twice".to_owned());
+                }
+                cfg.wake_mode = Some(string_after(&mut args, "--wake-mode")?);
+            }
+            "--wake-interval" => {
+                if cfg.wake_interval.is_some() {
+                    return Err("--wake-interval was given twice".to_owned());
+                }
+                let raw = string_after(&mut args, "--wake-interval")?;
+                let secs = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("--wake-interval needs seconds (got `{raw}`)"))?;
+                cfg.wake_interval = Some(secs);
+            }
+            "--context-mode" => {
+                if cfg.context_mode.is_some() {
+                    return Err("--context-mode was given twice".to_owned());
+                }
+                cfg.context_mode = Some(string_after(&mut args, "--context-mode")?);
+            }
+            "--context-view" => {
+                cfg.context_views
+                    .push(string_after(&mut args, "--context-view")?);
+            }
+            "--context-repo" => {
+                cfg.context_repos
+                    .push(string_after(&mut args, "--context-repo")?);
+            }
+            "--context-label" => {
+                cfg.context_labels
+                    .push(string_after(&mut args, "--context-label")?);
+            }
+            "--hydrate-cmd" => {
+                if cfg.hydrate_cmd.is_some() {
+                    return Err("--hydrate-cmd was given twice".to_owned());
+                }
+                cfg.hydrate_cmd = Some(string_after(&mut args, "--hydrate-cmd")?);
+            }
+            "--write-bound" => {
+                if cfg.write_bound.is_some() {
+                    return Err("--write-bound was given twice".to_owned());
+                }
+                let raw = string_after(&mut args, "--write-bound")?;
+                let bound = raw
+                    .parse::<u32>()
+                    .map_err(|_| format!("--write-bound needs an integer 1..=32 (got `{raw}`)"))?;
+                cfg.write_bound = Some(bound);
+            }
+            "--runtime-idle-secs" => {
+                if cfg.runtime_idle_secs.is_some() {
+                    return Err("--runtime-idle-secs was given twice".to_owned());
+                }
+                let raw = string_after(&mut args, "--runtime-idle-secs")?;
+                let secs = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("--runtime-idle-secs needs seconds (got `{raw}`)"))?;
+                cfg.runtime_idle_secs = Some(secs);
+            }
+            "--env" => {
+                let raw = string_after(&mut args, "--env")?;
+                let Some((key, val)) = raw.split_once('=') else {
+                    return Err("--env expects KEY=VALUE".to_owned());
+                };
+                cfg.env_vars.push((key.to_owned(), val.to_owned()));
+            }
+            "--secret-env-file" => {
+                let raw = string_after(&mut args, "--secret-env-file")?;
+                let Some((key, path)) = raw.split_once('=') else {
+                    return Err("--secret-env-file expects KEY=PATH".to_owned());
+                };
+                if path.trim().is_empty() {
+                    return Err("--secret-env-file expects KEY=PATH with a non-empty file path".to_owned());
+                }
+                cfg.secret_env_files
+                    .push((key.to_owned(), PathBuf::from(path)));
             }
             "--start-agent" => {
                 cfg.start_agents.push(string_after(&mut args, "--start-agent")?);

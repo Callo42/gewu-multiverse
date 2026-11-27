@@ -104,7 +104,7 @@ pub const TERMS_VERSION: u32 = 2;
 ///
 /// It stays inside what the product can observe and does not promise perfect shell
 /// interpretation or unconditional containment of detached processes.
-pub const WHATS_NEW: &str = "headless run cleanup isolates normal finishes from unrelated services, and live --control wakes hand over immediately without premature --stop-on-no-work parking";
+pub const WHATS_NEW: &str = "role-defined teams with tiered Forgejo permissions, local webhook wakes, per-role resident HarnessRuntime (dsh fresh default), and TUI auto-attach — existing v0.1.x configs keep builtin/periodic/least-privilege unchanged";
 
 /// The terms the first-run screen shows, one short item each. They are the product's
 /// fixed words, in the first-time reader's language.
@@ -232,6 +232,10 @@ fn start_forgejo(
 /// The engine, as the board holds it.
 pub struct Engine {
     inner: Arc<Mutex<Inner>>,
+    /// Per-role resident harness server/RPC pool (never shared across roles).
+    harness_pool: Arc<Mutex<crate::harness_runtime::HarnessPool>>,
+    /// Whether this engine uses real resident runtimes and local Forgejo webhooks.
+    use_resident_pool: bool,
     /// The data-directory lock, held until this value drops.
     _lock: Flock<File>,
     clock: SharedClock,
@@ -258,7 +262,7 @@ pub fn open_with(options: EngineOptions) -> Result<Engine, String> {
     let clock: SharedClock = Arc::new(RealClock);
     let spawner: Arc<dyn SessionSpawner> =
         Arc::new(RealSpawner::new(options.product_binary.clone()));
-    build(options, clock, spawner, None)
+    build(options, clock, spawner, None, true)
 }
 
 /// Open with a test's clock, spawner and settings. The session loop is exercised
@@ -274,7 +278,7 @@ pub(crate) fn open_for_test(
     if options.product_binary.as_os_str().is_empty() {
         options.product_binary = PathBuf::from("/bin/true");
     }
-    build(options, clock, spawner, Some(settings))
+    build(options, clock, spawner, Some(settings), false)
 }
 
 /// Open an engine whose settings are already loaded.
@@ -283,6 +287,7 @@ fn build(
     clock: SharedClock,
     spawner: Arc<dyn SessionSpawner>,
     settings: Option<Settings>,
+    use_resident_pool: bool,
 ) -> Result<Engine, String> {
     options
         .layout
@@ -310,6 +315,9 @@ fn build(
     // product started, and stopped before a fresh one can start.
     bundled_forgejo::recover_stale_server(&options.data_root, options.stop_grace)?;
     let (_, leftovers) = recover_stale_sessions(&options.layout, options.stop_grace)?;
+    if use_resident_pool {
+        crate::harness_runtime::HarnessPool::recover_stale_runtimes(options.layout.state_root());
+    }
     remove_stale_run_temps();
     // A kill between the installer's two directory renames is restored before the
     // first picture reads the program cards. A live install owns its directory and
@@ -342,8 +350,13 @@ fn build(
     if inner.options.layout.config_file().is_file() {
         inner.note("an earlier setup was found and left as it was");
     }
+    if use_resident_pool && options.auto_start_forgejo {
+        inner.webhook = crate::webhook::WebhookReceiver::start().ok();
+    }
     let engine = Engine {
         inner: Arc::new(Mutex::new(inner)),
+        harness_pool: Arc::new(Mutex::new(crate::harness_runtime::HarnessPool::new())),
+        use_resident_pool,
         _lock: lock,
         clock,
         spawner,
@@ -649,6 +662,16 @@ struct AgentRuntime {
     /// Set when `Command::Start` arrives while a session is already in flight so the
     /// follow-up run starts immediately on completion instead of waiting a watch/backoff delay.
     wake_pending: bool,
+    /// Human-readable reason for the next wake (e.g. Forgejo webhook summary or manual start).
+    pending_wake_reason: Option<String>,
+    /// Debounce deadline for an incoming Forgejo webhook event before launching a run.
+    event_debounce_at: Option<Instant>,
+    /// True when an `event`-mode role finished with no work and is parked silently until an event or manual Start.
+    waiting_for_event: bool,
+    /// Recent webhook-triggered wake timestamps for per-role rate limiting (anti-loop).
+    webhook_wake_times: std::collections::VecDeque<Instant>,
+    /// Timestamp of the last webhook-triggered wake for minimum cooldown enforcement.
+    last_webhook_wake_at: Option<Instant>,
     last_end: Option<SessionEnd>,
     quick_failures: u32,
     provision_inflight: bool,
@@ -716,6 +739,8 @@ struct Inner {
     generation: u64,
     /// Install progress/errors for the Program screen.
     program_states: HashMap<String, ProgramState>,
+    /// Loopback-only Forgejo HMAC-SHA256 webhook receiver for `event`/`hybrid` wakes.
+    webhook: Option<crate::webhook::WebhookReceiver>,
 }
 
 #[derive(Default)]
@@ -828,6 +853,7 @@ impl Inner {
             stopping: false,
             generation: 0,
             program_states: HashMap::new(),
+            webhook: None,
         };
         // A number this installation has ever used is never reused, even when the
         // agent is gone from the settings. The names on disk are the floor for an
@@ -1109,6 +1135,11 @@ impl AgentRuntime {
             starting_since: None,
             next_at: None,
             wake_pending: false,
+            pending_wake_reason: None,
+            event_debounce_at: None,
+            waiting_for_event: false,
+            webhook_wake_times: std::collections::VecDeque::new(),
+            last_webhook_wake_at: None,
             last_end: None,
             quick_failures: 0,
             provision_inflight: false,
@@ -1380,6 +1411,9 @@ impl Engine {
 
     /// The design's tick: reap, start due sessions, follow the Forgejo child.
     fn tick_at(&mut self) {
+        if let Ok(mut pool) = self.harness_pool.lock() {
+            pool.reap_exited();
+        }
         let now = self.clock.now();
         let jobs = {
             let mut inner = match self.inner.lock() {
@@ -1482,8 +1516,24 @@ impl Engine {
                 std::thread::spawn(move || provision_agent_job(inner, name));
             }
             Job::Session(request) => {
+                let harness_pool = Arc::clone(&self.harness_pool);
+                let use_resident_pool = self.use_resident_pool;
+                let product_binary = self.options.product_binary.clone();
+                let runtime_idle_secs = lock_inner(&self.inner)
+                    .settings
+                    .effective_runtime_idle_secs();
                 std::thread::spawn(move || {
-                    session_job(inner, *request, spawner, clock, generation);
+                    session_job(
+                        inner,
+                        *request,
+                        spawner,
+                        clock,
+                        generation,
+                        harness_pool,
+                        use_resident_pool,
+                        product_binary,
+                        runtime_idle_secs,
+                    );
                 });
             }
             Job::RemoveAgent(name) => {
@@ -1494,14 +1544,92 @@ impl Engine {
 }
 
 impl Inner {
+    fn role_wake_schedule(&self, name: &str) -> (settings::WakeMode, u64) {
+        let global = self.settings.effective_wake_mode();
+        let Some(saved) = self.settings.agent(name) else {
+            return (global, NO_WORK_DELAY.as_secs());
+        };
+        let mode = saved.effective_wake_mode(global);
+        let interval = saved.effective_wake_interval_secs(mode);
+        (mode, interval)
+    }
+
     fn poll(&mut self, now: Instant) {
         if self.stopping {
             return;
         }
         self.refresh_instructions();
         self.poll_forgejo(now);
+        self.poll_webhooks(now);
         for index in 0..self.agents.len() {
             self.poll_agent(index, now);
+        }
+    }
+
+    fn poll_webhooks(&mut self, now: Instant) {
+        let events = match self.webhook.as_ref() {
+            Some(receiver) => receiver.drain_events(),
+            None => return,
+        };
+        if events.is_empty() {
+            return;
+        }
+        let global_wake = self.settings.effective_wake_mode();
+        let global_ctx = self.settings.effective_default_context();
+        const WEBHOOK_WINDOW: Duration = Duration::from_secs(300);
+        const MAX_WEBHOOK_WAKES_PER_WINDOW: usize = 12;
+        const WEBHOOK_MIN_COOLDOWN: Duration = Duration::from_secs(5);
+        for ev in events {
+            for index in 0..self.agents.len() {
+                // IRON LAW: a stopped role is strictly silent (0 wakes, 0 LLM calls)
+                // regardless of wake_mode or incoming Forgejo events.
+                if self.agents[index].desired != Desired::Started
+                    || self.agents[index].removal_pending
+                {
+                    continue;
+                }
+                let name = self.agents[index].name.clone();
+                let Some(saved) = self.settings.agent(&name) else {
+                    continue;
+                };
+                let mode = saved.effective_wake_mode(global_wake);
+                if mode == settings::WakeMode::Periodic {
+                    continue;
+                }
+                let login = self.agents[index]
+                    .login
+                    .clone()
+                    .unwrap_or_else(|| format!("gewu-{name}"));
+                let ctx = saved.effective_context(global_ctx);
+                let perms = saved.effective_permissions();
+                if crate::webhook::event_matches_role(&ev, &login, &perms, &ctx) {
+                    let agent = &mut self.agents[index];
+                    // Bounded sliding-window rate limit prevents cross-role ping-pong storms.
+                    while let Some(oldest) = agent.webhook_wake_times.front().copied() {
+                        if now.saturating_duration_since(oldest) >= WEBHOOK_WINDOW {
+                            agent.webhook_wake_times.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    if agent.webhook_wake_times.len() >= MAX_WEBHOOK_WAKES_PER_WINDOW {
+                        continue;
+                    }
+                    agent.pending_wake_reason = Some(ev.summary.clone());
+                    let cooldown_until = agent
+                        .last_webhook_wake_at
+                        .map(|t| t + WEBHOOK_MIN_COOLDOWN)
+                        .unwrap_or(now);
+                    let target = (now + Duration::from_millis(1500)).max(cooldown_until);
+                    // Preserve an existing earlier debounce deadline so steady event traffic
+                    // can never starve a role by endlessly pushing `event_debounce_at` forward.
+                    if agent.event_debounce_at.is_none() {
+                        agent.event_debounce_at = Some(target);
+                        agent.webhook_wake_times.push_back(now);
+                        agent.last_webhook_wake_at = Some(now);
+                    }
+                }
+            }
         }
     }
 
@@ -1734,8 +1862,19 @@ impl Inner {
             self.agents[index].starting = false;
             self.agents[index].activity_refresh_at = None;
             let state_root = self.options.layout.state_root().to_path_buf();
+            let agent_name = self.agents[index].name.clone();
+            let (wake_mode, wake_interval_secs) = self.role_wake_schedule(&agent_name);
             let agent = &mut self.agents[index];
-            finish_session(agent, end, now, started, &state_root, Some(&run_dir));
+            finish_session(
+                agent,
+                end,
+                now,
+                started,
+                &state_root,
+                Some(&run_dir),
+                wake_mode,
+                wake_interval_secs,
+            );
             if agent.leftover.is_some() {
                 // A surviving old process outranks the normal restart: block the
                 // agent (and say why) until Start retries the cleanup.
@@ -1797,6 +1936,14 @@ impl Inner {
         }
         if self.agents[index].running.is_some() || self.agents[index].starting {
             return;
+        }
+        if self.agents[index]
+            .event_debounce_at
+            .is_some_and(|at| now >= at)
+        {
+            self.agents[index].event_debounce_at = None;
+            self.agents[index].waiting_for_event = false;
+            self.agents[index].next_at = Some(now);
         }
         if let Some(reason) = self.block_reason(index) {
             if !matches!(
@@ -1957,6 +2104,7 @@ impl Inner {
                     agent.desired == Desired::Started
                         && agent.running.is_none()
                         && !agent.starting
+                        && !agent.waiting_for_event
                         && !matches!(agent.session, SessionState::Blocked { .. })
                         && agent.next_at.is_none_or(|next_at| now >= next_at),
                     agent
@@ -1983,6 +2131,8 @@ impl Inner {
             }
             if let Some(request) = self.session_request(index) {
                 self.agents[index].starting = true;
+                self.agents[index].waiting_for_event = false;
+                self.agents[index].event_debounce_at = None;
                 self.agents[index].starting_since = Some(now);
                 self.agents[index].session_number =
                     self.agents[index].session_number.saturating_add(1);
@@ -2026,7 +2176,6 @@ impl Inner {
                 ));
             }
         }
-        let agent = &self.agents[index];
         let saved_agent = self.settings.agent(&agent_name).cloned()?;
         let program = saved_agent.harness();
         let (protocol, base_url, model) = self.connection_for(&saved_agent)?;
@@ -2045,6 +2194,29 @@ impl Inner {
         } else {
             None
         };
+        let global_ctx = self.settings.effective_default_context();
+        let role_context = saved_agent.effective_context(global_ctx);
+        let role_permissions = saved_agent.effective_permissions();
+        let role_mcp = paths
+            .mcp_config()
+            .is_file()
+            .then(|| paths.mcp_config().to_path_buf());
+        let pending_reason = self.agents[index].pending_wake_reason.take();
+        let wake_reason = pending_reason.or_else(|| {
+            (role_context.mode != settings::ContextMode::None)
+                .then(|| "scheduled check".to_owned())
+        });
+        let role = crate::run::RoleRunPlan {
+            wake_reason: wake_reason.unwrap_or_default(),
+            context: (role_context != settings::RoleContextConfig::default())
+                .then_some(role_context),
+            permissions: (!role_permissions.is_default()).then_some(role_permissions),
+            env: saved_agent.env.clone(),
+            mcp_config: role_mcp,
+            runtime_socket: None,
+            runtime_cookie: None,
+        };
+        let agent = &self.agents[index];
         self.sequence = self.sequence.saturating_add(1);
         let run_id = run::new_run_id(self.sequence);
         let run_dir = paths.run_dir(&run_id);
@@ -2087,6 +2259,7 @@ impl Inner {
             confinement,
             hide,
             native,
+            role,
         })
     }
 
@@ -2521,6 +2694,7 @@ fn temporary_model_cause(cause: &str) -> bool {
         .any(|code| lower.contains(code))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_session(
     agent: &mut AgentRuntime,
     end: SessionEnd,
@@ -2528,6 +2702,8 @@ fn finish_session(
     started: Instant,
     state_root: &Path,
     attempt_dir: Option<&Path>,
+    wake_mode: settings::WakeMode,
+    wake_interval_secs: u64,
 ) {
     // The run's own ending is used even when the user has just pressed Stop: the
     // selector already chose Stopped only when the stop genuinely ended the run.
@@ -2592,25 +2768,45 @@ fn finish_session(
     if agent.desired == Desired::Stopped || matches!(end, SessionEnd::Stopped { .. }) {
         agent.session = SessionState::Idle;
         agent.next_at = None;
+        agent.waiting_for_event = false;
+        agent.event_debounce_at = None;
         return;
     }
-    // A fresh Start received while this session was already in flight means new work or a
-    // refreshed instruction may have arrived after this run started; launch the follow-up
-    // run immediately rather than waiting through a watch or backoff delay.
-    // Otherwise, a no-work run takes the documented 20 s watch interval, a warned run takes
-    // the same watch interval rather than the five-second success loop that used to replay a
-    // deterministic comment every few seconds, only an actual quick failure grows the
-    // back-off, and a successful work run keeps the existing good-run interval.
+    // A fresh Start or incoming Forgejo event received while this session was already in
+    // flight means new work may have arrived; launch the follow-up run immediately.
+    // Otherwise:
+    // - `NoWork` / `Warned` obey the role's `wake_mode` (`periodic`: 20s or custom interval;
+    //   `hybrid`: 300s fallback or custom interval, interruptible by webhooks; `event`: park
+    //   silently until a matching webhook or manual Start).
+    // - `Succeeded` / long runs keep the short restart cadence.
+    // - Quick failures use exponential backoff.
     let delay = if wake_pending {
         agent.quick_failures = 0;
+        agent.waiting_for_event = false;
         Duration::ZERO
     } else if matches!(end, SessionEnd::NoWork { .. } | SessionEnd::Warned { .. }) {
         agent.quick_failures = 0;
-        NO_WORK_DELAY
+        match wake_mode {
+            settings::WakeMode::Event => {
+                agent.waiting_for_event = true;
+                agent.next_at = None;
+                agent.session = SessionState::Restarting {
+                    next_at: SystemTime::now(),
+                    last: end,
+                };
+                return;
+            }
+            settings::WakeMode::Periodic | settings::WakeMode::Hybrid => {
+                agent.waiting_for_event = false;
+                Duration::from_secs(wake_interval_secs.max(1))
+            }
+        }
     } else if matches!(end, SessionEnd::Succeeded) || ran >= LONG_SESSION {
         agent.quick_failures = 0;
+        agent.waiting_for_event = false;
         RESTART_DELAY
     } else {
+        agent.waiting_for_event = false;
         let delay = backoff_for_quick_failure(agent.quick_failures);
         agent.quick_failures = agent.quick_failures.saturating_add(1);
         delay
@@ -3431,6 +3627,132 @@ impl EngineApi for Engine {
                 inner.note(format!("`{name}` was added"));
                 Ok(())
             }
+            Command::AddNamedAgent { name } => {
+                let name = name.trim().to_owned();
+                if !crate::naming::is_safe_agent_name(&name) {
+                    return Err(format!(
+                        "`{name}` is not a valid role name (use letters, digits, hyphens or underscores)"
+                    ));
+                }
+                if inner.agent_index(&name).is_some() {
+                    return Err(format!("there is already a role named `{name}`"));
+                }
+                let settings_before = inner.settings.clone();
+                let mut next = inner.settings.clone();
+                next.add_agent(&name, Desired::Stopped)?;
+                let key = inner.assign_new_agent_program(&mut next, &name)?;
+                ensure_agent_paths(&inner.options.layout, &name)?;
+                next.save(&inner.settings_path)?;
+                inner.settings = next;
+                if let Some(key) = key
+                    && let Err(error) = credentials::record_secret(
+                        &inner.credentials,
+                        Some("model_keys"),
+                        &name,
+                        &key,
+                    )
+                {
+                    inner.settings = settings_before;
+                    let _ = inner.save_settings();
+                    return Err(format!(
+                        "{name} was created, but its current model key could not be saved: {error}. Its next run will show the missing-key action; no global key is substituted."
+                    ));
+                }
+                let runtime = AgentRuntime::load(&inner, &name);
+                inner.agents.push(runtime);
+                inner.refresh_confinement();
+                inner.note(format!("`{name}` was added"));
+                Ok(())
+            }
+            Command::SetAgentRoleConfig {
+                name,
+                wake_mode,
+                wake_interval_secs,
+                context,
+                permissions,
+                env_updates,
+                env_removals,
+            } => {
+                if inner.agent_index(&name).is_none() {
+                    return Err(format!("there is no agent named `{name}`"));
+                }
+                let parsed_wake = match wake_mode {
+                    Some(Some(ref raw)) => Some(Some(settings::WakeMode::parse(raw).ok_or_else(
+                        || {
+                            format!(
+                                "unknown wake mode `{raw}` (choose periodic, event or hybrid)"
+                            )
+                        },
+                    )?)),
+                    Some(None) => Some(None),
+                    None => None,
+                };
+                for (key, _) in &env_updates {
+                    settings::validate_external_env_key(key)?;
+                }
+                inner.commit_settings(|settings| {
+                    let Some(saved) = settings.agent_mut(&name) else {
+                        return Err(format!("there is no agent named `{name}`"));
+                    };
+                    if let Some(wm) = parsed_wake {
+                        saved.wake_mode = wm.map(|m| m.id().to_owned());
+                    }
+                    if let Some(interval) = wake_interval_secs {
+                        saved.wake_interval_secs = interval;
+                    }
+                    if let Some(ctx) = context {
+                        saved.context = Some(ctx);
+                    }
+                    if let Some(perms) = permissions {
+                        saved.permissions = Some(perms);
+                    }
+                    for key in &env_removals {
+                        saved.env.remove(key);
+                    }
+                    for (key, val) in env_updates {
+                        saved.env.insert(key, val);
+                    }
+                    Ok(())
+                })?;
+                inner.note(format!("`{name}`'s role settings are saved"));
+                drop(inner);
+                if let Ok(mut pool) = self.harness_pool.lock() {
+                    pool.stop_role(&name);
+                }
+                Ok(())
+            }
+            Command::SetGlobalRoleDefaults {
+                wake_mode,
+                default_context,
+                runtime_idle_secs,
+            } => {
+                let parsed_wake = match wake_mode {
+                    Some(ref raw) => Some(settings::WakeMode::parse(raw).ok_or_else(|| {
+                        format!("unknown wake mode `{raw}` (choose periodic, event or hybrid)")
+                    })?),
+                    None => None,
+                };
+                let parsed_ctx = match default_context {
+                    Some(ref raw) => Some(settings::ContextMode::parse(raw).ok_or_else(|| {
+                        format!("unknown context mode `{raw}` (choose none or self)")
+                    })?),
+                    None => None,
+                };
+                inner.commit_settings(|settings| {
+                    if let Some(wm) = parsed_wake {
+                        settings.wake_mode = Some(wm.id().to_owned());
+                    }
+                    if let Some(ctx) = parsed_ctx {
+                        settings.default_context = Some(ctx.id().to_owned());
+                    }
+                    if let Some(idle) = runtime_idle_secs {
+                        settings.runtime_idle_secs = Some(idle);
+                    }
+                    Ok(())
+                })?;
+                inner.note("global role defaults are saved");
+                Ok(())
+            }
             Command::RemoveAgent { name } => {
                 let Some(index) = inner.agent_index(&name) else {
                     return Err(format!("there is no agent named `{name}`"));
@@ -3457,6 +3779,10 @@ impl EngineApi for Engine {
                 inner.agents[index].removal_pending = true;
                 inner.agents[index].removal_retry_at = None;
                 inner.note(format!("`{name}` is being removed"));
+                drop(inner);
+                if let Ok(mut pool) = self.harness_pool.lock() {
+                    pool.stop_role(&name);
+                }
                 Ok(())
             }
             Command::Start { name } => {
@@ -3533,6 +3859,9 @@ impl EngineApi for Engine {
                 }
                 agent.quick_failures = 0;
                 agent.next_at = None;
+                agent.waiting_for_event = false;
+                agent.event_debounce_at = None;
+                agent.pending_wake_reason = Some("manual start".to_owned());
                 let no_instruction = agent.instruction_chars == 0;
                 if no_instruction {
                     agent.wake_pending = false;
@@ -3567,14 +3896,27 @@ impl EngineApi for Engine {
                 }) {
                     Ok(()) => {
                         inner.note(format!("`{name}` stopped"));
+                        drop(inner);
+                        if let Ok(mut pool) = self.harness_pool.lock() {
+                            pool.stop_role(&name);
+                        }
                         Ok(())
                     }
-                    Err(error) => Err(format!(
-                        "`{name}` was stopped, but the stopped state could not be saved; it will start again the next time the program opens ({error})"
-                    )),
+                    Err(error) => {
+                        drop(inner);
+                        if let Ok(mut pool) = self.harness_pool.lock() {
+                            pool.stop_role(&name);
+                        }
+                        Err(format!(
+                            "`{name}` was stopped, but the stopped state could not be saved; it will start again the next time the program opens ({error})"
+                        ))
+                    }
                 }
             }
             Command::StartForgejo => {
+                if self.use_resident_pool && inner.webhook.is_none() {
+                    inner.webhook = crate::webhook::WebhookReceiver::start().ok();
+                }
                 if matches!(
                     inner.forgejo.state,
                     ForgejoState::Running
@@ -3679,6 +4021,7 @@ impl EngineApi for Engine {
                 return;
             }
             inner.stopping = true;
+            inner.webhook = None;
             inner.generation = inner.generation.saturating_add(1);
             for state in inner.program_states.values() {
                 if let Some(cancel) = &state.cancel {
@@ -3946,6 +4289,10 @@ impl EngineApi for Engine {
                 let _ = handle.join();
             }
         }
+        // Stop every per-role resident harness runtime host cleanly.
+        if let Ok(mut pool) = self.harness_pool.lock() {
+            pool.stop_all();
+        }
         // A clean exit records the version too, so an installation that is opened and
         // closed many times keeps one current line.
         let root = lock_inner(&self.inner).options.layout.root().to_path_buf();
@@ -4203,6 +4550,9 @@ fn stop_agent(agent: &mut AgentRuntime, grace: Duration) -> Result<(), String> {
     }
     agent.next_at = None;
     agent.wake_pending = false;
+    agent.waiting_for_event = false;
+    agent.event_debounce_at = None;
+    agent.pending_wake_reason = None;
     agent.session = SessionState::Idle;
     Ok(())
 }
@@ -4358,11 +4708,26 @@ fn forgejo_start_job_inner(inner: Arc<Mutex<Inner>>, options: EngineOptions, gen
                 &prepared.admin_login,
                 &token_cancel,
             );
+            let webhook_info = inner.lock().ok().and_then(|guard| {
+                guard
+                    .webhook
+                    .as_ref()
+                    .map(|wh| (wh.url().to_owned(), wh.secret().to_owned()))
+            });
             let provisioned = token.as_ref().ok().map(|token| {
                 let client = ForgejoClient::new(&url, token.clone(), DEFAULT_TIMEOUT);
-                client
-                    .ok()
-                    .and_then(|client| bundled_forgejo::provision(&client).ok())
+                client.ok().and_then(|client| {
+                    let repos = bundled_forgejo::provision(&client).ok()?;
+                    if let Some((wh_url, wh_secret)) = webhook_info.as_ref() {
+                        let _ = crate::webhook::ensure_org_webhook(
+                            &client,
+                            bundled_forgejo::ORGANISATION,
+                            wh_url,
+                            wh_secret,
+                        );
+                    }
+                    Some(repos)
+                })
             });
             if let Ok(mut inner) = inner.lock() {
                 if inner.generation != generation || inner.stopping {
@@ -4513,9 +4878,25 @@ fn forgejo_provision_job(inner: Arc<Mutex<Inner>>, options: EngineOptions) {
         )
         .ok()
     });
+    let webhook_info = inner.lock().ok().and_then(|guard| {
+        guard
+            .webhook
+            .as_ref()
+            .map(|wh| (wh.url().to_owned(), wh.secret().to_owned()))
+    });
     let result = match token.as_ref() {
-        Some(token) => ForgejoClient::new(&url, token.clone(), DEFAULT_TIMEOUT)
-            .and_then(|client| bundled_forgejo::provision(&client)),
+        Some(token) => ForgejoClient::new(&url, token.clone(), DEFAULT_TIMEOUT).and_then(|client| {
+            let repos = bundled_forgejo::provision(&client)?;
+            if let Some((wh_url, wh_secret)) = webhook_info.as_ref() {
+                let _ = crate::webhook::ensure_org_webhook(
+                    &client,
+                    bundled_forgejo::ORGANISATION,
+                    wh_url,
+                    wh_secret,
+                );
+            }
+            Ok(repos)
+        }),
         None => Err(ForgejoError::MissingToken),
     };
     if let Ok(mut inner) = inner.lock() {
@@ -4773,13 +5154,100 @@ fn provision_agent_job(inner: Arc<Mutex<Inner>>, name: String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_job(
     inner: Arc<Mutex<Inner>>,
-    request: SessionRequest,
+    mut request: SessionRequest,
     spawner: Arc<dyn SessionSpawner>,
     clock: SharedClock,
     generation: u64,
+    harness_pool: Arc<Mutex<crate::harness_runtime::HarnessPool>>,
+    use_resident_pool: bool,
+    product_binary: PathBuf,
+    runtime_idle_secs: u64,
 ) {
+    // When running a real native harness under Landlock, warm or reuse this role's
+    // dedicated per-role resident HarnessRuntime host (never shared across roles).
+    // If warm-up fails for any reason, transparently fall back to confined one-shot execution.
+    if use_resident_pool
+        && request.confinement == crate::confinement::Method::Landlock
+        && let Some(native) = request.native.as_ref()
+        && let Some(program) = Program::parse(&native.harness).filter(|p| p.is_native())
+        && let Some(protocol) = Protocol::parse(&native.protocol)
+    {
+        let forgejo_ctx = (!request.repositories.is_empty()).then(|| crate::run::RunForgejo {
+            url: request.forgejo_url.clone(),
+            login: request.login.clone(),
+            repositories: request
+                .repositories
+                .iter()
+                .map(|r| crate::run::RunForgejoRepository {
+                    full_name: r.full_name.clone(),
+                    directory: r.directory.clone(),
+                })
+                .collect(),
+        });
+        let role_secrets =
+            credentials::agent_env_secrets(&request.credentials, &request.agent).unwrap_or_default();
+        let effective_perms = request.role.permissions.clone().unwrap_or_default();
+        let fingerprint = crate::harness_runtime::compute_fingerprint(
+            &request.agent,
+            program,
+            &native.version,
+            &native.program,
+            protocol,
+            &native.base_url,
+            &native.model,
+            &native.codex_sandbox,
+            &effective_perms,
+            &request.role.env,
+            &role_secrets,
+            &request.skills_dir,
+            request.role.mcp_config.as_deref(),
+            forgejo_ctx.as_ref(),
+        );
+        let runtime_dir =
+            crate::harness_runtime::HarnessPool::role_runtime_dir(&request.state_root, &request.agent);
+        let spec = crate::harness_runtime::RoleRuntimeSpec {
+            agent: request.agent.clone(),
+            fingerprint,
+            auth_cookie: String::new(),
+            runs_root: request.state_root.join(&request.agent),
+            workspace: request.workspace.clone(),
+            skills_dir: request.skills_dir.clone(),
+            credentials: request.credentials.clone(),
+            socket: runtime_dir.join(crate::harness_runtime::RUNTIME_SOCKET_FILE),
+            pid_file: runtime_dir.join(crate::harness_runtime::RUNTIME_PID_FILE),
+            harness: native.harness.clone(),
+            version: native.version.clone(),
+            program: native.program.clone(),
+            install_root: native.install_root.clone(),
+            protocol: native.protocol.clone(),
+            base_url: native.base_url.clone(),
+            model: native.model.clone(),
+            codex_sandbox: native.codex_sandbox.clone(),
+            timeout_secs: request.timeout_secs,
+            idle_secs: runtime_idle_secs,
+            permissions: effective_perms,
+            role_env: request.role.env.clone(),
+            role_mcp_config: request.role.mcp_config.clone(),
+            forgejo: forgejo_ctx,
+        };
+        if let Ok(mut pool) = harness_pool.lock() {
+            match pool.ensure_ready(&product_binary, &spec) {
+                Ok((socket, cookie)) => {
+                    request.role.runtime_socket = Some(socket);
+                    request.role.runtime_cookie = Some(cookie);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "gewu-multiverse: role `{}` resident runtime warm-up fell back to one-shot: {error}",
+                        request.agent
+                    );
+                }
+            }
+        }
+    }
     let prepared: Result<PreparedSession, String> = spawner.prepare(&request);
     // The slow half is over: no child exists yet. A stop or shutdown that happened
     // during it must win before anything is spawned.
@@ -4823,6 +5291,7 @@ fn session_job(
             guard.agents[index].starting_run_dir = None;
             let started = guard.agents[index].starting_since.unwrap_or(now);
             let state_root = guard.options.layout.state_root().to_path_buf();
+            let (wake_mode, wake_interval_secs) = guard.role_wake_schedule(&request.agent);
             let agent = &mut guard.agents[index];
             finish_session(
                 agent,
@@ -4831,6 +5300,8 @@ fn session_job(
                 started,
                 &state_root,
                 Some(&request.run_dir),
+                wake_mode,
+                wake_interval_secs,
             );
             return;
         }
@@ -5002,6 +5473,7 @@ fn session_job(
             guard.agents[index].starting_run_dir = None;
             let _ = run::request_failed_finish(&request.run_dir, &request.run_id, &reason);
             let state_root = guard.options.layout.state_root().to_path_buf();
+            let (wake_mode, wake_interval_secs) = guard.role_wake_schedule(&request.agent);
             let agent = &mut guard.agents[index];
             finish_session(
                 agent,
@@ -5010,6 +5482,8 @@ fn session_job(
                 started_at,
                 &state_root,
                 Some(&request.run_dir),
+                wake_mode,
+                wake_interval_secs,
             );
         }
     }

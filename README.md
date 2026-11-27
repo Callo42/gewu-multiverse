@@ -1,489 +1,267 @@
 # gewu-multiverse
 
-**One Forgejo on your own computer, and the agents you run on it — drawn as one picture in your terminal.**
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-You install one small program. It brings its own Forgejo and keeps it running for you.
-You choose a model, choose how many agents you want, and write each one an instruction.
-Every agent has its own login on your Forgejo, so its commits, comments and pull
-requests are its own. The board shows the whole thing at a glance:
+**Traditional agent harnesses define one-off tasks. `gewu-multiverse` defines long-lived roles.**
 
+`gewu-multiverse` gives you a **private internal GitHub** (a bundled, loopback-only Forgejo) paired with a **customizable team of role-defined AI agents**—all in one lightweight binary you run on your own Linux machine.
+
+Each agent has its own Forgejo identity (`gewu-<role>`), its own Landlock-isolated workspace, its own instruction, skills, external MCP servers, and role-scoped credentials. Roles coordinate asynchronously through repositories, issues, pull requests, and reviews—and interact with the outside world by writing and running code inside their own sandbox.
+
+```text
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  TUI (gewu-multiverse)  ── auto-attach over headless.sock ──▶       │
+  │  CLI (--control/--status)      (q detaches; daemon keeps running)   │
+  └────────────────────────────────────────┬────────────────────────────┘
+                                           ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                 gewu-multiverse --headless (Outer Daemon)           │
+  │                                                                     │
+  │   ┌─────────────────────────────────────────────────────────────┐   │
+  │   │  Bundled Forgejo 17.0.0 (127.0.0.1 only, Shared Truth)      │   │
+  │   │  team/* repos · issues · PRs · reviews · HMAC webhooks      │   │
+  │   └──────────────────────────────┬──────────────────────────────┘   │
+  │                                  │ wake (event / hybrid / periodic) │
+  │         ┌────────────────────────┼────────────────────────┐         │
+  │         ▼                        ▼                        ▼         │
+  │  ┌──────────────┐        ┌──────────────┐        ┌──────────────┐   │
+  │  │ role: pm     │        │ role: coder  │        │role: reviewer│   │
+  │  │ (Landlock)   │        │ (Landlock)   │        │ (Landlock)   │   │
+  │  │ workspace/   │        │ workspace/   │        │ workspace/   │   │
+  │  │ skills/ mcp  │        │ skills/ mcp  │        │ skills/ mcp  │   │
+  │  │ HarnessPool  │        │ HarnessPool  │        │ HarnessPool  │   │
+  │  └──────────────┘        └──────────────┘        └──────────────┘   │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Each wakeup runs a stateless closure inside that role's own sandbox:
+    [Trigger] ─▶ [Mechanical <environment-snapshot>] ─▶ [Fresh Ephemeral Session]
+              ─▶ [Objective Action Ledger]           ─▶ [Discard Session]
 ```
-╭─╴ gewu-multiverse ╶──────────────────────────────────────────────────────────────────────────────╮
-│                                                                                                  │
-│                                                                                                  │
-│                       ╭╴ FORGEJO ╶─────────────────────────────╴ ● running ╶─╮                   │
-│                       │                                                      │                   │
-│                       │ http://127.0.0.1:3000                                │                   │
-│                       │ team · 1 repository · team/workspace                 │                   │
-│                       │ 3 agents                                             │                   │
-│                       │ your login: owner                                    │                   │
-│                       ╰───────────────────────────┬──────────────────────────╯                   │
-│                                                   │                                              │
-│                  ╭────────────────────────────────┼────────────────────────────────╮             │
-│ ╭╴ ○ agent-1 ╶───┴───────────╮   ╭╴ ○ agent-2 ╶───┴───────────╮   ╭╴ ○ agent-3 ╶───┴───────────╮ │
-│ │ gewu-agent-1               │   │ gewu-agent-2               │   │ gewu-agent-3               │ │
-│ │ stopped                    │   │ stopped                    │   │ stopped                    │ │
-│ │                            │   │                            │   │                            │ │
-│ ╰────────────────────────────╯   ╰────────────────────────────╯   ╰────────────────────────────╯ │
-│                                                                                                  │
-│ ←→ pick   ⏎ open   s start/stop   + add   − remove                                               │
-│ f Forgejo   m model   ? help   q quit                                                            │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+## Why role-defined?
+
+Single-agent CLIs are built around one user driving one task in one growing chat thread. As context accumulates, conversations drift, responsibilities blur, and teams collapse into manual copy-paste.
+
+`gewu-multiverse` flips the model:
+
+- **One shared source of truth:** Bundled Forgejo (`127.0.0.1` only) holds all repositories, issues, branches, pull requests, reviews, and audit history. Agents never pass fragile hidden state behind your back.
+- **Stateless per-wake closure:** No cross-round chat history carryover. On every wakeup, the supervisor mechanically builds a concise `<environment-snapshot>` (wake reason, local git state, assigned issues, own open PRs, plus any role-selected views or sandboxed `hydrate_cmd` output), runs one **fresh ephemeral session** against the role's `instruction.md`, classifies the outcome from an **objective action ledger** (MCP writes, Git pushes, and native terminal facts—language-agnostic across English and Chinese prompts), and discards the session.
+- **Two-layer server architecture:**
+  - **Outer daemon (`--headless`):** Runs cleanly under `systemd` or in the background. Opening `gewu-multiverse` interactively automatically detects and attaches to a running daemon over its private Unix socket (`q` detaches without stopping Forgejo or agents; `Q` stops the daemon).
+  - **Inner per-role resident `HarnessRuntime`:** Strictly **one Landlock-confined runtime per role** (never shared across roles; every per-role runtime socket, MCP bridge socket, and loopback Git proxy is authenticated with a per-role 256-bit `0600` cookie held outside other roles' Landlock allow-lists), idle-parked automatically after `runtime_idle_secs` (default `300s`). Supports 4 pinned open-source harnesses: **DeepSeek Harness (`dsh` `0.2.2-rc.5`, fresh-install default)**, **Pi (`1.6.1`)**, **Codex (`0.172.0`)**, and **OpenCode (`2.4.2`)**. The legacy `built-in` loop stays frozen for backward compatibility.
+- **Switchable wake modes (`periodic` | `event` | `hybrid`):** Fresh installations default to `hybrid` (instant local Forgejo HMAC-SHA256 webhooks with delivery deduplication, debounce, cooldown & anti-echo, plus a 300s fallback check). Roles can opt into pure `event` or fixed `periodic` polling. **Stopped roles (`desired = "stopped"`) are strictly silent: 0 wakes and 0 model calls under every mode.**
+- **Tiered internal GitHub permissions:** Every role starts with least privilege (list assigned issues, read issue/PR, comment, list/open/update own PRs, push branches via authenticated loopback Git proxy—no raw Forgejo token in the sandbox). Grant higher team authority per role only when needed:
+  - `triage`: list/create/update/assign/label/close/reopen issues;
+  - `review`: list PRs, read diffs (stream-bounded), submit formal reviews (**supervisor hard-blocks self-review and verifies live token identity**);
+  - `maintain`: merge approved non-own PRs (**supervisor hard-blocks self-merge and requires a current, non-dismissed, non-stale non-author `APPROVED` review matching the PR head SHA with `head_commit_id` pinning and zero unresolved `REQUEST_CHANGES`**) and create private `team/*` repos. Repository deletion and organization admin remain strictly human `owner`-only.
+- **Real-world execution inside strict local confinement:** Automatic kernel **Landlock** confines every role's writable filesystem access to its own `workspace/` and exact per-role leaf runtime directories (`home`, `tmp`, `xdg`, and the harness state leaf under a non-writable parent), excluding `$HOME`, saved credentials, daemon cookie, Forgejo data, sibling workspaces, `/run/user/*`, and `/dev/shm`, and enables Landlock `Scope::Signal` + `Scope::AbstractUnixSocket` where supported by the host kernel (Landlock ABI v6+). To connect roles to external systems (cloud APIs, ticketing, docs, data pipelines), attach role-scoped `env`, `0600` external API secrets (`credentials.toml` `[agent_env_secrets.<role>]`, auto-redacted from logs/transcripts), `skills/`, and `mcp.json`.
+
+## Configure a team (Layout A)
+
+Team topology lives in `~/.config/gewu-multiverse/multiverse.toml`; each role's equipment lives under `~/.config/gewu-multiverse/agents/<role>/`:
+
+```text
+~/.config/gewu-multiverse/
+├── multiverse.toml          # Team topology, wake modes, context & permissions
+├── credentials.toml         # Mode 0600: model keys, Forgejo tokens, role external secrets
+└── agents/
+    ├── pm/
+    │   ├── instruction.md   # Role charter & operating procedure
+    │   ├── skills/          # Role-specific skills
+    │   ├── mcp.json         # Optional role-specific external MCP servers
+    │   └── workspace/       # Role's private Git clones (Landlock writable root)
+    ├── coder/
+    ├── reviewer/
+    └── ops/
 ```
 
-## What it is
+Example `multiverse.toml`:
 
-- **One Forgejo, on your machine.** The program downloads a fixed Forgejo release,
-  starts it, and gives you an administrator login. Nothing is hosted anywhere else,
-  and the address is reachable only from this computer.
-- **Agents with their own accounts.** Each agent is a Forgejo account named
-  `gewu-<agent>`. When it commits, comments or opens a pull request, Forgejo shows the
-  agent as the author, not you.
-- **A real agent program per agent.** A fresh install brings Pi 1.4.0. On an
-  agent's Program screen (`p`) you can install and select Codex 0.164.0, DeepSeek
-  Harness 0.2.1-rc.2 or OpenCode 2.1.4, each from its official pinned package. The
-  program owns its model turns, tools, retries, compaction and session; the product
-  owns the run boundary, the Forgejo tools and the record. If Codex's own sandbox
-  cannot start on this computer, the Agent screen keeps the cause and names the
-  double-`f` opt-out; pressing `f` twice there performs it and the product Landlock
-  boundary stays. A missing native-program prerequisite names `i`, and pressing it on
-  that screen starts the install.
-- **One default connection, and a saved choice per agent.** The first-run model
-  address and key are the default. Each agent can save its own compatible
-  provider/protocol/address/model/key; the protocol is shown beside the address and
-  model, a save is used by that agent's next run, while the running run keeps the exact
-  facts it started with. The board and the agent
-  screen show active and next when they differ.
-- **Migrate only when you choose.** An agent made by an older installation keeps the
-  built-in engine. Its instruction, workspace, steps, skills, account and records are
-  untouched until you deliberately choose another program.
-- **A card for each agent.** A filled circle means working, a half circle means waiting
-  for its next run, an empty ring means stopped or not started. The board card keeps
-  the few words: the agent's name, its program (`built-in`, `Pi`, `Codex`, `DSH` or
-  `OpenCode`), its Forgejo login, its state, its newest work or failure mark and its run
-  count. `run N` is the total from the run records, so it does not reset when an
-  agent starts again or the program reopens. Open it with `⏎` for the Agent screen:
-  the run's own ending or result first, then the completed-work heading and its
-  remote work, then failure detail and reads; the last work block (typed, and kept
-  until a later run does new work), the instruction's first line, always, and `… (N more lines)` where N counts the
-  document's **file** lines (not wrapped display rows); where no count row fits, the
-  visible cut itself ends in `…`, the bounded run marks with
-  their legend (`✓ ok ⊘ refused ∅ no work ✗ failed ⚠ warning ■ stopped ◷ timed out`,
-  wrapped whole on two rows at 72 columns), the newest mark's word, the last
-  tool failure and the newest run's reason. The run's own final sentence is not
-  rewritten apart from the credential masking; when it is too long for the visible
-  row it is shortened with an explicit `…`, and `t` opens the transcript that keeps
-  the whole sentence. The product's status vocabulary is never substituted into it. `✓` means every status the shell itself reported was 0: each trap record's `$?` and
-  every element of `PIPESTATUS`, so a failed command in a pipeline, a condition or a
-  nested `bash -c`/`#!/bin/bash` script that reads the prelude can never hide behind
-  a zero-exit wrapper, and
-  no line starts with the shell's own `<name>:` diagnostic prefix. Any
-  failed status is `⚠` with its cause as the row, or `⊘ refused` when it was a write; a
-  write inside a compound whose status the shell hides is `⊘` when the operating
-  system's own diagnostic is in the output, when the shell itself prints a line in its
-  own `<name>:` prefix (the shell's own name, the name of a nested `bash` that reads
-  `BASH_ENV`, or a sourced file's —
-  whatever the message — `ambiguous redirect`, `cannot overwrite
-  existing file`, …, or a recorded write's plain target named by the line), or when
-  any program's diagnostic is read — any
-  system error message the C library prints, not a list of programs or a list of error
-  strings. (Limits **(a)**–**(g)** in `docs/board.md`: a model that forges
-  the record or masks a failure, a `curl` without `-f` whose 200 body says `Forbidden`,
-  the conservative rule that only ever lowers the mark, a host without `bash`, a
-  nested interpreter that does not load the recorder (a non-bash interpreter, or
-  `bash` in POSIX or privileged mode), a failure that leaves neither a status nor any
-  diagnostic text, and a failure inside a piped or negated condition reported only by
-  a program's own free-form message.) A run that exited 0 with a refused or failed
-  write and no other work is `⊘ refused` (or `⚠` when the failed call is a read);
-  the refused write's cause row says `⊘ write refused: …`, matching the strip. A run
-  that only read its issue and wrote nothing is `∅ no work` with its own sentence,
-  even when its instruction used a change word; the same is true when its
-  assigned-issues list came back empty. A change left only in the workspace — a
-  content edit, a mode change, a new link, an empty directory, or a local commit,
-  tag, index, config or local ref change — is `⚠`, and its work line names the
-  recorded local work (`local change README.md`) instead of borrowing an older run's
-  branch. A fetch that only moves remote-tracking refs, their logs or `FETCH_HEAD` is
-  reading, not local work. A declared step is a real tool result, not an absent call.
-  A run that recorded no tool call at all is never `✓`: its requested work is
-  unconfirmed. A run
-  that actually pushed, opened or updated a pull request, or commented stays `✓` even
-  if a later write was refused, a test failed first, it reused the branch an
-  interrupted run left, or it ended with a sentence claiming failure; the work block
-  keeps the product-observed fact, including the pull request. The
-  summary line prefers the newest run that did work (`last work: comment on team/workspace#2`,
-  `last work: PR team/workspace#3 open`, `last work: local change README.md`); a later no-op's
-  reason is labelled `no work: …`. When the newest run was stopped, its own ending
-  takes that line (`stopped 2m ago — the run was stopped on request`) and the earlier
-  work is labelled `last completed work`; a previous run's result is not presented
-  as the stopped run's own. A failed command and a local-only change both wear `⚠`,
-  so the legend says `⚠ warning`; the newest mark's word is `cmd failed` only for a
-  real command failure and `local change` for the workspace change. A pull request's
-  word follows its live state (`PR team/workspace#4 merged`,
-  `PR team/workspace#4 closed`), refreshed from Forgejo while the board is open. The
-  work fact keeps its repository, so a `#4` in another repository can never supply
-  this state; a pushed branch is identified as `team/workspace#fix/x`. A request the product has not refreshed keeps the run's recorded word.
-  Started agents keep
-  a visible idle between runs (the Agent screen says `next run in 5s`; a card's shorter
-  form is `next 5s`); a no-work or warned run's longer wait says
-  `next run in 20s · no work` (`next 20s·no work` on a card). A 503 is named as
-  temporary and says it is retrying. The selected card is marked `▸`, and
-  a window from 140 to 160 columns uses its width for the repository names and card
-  detail; a wider one centres the same picture in 160.
+```toml
+terms_acknowledged = true
+terms_version = 1
+default_harness = "dsh"
+wake_mode = "hybrid"          # periodic | event | hybrid
+default_context = "self"      # none | self
+runtime_idle_secs = 300
 
-The program keeps the Forgejo running while it is open. When an agent is started, it
-runs its instruction, and when that run ends it starts another one after a short
-visible idle, until you stop it. Each run's process group and the shell's boot/start
-identity are written down; if the program or a run's supervisor is killed outright, the
-next start checks the live process identity, binds each process to a kernel pidfd, stops
-the group through those handles, and writes the run's durable ending (and a
-`run_stopped` cleanup record when it had to close the run) before the board opens, so a
-shell cannot keep editing beside the new run. A process the engine still cannot stop is named on the agent's card,
-and the agent stays blocked until `Start` retries the cleanup successfully. An agent's
-shell is confined where the computer allows it. **Landlock is the automatic mechanism**:
-it denies the product's roots, and is not chosen when one of them lies inside a tree it
-must allow. The product claims Landlock
-only after a child process proved that a ruleset is fully enforced — it reads a file it
-allows and is denied one it does not — so a kernel without Landlock gets the `none`
-sentence below, not a promise. **bwrap or unshare are
-opt-in** (`GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare`); they replace this
-product's configuration, state and Forgejo data roots, your home, and the engine's
-temporary directory (with `/tmp`) with empty mounts, bind back only this run's own
-directory and workspace, and clear the run's environment to a short allow-list. Their
-complete argument lists are tested against the real contracts but they are not yet
-proven on a real user-namespace host, so they are never chosen for you; an opt-in that
-cannot be honoured gives `none`, never a substitute mechanism. Every hidden
-path and the engine's temporary root are resolved with `realpath` first, and the engine
-enumerates every real workspace, so a symlinked root cannot slip past. The workspace,
-the run's private `TMPDIR`, the network and the tools you installed stay visible, as do
-the system's `/etc`, `/proc`, `/sys` and `/run`. The warnings screen states what is true on **this** computer: `runs on this computer
-are confined (Landlock)` (or `bwrap`/`unshare`) after the second warning, or the same
-negative line when the computer offers no mechanism or the layout cannot be confined.
-The warnings are one compact numbered block: five warnings, or six when this computer
-cannot confine a run; the footer states the count, and the fact about this computer is
-the first line under item 2.
-The board repeats the negative sentence. One layout rule holds for 1–12 agents at
-72×18, 80×24, 100×30, 120×40 and 200×60 (a home past twelve keeps the compact
-two-column list and scrolls with the selection): cards never collide, truncate a name or leave
-a dangling connector; the grid keeps its columns fixed so a wrapped last row cannot
-move under the wire. At 72×18 the board is always the compact list: one wired box
-with one line per agent and no connector drawn between rows. At 80×24 and above the
-card grid is unchanged. When the cards cannot keep a whole title and their facts at
-a size that uses them, the board also takes the compact list: one wired box with a
-line (or two columns) per agent, keeping the name, run count, state mark and the
-current or last-work word on the frame. The login is on the line while it fits; otherwise the box legend
-`login=gewu-<name>` names the exact generated login when that equality holds (the
-Agent screen always shows the whole login); a persisted non-standard login stays
-whole and agent-associated. On a mixed compact board, an exact `agent-N` name
-displays as `N` under the same-frame rule `N=agent-N`, followed by the actual
-`N:<login>`, so a third, fourth or later recorded identity needs no separate map and
-cannot lose its row association. Names that do not equal `agent-N` stay verbatim;
-generated rows keep their inline login or a `*` marker covered by `*=gewu-<name>`
-only when that equality is true. The
-72×18 Forgejo box keeps the address, repository count, agent count and login on three
-rows (the version stays on the top border); the 80×24 box keeps the organisation, the
-repository names that fit and the login on four rows; from 100×30 the box is six rows.
-The version and then the names are the first facts given up when the box is tight. The newest repository event is stored
-with the settings, so it survives a reopen and has a footer row of its own when the box
-is too short for it, never overwriting the keys.
+[endpoint]
+base_url = "https://api.example.com/v1"
+protocol = "chat-completions"
+model = "your-model-id"
+max_turns = 24
 
-The last-work word keeps its repository and number: `pull request team/workspace#100`
-is `team/workspace#100`, never `team/workspace#10`, and `#10000` stays whole — the label is shortened, not the number. A failed run's word
-starts with the HTTP status (`✗ HTTP 500` on a card; the Agent screen names the model
-as well) and is cut on whole words, and
-a single-column connector is placed after the label so it never crosses the word.
+[[agents]]
+name = "pm"
+desired = "started"
+harness = "dsh"
+wake_mode = "hybrid"
+[agents.context]
+mode = "self"
+views = ["unassigned_issues", "open_pulls"]
+[agents.permissions]
+triage = true
 
-After an upgrade, the first open shows one screen: the version this installation was,
-the version this is, what was found (settings, agents, instructions and runs), what is
-reused or ignored, one line from this release's notes naming what changed, and the
-release page address for this exact build (`…/releases/tag/v0.1.43`). If the first-run warnings changed since this installation last
-agreed to them, the screen says so and the next screen shows them again; after they are
-agreed the program returns to the board, never into the first-run model and picker
-flow. The next open goes straight to the board. The installer records the old version before it replaces the binary, and a
-home whose old build wrote no version marker (0.1.30 and earlier) still gets the
-screen, naming the version as an earlier one when it cannot know it exactly.
+[[agents]]
+name = "coder"
+desired = "started"
+harness = "codex"
+wake_mode = "event"           # wakes instantly on assigned issue / review feedback
+
+[[agents]]
+name = "reviewer"
+desired = "started"
+harness = "dsh"
+wake_mode = "event"
+[agents.context]
+mode = "self"
+views = ["open_pulls"]
+[agents.permissions]
+review = true
+maintain = true               # can merge approved non-own PRs; self-review & self-merge hard-blocked
+
+[[agents]]
+name = "ops"
+desired = "started"
+harness = "pi"
+wake_mode = "hybrid"
+wake_interval_secs = 600
+[agents.context]
+mode = "self"
+hydrate_cmd = "python3 scripts/check_alerts.py --summary"  # runs inside same Landlock sandbox
+[agents.env]
+SERVICE_ENV = "staging"       # paired with 0600 [agent_env_secrets.ops] in credentials.toml
+```
+
+Semantic role names (`pm`, `coder`, `reviewer`, `ops`) work seamlessly alongside classic `agent-1`, `agent-2`, ... names. Every new field is optional.
 
 ## Install
 
-One line, no Rust:
+One line, no Rust required (Linux `x86_64`, glibc 2.39+):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Callo42/gewu-multiverse/main/install.sh | sh
-# Air-gapped / offline install from a pre-downloaded release archive (no network fetch):
+
+# Offline / air-gapped install from a pre-downloaded release tarball:
 sh install.sh --tarball ./gewu-multiverse-*-x86_64-linux.tar.gz [--checksum ./file.sha256] --harness none
-# Pi is installed by default. Other official programs are explicit:
-sh install.sh --harness pi,codex
-sh install.sh --harness none        # no agent program; a new agent still starts as Pi
+
+# DeepSeek Harness (dsh) is installed by default. Other official programs are explicit:
+sh install.sh --harness dsh,codex
+sh install.sh --harness pi
+sh install.sh --harness none        # no agent program; a new agent still starts as DeepSeek Harness
 ```
 
-`--harness none` installs no native agent program. A fresh installation still
-defaults a new agent to Pi, which is not installed: its card says Pi is not
-installed until you choose the built-in engine there or install Pi.
+`--harness none` installs no native agent program. A fresh installation still defaults a new agent to DeepSeek Harness, which is not installed until you install it from the Program screen (`p` → `i`) or switch the agent to another installed program or the legacy built-in engine.
 
-The one-liner trusts the TLS connection to GitHub and the repository's release page —
-the checksum detects a damaged download, not a replaced release — and the bundled
-Forgejo binary is additionally pinned by digest and signed upstream.
+The release `.tar.gz` bundles both `gewu-multiverse` (`~/.local/bin/gewu-multiverse`) and the unmodified, GPG-verified `forgejo-17.0.0-linux-amd64` binary (`~/.local/share/gewu-multiverse/`, zero second-stage Forgejo download). Unless `--harness none` is passed, the installer fetches the chosen pinned agent program(s) into `~/.local/share/gewu-multiverse/` and verifies every SHA-256 / npm lock integrity digest. DeepSeek Harness (`dsh 0.2.2-rc.5`) requires Node.js 24.9+ and npm 11.16.0+ and is installed with `npm ci --ignore-scripts` followed by an explicit `npm rebuild` of only the three reviewed native helpers (`@deepseek-ai/dsh-subprocess-local`, `koffi`, `node-pty`).
 
-The release `.tar.gz` archive carries both the prebuilt `gewu-multiverse` binary
-(installed to `~/.local/bin/gewu-multiverse`) and the unmodified, GPG-verified
-`forgejo-17.0.0-linux-amd64` executable under `forgejo/` (installed into
-`~/.local/share/gewu-multiverse/` with zero second-stage Forgejo download). Unless you
-pass `--harness none` (for example on an offline host), the installer then fetches the
-one agent program you named (Pi by default) into `~/.local/share/gewu-multiverse/`. Every package is checked against its published
-SHA-256 or npm integrity. DeepSeek Harness needs Node 24.9 or newer and npm 11.16.0
-or newer (older npm ignores the reviewed install-script policy); its locked closure
-is about 613 packages and 753 MB. Nothing else is downloaded unless
-you name it. If `~/.local/bin`
-is not on your `PATH`, the installer says how to add it. The prebuilt program is for
-64-bit x86 Linux with glibc 2.39 or newer (for example Ubuntu 24.04 or newer).
-
-From source, with Rust 1.85 or newer:
+From source (Rust 1.85+):
 
 ```sh
 cargo install --git https://github.com/Callo42/gewu-multiverse
 ```
 
-Then run:
+## Quick start
+
+### Interactive terminal board
 
 ```sh
 gewu-multiverse
 ```
 
-## The four steps
+1. **First run:** Review and accept the host confinement warnings (`y`), configure your default model endpoint (`t` to test), choose initial agents, and press `⏎` → `e` on each card to write its `instruction.md`. Press `s` to start or stop an agent, `p` to switch or install harnesses, `f` to view Forgejo credentials/URL, and `?` for all keys.
+2. **Auto-attach to a running daemon:** If `gewu-multiverse --headless` is already running against the same directories, running `gewu-multiverse` automatically attaches to it as a live console. Pressing `q` detaches cleanly without interrupting Forgejo or running agents; pressing `Q` stops the daemon cleanly.
+3. **Scripted preview without Forgejo:** `gewu-multiverse --demo`
 
-On the first start the board walks you through these; after that it opens on the board
-and you can change any of them later.
-
-1. **Read the warnings.** They say that agents use this computer with your
-   permissions. When this computer can confine an agent's shell, a run cannot read your
-   configuration, saved keys, Forgejo data, home or another run's login file; when it
-   cannot, the same screen says, in one sentence,
-   `runs are not confined on this computer`; on a host that can confine, it says
-   `runs on this computer are confined (Landlock)` under the second warning. The screen
-   is one numbered block and its footer states how many warnings there are. Landlock is the automatic
-   mechanism; `bwrap` and `unshare` are opt-in with
-   `GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare` and are tested but not yet
-   proven on a real user-namespace host. Press `y` after you have read every one.
-2. **Set the model.** Give the full model address (it ends in `/chat/completions`), the
-   model name, and the key. Press `t` to test it; `✓ the model answered` means it
-   works. On an agent's own form the test also declares one Forgejo tool and requires
-   a tool call: `✓ the model called a tool` means that agent's tools work on the
-   connection, and a text-only answer fails with the tool the model did not call.
-   The address suffix and an empty key are checked before anything is sent;
-   on a per-agent form `ctrl-u` then `⏎` clears that agent's stored key;
-   every other failure names the provider's status and its own message, kept whole and
-   wrapped to the form's rows at 80 columns (a 404 on a `/chat/completions` address
-   without `/v1` says so first); a 401 or 403 reserves its `— check the key` /
-   `— check the model and its access` action at 72×18 and 80×24, shortening only the
-   provider's part when the rows run out. `↑`/`↓` moves between fields; `⏎` keeps a field and
-   selects the next one without entering its edit mode, so `t` still tests; `Ctrl-U`
-   (shown as `ctrl-u clear`) empties the selected field. Continuing past the model step
-   runs the same address and key check: a wrong address stays on the form with the `✗`
-   line, and a valid but untested one says `not tested — t to test`. The saved and the
-   edited key are both shown as eight bullets, and a test result disappears on the
-   first edit.
-3. **Choose how many agents.** The first setup offers 1 to 12: `←` / `→` changes the
-   number. Press `⏎` to create them. Later, `+` adds one agent at a time and an
-   installation can grow to 20 in all; `−` removes the selected one. The board shows
-   `downloading n%`, `setting up`, `starting`, then `● running` while your Forgejo is
-   prepared.
-4. **Write each agent's instruction.** Pick a card with `←` / `→` and press `⏎`, then
-   `e`. Your own editor opens `instruction.md`; write what the agent should do and
-   save. Press `s` to start it. Press `s` again to stop it. **Assign an issue in
-   Forgejo first:** the assigned-issues list is the starting point. An unassigned
-   issue is not listed, though an agent can still read or comment on an issue in a
-   cloned team repository with its own account.
-
-After the first setup, `+` adds one new agent (the settings' twenty is the most an
-installation can hold) and `−` removes the selected one (it asks once). A removed agent's number and Forgejo account are never reused: `+` after
-removing `agent-2` makes `agent-3`, with its own new account, while the removed account
-stays deactivated with its history. The last agent cannot be removed and the screen says
-why. `m` opens the model settings, `f` opens the Forgejo page, `?` lists every key, and
-`q` quits.
-
-## Where things live
-
-| What | Where |
-|---|---|
-| The program | `~/.local/bin/gewu-multiverse` |
-| Your settings (model address and name, Forgejo login, agent names) | `~/.config/gewu-multiverse/multiverse.toml` |
-| Your saved keys | `~/.config/gewu-multiverse/credentials.toml` (mode 0600, yours alone) |
-| Each agent's instruction, skills and workspace | `~/.config/gewu-multiverse/agents/<agent>/` |
-| Every run's log and record | `~/.local/state/gewu-multiverse/<agent>/<run>/` |
-| Headless daemon snapshot and control socket | `~/.local/state/gewu-multiverse/headless-status.json`, `headless.sock` and `headless.sock.cookie` (mode 0600, yours alone) |
-| Forgejo and its database | `~/.local/share/gewu-multiverse/forgejo/` |
-| The Forgejo administrator password | not on disk: `p` on the Forgejo page resets it through Forgejo's administration API and shows the new one |
-
-The Forgejo address is on the board and on the Forgejo page, for example
-`http://127.0.0.1:3000`. The page also says `assigned issues are the focus; comments
-in cloned team repos`, and its organisation row says `team — create repositories under
-team`; its team link is `/org/<organisation>/teams/<team>`. On the Forgejo page (`f`) your login is shown next to
-`your login:`, the repositories are listed by name, and the agents' one-line
-permission summary is there with the team page address. The newest repository event is
-on the page and on the board at every supported size; the 80-column board also keeps
-the organisation, the repository count and your login. A new installation uses the
-fixed login `owner`, not your computer account name; an installation made by an
-earlier version keeps its recorded login, and the page says `(kept from an earlier
-setup)`.
-
-The password is never written down. Open the Forgejo page and press `p`: the product
-resets it through Forgejo's administration API, with the new value in the request body,
-and the new value is shown, wrapped in full, for ten seconds — deliberately two lines
-at 80 columns, never cut. `c` puts the shown value on the terminal clipboard with one
-OSC 52 sequence and shows `copied`; a terminal without OSC 52 ignores the sequence and
-the value is still on screen. The one-line consequence is a static row on the page:
-`p resets it, c copies — shown for 10 s, old stops`, so the password shown before that
-moment no longer works. While the value is on show, `c` puts it on the terminal's
-clipboard with one OSC 52 sequence (base64) — never into a file, a log or a second
-plaintext line. A terminal without OSC 52 ignores the sequence, and the screen still
-shows the value for its ten seconds.
-
-`--config-dir <dir>` moves the settings, keys and agent folders; `--state-dir <dir>` moves the run records; `--data-dir <dir>` moves the bundled Forgejo and installed agent programs.
-A relative folder is taken from the folder you started the program in.
-`--demo` opens the board with a scripted example and no real Forgejo.
-
-## Headless and server deployments
-
-On unattended Linux hosts or under `systemd` (with no interactive terminal attached), configure the installation with `--configure`, run the engine loop with `--headless`, adjust running agents live with `--control`, and inspect health with `--status`:
+### Headless daemon & automation (`systemd` / CI / servers)
 
 ```sh
-# 1. Non-interactive setup (API keys come from a file or stdin, never argv):
+# 1. Configure non-interactively (secrets come from files or stdin, never argv):
 gewu-multiverse --configure \
   --accept-terms \
-  --agents 1 \
-  --agent agent-1 \
-  --program builtin \
+  --add-role coder \
+  --agent coder \
+  --program dsh \
+  --wake-mode hybrid \
+  --context-mode self \
   --base-url https://api.example.com/v1 \
   --model your-model-id \
   --api-key-file /run/secrets/model.key \
-  --instruction-file ./agent-1.md
+  --instruction-file ./coder.md
 
-# 2a. Standard daemon (requires >= 1 started agent; fails fast otherwise):
-gewu-multiverse --configure --start-agent agent-1
+# Optional: grant reviewer permissions and attach a role-scoped external secret:
+gewu-multiverse --configure \
+  --add-role reviewer \
+  --agent reviewer \
+  --allow-review \
+  --context-view open_pulls \
+  --env REVIEW_STRICT=1 \
+  --secret-env-file WEBHOOK_TOKEN=/run/secrets/external.token
+
+# 2a. Start standard foreground daemon (systemd compatible):
+gewu-multiverse --configure --start-all
 gewu-multiverse --headless
 
-# 2b. Event-driven warm standby (keeps local Forgejo and agent accounts ready at
-#     zero idle model calls while all agents remain stopped):
+# 2b. Warm standby with strictly zero idle LLM calls:
 gewu-multiverse --configure --stop-all
 gewu-multiverse --headless --allow-idle
 
-# 3. Wake or park individual agents live over the private Unix socket without
-#    restarting Forgejo (`instruction.md` on disk is re-read automatically):
-gewu-multiverse --control --start-agent agent-1 --stop-on-no-work
-gewu-multiverse --control --stop-agent agent-1
+# 3. Control live roles without restarting Forgejo (instruction.md is re-read automatically):
+gewu-multiverse --control --start-agent coder --stop-on-no-work
+gewu-multiverse --control --stop-agent coder
 gewu-multiverse --control --stop-all --json
 
-# 4. Read-only status without acquiring the daemon lock:
+# 4. Read-only health & status (does not acquire the daemon lock):
 gewu-multiverse --status
 gewu-multiverse --status --json
 ```
 
-Without `--allow-idle`, `--headless` checks that the terms are acknowledged and at least one started agent has a valid program, model key and non-empty instruction before entering the loop, exiting non-zero immediately instead of idling on an incomplete setup. With `--allow-idle`, `--headless` boots the loopback Forgejo and provisions `team/workspace` plus every configured agent's Forgejo login while keeping stopped agents at strictly zero model calls. `--control` connects to the daemon's `0600` Unix domain socket (`~/.local/state/gewu-multiverse/headless.sock`, verified with same-UID `SO_PEERCRED` plus a `0600` `headless.sock.cookie` capability under the hidden state directory so Landlock- and namespace-confined agent shells cannot control the daemon) to start or stop agents in milliseconds; `--stop-on-no-work` lets a woken agent run across multiple sessions while doing real work and automatically parks it back to `stopped` as soon as a session finishes with `no work` (before the next idle poll). `--configure --remove-agent <name>` revokes a provisioned agent's Forgejo tokens, deactivates its Forgejo login, and deletes its `forgejo_agent_tokens` and `model_keys` secrets without scheduling other agents (non-secret login and run history are kept so removed account numbers are never reused).
+All custom paths can be relocated via `--config-dir <dir>`, `--state-dir <dir>`, and `--data-dir <dir>`.
 
-## Stopping, quitting, and opening again
+## Compatibility & upgrading to `v0.2.0`
 
-- `s` stops the selected agent. Its current run is asked to stop, and then made to stop
-  if it does not; the run's ending is written to its record before the process handles
-  are removed, and nothing new starts.
-- `q` quits. If an agent is running, the board first names the agents that will stop —
-  `quit stops agent-2 and agent-3, and Forgejo; they start again on reopen — q again
-  quits`; press `q` again. An agent that is only
-  started and blocked on an instruction is not named, because it has no live run. It
-  stops every live run and the Forgejo, then prints one line counting the same live
-  agents the warning named (`stopped 1 agent`, not `1 agents`); the started choices
-  still resume when you reopen.
-  Closing the terminal window does the same. A run ended by quitting is settled like a
-  stopped one: its durable ending is written before its process handles are removed.
-- Opening the program again starts the Forgejo, and starts the agents you had left
-  started, with the same instructions.
-- If the program was killed outright, the next start finds the Forgejo and any run
-  process groups it left behind, stops them, writes the durable ending for each run it
-  has to close (with `run-stopped.json` where it reaps a group or supplies a missing
-  ending), and only then opens. A group is believed only through live identity: the shell's recorded
-  boot id and start time checked against the live process, or the inherited anonymous
-  capability, or the actual supervisor executable with its exact run invocation.
-  A run-directory path in some other process's argv does not own the group;
-  stored pid/group numbers alone are never trusted; no other process's environment is
-  read. A process that survives, or a live group the
-  engine cannot prove is this run's, is named on the agent's card and blocks a replacement
-  run until `Start` retries the cleanup. A stopped, killed
-  or crashed run's private temporary directory — including the per-run `askpass.toml` that held its own
-  login — is removed by the run on every exit it sees and by the engine or the next open
-  otherwise; a live run's directory is never touched.
+Upgrading an existing `v0.1.x` installation (including downstream `matrixorg` headless deployments) is **non-breaking**:
 
-## Removing it
+- Existing `multiverse.toml` files without `default_harness`, `wake_mode`, or `default_context` automatically preserve `built-in` (or their saved harness), `wake_mode = "periodic"`, `context = "none"`, and least-privilege Forgejo tools.
+- `--headless --allow-idle`, `--control`, `--configure`, `--status --json`, and `headless-status.json` remain 100% backward-compatible.
+- `desired = "stopped"` remains guaranteed to trigger **0 wakes and 0 model calls** in every wake mode.
+- The new defaults (`dsh`, `wake_mode = "hybrid"`, `default_context = "self"`) apply **only to fresh installations** or when you explicitly enable them.
 
-The program is one file; removing it is the whole uninstall:
+## Security boundaries & what it does not do
+
+- **Not a container or VM:** Agents run as your local OS user. **Landlock** is applied automatically (verified by a live child probe before being claimed) and is compatible with `systemd` `NoNewPrivileges=true` + `ProtectHome=true`. Signal and abstract-Unix-socket scoping (`Scope::Signal`, `Scope::AbstractUnixSocket`) are applied automatically on Linux kernels supporting Landlock ABI v6+; on older Landlock kernels, same-UID signal isolation is not enforced by Landlock, and `/proc` remains readable subject to host `hidepid` / Yama `ptrace_scope` settings (opt-in `GEWU_CONFINEMENT=bwrap` or `unshare` is also available).
+- **Strict filesystem & IPC boundary:** Aside from fixed read-only system trees (`/usr`, `/etc`, `/proc`, `/sys`, ...) and safe `/dev/*` device nodes, confined runs can write user data only to their own `workspace/` and exact per-role leaf directories (`home`, `tmp`, `xdg`, and the harness state leaf under a non-writable `<TMPDIR>/gewu-rt-*` parent); Landlock opens every writable grant component-by-component with `O_NOFOLLOW` so symlinks can never redirect confinement to `~/.config/gewu-multiverse`, `credentials.toml`, `headless.sock.cookie`, Forgejo data, `/run/user/*`, `/dev/shm`, your `$HOME`, or sibling agents' workspaces. Every supervisor IPC endpoint (`headless.sock`, `runtime.sock`, `mcp.sock`, loopback `GitProxy`) strictly requires a random 256-bit `0600` cookie or proxy credential. Private host paths outside the allowed system/runtime trees are never opened.
+- **No secrets in argv or logs:** Model keys, Forgejo tokens, and role external secrets (`[agent_env_secrets.<role>]`) live in mode-`0600` `credentials.toml`; `mcp.json` forbids `${SECRET}` references in `command`, `args`, and `url` (allowing them only in `env` and HTTP `headers`). Logs, transcripts, and `hydrate_cmd` output scrub raw, JSON-escaped, URL-encoded, and Base64 secret forms.
+- **Loopback-only Forgejo:** Bound exclusively to `127.0.0.1`; no external host exposure, no cloud dependency, and no multi-tenant hosting.
+
+## Where things live
+
+| What | Path |
+|---|---|
+| Binary | `~/.local/bin/gewu-multiverse` |
+| Team & role configuration | `~/.config/gewu-multiverse/multiverse.toml` |
+| Secrets (mode `0600`) | `~/.config/gewu-multiverse/credentials.toml` |
+| Per-role files (`instruction.md`, `skills/`, `mcp.json`, `workspace/`) | `~/.config/gewu-multiverse/agents/<role>/` |
+| Run records, logs & transcripts | `~/.local/state/gewu-multiverse/<role>/<run>/` |
+| Daemon snapshot & Unix control socket (`0600` cookie) | `~/.local/state/gewu-multiverse/headless-status.json`, `headless.sock`, `headless.sock.cookie` |
+| Bundled Forgejo & installed harnesses | `~/.local/share/gewu-multiverse/{forgejo,harnesses}/` |
+
+Uninstall completely:
 
 ```sh
 rm ~/.local/bin/gewu-multiverse
-```
-
-Your data is in three folders. Removing them removes the Forgejo, its database, your
-settings, your agents' files and every run record:
-
-```sh
 rm -rf ~/.config/gewu-multiverse ~/.local/state/gewu-multiverse ~/.local/share/gewu-multiverse
 ```
 
-Nothing else is installed: no service, no system-wide file, no other account.
+## Documentation
 
-## When something goes wrong
+Detailed engineering contracts live in `docs/`:
 
-- **The Forgejo download did not finish.** The board says
-  `could not download Forgejo — check the internet connection; the next start tries again`.
-  Check the connection and start the program again, or run
-  `gewu-multiverse --install-forgejo` and watch the percentage. Nothing partly
-  downloaded is kept.
-- **The model test fails.** The board gives one line. `✗ wrong address — it should end
-  in /chat/completions` and `✗ the API key is empty` mean nothing was sent. Any other
-  line is the provider's answer: `✗ the provider refused the API key (HTTP 401)`
-  (check the key), `✗ the provider denied access to this model (HTTP 403)` (check the
-  model and its access), `✗ no model called <name> at this address (HTTP 404)` (check the
-  model name), `✗ the provider answered HTTP 404: …` (check the address; on a
-  `/chat/completions` path without `/v1`, add `/v1`), or `✗ no answer within 15 s`
-  (the provider did not answer; try again).
-- **An agent keeps failing.** Its card shows `next run in Ns` and its last runs as
-  `✓`, `⊘`, `∅`, `⚠`, `✗`, `■` and `◷`. Open it with `⏎`; `l` opens the newest log,
-  `t` a readable transcript (turns, tools and their output) and `j` the raw JSONL
-  record, in your pager. The wait between attempts starts at 10 seconds and doubles up to 5
-  minutes, so a broken instruction does not spin. Fix the instruction with `e` or the
-  model with `m`, then stop and start the agent with `s`.
-- **Forgejo stops unexpectedly.** The board says
-  `Forgejo stopped unexpectedly — restarting it` and tries again, waiting a little longer
-  each time. If it says `stopped: …` while it is still setting up, press `r` to try now.
-- **Another copy is already open.** The program uses one data folder at a time and says
-  so; close the other copy first.
-
-## What it does not do
-
-- It is **not a container and not a privilege boundary**. Agents run as you, with your
-  permissions, and their shell is confined only by the mechanism this computer offers.
-  **Landlock is chosen automatically.** `bwrap` and `unshare` are chosen only when you
-  ask for one (`GEWU_CONFINEMENT=bwrap` or `GEWU_CONFINEMENT=unshare`); their complete
-  argument lists are tested against the real contracts, but they are not yet proven on
-  a real user-namespace host. A confined run cannot read the product's configuration,
-  saved keys, state or Forgejo data root, your home, another run's login file, or a
-  secret you exported in an ordinary variable such as `OPENAI_API_KEY` (the run starts
-  with a cleared environment: only `PATH`, `LANG`/`LC_*`, `TERM` and `TZ` survive).
-  Landlock denies the product's roots and is skipped when one lies inside a tree it
-  must allow; it is claimed only after a child probe proved a fully enforced ruleset
-  (a denied read outside the grant). An opted-in namespace makes `/tmp` and the
-  engine's temporary directory private; an opt-in that cannot be honoured gives
-  `none` rather than Landlock. Every hidden path and the engine's temporary root are
-  resolved with `realpath` first, and the engine enumerates every real agent
-  workspace, so a symlinked root cannot slip past the check. A confined run can still
-  read `/etc`, `/proc`, `/sys` and `/run`, reach the network and use the tools you
-  installed. When no mechanism works, the run is not confined at all and the board
-  says so; a run whose plan promised a boundary it cannot keep records `none` and
-  does not execute the command. The program also removes saved keys from the logs and
-  records it writes, but redaction is not the confinement.
-- It does not connect to another Forgejo, and it does not host more than one.
-- It does not let you open or update pull requests from the terminal. The agents do
-  that in Forgejo; you review there in a browser.
-- It has no scheduler beyond "keep running until stopped", no separate web page or API
-  beyond the bundled Forgejo, no cloud service, and no user accounts other than your own
-  and the agents'.
-- It does not expose the Forgejo to your network. It listens on this computer only.
+- [docs/native-programs.md](docs/native-programs.md) — Pinned harnesses (`dsh`, `pi`, `codex`, `opencode`), per-role resident `HarnessRuntime`, and install verification
+- [docs/engine.md](docs/engine.md) — Engine lifecycle, wake scheduling, headless daemon, and recovery
+- [docs/agent-execution.md](docs/agent-execution.md) — Confinement, Landlock boundary, run records, and objective outcome ledger
+- [docs/forgejo.md](docs/forgejo.md) — Bundled Forgejo provisioning, tiered MCP tools, and local webhooks
+- [docs/board.md](docs/board.md) — Terminal UI layout, keybindings, and status marks
 
 ## Licence
 

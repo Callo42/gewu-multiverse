@@ -1345,6 +1345,13 @@ pub fn ending_for_instruction(
         "there is no open",
         "no changes",
         "nothing to commit",
+        "无事可做",
+        "暂无任务",
+        "暂无新",
+        "无需修改",
+        "没有分配",
+        "没有待处理",
+        "没有需要处理",
     ];
     if no_work.iter().any(|needle| lower.contains(needle)) && !evidence.wrote {
         return if evidence.failed_call().is_some() {
@@ -2269,6 +2276,14 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
             return RunEnd::failed(format!("the native program plan cannot be read: {error}"));
         }
     };
+    let role_plan = match crate::run::RoleRunPlan::read(run_dir) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return RunEnd::failed(format!("the role run plan cannot be read: {error}"));
+        }
+    };
+    let external_secrets =
+        credentials::agent_env_secrets(&plan.credentials, &plan.agent).unwrap_or_default();
 
     // The key is read here, before anything runs, so that a declared step's output is
     // redacted too. A run without a key cannot proceed: it would have nothing to think
@@ -2339,10 +2354,12 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
 
     // The shell is confined before any command runs. If this computer offers no
     // confinement the run still works, and the board and warnings already say so.
-    let shell = match Shell::prepare(plan, run_dir) {
+    let mut shell = match Shell::prepare(plan, run_dir) {
         Ok(shell) => shell,
         Err(reason) => return RunEnd::failed(reason),
     };
+    shell.external_env = role_plan.env.clone();
+    shell.external_secrets = external_secrets.clone();
     // A plan promised a boundary this layout cannot keep. The marker and the
     // rewritten plan are already on disk, so the engine's board stops claiming it;
     // no command runs before the person sees that (B9-R-R).
@@ -2363,11 +2380,56 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
         }
     }
 
+    // Mechanical per-wake context reconstruction (no-op when `mode == None` and no
+    // views/hydrate_cmd are configured, keeping legacy prompts verbatim).
+    let hydrated_instruction = if let Some(ctx_cfg) = role_plan.context.as_ref() {
+        let fj_ctx = crate::run::read_forgejo_context(run_dir);
+        let fj_tok = credentials::forgejo_agent_token(&plan.credentials, &plan.agent).ok();
+        let hydrated = crate::context_hydrate::hydrate(
+            &instruction,
+            &crate::context_hydrate::HydrateInput {
+                plan,
+                run_dir,
+                config: ctx_cfg,
+                wake_reason: &role_plan.wake_reason,
+                forgejo: fj_ctx.as_ref(),
+                forgejo_token: fj_tok.as_ref(),
+                external_env: &role_plan.env,
+                external_secrets: &external_secrets,
+                redactor: &secret,
+                sandbox: crate::context_hydrate::HydrateSandbox {
+                    method: shell.method,
+                    workspace: &shell.workspace,
+                    hide: &shell.hide,
+                    temp: shell.temp.as_deref(),
+                    home: shell.home.as_deref(),
+                    root: shell.root.as_deref(),
+                    stage: shell.stage.as_deref(),
+                },
+            },
+        );
+        if let Some(snap) = hydrated.snapshot.as_ref() {
+            log.line(&format!(
+                "context snapshot reconstructed: {} bytes ({})",
+                snap.len(),
+                ctx_cfg.mode.id()
+            ));
+        }
+        for warn in &hydrated.warnings {
+            log.line(&format!("context hydration warning: {warn}"));
+        }
+        hydrated.prompt
+    } else {
+        instruction
+    };
+
     if let Some(native_plan) = native_plan.as_ref() {
         return native::run(
             plan,
             native_plan,
-            &instruction,
+            &role_plan,
+            &external_secrets,
+            &hydrated_instruction,
             &secret,
             tool_index,
             &shell,
@@ -2379,10 +2441,10 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
     // The Forgejo tools are declared only when the context file names at least one
     // clone that is still there and the agent's own token is present. The token is
     // read here, at the run, and never written or handed to the model.
-    let mut forgejo = forgejo_tools_for(plan, run_dir, log);
+    let mut forgejo = forgejo_tools_for(plan, &role_plan, run_dir, log);
     model_loop(
         plan,
-        &instruction,
+        &hydrated_instruction,
         &secret,
         tool_index,
         &mut forgejo,
@@ -2398,7 +2460,12 @@ fn run(plan: &RunPlan, run_dir: &Path, transcript: &mut Transcript, log: &mut Ru
 /// start time. This re-checks the part that can change between the start and the first
 /// turn — a clone removed, a token deleted — so a run never declares a tool whose
 /// repository or token is already gone.
-fn forgejo_tools_for(plan: &RunPlan, run_dir: &Path, log: &mut RunLog) -> Option<ForgejoTools> {
+fn forgejo_tools_for(
+    plan: &RunPlan,
+    role_plan: &crate::run::RoleRunPlan,
+    run_dir: &Path,
+    log: &mut RunLog,
+) -> Option<ForgejoTools> {
     let Some(mut context) = crate::run::read_forgejo_context(run_dir) else {
         log.line("forgejo tools: off — no Forgejo context was written for this run");
         return None;
@@ -2420,6 +2487,14 @@ fn forgejo_tools_for(plan: &RunPlan, run_dir: &Path, log: &mut RunLog) -> Option
             return None;
         }
     };
+    let permissions = role_plan.permissions.clone().unwrap_or_default();
+    let admin_token = if permissions.maintain {
+        credentials::forgejo_admin_token(&plan.credentials)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     log.line(&format!(
         "forgejo tools: on as `{}` on {}",
         context.login,
@@ -2430,12 +2505,11 @@ fn forgejo_tools_for(plan: &RunPlan, run_dir: &Path, log: &mut RunLog) -> Option
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    Some(ForgejoTools::new(
-        context,
-        plan.workspace.clone(),
-        plan.agent.clone(),
-        token,
-    ))
+    Some(
+        ForgejoTools::new(context, plan.workspace.clone(), plan.agent.clone(), token)
+            .with_permissions(permissions)
+            .with_org_creator_token(admin_token),
+    )
 }
 
 /// Run one declared step, recording it exactly like a model-asked tool call.
@@ -2542,7 +2616,11 @@ fn model_loop(
         Message::system(system_prompt(plan, forgejo.as_ref())),
         Message::user(instruction_text.clone()),
     ];
-    let declared_tools = model::tools_with(forgejo.is_some(), shell.method);
+    let permissions = forgejo
+        .as_ref()
+        .map(|f| f.permissions().clone())
+        .unwrap_or_default();
+    let declared_tools = model::tools_with_permissions(forgejo.is_some(), &permissions, shell.method);
     let deadline = Instant::now() + Duration::from_secs(plan.timeout_secs);
     let mut turn: u32 = 0;
     // What the run's own tool results prove about its outcome, so a positive
@@ -3173,8 +3251,11 @@ struct Shell {
     hide: Vec<std::path::PathBuf>,
     temp: Option<std::path::PathBuf>,
     home: Option<std::path::PathBuf>,
-    askpass: Option<std::path::PathBuf>,
-    login: Option<String>,
+    /// Supervisor-owned authenticated loopback Git proxy for built-in runs so
+    /// the raw Forgejo token is never written into sandbox-readable files.
+    _git_proxy: Option<crate::git_proxy::GitProxy>,
+    /// Private `.gitconfig` configuring `[http] proxy = http://gewu:<secret>@127.0.0.1:<port>`.
+    git_config: Option<std::path::PathBuf>,
     root: Option<std::path::PathBuf>,
     stage: Option<std::path::PathBuf>,
     /// Where the shell writes its per-command status record (correction 5). It is in
@@ -3185,6 +3266,10 @@ struct Shell {
     /// plan is rewritten, a marker is left for the engine and the run does not
     /// execute a command on an unconfined fallback (B9-R-R).
     refused: Option<String>,
+    /// Role-scoped non-secret external environment variables.
+    external_env: std::collections::BTreeMap<String, String>,
+    /// Role-scoped secret external environment variables (redacted in all outputs).
+    external_secrets: std::collections::BTreeMap<String, Secret>,
 }
 
 // A test-only engine temp root for one shell.
@@ -3284,6 +3369,20 @@ impl Shell {
             record_refusal(plan, run_dir, method, reason)?;
         }
         if !method.confined() {
+            let git_proxy =
+                crate::git_proxy::GitProxy::start(run_dir, &plan.agent, &plan.credentials)
+                    .ok()
+                    .flatten();
+            let git_config = if let Some(proxy) = git_proxy.as_ref() {
+                let path = run_dir.join("run-gitconfig");
+                let text = format!("[http]\n\tproxy = {}\n", proxy.url());
+                crate::mode::write_private_nofollow(&path, text.as_bytes()).map_err(|error| {
+                    format!("the run's Git transport config cannot be written: {error}")
+                })?;
+                Some(path)
+            } else {
+                None
+            };
             return Ok(Self {
                 method,
                 run_dir: run_dir.to_path_buf(),
@@ -3291,12 +3390,14 @@ impl Shell {
                 hide: Vec::new(),
                 temp: None,
                 home: None,
-                askpass: None,
-                login: None,
+                _git_proxy: git_proxy,
+                git_config,
                 root: None,
                 stage: None,
                 segments: Some(run_dir.join("shell-segments")),
                 refused,
+                external_env: std::collections::BTreeMap::new(),
+                external_secrets: std::collections::BTreeMap::new(),
             });
         }
         let engine_temp = engine_temp.take().expect("a confined run has a temp root");
@@ -3323,29 +3424,23 @@ impl Shell {
             .and_then(|()| fs::create_dir_all(home.join(".local/state")))
             .and_then(|()| fs::write(home.join(".gitconfig"), b""))
             .map_err(|error| format!("the confined shell's home cannot be written: {error}"))?;
-        let login = crate::run::read_forgejo_context(run_dir).map(|context| context.login);
-        let askpass = match (
-            login.as_ref(),
-            credentials::forgejo_agent_token(&plan.credentials, &plan.agent),
-        ) {
-            (Some(login), Ok(token)) => {
-                // Under the run's private TMPDIR, which every mechanism lets the run
-                // read. The old path beside the run root was outside Landlock's
-                // allow-list, so git could not authenticate in a confined run.
-                let path = temp.join("askpass.toml");
-                let text = format!(
-                    "[forgejo_agent_tokens]\n\"{}\" = \"{}\"\n[forgejo_logins]\n\"{}\" = \"{}\"\n",
-                    plan.agent,
-                    token.expose(),
-                    plan.agent,
-                    login
-                );
-                crate::mode::write_private(&path, text.as_bytes()).map_err(|error| {
-                    format!("the confined shell's login file cannot be written: {error}")
-                })?;
-                Some(path)
-            }
-            _ => None,
+        // Never write the raw Forgejo token into sandbox-readable `askpass.toml`:
+        // route git HTTP authentication through a run-private, capability-authenticated
+        // loopback `GitProxy` so the shell cannot bypass supervisor hard blocks or
+        // write bounds via direct Forgejo API calls.
+        let git_proxy =
+            crate::git_proxy::GitProxy::start(run_dir, &plan.agent, &plan.credentials)
+                .ok()
+                .flatten();
+        let git_config = if let Some(proxy) = git_proxy.as_ref() {
+            let path = home.join(".gitconfig");
+            let text = format!("[http]\n\tproxy = {}\n", proxy.url());
+            crate::mode::write_private_nofollow(&path, text.as_bytes()).map_err(|error| {
+                format!("the confined shell's Git transport config cannot be written: {error}")
+            })?;
+            Some(path)
+        } else {
+            Some(home.join(".gitconfig"))
         };
         Ok(Self {
             method,
@@ -3354,14 +3449,16 @@ impl Shell {
             hide,
             temp: Some(temp.clone()),
             home: Some(home),
-            askpass,
-            login,
+            _git_proxy: git_proxy,
+            git_config,
             root: Some(root),
             stage,
             // The private temporary root is writable under every confinement
             // mechanism, unlike the engine's run directory (which a namespace hides).
             segments: Some(temp.join("shell-segments")),
             refused,
+            external_env: std::collections::BTreeMap::new(),
+            external_secrets: std::collections::BTreeMap::new(),
         })
     }
 }
@@ -3499,24 +3596,22 @@ fn run_shell(
         .env("GEWU_AGENT", &plan.agent)
         .env("GEWU_RUN_ID", &plan.run_id)
         .env("GEWU_WORKSPACE", &shell.workspace);
-    // `git` in the workspace authenticates as the agent, and asks this same program
-    // for the token through `GIT_ASKPASS`. In a confined run the askpass process reads
-    // a per-run file that holds only this run's own login and token; the product's
-    // credentials file, with the model key and every other agent's login, is outside
-    // the sandbox. The token is never an argument, a URL or a log line.
-    if let Ok(askpass) = std::env::current_exe() {
-        let credential_path = shell
-            .askpass
-            .as_deref()
-            .unwrap_or(plan.credentials.as_path());
-        child_command
-            .env("GIT_ASKPASS", askpass)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env(crate::workspace::ASKPASS_CREDENTIALS, credential_path)
-            .env(crate::workspace::ASKPASS_AGENT, &plan.agent);
-        if let Some(login) = shell.login.as_ref() {
-            child_command.env(crate::workspace::ASKPASS_LOGIN, login);
+    for (key, value) in &shell.external_env {
+        if crate::engine::settings::validate_external_env_key(key).is_ok() {
+            child_command.env(key, value);
         }
+    }
+    for (key, secret) in &shell.external_secrets {
+        if crate::engine::settings::validate_external_env_key(key).is_ok() {
+            child_command.env(key, secret.expose());
+        }
+    }
+    // `git` in the workspace authenticates through the supervisor-owned loopback
+    // `GitProxy` configured in `GIT_CONFIG_GLOBAL`; the raw Forgejo token is never
+    // placed in `askpass.toml`, `GEWU_GIT_CREDENTIALS`, or any sandbox-readable file.
+    child_command.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(git_cfg) = shell.git_config.as_ref() {
+        child_command.env("GIT_CONFIG_GLOBAL", git_cfg);
     }
     // An anonymous memfd ownership capability created before the spawn is inherited
     // by the shell and its children. It is live identity for the group even in the
@@ -4377,7 +4472,7 @@ mod tests {
     }
 
     #[test]
-    fn a_confined_runs_askpass_file_lives_in_the_tmpdir_it_may_read() {
+    fn a_confined_run_uses_git_proxy_without_exposing_raw_forgejo_token_file() {
         let (root, config, skills, credentials) = agent_source("agent-run-askpass");
         let dir = run_dir(&root);
         crate::mode::write_private(
@@ -4390,7 +4485,7 @@ mod tests {
             serde_json::json!({
                 "url": "http://127.0.0.1:3000",
                 "login": "gewu-scribe",
-                "repositories": []
+                "repositories": [{ "full_name": "team/workspace", "directory": "workspace" }]
             })
             .to_string(),
         )
@@ -4406,28 +4501,22 @@ mod tests {
         );
         plan.confinement = "landlock".to_owned();
         plan.hide = vec![config.clone(), root.join("state")];
-        // `Engine::open` removes stale `gewu-run-*` trees directly under TMPDIR.
-        // This test process is not a `--run-agent` owner, so a concurrent engine
-        // would remove a live shell root there. Keep this shell under a private
-        // root that the cleanup does not scan; the assertions below are unchanged.
         let private_temp = root.join("shell-temp");
         fs::create_dir_all(&private_temp).expect("the private engine temp root");
         let shell = with_test_engine_temp(&private_temp, || Shell::prepare(&plan, &dir))
             .expect("the confined shell prepares");
-        let askpass = shell.askpass.as_ref().expect("the run has a login file");
         let temp = shell.temp.as_ref().expect("the run has a private TMPDIR");
-        // The file is under TMPDIR, which the Landlock path allows; the path beside
-        // the run root was outside the allow-list (B1).
+        // No askpass.toml containing the raw Forgejo token is ever placed in TMPDIR.
         assert!(
-            askpass.starts_with(temp),
-            "{} is not under {}",
-            askpass.display(),
-            temp.display()
+            !temp.join("askpass.toml").exists(),
+            "raw Forgejo token file must never be placed in sandbox-readable TMPDIR"
         );
-        assert!(askpass.is_file(), "the login file was not written");
-        assert_eq!(
-            crate::mode::mode_of(askpass).expect("the login file mode"),
-            0o600
+        let git_cfg = shell.git_config.as_ref().expect("private .gitconfig");
+        let cfg_text = fs::read_to_string(git_cfg).expect("gitconfig readable");
+        assert!(cfg_text.contains("proxy = http://gewu:"), "{cfg_text}");
+        assert!(
+            !cfg_text.contains("gw-fixture-token"),
+            "raw Forgejo token must never appear in .gitconfig"
         );
         // The product roots and the person's real home are in the hide list.
         assert!(shell.hide.iter().any(|path| path == &config));

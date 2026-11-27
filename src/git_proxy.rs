@@ -16,12 +16,14 @@ use std::time::Duration;
 
 pub struct GitProxy {
     address: SocketAddr,
+    proxy_secret: String,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl GitProxy {
-    /// Start a proxy for one run, with the token held only by the supervisor.
+    /// Start a proxy for one run, with the token held only by the supervisor and
+    /// a per-instance 256-bit Proxy-Authorization secret bound to this role.
     pub fn start(run_dir: &Path, agent: &str, credentials: &Path) -> Result<Option<Self>, String> {
         let Some(context) = crate::run::read_forgejo_context(run_dir) else {
             return Ok(None);
@@ -45,6 +47,9 @@ impl GitProxy {
         if repos.is_empty() {
             return Ok(None);
         }
+        let proxy_secret = crate::mode::random_hex_256()
+            .map_err(|error| format!("the run-private Git transport secret cannot be generated: {error}"))?;
+        let expected_proxy_auth = basic_auth("gewu", &proxy_secret);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .map_err(|error| format!("the run-private Git transport cannot listen: {error}"))?;
         listener
@@ -61,8 +66,10 @@ impl GitProxy {
             let _token = token_guard;
             while !stop_thread.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        let _ = serve(stream, &host, port, &repos, &auth);
+                    Ok((stream, peer)) => {
+                        if peer.ip().is_loopback() {
+                            let _ = serve(stream, &host, port, &repos, &auth, &expected_proxy_auth);
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(10));
@@ -73,13 +80,14 @@ impl GitProxy {
         });
         Ok(Some(Self {
             address,
+            proxy_secret,
             stop,
             handle: Some(handle),
         }))
     }
 
     pub fn url(&self) -> String {
-        format!("http://{}", self.address)
+        format!("http://gewu:{}@{}", self.proxy_secret, self.address)
     }
 }
 
@@ -285,7 +293,14 @@ fn decode_chunked(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     }
 }
 
-fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &str) -> Option<()> {
+fn serve(
+    mut client: TcpStream,
+    host: &str,
+    port: u16,
+    repos: &[String],
+    auth: &str,
+    expected_proxy_auth: &str,
+) -> Option<()> {
     client
         .set_read_timeout(Some(Duration::from_secs(30)))
         .ok()?;
@@ -299,6 +314,27 @@ fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &
     let mut request = parsed.next()?.split_whitespace();
     let method = request.next()?.to_ascii_uppercase();
     let target = request.next()?;
+    let headers: Vec<String> = parsed
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // Require exact per-instance 256-bit Proxy-Authorization before routing any request,
+    // so another local same-UID role cannot push/fetch through this role's Git proxy.
+    let provided_proxy_auth = headers.iter().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("proxy-authorization")
+            .then(|| value.trim())
+    });
+    if !provided_proxy_auth
+        .is_some_and(|val| crate::mode::constant_time_eq(val.as_bytes(), expected_proxy_auth.as_bytes()))
+    {
+        let _ = client.write_all(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"gewu\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let _ = client.flush();
+        return None;
+    }
     if method != "GET" && method != "POST" {
         return None;
     }
@@ -311,10 +347,6 @@ fn serve(mut client: TcpStream, host: &str, port: u16, repos: &[String], auth: &
         return None;
     }
     let path = fixed_route(&format!("/{raw_path}"), repos, &method)?;
-    let headers: Vec<String> = parsed
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect();
     let framing = parse_lengths(&headers)?;
     let mut received = head[split..].to_vec();
     let owned_body;
@@ -463,5 +495,36 @@ mod boundary_tests {
             parse_lengths(&["Content-Length: 5".to_owned()]),
             Some(Framing::Fixed(5))
         ));
+    }
+
+    #[test]
+    fn unauthenticated_proxy_requests_are_refused_with_407() {
+        let root = crate::test_support::scratch_root("git-proxy-auth");
+        let creds = root.join("credentials.toml");
+        crate::mode::write_private(
+            &creds,
+            b"[forgejo_agent_tokens]\n\"coder\" = \"tok-1\"\n[forgejo_logins]\n\"coder\" = \"gewu-coder\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(crate::run::FORGEJO_CONTEXT_FILE),
+            serde_json::json!({
+                "url": "http://127.0.0.1:9",
+                "login": "gewu-coder",
+                "repositories": [{ "full_name": "team/workspace", "directory": "workspace" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let proxy = GitProxy::start(&root, "coder", &creds)
+            .expect("proxy starts")
+            .expect("proxy active");
+        let mut stream = TcpStream::connect(proxy.address).expect("connect");
+        stream
+            .write_all(b"GET http://127.0.0.1:9/team/workspace.git/HEAD HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n")
+            .unwrap();
+        let mut resp = String::new();
+        let _ = stream.read_to_string(&mut resp);
+        assert!(resp.starts_with("HTTP/1.1 407"), "expected 407, got: {resp}");
     }
 }
