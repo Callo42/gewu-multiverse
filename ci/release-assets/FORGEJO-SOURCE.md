@@ -1,7 +1,7 @@
 # Forgejo 17.0.0 for Linux amd64
 
 This is the pinned Forgejo binary distributed unmodified alongside
-**gewu-multiverse 0.1.43** (both inside the `x86_64-linux` release archive under
+**gewu-multiverse 0.2.0** (both inside the `x86_64-linux` release archive under
 `forgejo/` as a separate executable aggregation and as a standalone release
 asset).
 
